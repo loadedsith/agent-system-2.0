@@ -1,5 +1,5 @@
 # agent-system 2.0 install manifest (SPEC-2.0.md § B8): the machinery table, machine-read.
-# One row per artifact under a machinery directory: path (repo-relative), kind, destination, proposal_id.
+# One row per artifact under a machinery directory: path (repo-relative), kind, destination, and an optional proposal_id.
 # install/install.sh fails when a file under a machinery directory has no row here, or when any
 # symbolic link sits under one. Exactly one ledger-schema row (ledger/schema.sql, the file the
 # module applies), one ledger-init row, one ledger-backup row and one ledger-backup-agent row.
@@ -7,1297 +7,1298 @@
 #              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db);
 #              "{launch_agents}/<name>" = $HOME/Library/LaunchAgents/<name>, written filled in on macOS
 #              only, never loaded by the installer.
-# proposal_id: "-" = no tuning proposal made the row; "p-<id>" = the proposal (B14.3) the row came from
-#              (PLAN wl-mv654hoqwpfhmo § 11.3). install/install.sh refuses a row without one.
+# proposal_id (optional fourth column): "-" = no tuning proposal made the row; "p-<id>" = the proposal
+#              (B14.3) the row came from (PLAN wl-mv654hoqwpfhmo § 11.3). A three-column row means
+#              proposal_id "-"; a fourth column that is present must be "-" or p-[a-z0-9]+.
 # Columns are separated by one TAB. Lines starting with # are comments.
 path	kind	destination	proposal_id
-ledger/SCHEMA.md	doc	-	-
-ledger/schema.sql	ledger-schema	{ledger_db}	-
-ledger/src/index.ts	ledger-module	-	-
-ledger/src/locality.ts	ledger-module	-	-
-ledger/scripts/init.ts	ledger-init	-	-
-ledger/scripts/backup.ts	ledger-backup	-	-
-ledger/test/facts.test.ts	test	-	-
-ledger/test/install.test.ts	test	-	-
-ledger/test/ledger.test.ts	test	-	-
-ledger/test/raw-sqlite.test.ts	test	-	-
-install/manifest.tsv	install	-	-
-install/install.sh	install	-	-
-install/fresh-machine-test.sh	install	-	-
-install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist	-
+ledger/SCHEMA.md	doc	-
+ledger/schema.sql	ledger-schema	{ledger_db}
+ledger/src/index.ts	ledger-module	-
+ledger/src/locality.ts	ledger-module	-
+ledger/scripts/init.ts	ledger-init	-
+ledger/scripts/backup.ts	ledger-backup	-
+ledger/test/facts.test.ts	test	-
+ledger/test/install.test.ts	test	-
+ledger/test/ledger.test.ts	test	-
+ledger/test/raw-sqlite.test.ts	test	-
+install/manifest.tsv	install	-
+install/install.sh	install	-
+install/fresh-machine-test.sh	install	-
+install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist
 # M3/M4 (2026-09-29): tier files, the classifier and gates extensions with their modules, tests and
 # data, and the 2.0 profile template (config.yml + models.yml, the judge pin). All used in place:
 # the profile names the extension entry points by repo path. `profile` rows are the template the
 # profile rendering is owned by M6 (MIGRATION.md; corrected 2026-09-29 from "M8"); models.yml must land beside config.yml.
-classifier/calibration.json	data	-	-
-classifier/extension.ts	extension	-	-
-classifier/kind-question.json	data	-	-
-classifier/scripts/ledger-replay.ts	module	-	-
-classifier/src/brief.ts	module	-	-
-classifier/src/build-row.ts	module	-	-
-classifier/src/classify.ts	module	-	-
-classifier/src/fingerprint.ts	module	-	-
-classifier/src/hand-session.ts	module	-	-
-classifier/src/headroom.ts	module	-	-
-classifier/src/lab.ts	module	-	-
-classifier/src/ledger-port.ts	module	-	-
-classifier/src/panel.ts	module	-	-
-classifier/src/review-stop.ts	module	-	-
-classifier/src/rounds.ts	module	-	-
-classifier/src/route.ts	module	-	-
-classifier/src/tier-table.ts	module	-	-
-classifier/test/build-row.test.ts	test	-	-
-classifier/test/crosslab.test.ts	test	-	-
-classifier/test/extension.test.ts	test	-	-
-classifier/test/fingerprint.test.ts	test	-	-
-classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-	-
-classifier/test/fixtures/classifier-sample-30.jsonl	test	-	-
-classifier/test/fixtures/kind-question-2026-09-23.json	test	-	-
-classifier/test/fixtures/kind-question-2026-09-28.json	test	-	-
-classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/backup-2026-10-08T16-38-35.059Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/backup-2026-10-09T16-59-40.338Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/backup-2026-10-10T17-20-31.871Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/golden.txt	test	-	-
-classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-	-
-classifier/test/fixtures/ledger-replay/manifest.json	test	-	-
-classifier/test/hand-session.test.ts	test	-	-
-classifier/test/headroom.test.ts	test	-	-
-classifier/test/helpers.ts	test	-	-
-classifier/test/kimi-rule.test.ts	test	-	-
-classifier/test/lab.test.ts	test	-	-
-classifier/test/lane-lab.test.ts	test	-	-
-classifier/test/ledger-replay.test.ts	test	-	-
-classifier/test/panel-dispatch.test.ts	test	-	-
-classifier/test/panel.test.ts	test	-	-
-classifier/test/review-defects.test.ts	test	-	-
-classifier/test/profile-rows.test.ts	test	-	-
-classifier/test/replay.test.ts	test	-	-
-classifier/test/review-round1.test.ts	test	-	-
-classifier/test/review-round2.test.ts	test	-	-
-classifier/test/review-stop.test.ts	test	-	-
-classifier/test/rounds.test.ts	test	-	-
-classifier/test/snapshot-settle.test.ts	test	-	-
-classifier/test/route.test.ts	test	-	-
-classifier/test/tier-files.test.ts	test	-	-
-classifier/test/tier-table.test.ts	test	-	-
-gates/extensions/question.ts	extension	-	-
-gates/extensions/r01-turn-shape.ts	extension	-	-
-gates/extensions/r02-contract.ts	extension	-	-
-gates/extensions/r03-receipts.ts	extension	-	-
-gates/extensions/r04-tier-name.ts	extension	-	-
-gates/extensions/r05-brief-fields.ts	extension	-	-
-gates/extensions/r06-reserved.ts	extension	-	-
-gates/extensions/r07-wake-read.ts	extension	-	-
-gates/extensions/r08-push-rebase.ts	extension	-	-
-gates/extensions/r09-protected-edit.ts	extension	-	-
-gates/extensions/r10-raw-ledger.ts	extension	-	-
-gates/extensions/r11-jo-instruction.ts	extension	-	-
-gates/extensions/r14-ask-policy.ts	extension	-	-
-gates/index.ts	extension	-	-
-gates/src/eval-code.ts	module	-	-
-gates/src/exec.ts	module	-	-
-gates/src/gates.ts	module	-	-
-gates/src/rows/question.ts	module	-	-
-gates/src/rows/r01-turn-shape.ts	module	-	-
-gates/src/rows/r02-contract.ts	module	-	-
-gates/src/rows/r03-receipts.ts	module	-	-
-gates/src/rows/r04-tier-name.ts	module	-	-
-gates/src/rows/r05-brief-fields.ts	module	-	-
-gates/src/rows/r06-reserved.ts	module	-	-
-gates/src/rows/r07-wake-read.ts	module	-	-
-gates/src/rows/r08-push-rebase.ts	module	-	-
-gates/src/rows/r09-protected-edit.ts	module	-	-
-gates/src/rows/r10-raw-ledger.ts	module	-	-
-gates/src/rows/r11-jo-instruction.ts	module	-	-
-gates/src/rows/r14-ask-policy.ts	module	-	-
-gates/src/session.ts	module	-	-
-gates/src/shell-parse.ts	module	-	-
-gates/src/targets.ts	module	-	-
-gates/src/types.ts	module	-	-
-gates/src/test-run.ts	module	-	-
-gates/src/git-model.ts	module	-	-
-gates/src/fence.ts	module	-	-
-gates/test/case-and-noexec.test.ts	test	-	-
-gates/test/extension.test.ts	test	-	-
-gates/test/helpers.ts	test	-	-
-gates/test/known-fragment.test.ts	test	-	-
-gates/test/ledger-rows.test.ts	test	-	-
-gates/test/message-rows.test.ts	test	-	-
-gates/test/review-round1.test.ts	test	-	-
-gates/test/review-round2.test.ts	test	-	-
-gates/test/review-round3.test.ts	test	-	-
-gates/test/review-round4.test.ts	test	-	-
-gates/test/manifest-sync.test.ts	test	-	-
-gates/test/printf-property.test.ts	test	-	-
-gates/test/tool-call-rows.test.ts	test	-	-
-gates/test/r08-tree-evidence.test.ts	test	-	-
-gates/test/review-round5.test.ts	test	-	-
-gates/test/review-round6.test.ts	test	-	-
-gates/test/review-round7-env.test.ts	test	-	-
-gates/test/review-round7-eval.test.ts	test	-	-
-gates/test/review-round7-git.test.ts	test	-	-
-gates/test/review-round8-env.test.ts	test	-	-
-gates/test/review-round8-eval.test.ts	test	-	-
-gates/test/fence.test.ts	test	-	-
-gates/test/r06-eval-literals.test.ts	test	-	-
-gates/test/r06-eval-process.test.ts	test	-	-
-gates/test/r06-quoted-data.test.ts	test	-	-
-gates/test/r06-alias.test.ts	test	-	-
-gates/extensions/r15-orchestrator-role.ts	extension	-	-
-gates/src/rows/r15-orchestrator-role.ts	module	-	-
-gates/src/host.ts	module	-	-
-gates/test/r15-orchestrator-role.test.ts	test	-	-
-gates/test/host.test.ts	test	-	-
-gates/test/turn-shape-once.test.ts	test	-	-
-gates/extensions/r17-spawn-rate.ts	extension	-	-
-gates/src/rows/r17-spawn-rate.ts	module	-	-
-gates/test/r17-spawn-rate.test.ts	test	-	-
-gates/scripts/guard-replay.ts	module	-	-
-gates/test/guard-replay.test.ts	test	-	-
-gates/test/fixtures/guard-replay/corpus.jsonl	test	-	-
-gates/scripts/probe-history.ts	module	-	-
-gates/test/probe-harness.ts	test	-	-
-gates/test/probe-suite.test.ts	test	-	-
-gates/test/fixtures/probe-cases.json	test	-	-
-gates/extensions/r18-typed-wrapper.ts	extension	-	-
-gates/src/rows/r18-typed-wrapper.ts	module	-	-
-gates/test/r18-typed-wrapper.test.ts	test	-	-
-gates/test/r18-typed-wrapper-exec.test.ts	test	-	-
-gates/src/shell-start.ts	module	-	-
-gates/test/shell-start.test.ts	test	-	-
-gates/test/shell-start-bash.test.ts	test	-	-
-gates/test/shell-start-session-harness.ts	test	-	-
-gates/test/shell-start-session-recorder.ts	test	-	-
-gates/test/shell-start-session-rc.test.ts	test	-	-
-gates/test/shell-start-session-named.test.ts	test	-	-
-gates/test/shell-start-session-reuse.test.ts	test	-	-
-gates/test/shell-start-session-hooks.test.ts	test	-	-
-gates/test/shell-start-session-env.test.ts	test	-	-
-gates/test/shell-start-session-work.test.ts	test	-	-
-gates/src/clean-shell.ts	module	-	-
-gates/scripts/clean-shell.ts	module	-	-
-gates/test/clean-shell.test.ts	test	-	-
-gates/test/shell-start-session-switch.test.ts	test	-	-
-gates/test/rss-watchdog.ts	test	-	-
-gates/test/rss-watchdog.test.ts	test	-	-
-profile/config.yml	profile	{profile}/agent/config.yml	-
-profile/mcp.json	profile	{profile}/agent/mcp.json	-
-profile/models.yml	profile	{profile}/agent/models.yml	-
-tiers/deep.md	tier	{profile}/agent/agents/deep.md	-
-tiers/fast.md	tier	{profile}/agent/agents/fast.md	-
-tiers/lane.md	tier	{profile}/agent/agents/lane.md	-
-tiers/orchestrator.md	tier	{profile}/agent/agents/orchestrator.md	-
-tiers/standard.md	tier	{profile}/agent/agents/standard.md	-
-tiers/strong.md	tier	{profile}/agent/agents/strong.md	-
-tiers/test/size.test.ts	test	-	-
-bin/as2	launcher	{local_bin}/as2	-
+classifier/calibration.json	data	-
+classifier/extension.ts	extension	-
+classifier/kind-question.json	data	-
+classifier/scripts/ledger-replay.ts	module	-
+classifier/src/brief.ts	module	-
+classifier/src/build-row.ts	module	-
+classifier/src/classify.ts	module	-
+classifier/src/fingerprint.ts	module	-
+classifier/src/hand-session.ts	module	-
+classifier/src/headroom.ts	module	-
+classifier/src/lab.ts	module	-
+classifier/src/ledger-port.ts	module	-
+classifier/src/panel.ts	module	-
+classifier/src/review-stop.ts	module	-
+classifier/src/rounds.ts	module	-
+classifier/src/route.ts	module	-
+classifier/src/tier-table.ts	module	-
+classifier/test/build-row.test.ts	test	-
+classifier/test/crosslab.test.ts	test	-
+classifier/test/extension.test.ts	test	-
+classifier/test/fingerprint.test.ts	test	-
+classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
+classifier/test/fixtures/classifier-sample-30.jsonl	test	-
+classifier/test/fixtures/kind-question-2026-09-23.json	test	-
+classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-08T16-38-35.059Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-09T16-59-40.338Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/backup-2026-10-10T17-20-31.871Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/golden.txt	test	-
+classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
+classifier/test/fixtures/ledger-replay/manifest.json	test	-
+classifier/test/hand-session.test.ts	test	-
+classifier/test/headroom.test.ts	test	-
+classifier/test/helpers.ts	test	-
+classifier/test/kimi-rule.test.ts	test	-
+classifier/test/lab.test.ts	test	-
+classifier/test/lane-lab.test.ts	test	-
+classifier/test/ledger-replay.test.ts	test	-
+classifier/test/panel-dispatch.test.ts	test	-
+classifier/test/panel.test.ts	test	-
+classifier/test/review-defects.test.ts	test	-
+classifier/test/profile-rows.test.ts	test	-
+classifier/test/replay.test.ts	test	-
+classifier/test/review-round1.test.ts	test	-
+classifier/test/review-round2.test.ts	test	-
+classifier/test/review-stop.test.ts	test	-
+classifier/test/rounds.test.ts	test	-
+classifier/test/snapshot-settle.test.ts	test	-
+classifier/test/route.test.ts	test	-
+classifier/test/tier-files.test.ts	test	-
+classifier/test/tier-table.test.ts	test	-
+gates/extensions/question.ts	extension	-
+gates/extensions/r01-turn-shape.ts	extension	-
+gates/extensions/r02-contract.ts	extension	-
+gates/extensions/r03-receipts.ts	extension	-
+gates/extensions/r04-tier-name.ts	extension	-
+gates/extensions/r05-brief-fields.ts	extension	-
+gates/extensions/r06-reserved.ts	extension	-
+gates/extensions/r07-wake-read.ts	extension	-
+gates/extensions/r08-push-rebase.ts	extension	-
+gates/extensions/r09-protected-edit.ts	extension	-
+gates/extensions/r10-raw-ledger.ts	extension	-
+gates/extensions/r11-jo-instruction.ts	extension	-
+gates/extensions/r14-ask-policy.ts	extension	-
+gates/index.ts	extension	-
+gates/src/eval-code.ts	module	-
+gates/src/exec.ts	module	-
+gates/src/gates.ts	module	-
+gates/src/rows/question.ts	module	-
+gates/src/rows/r01-turn-shape.ts	module	-
+gates/src/rows/r02-contract.ts	module	-
+gates/src/rows/r03-receipts.ts	module	-
+gates/src/rows/r04-tier-name.ts	module	-
+gates/src/rows/r05-brief-fields.ts	module	-
+gates/src/rows/r06-reserved.ts	module	-
+gates/src/rows/r07-wake-read.ts	module	-
+gates/src/rows/r08-push-rebase.ts	module	-
+gates/src/rows/r09-protected-edit.ts	module	-
+gates/src/rows/r10-raw-ledger.ts	module	-
+gates/src/rows/r11-jo-instruction.ts	module	-
+gates/src/rows/r14-ask-policy.ts	module	-
+gates/src/session.ts	module	-
+gates/src/shell-parse.ts	module	-
+gates/src/targets.ts	module	-
+gates/src/types.ts	module	-
+gates/src/test-run.ts	module	-
+gates/src/git-model.ts	module	-
+gates/src/fence.ts	module	-
+gates/test/case-and-noexec.test.ts	test	-
+gates/test/extension.test.ts	test	-
+gates/test/helpers.ts	test	-
+gates/test/known-fragment.test.ts	test	-
+gates/test/ledger-rows.test.ts	test	-
+gates/test/message-rows.test.ts	test	-
+gates/test/review-round1.test.ts	test	-
+gates/test/review-round2.test.ts	test	-
+gates/test/review-round3.test.ts	test	-
+gates/test/review-round4.test.ts	test	-
+gates/test/manifest-sync.test.ts	test	-
+gates/test/printf-property.test.ts	test	-
+gates/test/tool-call-rows.test.ts	test	-
+gates/test/r08-tree-evidence.test.ts	test	-
+gates/test/review-round5.test.ts	test	-
+gates/test/review-round6.test.ts	test	-
+gates/test/review-round7-env.test.ts	test	-
+gates/test/review-round7-eval.test.ts	test	-
+gates/test/review-round7-git.test.ts	test	-
+gates/test/review-round8-env.test.ts	test	-
+gates/test/review-round8-eval.test.ts	test	-
+gates/test/fence.test.ts	test	-
+gates/test/r06-eval-literals.test.ts	test	-
+gates/test/r06-eval-process.test.ts	test	-
+gates/test/r06-quoted-data.test.ts	test	-
+gates/test/r06-alias.test.ts	test	-
+gates/extensions/r15-orchestrator-role.ts	extension	-
+gates/src/rows/r15-orchestrator-role.ts	module	-
+gates/src/host.ts	module	-
+gates/test/r15-orchestrator-role.test.ts	test	-
+gates/test/host.test.ts	test	-
+gates/test/turn-shape-once.test.ts	test	-
+gates/extensions/r17-spawn-rate.ts	extension	-
+gates/src/rows/r17-spawn-rate.ts	module	-
+gates/test/r17-spawn-rate.test.ts	test	-
+gates/scripts/guard-replay.ts	module	-
+gates/test/guard-replay.test.ts	test	-
+gates/test/fixtures/guard-replay/corpus.jsonl	test	-
+gates/scripts/probe-history.ts	module	-
+gates/test/probe-harness.ts	test	-
+gates/test/probe-suite.test.ts	test	-
+gates/test/fixtures/probe-cases.json	test	-
+gates/extensions/r18-typed-wrapper.ts	extension	-
+gates/src/rows/r18-typed-wrapper.ts	module	-
+gates/test/r18-typed-wrapper.test.ts	test	-
+gates/test/r18-typed-wrapper-exec.test.ts	test	-
+gates/src/shell-start.ts	module	-
+gates/test/shell-start.test.ts	test	-
+gates/test/shell-start-bash.test.ts	test	-
+gates/test/shell-start-session-harness.ts	test	-
+gates/test/shell-start-session-recorder.ts	test	-
+gates/test/shell-start-session-rc.test.ts	test	-
+gates/test/shell-start-session-named.test.ts	test	-
+gates/test/shell-start-session-reuse.test.ts	test	-
+gates/test/shell-start-session-hooks.test.ts	test	-
+gates/test/shell-start-session-env.test.ts	test	-
+gates/test/shell-start-session-work.test.ts	test	-
+gates/src/clean-shell.ts	module	-
+gates/scripts/clean-shell.ts	module	-
+gates/test/clean-shell.test.ts	test	-
+gates/test/shell-start-session-switch.test.ts	test	-
+gates/test/rss-watchdog.ts	test	-
+gates/test/rss-watchdog.test.ts	test	-
+profile/config.yml	profile	{profile}/agent/config.yml
+profile/mcp.json	profile	{profile}/agent/mcp.json
+profile/models.yml	profile	{profile}/agent/models.yml
+tiers/deep.md	tier	{profile}/agent/agents/deep.md
+tiers/fast.md	tier	{profile}/agent/agents/fast.md
+tiers/lane.md	tier	{profile}/agent/agents/lane.md
+tiers/orchestrator.md	tier	{profile}/agent/agents/orchestrator.md
+tiers/standard.md	tier	{profile}/agent/agents/standard.md
+tiers/strong.md	tier	{profile}/agent/agents/strong.md
+tiers/test/size.test.ts	test	-
+bin/as2	launcher	{local_bin}/as2
 # Linux (later addition, not built): a systemd user timer running the ledger-backup row, e.g.
 # install/agent-system-2-ledger-backup.timer + .service, kind ledger-backup-timer, destination
 # {systemd_user}/<name>. Until it exists, off macOS the open-time copy is the only schedule.
-skills/VENDOR.md	doc	-	-
-skills/accessibility/SKILL.md	skill	-	-
-skills/accessibility/WCAG-AA-CHECKLIST.md	skill-asset	-	-
-skills/api-and-interface-design/SKILL.md	skill	-	-
-skills/code-review-and-quality/SKILL.md	skill	-	-
-skills/code-review-and-quality/references/code-simplification.md	skill-asset	-	-
-skills/code-review-and-quality/references/floor-guard.md	skill-asset	-	-
-skills/code-review-and-quality/references/performance-checklist.md	skill-asset	-	-
-skills/code-review-and-quality/references/security-checklist.md	skill-asset	-	-
-skills/cross-model-review/SKILL.md	skill	-	-
-skills/cross-model-review/references/doubt-driven-development.md	skill-asset	-	-
-skills/cross-model-review/references/orchestration-patterns.md	skill-asset	-	-
-skills/cross-model-review/references/panel/panel.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/doubt.leg.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/doubt.synth.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/quorum-refute.leg.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/quorum-refute.synth.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/quorum.leg.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/quorum.synth.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/refute.leg.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/refute.synth.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/synth-common.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/triad-verify.leg.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/triad-verify.synth.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/triad.leg.md	skill-asset	-	-
-skills/cross-model-review/references/panel/prompts/triad.synth.md	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/doubt.leg.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/quorum-refute.leg.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/quorum.leg.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/refute.leg.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/synth.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/triad-verify.leg.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/schema/triad.leg.schema.json	skill-asset	-	-
-skills/cross-model-review/references/panel/scripts/panel.ts	skill-asset	-	-
-skills/cross-model-review/references/quorum/prompts/ground.md	skill-asset	-	-
-skills/cross-model-review/references/quorum/prompts/plan.md	skill-asset	-	-
-skills/cross-model-review/references/quorum/prompts/plan.schema.json	skill-asset	-	-
-skills/cross-model-review/references/quorum/prompts/refute-plan.md	skill-asset	-	-
-skills/cross-model-review/references/quorum/prompts/refute-plan.schema.json	skill-asset	-	-
-skills/cross-model-review/references/quorum/quorum.md	skill-asset	-	-
-skills/cross-model-review/references/quorum/scripts/quorum-fanout.sh	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/architecture.md	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/architecture.schema.json	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/cold-read.md	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/correctness.md	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/correctness.schema.json	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/refute.md	skill-asset	-	-
-skills/cross-model-review/references/triad/prompts/refute.schema.json	skill-asset	-	-
-skills/cross-model-review/references/triad/scripts/herdr-legs.sh	skill-asset	-	-
-skills/cross-model-review/references/triad/scripts/triad-fanout.sh	skill-asset	-	-
-skills/cross-model-review/references/triad/triad.md	skill-asset	-	-
-skills/cross-model-review/test/panel.test.ts	test	-	-
-skills/ctx/SKILL.md	skill	-	-
-skills/debugging-and-error-recovery/SKILL.md	skill	-	-
-skills/deprecation-and-migration/SKILL.md	skill	-	-
-skills/documentation-and-adrs/SKILL.md	skill	-	-
-skills/execute-plan/LICENSE	skill-asset	-	-
-skills/execute-plan/SKILL.md	skill	-	-
-skills/execute-plan/code-reviewer-prompt.md	skill-asset	-	-
-skills/execute-plan/implementer-prompt.md	skill-asset	-	-
-skills/execute-plan/re-review-prompt.md	skill-asset	-	-
-skills/execute-plan/references/executing-plans.md	skill-asset	-	-
-skills/execute-plan/scripts/review-package	skill-asset	-	-
-skills/execute-plan/scripts/sdd-workspace	skill-asset	-	-
-skills/execute-plan/scripts/task-brief	skill-asset	-	-
-skills/execute-plan/scripts/task-done	skill-asset	-	-
-skills/execute-plan/scripts/task-start	skill-asset	-	-
-skills/execute-plan/task-reviewer-prompt.md	skill-asset	-	-
-skills/git-workflow-and-versioning/SKILL.md	skill	-	-
-skills/humanizer/LICENSE	skill-asset	-	-
-skills/humanizer/SKILL.md	skill	-	-
-skills/impeccable/SKILL.md	skill	-	-
-skills/impeccable/reference/adapt.md	skill-asset	-	-
-skills/impeccable/reference/adapt.native.md	skill-asset	-	-
-skills/impeccable/reference/android.md	skill-asset	-	-
-skills/impeccable/reference/animate.md	skill-asset	-	-
-skills/impeccable/reference/audit.md	skill-asset	-	-
-skills/impeccable/reference/audit.native.md	skill-asset	-	-
-skills/impeccable/reference/bolder.md	skill-asset	-	-
-skills/impeccable/reference/clarify.md	skill-asset	-	-
-skills/impeccable/reference/colorize.md	skill-asset	-	-
-skills/impeccable/reference/craft-floor.md	skill-asset	-	-
-skills/impeccable/reference/craft.md	skill-asset	-	-
-skills/impeccable/reference/critique.md	skill-asset	-	-
-skills/impeccable/reference/degraded/asset-producer.md	skill-asset	-	-
-skills/impeccable/reference/degraded/documenter.md	skill-asset	-	-
-skills/impeccable/reference/degraded/finish-reviewer.md	skill-asset	-	-
-skills/impeccable/reference/degraded/manual-edit-applier.md	skill-asset	-	-
-skills/impeccable/reference/delight.md	skill-asset	-	-
-skills/impeccable/reference/distill.md	skill-asset	-	-
-skills/impeccable/reference/doctor.md	skill-asset	-	-
-skills/impeccable/reference/document.md	skill-asset	-	-
-skills/impeccable/reference/extract.md	skill-asset	-	-
-skills/impeccable/reference/harden.md	skill-asset	-	-
-skills/impeccable/reference/hooks.md	skill-asset	-	-
-skills/impeccable/reference/init.md	skill-asset	-	-
-skills/impeccable/reference/ios.md	skill-asset	-	-
-skills/impeccable/reference/layout.md	skill-asset	-	-
-skills/impeccable/reference/live-setup.md	skill-asset	-	-
-skills/impeccable/reference/live.md	skill-asset	-	-
-skills/impeccable/reference/new-work.md	skill-asset	-	-
-skills/impeccable/reference/onboard.md	skill-asset	-	-
-skills/impeccable/reference/operate.md	skill-asset	-	-
-skills/impeccable/reference/optimize.md	skill-asset	-	-
-skills/impeccable/reference/overdrive.md	skill-asset	-	-
-skills/impeccable/reference/polish.md	skill-asset	-	-
-skills/impeccable/reference/quieter.md	skill-asset	-	-
-skills/impeccable/reference/routing.md	skill-asset	-	-
-skills/impeccable/reference/shape.md	skill-asset	-	-
-skills/impeccable/reference/typeset.md	skill-asset	-	-
-skills/impeccable/reference/visualize.md	skill-asset	-	-
-skills/impeccable/scripts/VERSION	skill-asset	-	-
-skills/impeccable/scripts/command-metadata.json	skill-asset	-	-
-skills/impeccable/scripts/data/font-index-failures.json	skill-asset	-	-
-skills/impeccable/scripts/data/font-index.json	skill-asset	-	-
-skills/impeccable/scripts/impeccable	skill-asset	-	-
-skills/impeccable/scripts/impeccable.cmd	skill-asset	-	-
-skills/impeccable/scripts/live-browser-dom.js	skill-asset	-	-
-skills/impeccable/scripts/live-browser-ignores.js	skill-asset	-	-
-skills/impeccable/scripts/live-browser-session.js	skill-asset	-	-
-skills/impeccable/scripts/live-browser.js	skill-asset	-	-
-skills/impeccable/scripts/modern-screenshot.umd.js	skill-asset	-	-
-skills/interview-me/SKILL.md	skill	-	-
-skills/interview-me/references/idea-refine/examples.md	skill-asset	-	-
-skills/interview-me/references/idea-refine/frameworks.md	skill-asset	-	-
-skills/interview-me/references/idea-refine/idea-refine.md	skill-asset	-	-
-skills/interview-me/references/idea-refine/refinement-criteria.md	skill-asset	-	-
-skills/interview-me/references/idea-refine/scripts/idea-refine.sh	skill-asset	-	-
-skills/observability-and-instrumentation/SKILL.md	skill	-	-
-skills/observability-and-instrumentation/references/observability-checklist.md	skill-asset	-	-
-skills/performance-optimization/SKILL.md	skill	-	-
-skills/performance-optimization/references/performance-checklist.md	skill-asset	-	-
-skills/research/SKILL.md	skill	-	-
-skills/resolving-merge-conflicts/SKILL.md	skill	-	-
-skills/resolving-merge-conflicts/agents/openai.yaml	skill-asset	-	-
-skills/security-and-hardening/SKILL.md	skill	-	-
-skills/security-and-hardening/references/hardening-patterns.md	skill-asset	-	-
-skills/security-and-hardening/references/security-checklist.md	skill-asset	-	-
-skills/seo-audit/SKILL.md	skill	-	-
-skills/seo-audit/references/do-not-flag.md	skill-asset	-	-
-skills/seo-audit/references/frameworks.md	skill-asset	-	-
-skills/seo-audit/references/research/ai-crawlers-bing.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-google-blog-2023-08-howto-faq-changes.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-google-blog-2024-10-sitelinks-search-box.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-google-javascript-seo-basics-robots.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-google-rich-results-test-help.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-rfc6596.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-rfc9309.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-w3c-wai-decorative-images.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-webdev-responsive-web-design-basics.md	skill-asset	-	-
-skills/seo-audit/references/research/fetch-whatwg-html-title-element.md	skill-asset	-	-
-skills/seo-audit/references/research/frameworks.md	skill-asset	-	-
-skills/seo-audit/references/research/google-core.md	skill-asset	-	-
-skills/seo-audit/references/research/performance-lighthouse.md	skill-asset	-	-
-skills/seo-audit/references/research/structured-data.md	skill-asset	-	-
-skills/seo-audit/references/research/survey.md	skill-asset	-	-
-skills/seo-audit/references/rules.md	skill-asset	-	-
-skills/seo-audit/references/sources.md	skill-asset	-	-
-skills/seo-audit/scripts/audit.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/catalogue.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/content-dom.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/content-iso.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/crux.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/directives.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/engine.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/evidence.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/fetch.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/guard.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/html.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/jsonld.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/lighthouse.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/perf-framework-source.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/proxy.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/render.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/report.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/robots.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/sd-social-json.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/sd-social-types.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/sitemap.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/source.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/uaprobe.ts	skill-asset	-	-
-skills/seo-audit/scripts/lib/url.ts	skill-asset	-	-
-skills/seo-audit/scripts/rules/README.md	skill-asset	-	-
-skills/seo-audit/scripts/rules/ai-bing.ts	skill-asset	-	-
-skills/seo-audit/scripts/rules/content.ts	skill-asset	-	-
-skills/seo-audit/scripts/rules/crawl-index.ts	skill-asset	-	-
-skills/seo-audit/scripts/rules/perf-framework.ts	skill-asset	-	-
-skills/seo-audit/scripts/rules/sd-social.ts	skill-asset	-	-
-skills/seo-audit/test/ai-bing.test.ts	test	-	-
-skills/seo-audit/test/catalogue.test.ts	test	-	-
-skills/seo-audit/test/content.test.ts	test	-	-
-skills/seo-audit/test/coverage.test.ts	test	-	-
-skills/seo-audit/test/crawl-index.test.ts	test	-	-
-skills/seo-audit/test/fixtures/ai-bing/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/csr-head.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/llms.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__csr-head.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__csr-head.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__xrt.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__xrt.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/sitemap.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-bing/xrt.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/blocked.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/rendered/127.0.0.1-47502__blocked.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/rendered/127.0.0.1-47502__blocked.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-robots/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/buried.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/expect/ai-bing.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/gallery.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/guide-1.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/guide-2.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/guide-3.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/hidden.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/prompt.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__buried.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__buried.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__gallery.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__gallery.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__hidden.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__hidden.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__prompt.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__prompt.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__sponsored.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__sponsored.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__stuffed.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__stuffed.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/sponsored.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-spam/stuffed.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/challenge.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/cloak-crawler.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/cloak.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/crawler-landing.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/expect/ai-bing.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__cloak.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__cloak.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__sneaky.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__sneaky.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/ai-uaprobe/sneaky.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/after-invalid.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/assets/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/body-hreflang.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/codes.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/de.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/en.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/fr.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/hdr.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/sitemap.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-intl/sm-only.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-headings-desktop.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-headings-mobile.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-noindex-desktop.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-noindex-mobile.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-same.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-status.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-title-desktop.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/m-title-mobile.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-mobile/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/dup-a.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/dup-b.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/expect/ai-bing.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/expect/content.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/good.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/images.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/js-noindex.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/links.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/narrow-viewport.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/no-headings.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/no-title.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/no-viewport.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/nofollow.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-a.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-a.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-b.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-b.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__good.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__good.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__images.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__images.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__js-noindex.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__js-noindex.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__links.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__links.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__narrow-viewport.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__narrow-viewport.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-headings.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-headings.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-title.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-title.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-viewport.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-viewport.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__nofollow.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__nofollow.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__stuffed.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__stuffed.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__titled-no-headings.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__titled-no-headings.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__two-titles.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__two-titles.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__vague.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__vague.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/stuffed.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/titled-no-headings.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/two-titles.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-page/vague.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__down.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__down.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/content-tls/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/expect/ai-bing.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/hedge.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/llms.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/rendered/127.0.0.1-47501__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/rendered/127.0.0.1-47501__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-ai-policy/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/content.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/crawl-index.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/rendered/127.0.0.1-47101__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/rendered/127.0.0.1-47101__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-basic/spacer.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/expect/sd-social.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/logo.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/og.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/rendered/127.0.0.1-47401__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-graph/rendered/127.0.0.1-47401__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/alias.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/private.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__alias.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__alias.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__private.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__private.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-intent/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/app/layout.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/app/new/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/app/old/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/app/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/new.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/next.config.ts	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/package.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__old.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__old.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/cocoa.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/coffee.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/expect/content.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/rendered/127.0.0.1-47102__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/rendered/127.0.0.1-47102__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/sitemap.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/tea.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-sitemap/visit.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/app.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/rendered/127.0.0.1-47402__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/control-spa/rendered/127.0.0.1-47402__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-attr.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-body.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-final.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-fragment.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-gone.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-head-div.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-header.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-host.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-js.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-relative.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-target.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-temp.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/can-two.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-attr.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-attr.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-body.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-body.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-fragment.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-fragment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-gone.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-gone.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-head-div.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-head-div.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-header.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-header.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-js.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-js.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-redirect.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-redirect.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-relative.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-relative.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-two.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-two.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-host.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-host.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-temp.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-temp.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-canonical/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/chain-end.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/expect/crawl-index.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/js-redirect.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/js-target.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/refresh.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__chain-0.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__chain-0.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__js-redirect.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__js-redirect.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__missing.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__missing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__refresh.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__refresh.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__soft-404.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__soft-404.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__temp.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__temp.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__two-hop.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__two-hop.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/soft-404.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/temp-target.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-http/two-hop-end.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/embedded.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/expired.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/noindex-header.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/noindex-meta.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/nosnippet-js.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/nosnippet-p.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__embedded.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__embedded.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__expired.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__expired.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-header.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-header.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-meta.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-meta.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-js.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-js.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-p.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-p.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__snippets.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__snippets.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-indexing/snippets.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/rendered/127.0.0.1-47202__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-5xx/rendered/127.0.0.1-47202__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/rendered/127.0.0.1-47204__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-oversize/rendered/127.0.0.1-47204__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/moved.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/rendered/127.0.0.1-47212__start.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/rendered/127.0.0.1-47212__start.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/blocked.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/rendered/127.0.0.1-47211__start.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/rendered/127.0.0.1-47211__start.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirect/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/rendered/127.0.0.1-47203__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/rendered/127.0.0.1-47203__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots-redirects/robots-final.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/assets/blocked/style.css	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/blocked.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__blocked.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__blocked.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-robots/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/cert.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/key.pem	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/opening-hours.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap-https/sitemap.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/broken.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/canon-other.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/child.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/index.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/noindexed.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/rendered/127.0.0.1-47208__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/rendered/127.0.0.1-47208__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/robots-blocked.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/sitemap.xml	skill-asset	-	-
-skills/seo-audit/test/fixtures/crawl-sitemap/urls.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(shop)/layout.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(shop)/shop/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(shop)/shop/seeds/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(site)/about/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(site)/contact/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(site)/journal/[slug]/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(site)/layout.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(site)/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/(site)/projects/[slug]/page.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/app/_components/like-button.tsx	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/next.config.ts	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-next/package.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/package.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite-ssr/vite.config.ts	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/package.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/fw-vite/vite.config.ts	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/hidden.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/rendered/127.0.0.1-47210__hidden.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/rendered/127.0.0.1-47210__hidden.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/intent-keep/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/crux.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/good-limit.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/mid.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/no-data.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/origin-only.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/poor-limit.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-field/poor.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/estuary.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/lhr-edits.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/lhr.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/rendered/127.0.0.1-47602__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/rendered/127.0.0.1-47602__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/site.css	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-lab/tides.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/app.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/fork.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/frame.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/hero.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/js-img.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/late.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/legacy.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/lugs.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/main.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/paint.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__js-img.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__js-img.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/vendor/analytics.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/perf-markup/widget.js	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__syntax.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__syntax.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__values.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__values.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/syntax.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-jsonld/values.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/logo.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/private/logo.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/rendered/127.0.0.1-47413__index.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/rendered/127.0.0.1-47413__index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-site/robots.txt	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/bag.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/large-card.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/late.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/mismatch.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-social/missing.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/_serve.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/app.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/crumbs.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/expect/ai-bing.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/expect/content.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/expect/crawl-index.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/expect/perf-framework.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/expect/sd-social.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/expect/sd-social.judgment.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/favicon.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/game.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/list.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/local.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/product.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__app.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__app.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__crumbs.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__crumbs.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__game.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__game.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__list.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__list.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__local.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__local.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__product.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__product.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__reviews.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__reviews.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__variants.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__variants.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__video.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__video.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__watch.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__watch.json	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/reviews.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/thumb.svg	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/variants.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/video.html	skill-asset	-	-
-skills/seo-audit/test/fixtures/sd-types/watch.html	skill-asset	-	-
-skills/seo-audit/test/harness.ts	skill-asset	-	-
-skills/seo-audit/test/perf-framework.test.ts	test	-	-
-skills/seo-audit/test/record-fixtures.ts	skill-asset	-	-
-skills/seo-audit/test/sd-social.test.ts	test	-	-
-skills/seo-audit/test/units.test.ts	test	-	-
-skills/spec-and-plan/SKILL.md	skill	-	-
-skills/spec-and-plan/references/definition-of-done.md	skill-asset	-	-
-skills/spec-and-plan/references/planning-and-task-breakdown.md	skill-asset	-	-
-skills/test-driven-development/SKILL.md	skill	-	-
-skills/test-driven-development/references/testing-patterns.md	skill-asset	-	-
-skills/writing-for-agents/SKILL-MECHANICS.md	skill-asset	-	-
-skills/writing-for-agents/SKILL.md	skill	-	-
-skills/writing-for-agents/agents/openai.yaml	skill-asset	-	-
-surface/index.ts	extension	-	-
-surface/src/types.ts	module	-	-
-surface/src/session.ts	module	-	-
-surface/src/render.ts	module	-	-
-surface/src/errors.ts	module	-	-
-surface/src/stakes.ts	module	-	-
-surface/src/identity.ts	module	-	-
-surface/src/input.ts	module	-	-
-surface/src/numbering.ts	module	-	-
-surface/src/decision-log.ts	module	-	-
-surface/extensions/wake.ts	module	-	-
-surface/extensions/surface-input.ts	module	-	-
-surface/extensions/workload.ts	module	-	-
-surface/test/helpers.ts	test	-	-
-surface/test/render.test.ts	test	-	-
-surface/test/input.test.ts	test	-	-
-surface/test/numbering.test.ts	test	-	-
-surface/test/decision-log.test.ts	test	-	-
-surface/test/extension.test.ts	test	-	-
-surface/src/signals.ts	module	-	-
-surface/src/delivery.ts	module	-	-
-surface/extensions/lane.ts	module	-	-
-surface/test/signals.test.ts	test	-	-
-surface/test/delivery.test.ts	test	-	-
-surface/test/lane.test.ts	test	-	-
-surface/test/fixtures-fable.test.ts	test	-	-
-surface/test/tool-mount.test.ts	test	-	-
-contract/output-types.md	doc	-	-
-contract/output-types-incidents.md	doc	-	-
-voice/VOICE.md	doc	-	-
-voice/agent-collaboration-with-adhd-and-autism.md	doc	-	-
-surface/src/launch.ts	module	-	-
-surface/extensions/launch.ts	module	-	-
-surface/extensions/lane-tools.ts	module	-	-
-surface/scripts/lane.ts	module	-	-
-surface/src/omp-probe.ts	module	-	-
-surface/test/lane-tools.test.ts	test	-	-
-ledger/test/lane.test.ts	test	-	-
-surface/test/fake-omp.ts	test	-	-
-surface/test/launch.test.ts	test	-	-
-surface/test/lane-script.test.ts	test	-	-
-surface/test/lane-smoke.test.ts	test	-	-
-surface/test/lane-model.test.ts	test	-	-
-surface/test/lane-model-script.test.ts	test	-	-
-surface/test/lane-headroom-script.test.ts	test	-	-
-surface/src/ctx-index.ts	module	-	-
-surface/test/ctx-index.test.ts	test	-	-
-surface/src/close-entry.ts	module	-	-
-surface/test/close-entry.test.ts	test	-	-
-surface/src/ceiling.ts	module	-	-
-surface/extensions/ceiling.ts	module	-	-
-surface/test/ceiling.test.ts	test	-	-
-surface/test/ceiling-meter.test.ts	test	-	-
-surface/test/ceiling-surface.test.ts	test	-	-
-surface/test/plan-first.test.ts	test	-	-
-surface/src/wtree.ts	module	-	-
-surface/test/wtree.test.ts	test	-	-
-surface/src/turn-end.ts	module	-	-
-surface/test/turn-end.test.ts	test	-	-
-surface/test/turn-idle.test.ts	test	-	-
-surface/test/wake-push.test.ts	test	-	-
-surface/src/test-run.ts	module	-	-
-surface/test/test-run.test.ts	test	-	-
-surface/scripts/test-runner.ts	module	-	-
-surface/test/test-runner.test.ts	test	-	-
-surface/src/merge-train.ts	module	-	-
-surface/src/merge-train-resolve.ts	module	-	-
-surface/src/merge-train-stack.ts	module	-	-
-surface/scripts/merge-train.ts	module	-	-
-surface/test/merge-train-resolve.test.ts	test	-	-
-surface/test/train-word.test.ts	test	-	-
-surface/test/merge-train-stack.test.ts	test	-	-
-surface/test/train-return.test.ts	test	-	-
-surface/scripts/train-tick.ts	module	-	-
-surface/test/train-tick.test.ts	test	-	-
-install/com.agent-system-2.train-tick.plist	install	-	-
-surface/scripts/test-exec.ts	module	-	-
-surface/src/as2test.ts	module	-	-
-surface/test/as2test.test.ts	test	-	-
-install/as2test-setup.sh	install	-	-
-gates/test/r08-push-dest.test.ts	test	-	-
-surface/test/close-fresh.test.ts	test	-	-
-surface/test/wake-close.test.ts	test	-	-
-surface/test/test-runner-smoke.test.ts	test	-	-
-surface/scripts/invariants.ts	module	-	-
-surface/test/invariants.test.ts	test	-	-
-surface/test/fixtures/invariants/build.ts	test	-	-
-surface/test/fixtures/invariants/ledger.db	test	-	-
-surface/src/facts.ts	module	-	-
-surface/test/facts.test.ts	test	-	-
-surface/src/orchestrator-question.ts	module	-	-
-surface/extensions/question.ts	module	-	-
-surface/test/orchestrator-question.test.ts	test	-	-
-surface/test/typed-input.test.ts	test	-	-
-surface/scripts/claim-check.ts	module	-	-
-surface/test/claim-check.test.ts	test	-	-
-surface/test/fixtures/claim-check/t1-a.jsonl	test	-	-
-surface/test/fixtures/claim-check/t1-b.jsonl	test	-	-
-surface/test/fixtures/claim-check/t1-c.jsonl	test	-	-
-surface/test/fixtures/claim-check/t1-d.jsonl	test	-	-
-surface/test/fixtures/claim-check/t2-a.jsonl	test	-	-
-surface/test/fixtures/claim-check/t2-b.jsonl	test	-	-
-surface/test/fixtures/claim-check/t2-c.jsonl	test	-	-
-surface/test/fixtures/claim-check/t2-d.jsonl	test	-	-
-surface/test/fixtures/claim-check/t3-a.jsonl	test	-	-
-surface/test/fixtures/claim-check/t3-b.jsonl	test	-	-
-surface/test/fixtures/claim-check/t3-c.jsonl	test	-	-
-surface/test/fixtures/claim-check/t3-d.jsonl	test	-	-
-surface/src/chaos.ts	module	-	-
-surface/scripts/chaos.ts	module	-	-
-surface/scripts/chaos-stub.ts	module	-	-
-surface/scripts/chaos-proxy.ts	module	-	-
-surface/test/chaos.test.ts	test	-	-
-surface/test/chaos-stub.test.ts	test	-	-
-surface/scripts/ps-shim/ps	module	-	-
-surface/test/ps-shim.test.ts	test	-	-
-surface/test/lane-run-guard.test.ts	test	-	-
-surface/src/plan-paths.ts	module	-	-
-surface/extensions/plan-path.ts	module	-	-
-surface/test/plan-paths.test.ts	test	-	-
-install/com.agent-system-2.chaos.plist	install	-	-
-gates/src/scratch.ts	module	-	-
-gates/test/scratch.test.ts	test	-	-
-gates/test/scratch-root.test.ts	test	-	-
-gates/test/scratch-fence.test.ts	test	-	-
-gates/test/fixtures/scratch-replay.json	test	-	-
-surface/scripts/scratch-sweep.ts	module	-	-
-surface/scripts/scratch-audit.ts	module	-	-
-surface/scripts/scratch-smoke.ts	module	-	-
-surface/src/scratch-remove.ts	module	-	-
-surface/src/scratch-root.ts	module	-	-
-surface/test/scratch-sweep.test.ts	test	-	-
-surface/test/scratch-audit.test.ts	test	-	-
-surface/test/scratch-surface.test.ts	test	-	-
-surface/test/scratch-remove.test.ts	test	-	-
-install/com.agent-system-2.scratch-sweep.plist	install	-	-
+skills/VENDOR.md	doc	-
+skills/accessibility/SKILL.md	skill	-
+skills/accessibility/WCAG-AA-CHECKLIST.md	skill-asset	-
+skills/api-and-interface-design/SKILL.md	skill	-
+skills/code-review-and-quality/SKILL.md	skill	-
+skills/code-review-and-quality/references/code-simplification.md	skill-asset	-
+skills/code-review-and-quality/references/floor-guard.md	skill-asset	-
+skills/code-review-and-quality/references/performance-checklist.md	skill-asset	-
+skills/code-review-and-quality/references/security-checklist.md	skill-asset	-
+skills/cross-model-review/SKILL.md	skill	-
+skills/cross-model-review/references/doubt-driven-development.md	skill-asset	-
+skills/cross-model-review/references/orchestration-patterns.md	skill-asset	-
+skills/cross-model-review/references/panel/panel.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/doubt.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/doubt.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum-refute.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum-refute.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/refute.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/refute.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/synth-common.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad-verify.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad-verify.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/schema/doubt.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/quorum-refute.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/quorum.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/refute.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/synth.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/triad-verify.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/triad.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/scripts/panel.ts	skill-asset	-
+skills/cross-model-review/references/quorum/prompts/ground.md	skill-asset	-
+skills/cross-model-review/references/quorum/prompts/plan.md	skill-asset	-
+skills/cross-model-review/references/quorum/prompts/plan.schema.json	skill-asset	-
+skills/cross-model-review/references/quorum/prompts/refute-plan.md	skill-asset	-
+skills/cross-model-review/references/quorum/prompts/refute-plan.schema.json	skill-asset	-
+skills/cross-model-review/references/quorum/quorum.md	skill-asset	-
+skills/cross-model-review/references/quorum/scripts/quorum-fanout.sh	skill-asset	-
+skills/cross-model-review/references/triad/prompts/architecture.md	skill-asset	-
+skills/cross-model-review/references/triad/prompts/architecture.schema.json	skill-asset	-
+skills/cross-model-review/references/triad/prompts/cold-read.md	skill-asset	-
+skills/cross-model-review/references/triad/prompts/correctness.md	skill-asset	-
+skills/cross-model-review/references/triad/prompts/correctness.schema.json	skill-asset	-
+skills/cross-model-review/references/triad/prompts/refute.md	skill-asset	-
+skills/cross-model-review/references/triad/prompts/refute.schema.json	skill-asset	-
+skills/cross-model-review/references/triad/scripts/herdr-legs.sh	skill-asset	-
+skills/cross-model-review/references/triad/scripts/triad-fanout.sh	skill-asset	-
+skills/cross-model-review/references/triad/triad.md	skill-asset	-
+skills/cross-model-review/test/panel.test.ts	test	-
+skills/ctx/SKILL.md	skill	-
+skills/debugging-and-error-recovery/SKILL.md	skill	-
+skills/deprecation-and-migration/SKILL.md	skill	-
+skills/documentation-and-adrs/SKILL.md	skill	-
+skills/execute-plan/LICENSE	skill-asset	-
+skills/execute-plan/SKILL.md	skill	-
+skills/execute-plan/code-reviewer-prompt.md	skill-asset	-
+skills/execute-plan/implementer-prompt.md	skill-asset	-
+skills/execute-plan/re-review-prompt.md	skill-asset	-
+skills/execute-plan/references/executing-plans.md	skill-asset	-
+skills/execute-plan/scripts/review-package	skill-asset	-
+skills/execute-plan/scripts/sdd-workspace	skill-asset	-
+skills/execute-plan/scripts/task-brief	skill-asset	-
+skills/execute-plan/scripts/task-done	skill-asset	-
+skills/execute-plan/scripts/task-start	skill-asset	-
+skills/execute-plan/task-reviewer-prompt.md	skill-asset	-
+skills/git-workflow-and-versioning/SKILL.md	skill	-
+skills/humanizer/LICENSE	skill-asset	-
+skills/humanizer/SKILL.md	skill	-
+skills/impeccable/SKILL.md	skill	-
+skills/impeccable/reference/adapt.md	skill-asset	-
+skills/impeccable/reference/adapt.native.md	skill-asset	-
+skills/impeccable/reference/android.md	skill-asset	-
+skills/impeccable/reference/animate.md	skill-asset	-
+skills/impeccable/reference/audit.md	skill-asset	-
+skills/impeccable/reference/audit.native.md	skill-asset	-
+skills/impeccable/reference/bolder.md	skill-asset	-
+skills/impeccable/reference/clarify.md	skill-asset	-
+skills/impeccable/reference/colorize.md	skill-asset	-
+skills/impeccable/reference/craft-floor.md	skill-asset	-
+skills/impeccable/reference/craft.md	skill-asset	-
+skills/impeccable/reference/critique.md	skill-asset	-
+skills/impeccable/reference/degraded/asset-producer.md	skill-asset	-
+skills/impeccable/reference/degraded/documenter.md	skill-asset	-
+skills/impeccable/reference/degraded/finish-reviewer.md	skill-asset	-
+skills/impeccable/reference/degraded/manual-edit-applier.md	skill-asset	-
+skills/impeccable/reference/delight.md	skill-asset	-
+skills/impeccable/reference/distill.md	skill-asset	-
+skills/impeccable/reference/doctor.md	skill-asset	-
+skills/impeccable/reference/document.md	skill-asset	-
+skills/impeccable/reference/extract.md	skill-asset	-
+skills/impeccable/reference/harden.md	skill-asset	-
+skills/impeccable/reference/hooks.md	skill-asset	-
+skills/impeccable/reference/init.md	skill-asset	-
+skills/impeccable/reference/ios.md	skill-asset	-
+skills/impeccable/reference/layout.md	skill-asset	-
+skills/impeccable/reference/live-setup.md	skill-asset	-
+skills/impeccable/reference/live.md	skill-asset	-
+skills/impeccable/reference/new-work.md	skill-asset	-
+skills/impeccable/reference/onboard.md	skill-asset	-
+skills/impeccable/reference/operate.md	skill-asset	-
+skills/impeccable/reference/optimize.md	skill-asset	-
+skills/impeccable/reference/overdrive.md	skill-asset	-
+skills/impeccable/reference/polish.md	skill-asset	-
+skills/impeccable/reference/quieter.md	skill-asset	-
+skills/impeccable/reference/routing.md	skill-asset	-
+skills/impeccable/reference/shape.md	skill-asset	-
+skills/impeccable/reference/typeset.md	skill-asset	-
+skills/impeccable/reference/visualize.md	skill-asset	-
+skills/impeccable/scripts/VERSION	skill-asset	-
+skills/impeccable/scripts/command-metadata.json	skill-asset	-
+skills/impeccable/scripts/data/font-index-failures.json	skill-asset	-
+skills/impeccable/scripts/data/font-index.json	skill-asset	-
+skills/impeccable/scripts/impeccable	skill-asset	-
+skills/impeccable/scripts/impeccable.cmd	skill-asset	-
+skills/impeccable/scripts/live-browser-dom.js	skill-asset	-
+skills/impeccable/scripts/live-browser-ignores.js	skill-asset	-
+skills/impeccable/scripts/live-browser-session.js	skill-asset	-
+skills/impeccable/scripts/live-browser.js	skill-asset	-
+skills/impeccable/scripts/modern-screenshot.umd.js	skill-asset	-
+skills/interview-me/SKILL.md	skill	-
+skills/interview-me/references/idea-refine/examples.md	skill-asset	-
+skills/interview-me/references/idea-refine/frameworks.md	skill-asset	-
+skills/interview-me/references/idea-refine/idea-refine.md	skill-asset	-
+skills/interview-me/references/idea-refine/refinement-criteria.md	skill-asset	-
+skills/interview-me/references/idea-refine/scripts/idea-refine.sh	skill-asset	-
+skills/observability-and-instrumentation/SKILL.md	skill	-
+skills/observability-and-instrumentation/references/observability-checklist.md	skill-asset	-
+skills/performance-optimization/SKILL.md	skill	-
+skills/performance-optimization/references/performance-checklist.md	skill-asset	-
+skills/research/SKILL.md	skill	-
+skills/resolving-merge-conflicts/SKILL.md	skill	-
+skills/resolving-merge-conflicts/agents/openai.yaml	skill-asset	-
+skills/security-and-hardening/SKILL.md	skill	-
+skills/security-and-hardening/references/hardening-patterns.md	skill-asset	-
+skills/security-and-hardening/references/security-checklist.md	skill-asset	-
+skills/seo-audit/SKILL.md	skill	-
+skills/seo-audit/references/do-not-flag.md	skill-asset	-
+skills/seo-audit/references/frameworks.md	skill-asset	-
+skills/seo-audit/references/research/ai-crawlers-bing.md	skill-asset	-
+skills/seo-audit/references/research/fetch-google-blog-2023-08-howto-faq-changes.md	skill-asset	-
+skills/seo-audit/references/research/fetch-google-blog-2024-10-sitelinks-search-box.md	skill-asset	-
+skills/seo-audit/references/research/fetch-google-javascript-seo-basics-robots.md	skill-asset	-
+skills/seo-audit/references/research/fetch-google-rich-results-test-help.md	skill-asset	-
+skills/seo-audit/references/research/fetch-rfc6596.md	skill-asset	-
+skills/seo-audit/references/research/fetch-rfc9309.md	skill-asset	-
+skills/seo-audit/references/research/fetch-w3c-wai-decorative-images.md	skill-asset	-
+skills/seo-audit/references/research/fetch-webdev-responsive-web-design-basics.md	skill-asset	-
+skills/seo-audit/references/research/fetch-whatwg-html-title-element.md	skill-asset	-
+skills/seo-audit/references/research/frameworks.md	skill-asset	-
+skills/seo-audit/references/research/google-core.md	skill-asset	-
+skills/seo-audit/references/research/performance-lighthouse.md	skill-asset	-
+skills/seo-audit/references/research/structured-data.md	skill-asset	-
+skills/seo-audit/references/research/survey.md	skill-asset	-
+skills/seo-audit/references/rules.md	skill-asset	-
+skills/seo-audit/references/sources.md	skill-asset	-
+skills/seo-audit/scripts/audit.ts	skill-asset	-
+skills/seo-audit/scripts/lib/catalogue.ts	skill-asset	-
+skills/seo-audit/scripts/lib/content-dom.ts	skill-asset	-
+skills/seo-audit/scripts/lib/content-iso.ts	skill-asset	-
+skills/seo-audit/scripts/lib/crux.ts	skill-asset	-
+skills/seo-audit/scripts/lib/directives.ts	skill-asset	-
+skills/seo-audit/scripts/lib/engine.ts	skill-asset	-
+skills/seo-audit/scripts/lib/evidence.ts	skill-asset	-
+skills/seo-audit/scripts/lib/fetch.ts	skill-asset	-
+skills/seo-audit/scripts/lib/guard.ts	skill-asset	-
+skills/seo-audit/scripts/lib/html.ts	skill-asset	-
+skills/seo-audit/scripts/lib/jsonld.ts	skill-asset	-
+skills/seo-audit/scripts/lib/lighthouse.ts	skill-asset	-
+skills/seo-audit/scripts/lib/perf-framework-source.ts	skill-asset	-
+skills/seo-audit/scripts/lib/proxy.ts	skill-asset	-
+skills/seo-audit/scripts/lib/render.ts	skill-asset	-
+skills/seo-audit/scripts/lib/report.ts	skill-asset	-
+skills/seo-audit/scripts/lib/robots.ts	skill-asset	-
+skills/seo-audit/scripts/lib/sd-social-json.ts	skill-asset	-
+skills/seo-audit/scripts/lib/sd-social-types.ts	skill-asset	-
+skills/seo-audit/scripts/lib/sitemap.ts	skill-asset	-
+skills/seo-audit/scripts/lib/source.ts	skill-asset	-
+skills/seo-audit/scripts/lib/uaprobe.ts	skill-asset	-
+skills/seo-audit/scripts/lib/url.ts	skill-asset	-
+skills/seo-audit/scripts/rules/README.md	skill-asset	-
+skills/seo-audit/scripts/rules/ai-bing.ts	skill-asset	-
+skills/seo-audit/scripts/rules/content.ts	skill-asset	-
+skills/seo-audit/scripts/rules/crawl-index.ts	skill-asset	-
+skills/seo-audit/scripts/rules/perf-framework.ts	skill-asset	-
+skills/seo-audit/scripts/rules/sd-social.ts	skill-asset	-
+skills/seo-audit/test/ai-bing.test.ts	test	-
+skills/seo-audit/test/catalogue.test.ts	test	-
+skills/seo-audit/test/content.test.ts	test	-
+skills/seo-audit/test/coverage.test.ts	test	-
+skills/seo-audit/test/crawl-index.test.ts	test	-
+skills/seo-audit/test/fixtures/ai-bing/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/csr-head.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/llms.txt	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__csr-head.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__csr-head.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__xrt.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/rendered/127.0.0.1-47503__xrt.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/sitemap.xml	skill-asset	-
+skills/seo-audit/test/fixtures/ai-bing/xrt.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/blocked.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/rendered/127.0.0.1-47502__blocked.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/rendered/127.0.0.1-47502__blocked.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-robots/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/buried.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/expect/ai-bing.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/gallery.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/guide-1.svg	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/guide-2.svg	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/guide-3.svg	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/hidden.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/prompt.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__buried.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__buried.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__gallery.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__gallery.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__hidden.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__hidden.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__prompt.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__prompt.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__sponsored.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__sponsored.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__stuffed.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/rendered/127.0.0.1-47504__stuffed.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/sponsored.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-spam/stuffed.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/challenge.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/cloak-crawler.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/cloak.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/crawler-landing.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/expect/ai-bing.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__cloak.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__cloak.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__sneaky.html	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/rendered/127.0.0.1-47505__sneaky.json	skill-asset	-
+skills/seo-audit/test/fixtures/ai-uaprobe/sneaky.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/after-invalid.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/assets/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/body-hreflang.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/codes.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/de.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/en.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/fr.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/hdr.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/sitemap.xml	skill-asset	-
+skills/seo-audit/test/fixtures/content-intl/sm-only.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-headings-desktop.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-headings-mobile.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-noindex-desktop.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-noindex-mobile.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-same.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-status.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-title-desktop.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/m-title-mobile.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-mobile/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/dup-a.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/dup-b.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/ai-bing.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/content.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/good.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/images.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/js-noindex.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/links.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/narrow-viewport.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/no-headings.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/no-title.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/no-viewport.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/nofollow.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-a.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-a.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-b.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__dup-b.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__good.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__good.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__images.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__images.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__js-noindex.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__js-noindex.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__links.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__links.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__narrow-viewport.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__narrow-viewport.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-headings.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-headings.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-title.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-title.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-viewport.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__no-viewport.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__nofollow.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__nofollow.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__stuffed.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__stuffed.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__titled-no-headings.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__titled-no-headings.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__two-titles.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__two-titles.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__vague.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/rendered/127.0.0.1-47301__vague.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/stuffed.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/titled-no-headings.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/two-titles.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-page/vague.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__down.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__down.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/rendered/127.0.0.1-47303__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/content-tls/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/expect/ai-bing.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/hedge.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/llms.txt	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/rendered/127.0.0.1-47501__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/rendered/127.0.0.1-47501__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-ai-policy/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/content.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/crawl-index.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/rendered/127.0.0.1-47101__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/rendered/127.0.0.1-47101__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-basic/spacer.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/expect/sd-social.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/logo.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/og.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/rendered/127.0.0.1-47401__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-graph/rendered/127.0.0.1-47401__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/alias.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/private.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__alias.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__alias.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__private.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/rendered/127.0.0.1-47103__private.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-intent/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/app/layout.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/app/new/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/app/old/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/app/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/new.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/next.config.ts	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/package.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__old.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-next/rendered/127.0.0.1-47605__old.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/cocoa.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/coffee.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/expect/content.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/rendered/127.0.0.1-47102__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/rendered/127.0.0.1-47102__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/sitemap.xml	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/tea.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-sitemap/visit.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/app.js	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/rendered/127.0.0.1-47402__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/control-spa/rendered/127.0.0.1-47402__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-attr.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-body.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-final.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-fragment.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-gone.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-head-div.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-header.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-host.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-js.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-relative.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-target.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-temp.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/can-two.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-attr.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-attr.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-body.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-body.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-fragment.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-fragment.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-gone.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-gone.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-head-div.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-head-div.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-header.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-header.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-js.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-js.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-redirect.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-redirect.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-relative.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-relative.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-two.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/127.0.0.1-47206__can-two.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-host.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-host.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-temp.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/rendered/localhost-47206__can-temp.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-canonical/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/chain-end.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/expect/crawl-index.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/js-redirect.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/js-target.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/refresh.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__chain-0.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__chain-0.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__js-redirect.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__js-redirect.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__missing.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__missing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__refresh.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__refresh.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__soft-404.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__soft-404.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__temp.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__temp.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__two-hop.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/rendered/127.0.0.1-47207__two-hop.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/soft-404.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/temp-target.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-http/two-hop-end.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/embedded.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/expired.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/noindex-header.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/noindex-meta.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/nosnippet-js.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/nosnippet-p.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__embedded.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__embedded.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__expired.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__expired.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-header.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-header.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-meta.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__noindex-meta.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-js.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-js.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-p.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__nosnippet-p.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__snippets.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/rendered/127.0.0.1-47205__snippets.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-indexing/snippets.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/rendered/127.0.0.1-47202__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-5xx/rendered/127.0.0.1-47202__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/rendered/127.0.0.1-47204__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-oversize/rendered/127.0.0.1-47204__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/moved.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/rendered/127.0.0.1-47212__start.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/rendered/127.0.0.1-47212__start.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect-xo/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/blocked.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/rendered/127.0.0.1-47211__start.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/rendered/127.0.0.1-47211__start.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirect/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/rendered/127.0.0.1-47203__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/rendered/127.0.0.1-47203__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots-redirects/robots-final.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/assets/blocked/style.css	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/blocked.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__blocked.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__blocked.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/rendered/127.0.0.1-47201__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-robots/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/cert.pem	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/key.pem	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/opening-hours.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap-https/sitemap.xml	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/broken.xml	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/canon-other.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/child.xml	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/index.xml	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/noindexed.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/rendered/127.0.0.1-47208__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/rendered/127.0.0.1-47208__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/robots-blocked.html	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/sitemap.xml	skill-asset	-
+skills/seo-audit/test/fixtures/crawl-sitemap/urls.txt	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(shop)/layout.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(shop)/shop/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(shop)/shop/seeds/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(site)/about/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(site)/contact/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(site)/journal/[slug]/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(site)/layout.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(site)/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/(site)/projects/[slug]/page.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/app/_components/like-button.tsx	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/next.config.ts	skill-asset	-
+skills/seo-audit/test/fixtures/fw-next/package.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/package.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite-ssr/vite.config.ts	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/package.json	skill-asset	-
+skills/seo-audit/test/fixtures/fw-vite/vite.config.ts	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/hidden.html	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/rendered/127.0.0.1-47210__hidden.html	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/rendered/127.0.0.1-47210__hidden.json	skill-asset	-
+skills/seo-audit/test/fixtures/intent-keep/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/crux.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/good-limit.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/mid.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/no-data.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/origin-only.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/poor-limit.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-field/poor.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/estuary.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/lhr-edits.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/lhr.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/rendered/127.0.0.1-47602__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/rendered/127.0.0.1-47602__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/site.css	skill-asset	-
+skills/seo-audit/test/fixtures/perf-lab/tides.js	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/app.js	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/fork.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/frame.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/hero.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/js-img.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/late.js	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/legacy.js	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/lugs.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/main.js	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/paint.svg	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__js-img.html	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/rendered/127.0.0.1-47603__js-img.json	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/vendor/analytics.js	skill-asset	-
+skills/seo-audit/test/fixtures/perf-markup/widget.js	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__syntax.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__syntax.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__values.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/rendered/127.0.0.1-47411__values.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/syntax.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-jsonld/values.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/index.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/logo.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/private/logo.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/rendered/127.0.0.1-47413__index.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/rendered/127.0.0.1-47413__index.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-site/robots.txt	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/bag.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/large-card.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/late.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/mismatch.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-social/missing.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/_serve.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/app.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/crumbs.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/expect/ai-bing.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/expect/content.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/expect/crawl-index.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/expect/perf-framework.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/expect/sd-social.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/expect/sd-social.judgment.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/favicon.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/game.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/list.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/local.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/product.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__app.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__app.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__crumbs.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__crumbs.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__game.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__game.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__list.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__list.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__local.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__local.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__product.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__product.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__reviews.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__reviews.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__variants.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__variants.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__video.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__video.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__watch.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/rendered/127.0.0.1-47412__watch.json	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/reviews.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/thumb.svg	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/variants.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/video.html	skill-asset	-
+skills/seo-audit/test/fixtures/sd-types/watch.html	skill-asset	-
+skills/seo-audit/test/harness.ts	skill-asset	-
+skills/seo-audit/test/perf-framework.test.ts	test	-
+skills/seo-audit/test/record-fixtures.ts	skill-asset	-
+skills/seo-audit/test/sd-social.test.ts	test	-
+skills/seo-audit/test/units.test.ts	test	-
+skills/spec-and-plan/SKILL.md	skill	-
+skills/spec-and-plan/references/definition-of-done.md	skill-asset	-
+skills/spec-and-plan/references/planning-and-task-breakdown.md	skill-asset	-
+skills/test-driven-development/SKILL.md	skill	-
+skills/test-driven-development/references/testing-patterns.md	skill-asset	-
+skills/writing-for-agents/SKILL-MECHANICS.md	skill-asset	-
+skills/writing-for-agents/SKILL.md	skill	-
+skills/writing-for-agents/agents/openai.yaml	skill-asset	-
+surface/index.ts	extension	-
+surface/src/types.ts	module	-
+surface/src/session.ts	module	-
+surface/src/render.ts	module	-
+surface/src/errors.ts	module	-
+surface/src/stakes.ts	module	-
+surface/src/identity.ts	module	-
+surface/src/input.ts	module	-
+surface/src/numbering.ts	module	-
+surface/src/decision-log.ts	module	-
+surface/extensions/wake.ts	module	-
+surface/extensions/surface-input.ts	module	-
+surface/extensions/workload.ts	module	-
+surface/test/helpers.ts	test	-
+surface/test/render.test.ts	test	-
+surface/test/input.test.ts	test	-
+surface/test/numbering.test.ts	test	-
+surface/test/decision-log.test.ts	test	-
+surface/test/extension.test.ts	test	-
+surface/src/signals.ts	module	-
+surface/src/delivery.ts	module	-
+surface/extensions/lane.ts	module	-
+surface/test/signals.test.ts	test	-
+surface/test/delivery.test.ts	test	-
+surface/test/lane.test.ts	test	-
+surface/test/fixtures-fable.test.ts	test	-
+surface/test/tool-mount.test.ts	test	-
+contract/output-types.md	doc	-
+contract/output-types-incidents.md	doc	-
+voice/VOICE.md	doc	-
+voice/agent-collaboration-with-adhd-and-autism.md	doc	-
+surface/src/launch.ts	module	-
+surface/extensions/launch.ts	module	-
+surface/extensions/lane-tools.ts	module	-
+surface/scripts/lane.ts	module	-
+surface/src/omp-probe.ts	module	-
+surface/test/lane-tools.test.ts	test	-
+ledger/test/lane.test.ts	test	-
+surface/test/fake-omp.ts	test	-
+surface/test/launch.test.ts	test	-
+surface/test/lane-script.test.ts	test	-
+surface/test/lane-smoke.test.ts	test	-
+surface/test/lane-model.test.ts	test	-
+surface/test/lane-model-script.test.ts	test	-
+surface/test/lane-headroom-script.test.ts	test	-
+surface/src/ctx-index.ts	module	-
+surface/test/ctx-index.test.ts	test	-
+surface/src/close-entry.ts	module	-
+surface/test/close-entry.test.ts	test	-
+surface/src/ceiling.ts	module	-
+surface/extensions/ceiling.ts	module	-
+surface/test/ceiling.test.ts	test	-
+surface/test/ceiling-meter.test.ts	test	-
+surface/test/ceiling-surface.test.ts	test	-
+surface/test/plan-first.test.ts	test	-
+surface/src/wtree.ts	module	-
+surface/test/wtree.test.ts	test	-
+surface/src/turn-end.ts	module	-
+surface/test/turn-end.test.ts	test	-
+surface/test/turn-idle.test.ts	test	-
+surface/test/wake-push.test.ts	test	-
+surface/src/test-run.ts	module	-
+surface/test/test-run.test.ts	test	-
+surface/scripts/test-runner.ts	module	-
+surface/test/test-runner.test.ts	test	-
+surface/src/merge-train.ts	module	-
+surface/src/merge-train-resolve.ts	module	-
+surface/src/merge-train-stack.ts	module	-
+surface/scripts/merge-train.ts	module	-
+surface/test/merge-train-resolve.test.ts	test	-
+surface/test/train-word.test.ts	test	-
+surface/test/merge-train-stack.test.ts	test	-
+surface/test/train-return.test.ts	test	-
+surface/scripts/train-tick.ts	module	-
+surface/test/train-tick.test.ts	test	-
+install/com.agent-system-2.train-tick.plist	install	-
+surface/scripts/test-exec.ts	module	-
+surface/src/as2test.ts	module	-
+surface/test/as2test.test.ts	test	-
+install/as2test-setup.sh	install	-
+gates/test/r08-push-dest.test.ts	test	-
+surface/test/close-fresh.test.ts	test	-
+surface/test/wake-close.test.ts	test	-
+surface/test/test-runner-smoke.test.ts	test	-
+surface/scripts/invariants.ts	module	-
+surface/test/invariants.test.ts	test	-
+surface/test/fixtures/invariants/build.ts	test	-
+surface/test/fixtures/invariants/ledger.db	test	-
+surface/src/facts.ts	module	-
+surface/test/facts.test.ts	test	-
+surface/src/orchestrator-question.ts	module	-
+surface/extensions/question.ts	module	-
+surface/test/orchestrator-question.test.ts	test	-
+surface/test/typed-input.test.ts	test	-
+surface/scripts/claim-check.ts	module	-
+surface/test/claim-check.test.ts	test	-
+surface/test/fixtures/claim-check/t1-a.jsonl	test	-
+surface/test/fixtures/claim-check/t1-b.jsonl	test	-
+surface/test/fixtures/claim-check/t1-c.jsonl	test	-
+surface/test/fixtures/claim-check/t1-d.jsonl	test	-
+surface/test/fixtures/claim-check/t2-a.jsonl	test	-
+surface/test/fixtures/claim-check/t2-b.jsonl	test	-
+surface/test/fixtures/claim-check/t2-c.jsonl	test	-
+surface/test/fixtures/claim-check/t2-d.jsonl	test	-
+surface/test/fixtures/claim-check/t3-a.jsonl	test	-
+surface/test/fixtures/claim-check/t3-b.jsonl	test	-
+surface/test/fixtures/claim-check/t3-c.jsonl	test	-
+surface/test/fixtures/claim-check/t3-d.jsonl	test	-
+surface/src/chaos.ts	module	-
+surface/scripts/chaos.ts	module	-
+surface/scripts/chaos-stub.ts	module	-
+surface/scripts/chaos-proxy.ts	module	-
+surface/test/chaos.test.ts	test	-
+surface/test/chaos-stub.test.ts	test	-
+surface/scripts/ps-shim/ps	module	-
+surface/test/ps-shim.test.ts	test	-
+surface/test/lane-run-guard.test.ts	test	-
+surface/src/plan-paths.ts	module	-
+surface/extensions/plan-path.ts	module	-
+surface/test/plan-paths.test.ts	test	-
+install/com.agent-system-2.chaos.plist	install	-
+gates/src/scratch.ts	module	-
+gates/test/scratch.test.ts	test	-
+gates/test/scratch-root.test.ts	test	-
+gates/test/scratch-fence.test.ts	test	-
+gates/test/fixtures/scratch-replay.json	test	-
+surface/scripts/scratch-sweep.ts	module	-
+surface/scripts/scratch-audit.ts	module	-
+surface/scripts/scratch-smoke.ts	module	-
+surface/src/scratch-remove.ts	module	-
+surface/src/scratch-root.ts	module	-
+surface/test/scratch-sweep.test.ts	test	-
+surface/test/scratch-audit.test.ts	test	-
+surface/test/scratch-surface.test.ts	test	-
+surface/test/scratch-remove.test.ts	test	-
+install/com.agent-system-2.scratch-sweep.plist	install	-
 # Guard A (wl-mv4yf3zgf9lm2o): every bun test run from a module root or a test dir preloads
 # ledger/test/isolate-preload.ts (a temp HOME and ledger). The root bunfig.toml is outside every machinery dir.
-classifier/bunfig.toml	test	-	-
-classifier/test/bunfig.toml	test	-	-
-gates/bunfig.toml	test	-	-
-gates/test/bunfig.toml	test	-	-
-ledger/bunfig.toml	test	-	-
-ledger/test/bunfig.toml	test	-	-
-surface/bunfig.toml	test	-	-
-surface/test/bunfig.toml	test	-	-
-tiers/bunfig.toml	test	-	-
-tiers/test/bunfig.toml	test	-	-
-ledger/test/isolate-preload.ts	test	-	-
-ledger/test/live-ledger-guard.test.ts	test	-	-
-ledger/test/fixtures/live-guard/reach.fixture.ts	test	-	-
-surface/src/pending.ts	module	-	-
-surface/src/batch.ts	module	-	-
-surface/test/pending.test.ts	test	-	-
-surface/test/batch.test.ts	test	-	-
+classifier/bunfig.toml	test	-
+classifier/test/bunfig.toml	test	-
+gates/bunfig.toml	test	-
+gates/test/bunfig.toml	test	-
+ledger/bunfig.toml	test	-
+ledger/test/bunfig.toml	test	-
+surface/bunfig.toml	test	-
+surface/test/bunfig.toml	test	-
+tiers/bunfig.toml	test	-
+tiers/test/bunfig.toml	test	-
+ledger/test/isolate-preload.ts	test	-
+ledger/test/live-ledger-guard.test.ts	test	-
+ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
+surface/src/pending.ts	module	-
+surface/src/batch.ts	module	-
+surface/test/pending.test.ts	test	-
+surface/test/batch.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
-surface/src/migration-items.ts	module	-	-
-surface/scripts/migration-items.ts	module	-	-
-surface/test/migration-items.test.ts	test	-	-
-surface/test/migration-items-repo.test.ts	test	-	-
+surface/src/migration-items.ts	module	-
+surface/scripts/migration-items.ts	module	-
+surface/test/migration-items.test.ts	test	-
+surface/test/migration-items-repo.test.ts	test	-
 # The suggest-only pair trigger (wl-mv67564rdkfvnk PR 1): the jev ask, the signals and offer, the read-only report.
-classifier/pair-signal-question.json	data	-	-
-classifier/src/judge-ask.ts	module	-	-
-surface/src/pair-suggest.ts	module	-	-
-surface/scripts/pair-suggest.ts	module	-	-
-classifier/test/judge-ask.test.ts	test	-	-
-classifier/test/pair-suggest-raise.test.ts	test	-	-
-surface/test/pair-suggest-answer.test.ts	test	-	-
-surface/test/pair-suggest-ceiling.test.ts	test	-	-
-surface/test/pair-suggest-forgery.test.ts	test	-	-
-surface/test/pair-suggest-module.test.ts	test	-	-
-surface/test/pair-suggest-switch.test.ts	test	-	-
+classifier/pair-signal-question.json	data	-
+classifier/src/judge-ask.ts	module	-
+surface/src/pair-suggest.ts	module	-
+surface/scripts/pair-suggest.ts	module	-
+classifier/test/judge-ask.test.ts	test	-
+classifier/test/pair-suggest-raise.test.ts	test	-
+surface/test/pair-suggest-answer.test.ts	test	-
+surface/test/pair-suggest-ceiling.test.ts	test	-
+surface/test/pair-suggest-forgery.test.ts	test	-
+surface/test/pair-suggest-module.test.ts	test	-
+surface/test/pair-suggest-switch.test.ts	test	-
 # Base-prompt voice and contract (migration/items/base-prompt-voice-contract.md): bin/as2 renders the
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
-surface/scripts/orchestrator-prompt.ts	module	-	-
-surface/test/base-prompt.test.ts	test	-	-
+surface/scripts/orchestrator-prompt.ts	module	-
+surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
-gates/test/as2test-refresh-pins.test.ts	test	-	-
+gates/test/as2test-refresh-pins.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
-surface/src/rank.ts	module	-	-
-surface/src/rank-audit.ts	module	-	-
-surface/src/rank-launch.ts	module	-	-
-surface/extensions/rank.ts	module	-	-
-surface/scripts/rank.ts	module	-	-
-surface/scripts/rank-mode.ts	module	-	-
-surface/test/rank.test.ts	test	-	-
-surface/test/rank-tool.test.ts	test	-	-
-surface/test/rank-audit.test.ts	test	-	-
-surface/test/rank-launch.test.ts	test	-	-
+surface/src/rank.ts	module	-
+surface/src/rank-audit.ts	module	-
+surface/src/rank-launch.ts	module	-
+surface/extensions/rank.ts	module	-
+surface/scripts/rank.ts	module	-
+surface/scripts/rank-mode.ts	module	-
+surface/test/rank.test.ts	test	-
+surface/test/rank-tool.test.ts	test	-
+surface/test/rank-audit.test.ts	test	-
+surface/test/rank-launch.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
 # on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
-install/com.agent-system-2.phoenix.plist	install	-	-
-install/phoenix-agent.sh	install	-	-
-install/phoenix-run.sh	install	-	-
-install/phoenix-serve.py	install	-	-
-install/phoenix-footprint.py	install	-	-
-surface/src/tracing.ts	module	-	-
-surface/scripts/tracing.ts	module	-	-
-surface/test/tracing.test.ts	test	-	-
-surface/test/phoenix-run.test.ts	test	-	-
+install/com.agent-system-2.phoenix.plist	install	-
+install/phoenix-agent.sh	install	-
+install/phoenix-run.sh	install	-
+install/phoenix-serve.py	install	-
+install/phoenix-footprint.py	install	-
+surface/src/tracing.ts	module	-
+surface/scripts/tracing.ts	module	-
+surface/test/tracing.test.ts	test	-
+surface/test/phoenix-run.test.ts	test	-
 # Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
 # jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
 # profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
-plugins/VENDOR.md	doc	-	-
-plugins/index.ts	extension	-	-
-plugins/ask-graham/.claude-plugin/plugin.json	data	-	-
-plugins/ask-graham/.omp-plugin/plugin.json	data	-	-
-plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-	-
-plugins/ask-graham/hooks/hooks.json	data	-	-
-plugins/ask-graham/omp/ask-graham-omp.ts	extension	-	-
-plugins/ask-graham/package.json	data	-	-
-plugins/ask-graham/README.md	doc	-	-
-plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-	-
-plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-	-
-plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-	-
-plugins/i-have-audhd/.claude-plugin/plugin.json	data	-	-
-plugins/i-have-audhd/.omp-plugin/plugin.json	data	-	-
-plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-	-
-plugins/i-have-audhd/checks/lines.mjs	module	-	-
-plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-	-
-plugins/i-have-audhd/checks/needs-you-first.mjs	module	-	-
-plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-	-
-plugins/i-have-audhd/example.i-have-audhd.json	data	-	-
-plugins/i-have-audhd/hooks/hooks.json	data	-	-
-plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-	-
-plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-	-
-plugins/i-have-audhd/judge/ask.mjs	module	-	-
-plugins/i-have-audhd/lib/config.mjs	module	-	-
-plugins/i-have-audhd/lib/state.mjs	module	-	-
-plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-	-
-plugins/i-have-audhd/omp/REGISTRATION.md	doc	-	-
-plugins/i-have-audhd/package.json	data	-	-
-plugins/i-have-audhd/README.md	doc	-	-
-plugins/i-have-audhd/skills/i-have-audhd/SKILL.md	skill	-	-
-plugins/i-have-audhd/skills/i-have-audhd/reference.md	skill-asset	-	-
-plugins/i-have-audhd/skills/i-have-audhd/references/comparison.md	skill-asset	-	-
-plugins/i-have-audhd/skills/i-have-audhd/references/rationale.md	skill-asset	-	-
-plugins/i-have-audhd/skills/i-have-audhd/references/sources.md	skill-asset	-	-
-plugins/i-have-audhd/tools/upgrade-from-communication-rules.mjs	module	-	-
-plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-	-
-plugins/i-have-audhd/triggers/batch-heading.mjs	module	-	-
-plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-	-
-plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-	-
-plugins/test/loader.test.ts	test	-	-
+plugins/VENDOR.md	doc	-
+plugins/index.ts	extension	-
+plugins/ask-graham/.claude-plugin/plugin.json	data	-
+plugins/ask-graham/.omp-plugin/plugin.json	data	-
+plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-
+plugins/ask-graham/hooks/hooks.json	data	-
+plugins/ask-graham/omp/ask-graham-omp.ts	extension	-
+plugins/ask-graham/package.json	data	-
+plugins/ask-graham/README.md	doc	-
+plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
+plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
+plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
+plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-
+plugins/i-have-audhd/checks/lines.mjs	module	-
+plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-
+plugins/i-have-audhd/checks/needs-you-first.mjs	module	-
+plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-
+plugins/i-have-audhd/example.i-have-audhd.json	data	-
+plugins/i-have-audhd/hooks/hooks.json	data	-
+plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
+plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
+plugins/i-have-audhd/judge/ask.mjs	module	-
+plugins/i-have-audhd/lib/config.mjs	module	-
+plugins/i-have-audhd/lib/state.mjs	module	-
+plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
+plugins/i-have-audhd/omp/REGISTRATION.md	doc	-
+plugins/i-have-audhd/package.json	data	-
+plugins/i-have-audhd/README.md	doc	-
+plugins/i-have-audhd/skills/i-have-audhd/SKILL.md	skill	-
+plugins/i-have-audhd/skills/i-have-audhd/reference.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/comparison.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/rationale.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/sources.md	skill-asset	-
+plugins/i-have-audhd/tools/upgrade-from-communication-rules.mjs	module	-
+plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-
+plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
+plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
+plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
+plugins/test/loader.test.ts	test	-

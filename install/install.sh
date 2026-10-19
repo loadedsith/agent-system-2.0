@@ -25,8 +25,9 @@
 # does not start is reported and does not fail the install. The last line names the providers the rendered profile
 # routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
 # first-launch sign-in scene).
-# Every row's fourth column, proposal_id, is `-` or the p-<id> of the tuning proposal the row came from
-# (PLAN wl-mv654hoqwpfhmo § 11.3); a row without it, or with anything else there, fails the install.
+# A row's optional fourth column, proposal_id, is `-` or the p-<id> of the tuning proposal the row came from
+# (PLAN wl-mv654hoqwpfhmo § 11.3); a three-column row means `-`. Five or more fields, an empty field or any
+# other proposal_id fails the install.
 #
 # Three flags (macOS only), each optional and usable together. --chaos-nightly also writes the nightly
 # chaos job: the template install/com.agent-system-2.chaos.plist filled with this checkout, the
@@ -287,10 +288,14 @@ while IFS= read -r line || [ -n "$line" ]; do
 		header_seen=1
 		continue
 	fi
-	IFS=$'\t' read -r path kind dest proposal_id extra <<<"$line"
-	[ -n "${path:-}" ] && [ -n "${kind:-}" ] && [ -n "${dest:-}" ] && [ -n "${proposal_id:-}" ] && [ -z "${extra:-}" ] \
-		|| fail "manifest line $line_no: need exactly four TAB-separated fields (path, kind, destination, proposal_id): $line" 2
-	# proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3): "-" when no tuning proposal made the row, else that proposal's p-<id>.
+	# Three or four TAB-separated fields, none empty: the count is taken from the TABs themselves, since `read` folds
+	# runs of TABs and would hide an empty field.
+	tabs=${line//[^$'\t']/}
+	{ [ "${#tabs}" -eq 2 ] || [ "${#tabs}" -eq 3 ]; } && [[ $line != $'\t'* && $line != *$'\t' && $line != *$'\t\t'* ]] \
+		|| fail "manifest line $line_no: need three or four TAB-separated fields, none empty (path, kind, destination, optional proposal_id): $line" 2
+	IFS=$'\t' read -r path kind dest proposal_id <<<"$line"
+	# proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3): absent means "-", no tuning proposal made the row; else that proposal's p-<id>.
+	proposal_id=${proposal_id:--}
 	[[ $proposal_id == - || $proposal_id =~ ^p-[a-z0-9]+$ ]] \
 		|| fail "manifest line $line_no: proposal_id '$proposal_id' is neither - nor a p-<id>: $line" 2
 	[ -f "$REPO/$path" ] || fail "manifest line $line_no: $path does not exist in the repo" 2

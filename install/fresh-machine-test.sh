@@ -463,39 +463,41 @@ rm "$CLONE/ledger/src/dangling"
 run_install >/dev/null || die "install after removing the symlinks exited $?"
 ok "a symlink to a real artifact and a dangling symlink were both refused with exit 2; install passes again"
 
-step "7c. a wrong, missing or duplicated ledger-schema manifest row, or a row without proposal_id, fails install and writes nothing"
+step "7c. a wrong, missing or duplicated ledger-schema manifest row, or a row with an empty or malformed proposal_id, fails install and writes nothing"
 MANIFEST="$CLONE/install/manifest.tsv"
 cp -p "$MANIFEST" "$WORK/manifest.orig"
 S1_DB="$WORK/s1-home-untouched/ledger.db"
 T=$'\t'
-# Every row ends in its proposal_id, `-` on rows no tuning proposal made (PLAN wl-mv654hoqwpfhmo § 11.3).
-DOC_ROW="ledger/SCHEMA.md${T}doc${T}-${T}-"
-SCHEMA_ROW="ledger/schema.sql${T}ledger-schema${T}{ledger_db}${T}-"
+DOC_ROW="ledger/SCHEMA.md${T}doc${T}-"
+SCHEMA_ROW="ledger/schema.sql${T}ledger-schema${T}{ledger_db}"
 # Rewrite the original manifest, replacing whole row $1 with $2 (and $3 with $4, when given).
 manifest_with() {
 	awk -v a="$1" -v b="$2" -v c="${3:-}" -v d="${4:-}" '$0 == a { $0 = b } c != "" && $0 == c { $0 = d } { print }' \
 		"$WORK/manifest.orig" >"$MANIFEST"
 }
 # swapped: the markdown doc claims to be the schema, the schema is filed as a doc
-manifest_with "$DOC_ROW" "ledger/SCHEMA.md${T}ledger-schema${T}{ledger_db}${T}-" "$SCHEMA_ROW" "ledger/schema.sql${T}doc${T}-${T}-"
+manifest_with "$DOC_ROW" "ledger/SCHEMA.md${T}ledger-schema${T}{ledger_db}" "$SCHEMA_ROW" "ledger/schema.sql${T}doc${T}-"
 grep -qF "ledger/SCHEMA.md${T}ledger-schema" "$MANIFEST" && grep -qF "ledger/schema.sql${T}doc" "$MANIFEST" || die "test setup: swap did not apply"
 expect_install_exit 2 AGENT_SYSTEM_LEDGER_DB="$S1_DB"
 # missing: no ledger-schema row at all (schema.sql filed as a doc)
-manifest_with "$SCHEMA_ROW" "ledger/schema.sql${T}doc${T}-${T}-"
+manifest_with "$SCHEMA_ROW" "ledger/schema.sql${T}doc${T}-"
 grep -qF "ledger-schema${T}" "$MANIFEST" && die "test setup: schema row still present"
 expect_install_exit 2 AGENT_SYSTEM_LEDGER_DB="$S1_DB"
 # duplicated: a second ledger-schema row
-manifest_with "$DOC_ROW" "ledger/SCHEMA.md${T}ledger-schema${T}{ledger_db}${T}-"
+manifest_with "$DOC_ROW" "ledger/SCHEMA.md${T}ledger-schema${T}{ledger_db}"
 [ "$(grep -cF "ledger-schema${T}" "$MANIFEST")" -eq 2 ] || die "test setup: duplicate did not apply"
 expect_install_exit 2 AGENT_SYSTEM_LEDGER_DB="$S1_DB"
-# no proposal_id: a row in its three-column shape from before PR-P
-manifest_with "$DOC_ROW" "ledger/SCHEMA.md${T}doc${T}-"
-grep -qxF "ledger/SCHEMA.md${T}doc${T}-" "$MANIFEST" || die "test setup: three-column row did not apply"
+# proposal_id, the optional fourth column (PLAN wl-mv654hoqwpfhmo § 11.3): present but empty, then neither - nor a p-<id>
+manifest_with "$DOC_ROW" "${DOC_ROW}${T}"
+grep -qxF "${DOC_ROW}${T}" "$MANIFEST" || die "test setup: empty proposal_id did not apply"
+expect_install_exit 2 AGENT_SYSTEM_LEDGER_DB="$S1_DB"
+manifest_with "$DOC_ROW" "${DOC_ROW}${T}proposal-1"
+grep -qxF "${DOC_ROW}${T}proposal-1" "$MANIFEST" || die "test setup: malformed proposal_id did not apply"
 expect_install_exit 2 AGENT_SYSTEM_LEDGER_DB="$S1_DB"
 [ ! -e "$S1_DB" ] && [ ! -e "$(dirname "$S1_DB")" ] || die "a refused manifest still wrote $S1_DB"
 cp -p "$WORK/manifest.orig" "$MANIFEST"
 run_install >/dev/null || die "install with the manifest restored exited $?"
-ok "swapped, missing and duplicated schema rows and a row without proposal_id each refused with exit 2; nothing written; install passes again"
+ok "swapped, missing and duplicated schema rows and an empty or malformed proposal_id each refused with exit 2; nothing written; install passes again"
 
 step "7d. a profile whose includeSkills differs from the manifest's skill rows fails install and writes no profile"
 CONFIG="$CLONE/profile/config.yml"

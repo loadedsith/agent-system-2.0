@@ -17,10 +17,8 @@ import { dirname, join } from "node:path";
 
 const REPO = join(import.meta.dir, "..", "..");
 const T = "\t";
-/** A manifest row: path, kind, destination and proposal_id (`-` unless given; PLAN wl-mv654hoqwpfhmo § 11.3), TAB-separated. */
-const row = (path: string, kind: string, dest: string, proposalId = "-"): string => [path, kind, dest, proposalId].join(T);
-const DOC_ROW = row("ledger/SCHEMA.md", "doc", "-");
-const SCHEMA_ROW = row("ledger/schema.sql", "ledger-schema", "{ledger_db}");
+const DOC_ROW = `ledger/SCHEMA.md${T}doc${T}-`;
+const SCHEMA_ROW = `ledger/schema.sql${T}ledger-schema${T}{ledger_db}`;
 
 let root: string;
 let copy: string;
@@ -229,17 +227,17 @@ describe("install: the manifest's ledger-schema row is strict (S1)", () => {
 	};
 
 	test("review probe E4: SCHEMA.md filed as the schema and schema.sql as a doc is refused, nothing written", () => {
-		manifestWith([DOC_ROW, row("ledger/SCHEMA.md", "ledger-schema", "{ledger_db}")], [SCHEMA_ROW, row("ledger/schema.sql", "doc", "-")]);
+		manifestWith([DOC_ROW, `ledger/SCHEMA.md${T}ledger-schema${T}{ledger_db}`], [SCHEMA_ROW, `ledger/schema.sql${T}doc${T}-`]);
 		refused("swapped", "the ledger module applies ledger/schema.sql and nothing else");
 	});
 
 	test("no ledger-schema row at all is refused", () => {
-		manifestWith([SCHEMA_ROW, row("ledger/schema.sql", "doc", "-")]);
+		manifestWith([SCHEMA_ROW, `ledger/schema.sql${T}doc${T}-`]);
 		refused("missing", "manifest needs exactly one ledger-schema row; found 0");
 	});
 
 	test("two ledger-schema rows are refused", () => {
-		manifestWith([DOC_ROW, row("ledger/SCHEMA.md", "ledger-schema", "{ledger_db}")]);
+		manifestWith([DOC_ROW, `ledger/SCHEMA.md${T}ledger-schema${T}{ledger_db}`]);
 		refused("duplicate", "manifest needs exactly one ledger-schema row; found 2");
 	});
 
@@ -252,12 +250,13 @@ describe("install: the manifest's ledger-schema row is strict (S1)", () => {
 	});
 });
 
-describe("install: every manifest row carries proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3, PR-P)", () => {
+describe("install: a manifest row's optional proposal_id (PLAN wl-mv654hoqwpfhmo § 11.3, PR-P)", () => {
+	const FIELDS = "need three or four TAB-separated fields, none empty";
 	const cases: [label: string, from: string, to: string, why: string][] = [
-		["no-proposal-column", DOC_ROW, `ledger/SCHEMA.md${T}doc${T}-`, "need exactly four TAB-separated fields"],
-		["empty-proposal", DOC_ROW, `ledger/SCHEMA.md${T}doc${T}-${T}`, "need exactly four TAB-separated fields"],
-		["fifth-field", DOC_ROW, `${DOC_ROW}${T}extra`, "need exactly four TAB-separated fields"],
-		["bad-proposal", DOC_ROW, row("ledger/SCHEMA.md", "doc", "-", "proposal-1"), "proposal_id 'proposal-1' is neither - nor a p-<id>"],
+		["empty-proposal", DOC_ROW, `${DOC_ROW}${T}`, FIELDS],
+		["fifth-field", DOC_ROW, `${DOC_ROW}${T}-${T}extra`, FIELDS],
+		["empty-kind", DOC_ROW, `ledger/SCHEMA.md${T}${T}doc${T}-`, FIELDS],
+		["bad-proposal", DOC_ROW, `${DOC_ROW}${T}proposal-1`, "proposal_id 'proposal-1' is neither - nor a p-<id>"],
 		["old-header", ["path", "kind", "destination", "proposal_id"].join(T), ["path", "kind", "destination"].join(T), "expected header 'path<TAB>kind<TAB>destination<TAB>proposal_id'"],
 	];
 	for (const [label, from, to, why] of cases) {
@@ -271,12 +270,16 @@ describe("install: every manifest row carries proposal_id (PLAN wl-mv654hoqwpfhm
 		});
 	}
 
-	test("a proposal's p- id is accepted", () => {
-		manifestWith([DOC_ROW, row("ledger/SCHEMA.md", "doc", "-", "p-mv0abc123")]);
-		const r = install("p-id");
-		writeFileSync(manifest, original);
-		expect(r.out).toContain("install complete");
-		expect(r.exitCode).toBe(0);
+	test("a three-column row reads as proposal_id -, and a fourth column of - or a proposal's p- id is accepted", () => {
+		expect(DOC_ROW.split(T)).toHaveLength(3);
+		const accepted = [["three-columns", DOC_ROW], ["dash", `${DOC_ROW}${T}-`], ["p-id", `${DOC_ROW}${T}p-mv0abc123`]] as const;
+		const runs = accepted.map(([label, to]) => {
+			manifestWith([DOC_ROW, to]);
+			const r = install(label);
+			writeFileSync(manifest, original);
+			return [label, r.exitCode, r.out.includes("install complete")];
+		});
+		expect(runs).toEqual(accepted.map(([label]) => [label, 0, true]));
 	});
 });
 
@@ -323,7 +326,7 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 	});
 
 	test("a link that has its own manifest row is still refused", () => {
-		refusedWithLink("link-row", "ledger/linked.ts", "src/index.ts", row("ledger/linked.ts", "ledger-module", "-"));
+		refusedWithLink("link-row", "ledger/linked.ts", "src/index.ts", `ledger/linked.ts${T}ledger-module${T}-`);
 	});
 
 	test("after every refusal the untouched copy installs again", () => {
@@ -360,11 +363,11 @@ describe("install: the vendored plugins' skills and loader (plugins/VENDOR.md)",
 	});
 
 	test("a plugin skill whose name another skill row already has is refused, nothing written", () => {
-		const from = row("plugins/ask-graham/skills/ask-graham/SKILL.md", "skill", "-");
+		const from = `plugins/ask-graham/skills/ask-graham/SKILL.md${T}skill${T}-`;
 		const dir = join(copy, "plugins", "ask-graham", "skills", "humanizer");
 		mkdirSync(dir);
 		cpSync(join(copy, "skills", "humanizer", "SKILL.md"), join(dir, "SKILL.md"));
-		writeFileSync(manifest, original.replace(`${from}\n`, `${from}\n${row("plugins/ask-graham/skills/humanizer/SKILL.md", "skill", "-")}\n`));
+		writeFileSync(manifest, original.replace(`${from}\n`, `${from}\nplugins/ask-graham/skills/humanizer/SKILL.md${T}skill${T}-\n`));
 		const r = install("plugins-dup-name");
 		writeFileSync(manifest, original);
 		rmSync(dir, { recursive: true });
