@@ -2,9 +2,9 @@
 title: Day-one provenance: as2Commit and as2Dirty on lane-started, an optional proposal_id manifest column
 status: building
 workload: wl-mv654hoqwpfhmo
-pr: none
+pr: 259
 ---
-**Built on branch `wl/wl-mv654hoqwpfhmo-prov` (PR-P).** Workload `wl-mv654hoqwpfhmo` (production stakes; plan at `~/agent-scratch/agent-system-2.0/wl-mv654hoqwpfhmo/PLAN.md` § 11.3 "Day one", approved by Jo). This is B14.3 part 5: the facts a tuning proposal is later judged against have to be recorded from the first day, because neither can be rebuilt afterwards.
+**Built on branch `wl/wl-mv654hoqwpfhmo-prov`, PR #259 (PR-P).** Workload `wl-mv654hoqwpfhmo` (production stakes; plan at `~/agent-scratch/agent-system-2.0/wl-mv654hoqwpfhmo/PLAN.md` § 11.3 "Day one", approved by Jo). This is B14.3 part 5: the facts a tuning proposal is later judged against have to be recorded from the first day, because neither can be rebuilt afterwards.
 
 Switch: none — two recorded fields; Jo q-mvfl9h64q7ivpc
 
