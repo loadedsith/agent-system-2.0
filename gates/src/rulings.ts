@@ -1,14 +1,13 @@
 // Jo's standing rulings, checked before any question reaches Jo (escalation policy, PLAN
 // wl-mvfkv7llkp7nk0 § 1; DRAFT.md § 4 "Already decided", REVIEW.md Appendix A4 for each scope and end).
 //
-// `askJo` is the one production path to `Ledger.raiseQuestion` (the runner's ceiling question in
-// surface/scripts/lane.ts excepted until its own slice removes it). It reads the question's kind off
+// `askJo` is the one production path to `Ledger.raiseQuestion`. It reads the question's kind off
 // its option set (`questionKind`), checks every active ruling (`checkRulings`) and either decides the
 // question, writing no question row but a `ruling-applied: <ruling> kind <k> slice <sl> answer <a>`
 // entry by the asker, or raises it as before. A ruling comes only from Jo's words and is added only by
 // a code change here; it ends at its date, at the event its source names, or at once on Jo's
 // `end-ruling <id>` (surface/src/input.ts), an instruction on the standing workload that
-// `endedRulings` reads. A ruling decides only its own kind: round-limit, ceiling, train, plan and
+// `endedRulings` reads. A ruling decides only its own kind: round-limit, train, plan and
 // every other question is `other` and always asks.
 //
 // Callers pass the facts a scope needs (`RulingFacts`): the classifier its R1–R5 verdict for a park

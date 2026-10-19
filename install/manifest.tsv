@@ -1223,7 +1223,6 @@ surface/scripts/pair-suggest.ts	module	-
 classifier/test/judge-ask.test.ts	test	-
 classifier/test/pair-suggest-raise.test.ts	test	-
 surface/test/pair-suggest-answer.test.ts	test	-
-surface/test/pair-suggest-ceiling.test.ts	test	-
 surface/test/pair-suggest-forgery.test.ts	test	-
 surface/test/pair-suggest-module.test.ts	test	-
 surface/test/pair-suggest-switch.test.ts	test	-

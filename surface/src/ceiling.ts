@@ -1,8 +1,9 @@
 // The per-workload ceiling's pure half (DESIGN-workload-ceiling.md § 2, § 4): the stakes-sized
 // ceiling, the `ceiling:` and `spend:` control bodies, the effective ceiling with the raise-needs-Jo
 // rule, the spend scan over the workload's session files, wall time from the lane lifecycle
-// entries, the threshold check and the question Jo answers. Nothing here opens the ledger: callers
-// read the rows and hand them in, as with launch.ts. `scanSpend` reads session files and nothing else.
+// entries, the threshold check and the notices Jo is told (PLAN wl-mvfkv7llkp7nk0 § 4). Nothing here
+// opens the ledger: callers read the rows and hand them in, as with launch.ts. `scanSpend` reads
+// session files and nothing else.
 //
 // Units (§ 1 C, § 2 item 3): dollars are nominal list price as OMP computes it
 // (`usage.cost.total` on each assistant message); tokens are counted beside them and never
@@ -54,6 +55,9 @@ export function ceilingBody(c: Ceiling, source: string, byInstruction?: string):
 	return `ceiling: usd ${c.usd} wall ${c.wallMin} source ${source.replace(/\s+/g, " ").trim()}${byInstruction ? ` by ${byInstruction}` : ""}`;
 }
 
+/** The `source` of the `ceiling:` entry a one-block raise writes: Jo's `extend <wl>` word, and before it the extend answer to the runner's ceiling question. */
+export const EXTEND_SOURCE = "extend one block";
+
 const CEILING_REST = /^usd\s+(\S+)\s+wall\s+(\S+)\s+source\s+(.+?)(?:\s+by\s+(in-\S+))?$/;
 
 /** A `ceiling:` entry's `rest` (the body after the prefix), parsed; null when either half is not a positive number or the source is missing. */
@@ -68,9 +72,10 @@ export function parseCeiling(rest: string): CeilingEntry | null {
 
 /**
  * The Jo instructions the surface writes to license a raise (surface/src/input.ts): the stakes word
- * (`stakes: <s>`), the `ceiling` word (`ceiling: <usd> <hours>`), and the *extend* answer to the
- * runner's ceiling question (an `answer` whose body is `extend`). Any other surface-written
- * author-jo row — an `orchestrator_record_instruction` row, whose text the model composes — is not one.
+ * (`stakes: <s>`), the `ceiling` and `extend` words (both `ceiling: <usd> <hours>`), and the *extend*
+ * answer to the runner's former ceiling question (an `answer` whose body is `extend`), which raised
+ * ceilings written before PLAN wl-mvfkv7llkp7nk0 § 4 still name. Any other surface-written author-jo
+ * row — an `orchestrator_record_instruction` row, whose text the model composes — is not one.
  */
 export function isRaiseInstruction(i: Pick<InstructionRow, "kind" | "body">): boolean {
 	return i.body.startsWith("ceiling: ") || i.body.startsWith("stakes: ") || (i.kind === "answer" && i.body === "extend");
@@ -237,21 +242,37 @@ export function crossed(s: Spend, c: Ceiling): 0 | 80 | 100 {
 	return 0;
 }
 
-// ---- the question ------------------------------------------------------------------------------
+// ---- the notices -------------------------------------------------------------------------------
 
-/** The ceiling question's answers (§ 2 items 4, 5); stop is the default. */
-export const CEILING_OPTIONS = ["stop", "extend", "split"] as const;
-export type CeilingOption = (typeof CEILING_OPTIONS)[number];
+/** The meter's two notice levels (PLAN wl-mvfkv7llkp7nk0 § 4): 80 % of either half, and the stop at 100 %. */
+export type CeilingNoticeLevel = 80 | 100;
 
-/** The body of the question raised at 80 % (§ 2 item 4): where the spend stands, stop as the default, and what each answer does. */
-export function ceilingQuestionBody(wl: string, s: Spend, c: Ceiling, stakes: Stakes): string {
+/** A ceiling value as the meter keys it: an extend, a `ceiling` word or a lowering is a new value, which may notify again. */
+export const ceilingKey = (c: Ceiling): string => `usd ${c.usd} wall ${c.wallMin}`;
+
+/**
+ * The text of the runner's ceiling notice (surface/src/notice.ts adds `notice: `). Its first line names the level and
+ * the ceiling value it was sent for (`parseCeilingNotice` reads them back, so the runner sends one per level per value),
+ * then where the spend stands; the second line says what happens and Jo's words: `extend <wl>` (one more block) and
+ * `ceiling <usd> [<hours>] <wl>`, and at 100 % `user-driven <wl>` too. Nothing is asked and nothing extends on its own.
+ */
+export function ceilingNoticeBody(level: CeilingNoticeLevel, wl: string, s: Spend, c: Ceiling, stakes: Stakes): string {
 	const pct = (a: number, b: number) => Math.floor((a / b) * 100);
+	const raise = `\`extend ${wl}\` (one more block of its own size) or \`ceiling <usd> [<hours>] ${wl}\``;
 	return [
-		`${wl} has used $${s.usd.toFixed(2)} of its $${c.usd} ceiling (${pct(s.usd, c.usd)} %) and ${Math.round(s.wallMin)} of ${c.wallMin} minutes (${pct(s.wallMin, c.wallMin)} %), ${stakes} stakes; ${s.tokens} tokens.`,
-		`stop (the default): the lane keeps working and is stopped at the ceiling; nothing relaunches.`,
-		`extend: the ceiling grows by one more block of this workload's own size and the lane goes on (a stopped lane relaunches); for an exact figure say \`ceiling <usd> [<hours>] ${wl}\` instead.`,
-		`split: the lane is stopped at the ceiling like stop, and the remaining work is split into a new workload; nothing relaunches here.`,
+		`ceiling ${level} % at ${ceilingKey(c)} on ${wl}: $${s.usd.toFixed(2)} of $${c.usd} (${pct(s.usd, c.usd)} %) and ${Math.round(s.wallMin)} of ${c.wallMin} minutes (${pct(s.wallMin, c.wallMin)} %), ${stakes} stakes; ${Math.round(s.tokens)} tokens.`,
+		level === 80
+			? `The lane goes on and is stopped at 100 %. For more room: ${raise}.`
+			: `The lane is stopped at the ceiling and nothing relaunches on its own. To go on: ${raise}; either relaunches it. To drive it yourself: \`user-driven ${wl}\`.`,
 	].join("\n");
+}
+
+const CEILING_NOTICE = /^notice: ceiling (80|100) % at (usd \S+ wall \S+) on (\S+):/;
+
+/** A ceiling notice's message body (with its `notice: ` prefix) read back: its level, ceiling value (`ceilingKey`) and workload; null for any other body. */
+export function parseCeilingNotice(body: string): { level: CeilingNoticeLevel; key: string; workloadId: string } | null {
+	const m = CEILING_NOTICE.exec(body);
+	return m ? { level: Number(m[1]) as CeilingNoticeLevel, key: m[2]!, workloadId: m[3]! } : null;
 }
 
 // ---- helpers -----------------------------------------------------------------------------------

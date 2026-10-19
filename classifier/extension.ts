@@ -265,7 +265,7 @@ import { controlEntries, holdersOf, type LaneStarted, laneStarted, planFirst, pl
 import { ompPidState, type PidState } from "../surface/src/omp-probe";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../surface/src/types";
 import {
-	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairOfferStamp, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
+	PAIR_OPTION, type PairLedger, type PairSignalId, pairExposureBody, pairOffer, pairOfferBody, pairSignalBody, pairSignalFailedBody, pairSuggestOn,
 	parsePairSignal, parsePairSignalFailed, readPairSuggestConfig,
 } from "../surface/src/pair-suggest";
 
@@ -1101,7 +1101,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { signals: PairSignalId[] } | null {
 		try {
 			// deps.ledger() is the ledger module's Ledger at run time; the port (src/ledger-port.ts) names only what routing calls.
-			return pairOffer(ledger as unknown as PairLedger, workloadId, "round-limit", { config: readPairSuggestConfig(), count });
+			return pairOffer(ledger as unknown as PairLedger, workloadId, { config: readPairSuggestConfig(), count });
 		} catch (error) {
 			log(`agent-system-2 classifier: the pair offer on ${workloadId} could not be computed (${message(error)}); the round-limit question is raised without it`);
 			return null;
@@ -1497,7 +1497,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					`the round-limit question of ${sliceId}`,
 				);
 				entry(reviewLimitBody(questionId, sliceId));
-				if (offer) ledger.recordEntry({ by: pairOfferStamp("round-limit"), workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
+				if (offer) ledger.recordEntry({ by: CLASSIFIER_BY, workloadId, kind: "assumption", body: pairOfferBody(questionId, "round-limit", offer.signals) });
 				return `review round ${round.n} of ${sliceId} brought the loop to its limit (${count.failed} failed of ${limit.total}); question ${questionId} (review-limit:; extend / accept / stop${offer ? " / pair" : ""}) is raised`;
 			});
 			if (settledLost.length > 0) {

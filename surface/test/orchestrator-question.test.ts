@@ -244,13 +244,14 @@ describe("Jo's answer", () => {
 		expect(ledger.question(ghost)!.state).toBe("open");
 	});
 
-	test("a withdrawal with `cancel` never cancels the standing slice: it replans, the slice is open, and a second question is raised", async () => {
+	test("a withdrawal never cancels the standing slice: it replans, the slice is open, and a second question is raised", async () => {
 		const { ledger, path } = tempLedger();
 		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const s = surface(path);
 		const q = s.idOf(await s.raise({ body: "Now or later?", options: ["now", "later"], about: wl }));
-		expect(interpret(ledger, `withdraw ${q}`)).toEqual({ kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "replan" });
-		const receipt = apply(ledger, { kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q, then: "cancel" });
+		const cmd = interpret(ledger, `withdraw ${q}`)!;
+		expect(cmd).toEqual({ kind: "withdraw", workloadId: STANDING_WORKLOAD_ID, questionId: q });
+		const receipt = apply(ledger, cmd);
 		expect(receipt).toMatch(new RegExp(`^withdrew the orchestrator's ${q} \\(withdrawal in-\\S+, then replan\\); the standing slice stays open$`));
 		const row = ledger.question(q)!;
 		expect(row.state).toBe("withdrawn");
