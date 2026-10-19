@@ -8,8 +8,9 @@
 // `CONFIG`, lane.ts preflight), with `PI_CODING_AGENT_DIR` pointing at the same agent directory. HOME is a per-file
 // temp directory, restored afterwards.
 //
-// Regression: the offering cases fail on 946c016 by assertion (no `pair` option, no `pair:` line, no `pair-offer:`).
-// C alone and switch off are guards that pass there too.
+// Regression: the offering cases fail on 946c016 by assertion (no `pair` option, no `pair-offer:`). C alone and switch
+// off are guards that pass there too. Since PLAN wl-mvb9mw00ycfjeo D1 (R1) an offered question's body is byte-identical
+// to the raise without the feature: the offer is shown by the surface from its `pair-offer:` entry, never in the body.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,29 +75,23 @@ function parsedOffer(body: string): { q: string; site: string; signals: string[]
 }
 
 const BASE = (wl: string) => ceilingQuestionBody(wl, SPEND, NORMAL, "normal");
-const CEILING_TAIL = (wl: string) =>
-	`Answering pair is stop plus a switch to user-driven: the autonomous lane stops at the ceiling, and you continue it yourself (as2 lane ${wl}).`;
 
-describe("ceiling raise with pair-suggest on (D1, D3, D6)", () => {
-	test("signals B and C (three long steers, no done slice): options end with pair, the body is the unchanged body plus one last `pair:` line, and one lane-runner pair-offer: names the question", () => {
+describe("ceiling raise with pair-suggest on (D1, D3, D6; PLAN wl-mvb9mw00ycfjeo D1, R1)", () => {
+	test("signals B and C (three long steers, no done slice): options end with pair, the body is byte-identical to the no-offer raise, and one lane-runner pair-offer: names the question", () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl } = workloadWithSlice(ledger);
 		for (let i = 0; i < 3; i++) steer(ledger, wl, LONG);
 		const q = raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS, "pair"]);
-		const lines = q.body.split("\n");
-		expect(lines.slice(0, -1).join("\n")).toBe(BASE(wl));
-		const line = lines.at(-1)!;
-		expect(line).toStartWith("pair: ");
-		expect(line).toContain("3 long steers from you since open");
-		expect(line).toEndWith(`. ${CEILING_TAIL(wl)}`);
+		expect(q.body).toBe(BASE(wl));
+		expect(q.body).not.toContain("pair");
 		const o = offers(ledger, wl);
 		expect(o.map((e) => e.created_by)).toEqual([LANE_RUNNER_BY]);
 		expect(parsedOffer(o[0]!.body)).toEqual({ q: q.id, site: "ceiling", signals: ["b", "c"] });
 	});
 
-	test("B with a done slice: offered on B alone, with B's reason as the whole reason", () => {
+	test("B with a done slice: offered on B alone, the body unchanged", () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
@@ -104,11 +99,11 @@ describe("ceiling raise with pair-suggest on (D1, D3, D6)", () => {
 		for (let i = 0; i < 4; i++) steer(ledger, wl, LONG);
 		const q = raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS, "pair"]);
-		expect(q.body).toBe(`${BASE(wl)}\npair: 4 long steers from you since open. ${CEILING_TAIL(wl)}`);
+		expect(q.body).toBe(BASE(wl));
 		expect(parsedOffer(offers(ledger, wl)[0]!.body)?.signals).toEqual(["b"]);
 	});
 
-	test("E alone (a classifier-stamped `pair-signal: taste yes 0.91`) with a done slice: offered with the jev reason", () => {
+	test("E alone (a classifier-stamped `pair-signal: taste yes 0.91`) with a done slice: offered on E, the body unchanged", () => {
 		pairSuggest("all");
 		const { ledger } = tempLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
@@ -116,7 +111,7 @@ describe("ceiling raise with pair-suggest on (D1, D3, D6)", () => {
 		ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: wl, kind: "assumption", body: "pair-signal: taste yes 0.91 ambiguous no 0.85 judge typesafe/jev-1.13.0 cost 0.0001" });
 		const q = raise(ledger, wl);
 		expect(q.options).toEqual([...CEILING_OPTIONS, "pair"]);
-		expect(q.body).toBe(`${BASE(wl)}\npair: jev: UI/taste work (0.91). ${CEILING_TAIL(wl)}`);
+		expect(q.body).toBe(BASE(wl));
 		expect(parsedOffer(offers(ledger, wl)[0]!.body)?.signals).toEqual(["e"]);
 	});
 });

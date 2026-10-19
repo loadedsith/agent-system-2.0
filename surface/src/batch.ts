@@ -35,14 +35,19 @@ export function surfaceWord(text: string): "pending" | "brb" | "back" | null {
 	return w === "pending" || w === "brb" || w === "back" ? w : null;
 }
 
-/** Whether `line` goes out on its own poll rather than waiting for the window (the four kinds above). */
+/**
+ * Whether `line` goes out on its own poll rather than waiting for the window (the kinds below). A `pair` line (PLAN
+ * wl-mvb9mw00ycfjeo D4): a taken line always; an offer line whenever its question is (the ceiling question).
+ */
 export function onFire(ledger: Ledger, line: ErrorLine): boolean {
 	switch (line.kind) {
 		case "lane-died": {
 			const w = ledger.workload(line.workloadId);
 			return w !== null && (w.open_slices > 0 || w.paused_slices > 0);
 		}
-		case "question": {
+		case "question":
+		case "pair": {
+			if (line.kind === "pair" && line.state === "taken") return true;
 			const q = ledger.question(line.rowId);
 			return q !== null && isCeilingQuestion(q, ledger.slice(q.slice_id));
 		}
