@@ -1099,6 +1099,7 @@ surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/by-hand-context.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
@@ -1256,47 +1257,91 @@ surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
 surface/test/phoenix-run.test.ts	test	-
-# Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
-# jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
-# profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
+# Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14; re-pinned with paired-coding added, wl-mvb9mw00ycfjeo,
+# 2026-10-19): i-have-audhd, ask-graham and paired-coding vendored from jo-wolff-plugins at the one pin in
+# plugins/VENDOR.md, upstream *.test.mjs left out. All used in place: profile/config.yml loads
+# plugins/index.ts (AuDHD and Graham in the orchestrator and lanes, paired-coding in by-hand lanes, none in
+# hands) and lists each plugins/<p>/skills dir. plugins/paired-as2.ts is as2's seam to the paired adapter.
 plugins/VENDOR.md	doc	-
 plugins/index.ts	extension	-
+plugins/paired-as2.ts	module	-
 plugins/ask-graham/.claude-plugin/plugin.json	data	-
 plugins/ask-graham/.omp-plugin/plugin.json	data	-
+plugins/ask-graham/README.md	doc	-
+plugins/ask-graham/fixtures/transcripts.mjs	module	-
 plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-
+plugins/ask-graham/hooks/ask-graham-stop.mjs	module	-
 plugins/ask-graham/hooks/hooks.json	data	-
 plugins/ask-graham/omp/ask-graham-omp.ts	extension	-
 plugins/ask-graham/package.json	data	-
-plugins/ask-graham/README.md	doc	-
 plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
+plugins/ask-graham/skills/ask-graham/references/comparables-criteria.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
+plugins/i-have-audhd/README.md	doc	-
 plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-
 plugins/i-have-audhd/checks/lines.mjs	module	-
 plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-
 plugins/i-have-audhd/checks/needs-you-first.mjs	module	-
 plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-
+plugins/i-have-audhd/checks/sections.mjs	module	-
 plugins/i-have-audhd/example.i-have-audhd.json	data	-
 plugins/i-have-audhd/hooks/hooks.json	data	-
 plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
+plugins/i-have-audhd/hooks/i-have-audhd-prompt.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
 plugins/i-have-audhd/judge/ask.mjs	module	-
 plugins/i-have-audhd/lib/config.mjs	module	-
+plugins/i-have-audhd/lib/judge-setup.mjs	module	-
+plugins/i-have-audhd/lib/pending.mjs	module	-
 plugins/i-have-audhd/lib/state.mjs	module	-
-plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
 plugins/i-have-audhd/omp/REGISTRATION.md	doc	-
+plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
 plugins/i-have-audhd/package.json	data	-
-plugins/i-have-audhd/README.md	doc	-
 plugins/i-have-audhd/skills/i-have-audhd/SKILL.md	skill	-
 plugins/i-have-audhd/skills/i-have-audhd/reference.md	skill-asset	-
 plugins/i-have-audhd/skills/i-have-audhd/references/comparison.md	skill-asset	-
 plugins/i-have-audhd/skills/i-have-audhd/references/rationale.md	skill-asset	-
 plugins/i-have-audhd/skills/i-have-audhd/references/sources.md	skill-asset	-
+plugins/i-have-audhd/tools/setup.mjs	module	-
 plugins/i-have-audhd/tools/upgrade-from-communication-rules.mjs	module	-
 plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-
 plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
 plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
+plugins/i-have-audhd/triggers/fixtures/omp-todo-edit-sequence.mjs	module	-
+plugins/i-have-audhd/triggers/fixtures/omp-todo-fragment.mjs	module	-
 plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
+plugins/paired-coding/.claude-plugin/plugin.json	data	-
+plugins/paired-coding/.mcp.json	data	-
+plugins/paired-coding/.omp-plugin/plugin.json	data	-
+plugins/paired-coding/README.md	doc	-
+plugins/paired-coding/core/gate.mjs	module	-
+plugins/paired-coding/hooks/hooks.json	data	-
+plugins/paired-coding/hooks/paired-coding-hook.mjs	module	-
+plugins/paired-coding/landlock/Cargo.lock	data	-
+plugins/paired-coding/landlock/Cargo.toml	data	-
+plugins/paired-coding/landlock/README.md	doc	-
+plugins/paired-coding/landlock/SHA256SUMS	data	-
+plugins/paired-coding/landlock/bin/pair-landlock-aarch64-linux	data	-
+plugins/paired-coding/landlock/bin/pair-landlock-x86_64-linux	data	-
+plugins/paired-coding/landlock/build.sh	data	-
+plugins/paired-coding/landlock/src/main.rs	data	-
+plugins/paired-coding/landlock/test/docker.sh	data	-
+plugins/paired-coding/landlock/test/enosys-landlock.json	data	-
+plugins/paired-coding/landlock/test/live.sh	data	-
+plugins/paired-coding/lib/bwrap.mjs	module	-
+plugins/paired-coding/lib/host-io.mjs	module	-
+plugins/paired-coding/lib/landlock.mjs	module	-
+plugins/paired-coding/lib/verbs.mjs	module	-
+plugins/paired-coding/omp/REGISTRATION.md	doc	-
+plugins/paired-coding/omp/paired-coding-omp.ts	extension	-
+plugins/paired-coding/package.json	data	-
+plugins/paired-coding/server/binding.mjs	module	-
+plugins/paired-coding/server/pair-server.mjs	module	-
+plugins/paired-coding/skills/paired-coding/SKILL.md	skill	-
 plugins/test/loader.test.ts	test	-
+plugins/test/omp-host.ts	test	-
+plugins/test/paired-coding.test.ts	test	-

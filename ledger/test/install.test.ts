@@ -304,14 +304,33 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 describe("install: the vendored plugins' skills and loader (plugins/VENDOR.md)", () => {
 	const rendered = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
 
-	test("the render lists <repo>/skills then both plugin skill dirs, names both plugin skills, and loads plugins/index.ts last", () => {
+	test("the render lists <repo>/skills then the three plugin skill dirs, sorted, names exactly the 25 manifest skills, and loads plugins/index.ts last", () => {
 		const r = install("plugins-baseline");
 		expect(r.exitCode).toBe(0);
 		const doc = Bun.YAML.parse(readFileSync(rendered(r.home), "utf8")) as { extensions: string[]; skills: { customDirectories: string[]; includeSkills: string[] } };
-		expect(doc.skills.customDirectories).toEqual([`${copy}/skills`, `${copy}/plugins/ask-graham/skills`, `${copy}/plugins/i-have-audhd/skills`]);
-		expect(doc.skills.includeSkills).toContain("ask-graham");
-		expect(doc.skills.includeSkills).toContain("i-have-audhd");
+		expect(doc.skills.customDirectories).toEqual([`${copy}/skills`, `${copy}/plugins/ask-graham/skills`, `${copy}/plugins/i-have-audhd/skills`, `${copy}/plugins/paired-coding/skills`]);
+		const skillRows = original
+			.split("\n")
+			.filter((l) => l.split(T)[1] === "skill")
+			.map((l) => l.split(T)[0]!.replace(/\/SKILL\.md$/, "").replace(/^.*\//, ""));
+		expect(skillRows).toHaveLength(25);
+		expect([...doc.skills.includeSkills].sort()).toEqual(skillRows.sort());
+		for (const name of ["ask-graham", "i-have-audhd", "paired-coding"]) expect(doc.skills.includeSkills).toContain(name);
 		expect(doc.extensions.at(-1)).toBe(`${copy}/plugins/index.ts`);
+	});
+
+	// Which modules OMP's discovery then skips, with a seeded control plugin still loading, is in
+	// plugins/test/loader.test.ts and install/fresh-machine-test.sh step 3c.
+	test("disabledExtensions names exactly each vendored adapter's module, from its package.json omp.extensions", () => {
+		const r = install("plugins-disabled");
+		expect(r.exitCode).toBe(0);
+		const doc = Bun.YAML.parse(readFileSync(rendered(r.home), "utf8")) as { disabledExtensions: string[] };
+		const adapters = ["ask-graham", "i-have-audhd", "paired-coding"].flatMap((p) => {
+			const pkg: { omp: { extensions: string[] } } = JSON.parse(readFileSync(join(copy, "plugins", p, "package.json"), "utf8"));
+			return pkg.omp.extensions.map((e) => `extension-module:${e.replace(/^.*\//, "").replace(/\.ts$/, "")}`);
+		});
+		expect(adapters).toEqual(["extension-module:ask-graham-omp", "extension-module:i-have-audhd-omp", "extension-module:paired-coding-omp"]);
+		expect([...doc.disabledExtensions].sort()).toEqual(adapters);
 	});
 
 	test("a plugin skill row whose skills dir the config does not list is refused, nothing written", () => {
