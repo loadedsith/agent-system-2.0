@@ -38,8 +38,9 @@ const asideMsgIds = (details: unknown): string[] => {
 type Drained = { worked: string[]; unconfirmed: { msgId: string; content: string }[] };
 type DrainModule = {
 	drainInbox: (io: Record<string, unknown>) => Drained;
-	confirmAsides: (ledger: Ledger, config: unknown, msgIds: string[], consume: boolean) => { confirmed: string[]; consumed: string[] };
-	turnReceiptsDue: (ledger: Ledger, config: unknown, since: string) => string[];
+	confirmAsides: (ledger: Ledger, config: unknown, msgIds: string[]) => string[];
+	consumeAsides: (ledger: Ledger, config: unknown) => string[];
+	turnReceiptsDue: (ledger: Ledger, config: unknown, since: string | null) => string[];
 };
 
 /**
@@ -401,7 +402,7 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 					crashed.push(...mod!.drainInbox(io(false)).unconfirmed.map((u) => u.msgId));
 					expect(crashed).toEqual([msgId]);
 					if (point !== "sent") {
-						mod!.confirmAsides(t.ledger, config, [msgId], false);
+						mod!.confirmAsides(t.ledger, config, [msgId]);
 						if (point !== "confirmed") expect(() => mod!.drainInbox(io(true))).toThrow(crash);
 					}
 				}
@@ -467,10 +468,11 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 				expect(text).not.toContain(`- ${msgId} from plumb`);
 				expect(text).not.toContain("plumb proposes");
 			}
-			// Its aside never reached the model, so the refusal line says nothing did (code review r1 #3).
+			// No aside of it was confirmed, but its row existed, so the `## from other agents` block may have shown it: the
+			// line says so rather than "nothing reached the model" (code review r2 #3).
 			const refusedLines = errorLines(t.s().ledger()).filter((l) => l.kind === "channel-refused").map((l) => l.line);
 			expect(refusedLines).toHaveLength(1);
-			expect(refusedLines[0]).toContain("quarantined in inbox/ilex as .invalid, nothing reached the model");
+			expect(refusedLines[0]).toContain(`quarantined in inbox/ilex as .invalid, no aside of ${msgId} was confirmed (it may have been read in the ledger); it is withdrawn from later renders`);
 		});
 
 		test("T5 a foreign ack placed after the aside: refused at publication, the ack byte-identical, no archive", async () => {
@@ -483,7 +485,7 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 			// The crashed session sent the aside and its message_end confirmed it; it died before the ack.
 			const config = { senders: [PLUMB] };
 			const crashed = mod!.drainInbox({ ledger: t.ledger, config, root: t.root, pid: DEAD_PID, alive: () => true }).unconfirmed.map((u) => u.msgId);
-			mod!.confirmAsides(t.ledger, config, crashed, false);
+			mod!.confirmAsides(t.ledger, config, crashed);
 			mkdirSync(join(t.root, "acks"), { recursive: true });
 			const foreign = `${JSON.stringify({ id: e.id, from: "Juno", to: "Lintel", deliveredAt: "2026-10-18T00:00:00.000Z" })}\n`;
 			writeFileSync(join(t.root, "acks", `${e.id}.json`), foreign);
@@ -684,7 +686,7 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 		// Each message is owed its aside by exactly one drain.
 		expect(owed.sort()).toEqual([`1001 msg-ch-${one.id}`, `1002 msg-ch-${two.id}`].sort());
 		// Each session's aside lands; each drain's next pass acks and archives its own claim.
-		mod!.confirmAsides(t.ledger, { senders: [PLUMB] }, [`msg-ch-${one.id}`, `msg-ch-${two.id}`], false);
+		mod!.confirmAsides(t.ledger, { senders: [PLUMB] }, [`msg-ch-${one.id}`, `msg-ch-${two.id}`]);
 		pass(t.ledger, 1001);
 		pass(other, 1002);
 		expect(owed).toHaveLength(2);
@@ -881,6 +883,173 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 		const config = { senders: [PLUMB] };
 		expect(mod!.turnReceiptsDue(t.ledger, config, new Date(Date.now() - 60_000).toISOString())).toEqual([e.id]);
 		expect(mod!.turnReceiptsDue(t.ledger, config, new Date(Date.now() + 60_000).toISOString())).toEqual([]);
+	});
+
+	describe("T16 a late collision never earns another seat's sender an acted receipt: a withdrawn message is never consumed and gets no turn receipt (code review r2 #1)", () => {
+		const config = { senders: [PLUMB] };
+		/** Another seat's ack at the envelope's id, as the registry would publish it; returns its bytes. */
+		const foreignAck = (root: string, id: string): string => {
+			mkdirSync(join(root, "acks"), { recursive: true });
+			const foreign = `${JSON.stringify({ id, from: "Juno", to: "Lintel", deliveredAt: "2026-10-18T00:00:00.000Z" })}\n`;
+			writeFileSync(join(root, "acks", `${id}.json`), foreign);
+			return foreign;
+		};
+		/** The withdrawn message's fate: its aside entry, the foreign ack (the `ack` field), no archive, no turn receipt, quarantined. */
+		const withdrawnFate = (msgId: string, state: string) => ({ msgId, aside: true, ack: true, archive: false, turn: false, claimed: false, state });
+
+		test("(a) the round-2 sequence: an aside confirmed outside a turn, a foreign ack, the drain refuses; the next agent_start consumes nothing and writes no turn receipt", async () => {
+			const mod = await drainModule();
+			expect(mod?.drainInbox).toBeInstanceOf(Function);
+			const t = surface();
+			ensureStandingWorkload(t.ledger);
+			const e = envelope("confirmed outside a turn, then a foreign ack");
+			const msgId = `msg-ch-${e.id}`;
+			t.publish(e);
+			// A crashed session recorded it and its aside was confirmed outside a turn (folded in); it died before the ack.
+			expect(mod!.drainInbox({ ledger: t.ledger, config, root: t.root, pid: DEAD_PID, alive: () => true }).unconfirmed.map((u) => u.msgId)).toEqual([msgId]);
+			mod!.confirmAsides(t.ledger, config, [msgId]);
+			const foreign = foreignAck(t.root, e.id);
+			await t.start();
+			expect(t.entriesWith("channel-refused:").map((r) => r.body)).toEqual([`channel-refused: ${e.id}.json from "Plumb" msg ${msgId} (id collision)`]);
+			await t.agentStart();
+			t.tick();
+			await t.f.emit("agent_end", { type: "agent_end" }, t.ctx);
+			await t.agentStart();
+			expect(t.fate(msgId)).toEqual(withdrawnFate(msgId, "delivered"));
+			expect(readFileSync(join(t.root, "acks", `${e.id}.json`), "utf8")).toBe(foreign);
+			expect(readdirSync(join(t.root, "acks"))).toEqual([`${e.id}.json`]);
+		});
+
+		test("(b) its aside lands inside a turn after a foreign ack appeared: refused at publication, never consumed, no turn receipt", async () => {
+			const t = surface();
+			await t.start();
+			const e = envelope("lands inside a turn, after a foreign ack");
+			const msgId = `msg-ch-${e.id}`;
+			t.publish(e);
+			t.tick();
+			expect(t.asides()).toHaveLength(1);
+			const foreign = foreignAck(t.root, e.id);
+			await t.agentStart();
+			await t.f.admit(t.asides()[0]!, t.ctx);
+			expect(t.entriesWith("channel-refused:").map((r) => r.body)).toEqual([`channel-refused: ${e.id}.json from "Plumb" msg ${msgId} (id collision)`]);
+			t.tick();
+			await t.f.emit("agent_end", { type: "agent_end" }, t.ctx);
+			await t.agentStart();
+			expect(t.fate(msgId)).toEqual(withdrawnFate(msgId, "delivered"));
+			expect(readFileSync(join(t.root, "acks", `${e.id}.json`), "utf8")).toBe(foreign);
+			expect(readdirSync(join(t.root, "acks"))).toEqual([`${e.id}.json`]);
+		});
+
+		test("(c) consumed, then refused: the reconcile writes no turn receipt for it", async () => {
+			const mod = await drainModule();
+			expect(mod?.drainInbox).toBeInstanceOf(Function);
+			const t = surface();
+			ensureStandingWorkload(t.ledger);
+			const e = envelope("consumed, then a foreign ack");
+			const msgId = `msg-ch-${e.id}`;
+			t.publish(e);
+			// A crashed session confirmed its aside inside a turn and committed `consumed`; it died before the ack.
+			expect(mod!.drainInbox({ ledger: t.ledger, config, root: t.root, pid: DEAD_PID, alive: () => true }).unconfirmed.map((u) => u.msgId)).toEqual([msgId]);
+			mod!.confirmAsides(t.ledger, config, [msgId]);
+			expect(mod!.consumeAsides(t.ledger, config)).toEqual([msgId]);
+			const foreign = foreignAck(t.root, e.id);
+			// The session_start pass refuses it, then the session's first (unbounded) reconcile runs; later ticks run bounded.
+			await t.start();
+			expect(t.entriesWith("channel-refused:").map((r) => r.body)).toEqual([`channel-refused: ${e.id}.json from "Plumb" msg ${msgId} (id collision)`]);
+			t.tick();
+			await t.agentStart();
+			t.tick();
+			expect(t.fate(msgId)).toEqual(withdrawnFate(msgId, "consumed"));
+			expect(readFileSync(join(t.root, "acks", `${e.id}.json`), "utf8")).toBe(foreign);
+			expect(readdirSync(join(t.root, "acks"))).toEqual([`${e.id}.json`]);
+			expect(mod!.turnReceiptsDue(t.ledger, config, null)).toEqual([]);
+		});
+	});
+
+	test("T17 a turn receipt lost before an outage longer than TURN_RECEIPT_DAYS is written at the next session_start; a tick's scan stays bounded (code review r2 #2)", async () => {
+		const mod = await drainModule();
+		expect(mod?.drainInbox).toBeInstanceOf(Function);
+		const t = surface();
+		ensureStandingWorkload(t.ledger);
+		// Eight days ago a session recorded it, confirmed its aside, acked, archived and consumed it, and crashed before its turn receipt.
+		const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000).toISOString();
+		const past = Ledger.open(t.path, { backup: false, backupOnOpen: false, clock: () => eightDaysAgo });
+		const e = envelope("consumed eight days ago; its turn receipt was never written");
+		const msgId = `msg-ch-${e.id}`;
+		t.publish(e);
+		const config = { senders: [PLUMB] };
+		const io = { ledger: past, config, root: t.root, pid: DEAD_PID, alive: () => true };
+		expect(mod!.drainInbox(io).unconfirmed.map((u) => u.msgId)).toEqual([msgId]);
+		mod!.confirmAsides(past, config, [msgId]);
+		mod!.drainInbox(io);
+		expect(mod!.consumeAsides(past, config)).toEqual([msgId]);
+		expect(t.ledger.message(msgId)!.changed_at).toBe(eightDaysAgo);
+		expect(t.fate(msgId)).toEqual({ msgId, aside: true, ack: true, archive: true, turn: false, claimed: false, state: "consumed" });
+		// A fresh session_start reconciles without bound: the receipt is written.
+		await t.start();
+		const receipt = join(t.root, "acks", `${e.id}.turn.json`);
+		expect(existsSync(receipt)).toBe(true);
+		expect(JSON.parse(readFileSync(receipt, "utf8"))).toMatchObject({ id: e.id, seat: "Ilex", pid: process.pid });
+		// Lost again: this session's ticks scan only the last TURN_RECEIPT_DAYS and leave it; the next session's start writes it.
+		unlinkSync(receipt);
+		t.tick();
+		t.tick();
+		expect(existsSync(receipt)).toBe(false);
+		await t.f.emit("session_start", { type: "session_start" }, ctxOf());
+		expect(existsSync(receipt)).toBe(true);
+	});
+
+	test("T18 the refusal line says how far a withdrawn message had come: no row, a row with no confirmed aside, a confirmed aside, handled before its aside (code review r2 #3)", async () => {
+		const mod = await drainModule();
+		expect(mod?.drainInbox).toBeInstanceOf(Function);
+		const t = surface();
+		await t.start();
+		const config = { senders: [PLUMB] };
+		const msg = (e: Envelope) => `msg-ch-${e.id}`;
+		const foreignAck = (id: string) => {
+			mkdirSync(join(t.root, "acks"), { recursive: true });
+			writeFileSync(join(t.root, "acks", `${id}.json`), `${JSON.stringify({ id, from: "Juno", to: "Lintel", deliveredAt: "2026-10-18T00:00:00.000Z" })}\n`);
+		};
+
+		// (1) Refused before its row: a foreign ack at its id on first sight. No row, nothing reached the model.
+		const norow = envelope("refused before its row");
+		foreignAck(norow.id);
+		t.publish(norow);
+		t.tick();
+		expect(t.channelRows().map((r) => r.id)).not.toContain(msg(norow));
+
+		// (2) A row with no confirmed aside: its send is dropped (no message_end), Ilex reads it in orchestrator_ledger, then a foreign ack.
+		const unread = envelope("recorded; its aside was never confirmed");
+		t.publish(unread);
+		t.tick();
+		expect(await t.read()).toContain(`- ${msg(unread)} from plumb`);
+		foreignAck(unread.id);
+		t.tick();
+
+		// (3) A confirmed aside, then a foreign ack before publication (a crashed session confirmed it and died before the ack).
+		const seen = envelope("its aside was confirmed");
+		t.publish(seen);
+		expect(mod!.drainInbox({ ledger: t.ledger, config, root: t.root, pid: DEAD_PID, alive: () => true }).unconfirmed.map((u) => u.msgId)).toEqual([msg(seen)]);
+		mod!.confirmAsides(t.ledger, config, [msg(seen)]);
+		foreignAck(seen.id);
+		t.tick();
+
+		// (4) Handled before its aside: its send is dropped, Ilex marks it done from the block, then a foreign ack.
+		const handled = envelope("handled from the block before its aside");
+		t.publish(handled);
+		t.tick();
+		await t.f.tool("orchestrator_channel_done").execute("1", { re: [msg(handled)] }, undefined, undefined, t.ctx);
+		foreignAck(handled.id);
+		t.tick();
+
+		const lines = errorLines(t.s().ledger()).filter((l) => l.kind === "channel-refused").map((l) => l.line);
+		const q = "(id collision) — quarantined in inbox/ilex as .invalid,";
+		expect(lines).toHaveLength(4);
+		expect(lines[0]).toContain(`${norow.id}.json from "Plumb" ${q} nothing reached the model (shown`);
+		expect(lines[1]).toContain(`msg ${msg(unread)} ${q} no aside of ${msg(unread)} was confirmed (it may have been read in the ledger); it is withdrawn from later renders (shown`);
+		expect(lines[2]).toContain(`msg ${msg(seen)} ${q} ${msg(seen)}'s aside had already reached Ilex; it is withdrawn from later renders (shown`);
+		expect(lines[3]).toContain(`msg ${msg(handled)} ${q} Ilex had already read and acted on ${msg(handled)}; it is withdrawn from later renders (shown`);
+		expect(lines.filter((l) => l.includes("nothing reached the model"))).toHaveLength(1);
 	});
 });
 

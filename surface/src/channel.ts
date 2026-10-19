@@ -251,11 +251,18 @@ export function withdrawnMessages(ledger: Ledger): Set<string> {
 }
 
 /**
- * The `channel-refused:` entries young enough to show (CHANNEL_REFUSED_SHOWN_HOURS), oldest first; `rest` is the body
- * after the prefix. A late collision names the message it withdraws (`msgId`), and `reached` says whether that message
- * had already reached Ilex (its `channel-aside:`, either form) when it was refused; null for any other refusal.
+ * How far a withdrawn message had come when a late collision refused it: its `channel-aside:` (either form), or
+ * `unconfirmed` when its row exists with no aside entry. Such a row may still have been read in the `## from other
+ * agents` block (the wake or `orchestrator_ledger`), so it is never reported as unseen (code review r2 #3).
  */
-export function channelRefusals(ledger: Ledger, now: string): { id: string; rest: string; createdAt: string; msgId: string | null; reached: AsideRecord | null }[] {
+export type RefusalReach = AsideRecord | "unconfirmed";
+
+/**
+ * The `channel-refused:` entries young enough to show (CHANNEL_REFUSED_SHOWN_HOURS), oldest first; `rest` is the body
+ * after the prefix. A late collision names the message it withdraws (`msgId`), and `reached` says how far that message
+ * had come (RefusalReach); null for any other refusal, and for a named message with no row (nothing reached the model).
+ */
+export function channelRefusals(ledger: Ledger, now: string): { id: string; rest: string; createdAt: string; msgId: string | null; reached: RefusalReach | null }[] {
 	const since = new Date(Date.parse(now) - CHANNEL_REFUSED_SHOWN_HOURS * 3_600_000).toISOString();
 	return ledger.db.query<{ id: string; body: string; created_at: string }, [string, string, string, string]>(
 		`SELECT id, body, created_at FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ? AND substr(body, 1, length(?3)) = ?3 AND created_at >= ?4
@@ -263,7 +270,7 @@ export function channelRefusals(ledger: Ledger, now: string): { id: string; rest
 	).all(STANDING_WORKLOAD_ID, CHANNEL_BY, CHANNEL_REFUSED_PREFIX, since).map((r) => {
 		const msgId = WITHDRAWN.exec(r.body)?.[1] ?? null;
 		const m = msgId ? ledger.message(msgId) : null;
-		return { id: r.id, rest: r.body.slice(CHANNEL_REFUSED_PREFIX.length).trim(), createdAt: r.created_at, msgId, reached: m ? asideOf(ledger, m.id, m.sender) : null };
+		return { id: r.id, rest: r.body.slice(CHANNEL_REFUSED_PREFIX.length).trim(), createdAt: r.created_at, msgId, reached: m ? (asideOf(ledger, m.id, m.sender) ?? "unconfirmed") : null };
 	});
 }
 
@@ -382,14 +389,14 @@ export function recordMessage(ledger: Ledger, envelope: Envelope, sender: Channe
  * turn message re-rendering unconfirmed ones), so its text reached the model. Each id that is a configured sender's
  * channel row gets its `channel-aside:` entry (once), whatever its state: confirmation is about transport, not handling
  * (code review r1 #1), so a message Ilex already walked to `acted-on` before its aside landed still gets the entry the
- * drain's ack and archive wait for. Only the state walk is skipped past `delivered`: one still held or delivered moves
- * held→delivered (F12) and, with `consume` (the `message_end` fell inside a turn), on to `consumed`, the observed-turn
- * receipt. Returns the ids that got their `channel-aside:` entry now, and the ids moved to consumed.
+ * drain's ack and archive wait for. Only the state walk is skipped past `delivered`: one still held moves
+ * held→delivered (F12). Consuming is not this step's: a `message_end` inside a turn consumes (consumeAsides) only after
+ * the drain has published the ack, so a message a late collision withdraws there is never consumed (code review r2 #1).
+ * Returns the ids that got their `channel-aside:` entry now.
  */
-export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: readonly string[], consume: boolean): { confirmed: string[]; consumed: string[] } {
+export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: readonly string[]): string[] {
 	const senders = new Set(config.senders.map((s) => channelBy(s.id)));
 	const confirmed: string[] = [];
-	const consumed: string[] = [];
 	ledger.write(() => {
 		for (const id of new Set(msgIds)) {
 			const m = ledger.message(id);
@@ -400,15 +407,10 @@ export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: rea
 				ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: asideBody(id) });
 				confirmed.push(id);
 			}
-			if (m.state !== "held" && m.state !== "delivered") continue;
 			if (m.state === "held") ledger.advanceMessage(id, "delivered", { by });
-			if (consume) {
-				ledger.advanceMessage(id, "consumed", { by });
-				consumed.push(id);
-			}
 		}
 	});
-	return { confirmed, consumed };
+	return confirmed;
 }
 
 /**
@@ -428,21 +430,23 @@ export function settleHandled(ledger: Ledger, msgId: string, senderId: string): 
 	});
 }
 
-/** How far back the drain's tick looks for a consumed or acted-on message whose turn receipt is missing (code review r1 #2). */
+/** How far back the drain's tick looks for a consumed or acted-on message whose turn receipt is missing (code review r1 #2); a session's first reconcile looks back without bound (code review r2 #2). */
 export const TURN_RECEIPT_DAYS = 7;
 
 /**
  * The envelope ids of the configured senders' channel messages that moved to `consumed` or `acted-on` at or after
- * `since` (their `changed_at`) and have their `channel-aside:` (either form): those whose registry turn receipt the
- * drain's tick writes again when it is missing (surface/extensions/agent-channel.ts). Bounded by `since`, so a tick
- * reads only recent rows.
+ * `since` (their `changed_at`; null: every one), have their `channel-aside:` (either form) and were not withdrawn by a
+ * late collision: those whose registry turn receipt the drain writes again when it is missing
+ * (surface/extensions/agent-channel.ts). Bounded by `since` on every tick, so a tick reads only recent rows; unbounded
+ * once per session, so a restart after any outage recovers a receipt lost before it.
  */
-export function turnReceiptsDue(ledger: Ledger, config: ChannelConfig, since: string): string[] {
+export function turnReceiptsDue(ledger: Ledger, config: ChannelConfig, since: string | null): string[] {
 	const senders = new Set(config.senders.map((s) => channelBy(s.id)));
-	return ledger.db.query<MessageRow, [string, string, string]>(
-		"SELECT * FROM messages WHERE workload_id = ? AND substr(id, 1, length(?2)) = ?2 AND state IN ('consumed', 'acted-on') AND changed_at >= ?3 ORDER BY created_at, rowid",
+	const withdrawn = withdrawnMessages(ledger);
+	return ledger.db.query<MessageRow, [string, string, string | null]>(
+		"SELECT * FROM messages WHERE workload_id = ? AND substr(id, 1, length(?2)) = ?2 AND state IN ('consumed', 'acted-on') AND (?3 IS NULL OR changed_at >= ?3) ORDER BY created_at, rowid",
 	).all(STANDING_WORKLOAD_ID, CHANNEL_MSG_PREFIX, since)
-		.filter((m) => senders.has(m.created_by) && m.created_by === channelBy(m.sender) && hasAside(ledger, m.id, m.sender))
+		.filter((m) => senders.has(m.created_by) && m.created_by === channelBy(m.sender) && !withdrawn.has(m.id) && hasAside(ledger, m.id, m.sender))
 		.map((m) => m.id.slice(CHANNEL_MSG_PREFIX.length));
 }
 
@@ -455,15 +459,18 @@ function channelMessages(ledger: Ledger, config: ChannelConfig): MessageRow[] {
 }
 
 /**
- * D2 Consumed, the fold case: at an `agent_start`, every channel message whose aside was confirmed (`channel-aside:`)
- * outside a turn and is not yet consumed moves to `consumed`, one legal step at a time: the observed-turn receipt.
- * Returns the ids moved.
+ * D2 Consumed, the observed-turn receipt: every channel message whose aside was confirmed (`channel-aside:`) and is
+ * not yet consumed moves to `consumed`, one legal step at a time; called at an `agent_start` (the fold case: asides
+ * confirmed outside a turn) and after a confirming `message_end` inside a turn, once the drain has acked it. A message
+ * a late collision withdrew is never consumed (code review r2 #1): its ack id may belong to another seat. Returns the
+ * ids moved.
  */
 export function consumeAsides(ledger: Ledger, config: ChannelConfig): string[] {
 	const moved: string[] = [];
 	ledger.write(() => {
+		const withdrawn = withdrawnMessages(ledger);
 		for (const m of channelMessages(ledger, config)) {
-			if ((m.state !== "held" && m.state !== "delivered") || !hasAside(ledger, m.id, m.sender)) continue;
+			if ((m.state !== "held" && m.state !== "delivered") || withdrawn.has(m.id) || !hasAside(ledger, m.id, m.sender)) continue;
 			const by = channelBy(m.sender);
 			if (m.state === "held") ledger.advanceMessage(m.id, "delivered", { by });
 			ledger.advanceMessage(m.id, "consumed", { by });

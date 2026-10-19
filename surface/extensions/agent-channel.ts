@@ -33,10 +33,14 @@
 // resumes at the ack. A message Ilex walks to `acted-on` (the reply or done tool, its id read from the block) before
 // any confirmation is settled at the next pass instead of resent: `channel-aside: <id> handled-before-aside`, then its
 // ack and archive (code review r1 #1). A message whose confirmation falls inside a turn (between `agent_start` and
-// `agent_end`) moves to `consumed` then; one folded in outside a turn moves at the next `agent_start` (the
-// observed-turn receipt). At either moment the registry's turn receipt `acks/<id>.turn.json` is written, so the
-// sender's `seat_message` reports `acted`; each tick writes it again where it is missing for a recent consumed or
-// acted-on message with its aside entry and its ack (code review r1 #2). The `context` hook keeps, after the last
+// `agent_end`) moves to `consumed` right after that confirmation's drain has acked it; one folded in outside a turn
+// moves at the next `agent_start` (the observed-turn receipt). A message a late collision withdrew is never consumed.
+// At either moment the registry's turn receipt `acks/<id>.turn.json` is written, so the sender's `seat_message`
+// reports `acted`, but only with proof the ack at that id is this drain's own: the message is not withdrawn, the
+// archive holds the bytes its `channel-in:` sha256 records, and the ack passes the publication path's ack test against
+// that envelope (code review r2 #1). Each tick writes a missing receipt again for a consumed or acted-on message with
+// its aside entry that moved in the last TURN_RECEIPT_DAYS, and a session's first tick looks back without bound, so a
+// restart after any outage recovers one (code review r1 #2, r2 #2). The `context` hook keeps, after the last
 // assistant message, only the newest copy of a resent aside.
 //
 // The tools Ilex answers with (D4) are the tools section at the end of this file: `orchestrator_reply` writes an
@@ -48,9 +52,9 @@ import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync,
 import { join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import {
-	asideText, CHANNEL_ASIDE_TYPE, CHANNEL_DRAIN_MS, CHANNEL_MSG_PREFIX, type ChannelConfig, channelIn, confirmAsides, consumeAsides, displayName, type Envelope, hasAside, ID_COLLISION,
+	asideText, CHANNEL_ASIDE_TYPE, CHANNEL_DRAIN_MS, type ChannelConfig, channelIn, confirmAsides, consumeAsides, displayName, type Envelope, hasAside, ID_COLLISION,
 	ILEX_SLUG, mailboxRoot, msgIdOf, readChannelConfig, recordMessage, recordOut, recordRefused, reRefusal, setChannelInForce, settleHandled, sha256, TURN_RECEIPT_DAYS, turnReceiptsDue,
-	validateEnvelope,
+	validateEnvelope, withdrawnMessages,
 } from "../src/channel";
 import { ensureStandingWorkload } from "../src/identity";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -274,18 +278,43 @@ const TURN_SEAT = "Ilex";
 const TURN_PROVEN_SEAT = "(not a launcher-started seat)";
 
 /**
- * The observed-turn receipt the sender's `seat_message` reads as `acted`: `acks/<id>.turn.json` for each envelope whose
- * message just moved to consumed (at its confirming `message_end` inside a turn, or at the next `agent_start`). Tmp
- * then `link`, so an existing receipt is never replaced (EEXIST skips it); every error is swallowed, as the registry
- * does: a receipt must never break the turn it reports.
+ * Proof that `acks/<id>.json` is this drain's own for the channel message `msgId` (code review r2 #1): the message
+ * was not withdrawn by a late collision, `archive/<id>.json` holds the bytes its `channel-in:` sha256 records, and the
+ * ack passes the publication path's ack test (`ownAck`) against that archived envelope. A turn receipt at an id whose
+ * ack is another seat's would tell that seat's sender its recipient acted. Returns the envelope id, or null.
  */
-export function writeTurnReceipts(root: string, envelopeIds: readonly string[], pid: number): void {
+function ownedAck(ledger: Ledger, root: string, msgId: string, withdrawn: ReadonlySet<string>): string | null {
+	const m = ledger.message(msgId);
+	if (!m || withdrawn.has(msgId)) return null;
+	const rec = channelIn(ledger, msgId, m.sender);
+	if (!rec || msgIdOf(rec.envelopeId) !== msgId) return null;
+	const archived = readOrNull(join(root, "archive", `${rec.envelopeId}.json`));
+	if (archived === null || sha256(archived) !== rec.sha) return null;
+	const ack = readOrNull(join(root, "acks", `${rec.envelopeId}.json`));
+	return ack !== null && ownAck(ack, JSON.parse(archived.toString("utf8")) as Envelope) ? rec.envelopeId : null;
+}
+
+/**
+ * The observed-turn receipt the sender's `seat_message` reads as `acted`: `acks/<id>.turn.json` for each channel
+ * message in `msgIds` (moved to consumed at its confirming `message_end` inside a turn or at the next `agent_start`,
+ * or found missing by the reconcile) whose ack is proven this drain's own (`ownedAck`); any other is skipped, and the
+ * reconcile tries it again once its ack and archive exist. Tmp then `link`, so an existing receipt is never replaced
+ * (EEXIST skips it); every error is swallowed, as the registry does: a receipt must never break the turn it reports.
+ */
+export function writeTurnReceipts(ledger: Ledger, root: string, msgIds: readonly string[], pid: number): void {
+	if (msgIds.length === 0) return;
 	const turnStartedAt = new Date().toISOString();
-	const acks = join(root, "acks");
-	for (const id of envelopeIds) {
+	let withdrawn: Set<string>;
+	try {
+		withdrawn = withdrawnMessages(ledger);
+	} catch {
+		return; // Diagnostic only: the reconcile tries again.
+	}
+	for (const msgId of msgIds) {
 		try {
-			mkdirSync(acks, { recursive: true });
-			const path = join(acks, `${id}.turn.json`);
+			const id = ownedAck(ledger, root, msgId, withdrawn);
+			if (id === null) continue;
+			const path = join(root, "acks", `${id}.turn.json`);
 			const tmp = `${path}.${pid}.${randomUUID()}.tmp`;
 			writeFileSync(tmp, `${JSON.stringify({ id, seat: TURN_SEAT, provenSeat: TURN_PROVEN_SEAT, pid, turnStartedAt })}\n`);
 			try {
@@ -353,6 +382,8 @@ interface Live {
 	tries: Map<string, number>;
 	/** Between `agent_start` and `agent_end`: a confirmation now falls inside a turn. */
 	inTurn: boolean;
+	/** The session's one unbounded turn-receipt reconcile is still owed (code review r2 #2): cleared once it has run. */
+	fullReconcile: boolean;
 }
 
 export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
@@ -373,20 +404,39 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 	 * The turn receipt is recoverable (code review r1 #2): `consumed` commits before `acks/<id>.turn.json` is written,
 	 * and a receipt write swallows its errors, so a crash or a failed write in between would lose it for good. Each tick
 	 * writes it again for every channel message that moved to consumed or acted-on in the last TURN_RECEIPT_DAYS, has
-	 * its `channel-aside:` and its ack, and has no turn receipt: no-replace, and every error swallowed, as at the first
-	 * write (a receipt must never break the drain). The registry never unlinks an ack or a turn receipt, so a written
-	 * one stays and the next tick finds nothing to do.
+	 * its `channel-aside:`, was not withdrawn, and has no turn receipt; writeTurnReceipts writes it only with proof the
+	 * ack is this drain's own (code review r2 #1). The session's first reconcile looks back without bound (r2 #2), so a
+	 * restart after an outage longer than the bound still recovers a receipt lost before it. No-replace, and every error
+	 * swallowed, as at the first write (a receipt must never break the drain). The registry never unlinks an ack or a
+	 * turn receipt, so a written one stays and the next tick finds nothing to do.
 	 */
 	const reconcileTurnReceipts = (ctx: Ctx, l: Live): void => {
 		try {
 			const ledger = surfaceSession(ctx, env).ledger();
 			const root = mailboxRoot(env);
-			const since = new Date(Date.parse(ledger.now()) - TURN_RECEIPT_DAYS * 86_400_000).toISOString();
-			const missing = turnReceiptsDue(ledger, l.config, since).filter((id) => existsSync(join(root, "acks", `${id}.json`)) && !existsSync(join(root, "acks", `${id}.turn.json`)));
-			writeTurnReceipts(root, missing, process.pid);
+			const since = l.fullReconcile ? null : new Date(Date.parse(ledger.now()) - TURN_RECEIPT_DAYS * 86_400_000).toISOString();
+			const missing = turnReceiptsDue(ledger, l.config, since).filter((id) => !existsSync(join(root, "acks", `${id}.turn.json`)));
+			writeTurnReceipts(ledger, root, missing.map(msgIdOf), process.pid);
+			l.fullReconcile = false;
 		} catch {
-			// Diagnostic only, as writeTurnReceipts: the next tick tries again.
+			// Diagnostic only, as writeTurnReceipts: the next tick tries again (unbounded, if this was the session's first).
 		}
+	};
+
+	/**
+	 * The observed-turn receipt: every confirmed aside not yet consumed (and not withdrawn) moves to consumed, and its
+	 * turn receipt is written where the ack is proven this drain's own.
+	 */
+	const consume = (ctx: Ctx, l: Live): void => {
+		const ledger = surfaceSession(ctx, env).ledger();
+		let moved: string[];
+		try {
+			moved = consumeAsides(ledger, l.config);
+		} catch (err) {
+			ctx.ui.notify(`agent channel: the consumed receipt could not be written: ${err instanceof Error ? err.message : String(err)}`, "warning");
+			return;
+		}
+		writeTurnReceipts(ledger, mailboxRoot(env), moved, process.pid);
 	};
 
 	/**
@@ -430,7 +480,7 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 		const ledger = s.ledger();
 		ensureStandingWorkload(ledger);
 		setChannelInForce(ledger, read.config);
-		const l: Live = { config: read.config, tries: new Map(), inTurn: false };
+		const l: Live = { config: read.config, tries: new Map(), inTurn: false, fullReconcile: true };
 		live.set(ctx.sessionManager, l);
 		tick(ctx, l);
 		ctx.setInterval(() => tick(ctx, l), CHANNEL_DRAIN_MS);
@@ -454,14 +504,7 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 		if (!l) return undefined;
 		l.inTurn = true;
 		// The fold case: asides confirmed outside a turn (plan mode, after an Esc) are consumed at this turn's start.
-		let moved: string[];
-		try {
-			moved = consumeAsides(surfaceSession(ctx, env).ledger(), l.config);
-		} catch (err) {
-			ctx.ui.notify(`agent channel: the consumed receipt could not be written: ${err instanceof Error ? err.message : String(err)}`, "warning");
-			return undefined;
-		}
-		writeTurnReceipts(mailboxRoot(env), moved.map((m) => m.slice(CHANNEL_MSG_PREFIX.length)), process.pid);
+		consume(ctx, l);
 		return undefined;
 	});
 
@@ -474,23 +517,22 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 	// Confirmation: OMP emits message_end for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages,
 	// after agent_start) and for an aside it folds into context without a turn (agent-session.ts:1232-1235). The ids
 	// the message names get `channel-aside:` whatever their state (one Ilex already acted on included, code review r1
-	// #1), and `consumed` with the turn receipt when inside a turn and not yet past delivered; their ack and archive
-	// follow at once. The entry is written first, so a crash before the archive leaves a claim the next tick resumes at
-	// the ack.
+	// #1), and their ack and archive follow at once. The entry is written first, so a crash before the archive leaves a
+	// claim the next tick resumes at the ack. Inside a turn they move to `consumed`, with the turn receipt, only after
+	// that drain: one it refuses as a late collision is withdrawn by then and is never consumed (code review r2 #1).
 	pi.on("message_end", (event, ctx) => {
 		const l = live.get(ctx.sessionManager);
 		const p = l ? channelPush(event.message) : null;
 		if (!l || !p) return undefined;
-		let consumed: string[];
 		try {
-			consumed = confirmAsides(surfaceSession(ctx, env).ledger(), l.config, p.msgIds, l.inTurn).consumed;
+			confirmAsides(surfaceSession(ctx, env).ledger(), l.config, p.msgIds);
 		} catch (err) {
 			ctx.ui.notify(`agent channel: the aside's confirmation could not be recorded: ${err instanceof Error ? err.message : String(err)}`, "warning");
 			return undefined;
 		}
 		for (const id of p.msgIds) l.tries.delete(id);
-		writeTurnReceipts(mailboxRoot(env), consumed.map((m) => m.slice(CHANNEL_MSG_PREFIX.length)), process.pid);
 		drain(ctx, l);
+		if (l.inTurn) consume(ctx, l);
 		return undefined;
 	});
 

@@ -149,8 +149,10 @@ and a word for it, the surface shows `#n plumb proposes <word> <target>` under t
 the row's own number; Jo decides it by typing `n <word>`, or any other word that fits. Every
 other request, flips and ceilings included, stays a note: the word is Jo's to type. A
 `channel-refused:` line under *needs you* is an envelope the channel set aside; it takes no word.
-When it names a message that had already reached you, the line says so, and that message is
-withdrawn from later renders.
+When it names a message already recorded, that message is withdrawn from later renders, and the
+line says how far it had come: no aside confirmed (you may still have read it in the ledger), its
+aside had already reached you, or you had already acted on it. Without a message, nothing reached
+the model.
 
 ## The one-liner
 

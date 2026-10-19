@@ -460,12 +460,15 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		}
 	}
 	for (const r of channelRefusals(ledger, now)) {
-		// A late collision can refuse a message that had already reached Ilex (code review r1 #3): say so, not "nothing reached the model".
+		// A late collision can refuse a message that had already reached Ilex (code review r1 #3), or whose row the
+		// `## from other agents` block may have shown without an aside (r2 #3): "nothing reached the model" only when no row exists.
 		const fate = r.reached === "confirmed"
 			? `${r.msgId}'s aside had already reached Ilex; it is withdrawn from later renders`
 			: r.reached === "handled-before-aside"
 				? `Ilex had already read and acted on ${r.msgId}; it is withdrawn from later renders`
-				: "nothing reached the model";
+				: r.reached === "unconfirmed"
+					? `no aside of ${r.msgId} was confirmed (it may have been read in the ledger); it is withdrawn from later renders`
+					: "nothing reached the model";
 		out.push({ kind: "channel-refused", workloadId: STANDING_WORKLOAD_ID, rowId: r.id, line: `agent channel refused an envelope: ${r.rest} — quarantined in inbox/ilex as .invalid, ${fate} (shown ${CHANNEL_REFUSED_SHOWN_HOURS}h; takes no word)` });
 	}
 	return out;
