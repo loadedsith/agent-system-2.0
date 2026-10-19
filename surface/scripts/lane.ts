@@ -65,7 +65,7 @@ import {
 	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
@@ -75,7 +75,7 @@ import {
 import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
-import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import { decideRanked, drainPick, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
@@ -328,7 +328,8 @@ class Refused extends Error {
  * The reservation (decision 8) under the policy for the path. Autonomous: `decideLaunch` with Jev ranking's gate composed
  * (`decideRanked`, PLAN wl-mv8k039gvogt8g D7; `config` is the profile's `jevRank`, read fresh here), inside
  * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
- * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
+ * `decideLaunch` with only the intake queue's gate (PLAN wl-mvbcjadqgblr7k D5). Interactive: `decideInteractive`, never
+ * gated (D6); an admit writes Jo's pick snapshot
  * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
  */
 export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig()): ReserveResult {
@@ -471,10 +472,12 @@ async function runStarter(wl: string): Promise<{ code: number; line: string }> {
 /**
  * `drain <wl>`: sequential. Each round reads the open workloads in the order Jev ranking's mode names
  * (`jevRank`, read fresh each round, PLAN wl-mv8k039gvogt8g D7): oldest first (`inFlight`, the tick's
- * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, and runs the
- * starter for the first one not yet tried whose predicate says launch, awaiting its own exit with no
+ * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, with the intake
+ * queue's workloads in queue order in the positions they occupy (`drainCandidates`, PLAN wl-mvbcjadqgblr7k D5),
+ * and runs the starter for the first one not yet tried whose predicate says launch and the queue gate admits
+ * (`drainPick`), awaiting its own exit with no
  * timeout (`runStarter`: a killed starter could strand its committed reservation; its exception path
- * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:` or `parallel:`
+ * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:`, `parallel:` or `queued:`
  * refusal is an attempt line like any other and the drain goes on to the next. Exit `cap` stops the
  * drain; any other exit (launched, failed after the reservation, refused) re-reads and goes on. Each
  * workload is tried at most once, so the drain ends after at most one attempt per open workload. Logs
@@ -493,13 +496,8 @@ async function cmdDrain(after: string): Promise<number> {
 			const cap = laneCap(process.env);
 			for (;;) {
 				const config = readRankConfig();
-				const order = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, ledger.now());
-				const next = order.find((id) => {
-					if (tried.has(id)) return false;
-					const rows = ledger.launchRows(id, cap);
-					return rows !== null && verdictOf(rows).launch;
-				});
-				if (next === undefined) break;
+				const next = drainPick(ledger, tried, cap, config);
+				if (next === null) break;
 				if (config.mode === "show") {
 					try {
 						drainLine(rankShadowLine(ledger, process.pid, next, tried, cap, config));

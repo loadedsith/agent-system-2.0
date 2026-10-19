@@ -3,7 +3,9 @@
 // missing or malformed reads as order) admits a workload only when no higher-ranked workload (`rankOpen`, Jo's pins
 // first) is launchable now, `show` changes no launch, and `parallel` adds the parallel rule (`parallelVerdict`) while
 // any other lane runs. In `order` alone, `preemptFor` (PLAN wl-mv8wzytml878b4 D3) pauses the lowest-ranked running lane
-// for a Jo-ruled workload waiting at cap.
+// for a Jo-ruled workload waiting at cap. The intake queue (PLAN wl-mvbcjadqgblr7k D1-D7) is gated in every mode,
+// `show` included: a queued workload takes a slot only when no queued workload ranked above it is launchable now
+// (`queueGate`), and the drain walks the queue in rank order (`drainCandidates`, `drainPick`).
 //
 // `rankGate` is composed into the starter's `decideLaunch` (surface/scripts/lane.ts `reserveOrExit`), so it runs inside
 // `reserveLane`'s transaction for the drain, the open tool and the wake tick alike; the surface runs it again as its own
@@ -19,13 +21,13 @@ import { type Ceiling, crossed, effectiveCeiling, parseSpend, type Spend } from 
 import { repoOf } from "./decision-log";
 import { ensureStandingWorkload } from "./identity";
 import {
-	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, laneStopRequestBody, type LaunchVerdict,
-	PRIORITY_REASON_PREFIX, priorityPausingOf, verdictOf,
+	attempts, boundPrs, causeText, consumedIds, controlEntries, heldLive, holdersOf, laneStopRequestBody, type LaunchVerdict,
+	PRIORITY_REASON_PREFIX, priorityPausingOf, queuedOf, verdictOf,
 } from "./launch";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
 import { parseTestRequested } from "./test-run";
-import { RANK_BY, STANDING_WORKLOAD_ID } from "./types";
+import { DUE_PREFIX, RANK_BY, STANDING_WORKLOAD_ID } from "./types";
 
 // ---- the switch (D7) -----------------------------------------------------------------------------------------------
 
@@ -73,16 +75,21 @@ export function pendingRequest(rows: ReserveRows): string | null {
 
 /**
  * The launch decision with the rank gate applied, over the rows `reserveLane` (or the surface's pre-check) read.
- * `show`: `launchable`'s decision unchanged. `order` / `parallel`: a refusal stays a refusal; a pending Jo request admits
- * at once with cause `request <id>` (even when `launchable` reports `first`, so the reservation consumes it); otherwise
- * the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under `parallel`
- * refused `parallel: <reason>` when `parallelVerdict` holds it.
+ * A refusal stays a refusal. In every mode the intake queue's gate (`queueGate`, PLAN wl-mvbcjadqgblr7k D5) refuses a
+ * queued workload `queued: position <n>` while a queued workload ranked above it is launchable now; Jo's pending request
+ * is never gated (D6). `show`: otherwise `launchable`'s decision unchanged. `order` / `parallel`: a pending Jo request
+ * admits at once with cause `request <id>` (even when `launchable` reports `first`, so the reservation consumes it);
+ * otherwise the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under
+ * `parallel` refused `parallel: <reason>` when `parallelVerdict` holds it.
  */
 export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict {
 	const v = verdictOf(rows);
-	if (config.mode === "show" || !v.launch) return v;
+	if (!v.launch) return v;
 	const request = pendingRequest(rows);
+	if (config.mode === "show") return request !== null ? v : (queueGate(ledger, rows, config) ?? v);
 	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
+	const queued = queueGate(ledger, rows, config);
+	if (queued !== null) return queued;
 	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
 	if (above !== null) return { launch: false, reason: `ranked: below ${above}` };
 	if (config.mode === "parallel") {
@@ -92,9 +99,8 @@ export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig):
 	return v;
 }
 
-/** `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch` itself). */
+/** `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch` plus the queue gate). */
 export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig): ReserveVerdict {
-	if (config.mode === "show") return decideLaunch(rows);
 	const v = rankGate(ledger, rows, config);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
@@ -120,6 +126,93 @@ export function drainOrder(ledger: Ledger, now: string): string[] {
 	return rankOpen(ledger, now).map((i) => i.workloadId);
 }
 
+// ---- the intake queue (PLAN wl-mvbcjadqgblr7k D1-D7) -----------------------------------------------------------------
+
+/** Whether the workload is in the intake queue now (`queuedOf` over its control entries). */
+export function isQueued(ledger: Ledger, workloadId: string): boolean {
+	return queuedOf(controlEntries(ledger.entries(workloadId, "assumption"))) !== null;
+}
+
+/**
+ * Started-but-idle workloads (D2), oldest first: open, not the standing workload, not a `due:` row, not queued, with at
+ * least one valid `launch:` attempt or at least one slice, and no live holder. The open tool queues an ask while there
+ * are more of them than lane slots.
+ */
+export function startedIdle(ledger: Ledger, now: string): string[] {
+	const out: string[] = [];
+	for (const { workload: w } of ledger.inFlight()) {
+		if (w.id === STANDING_WORKLOAD_ID || w.brief.startsWith(DUE_PREFIX) || heldLive(w, now)) continue;
+		const control = controlEntries(ledger.entries(w.id, "assumption"));
+		if (queuedOf(control) !== null) continue;
+		if (attempts(control).length > 0 || ledger.slices(w.id).length > 0) out.push(w.id);
+	}
+	return out;
+}
+
+/** The intake queue in D4 order: `rankOpen` filtered to queued workloads (Jo's pins, then Jev score, then unscored oldest first). */
+export function queueOrder(ledger: Ledger, now: string): RankItem[] {
+	return rankOpen(ledger, now).filter((i) => isQueued(ledger, i.workloadId));
+}
+
+/**
+ * A queued workload's place (D4): 1 + the queued workloads before it in `queueOrder`, of all queued, with its rank item
+ * (score or unscored reason); null when it is not queued.
+ */
+export function queuePosition(ledger: Ledger, workloadId: string, now: string): { position: number; of: number; item: RankItem } | null {
+	const queue = queueOrder(ledger, now);
+	const at = queue.findIndex((i) => i.workloadId === workloadId);
+	return at === -1 ? null : { position: at + 1, of: queue.length, item: queue[at]! };
+}
+
+/**
+ * The queue gate (D5, D6, D7), over the rows a launch decision read: null admits, a refusal `queued: position <n>` holds.
+ * Only a queued autonomous workload with no pending Jo request is gated; it is refused while a queued autonomous
+ * workload ranked above it in `queueOrder` is launchable now (`verdictOf` at `rows.cap`; under `parallel` one the
+ * parallel rule holds does not block, as in `higherLaunchable`). `<n>` is the gated workload's own position. User-driven
+ * queued workloads keep a position but never block a slot (D7). Reads only; no write.
+ */
+export function queueGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict | null {
+	const w = rows.workload;
+	if (w.mode !== "autonomous" || pendingRequest(rows) !== null) return null;
+	if (queuedOf(controlEntries(rows.entries, holdersOf(rows.entries, w.holder, rows.holders))) === null) return null;
+	const queue = queueOrder(ledger, rows.now);
+	const at = queue.findIndex((i) => i.workloadId === w.id);
+	for (const item of queue.slice(0, Math.max(0, at))) {
+		if (item.mode !== "autonomous" || item.state === "running") continue;
+		const above = ledger.launchRows(item.workloadId, rows.cap);
+		if (!above || !verdictOf(above).launch) continue;
+		if (config.mode === "parallel" && parallelVerdict(ledger, item.workloadId, rows.now, config).verdict === "hold") continue;
+		return { launch: false, reason: `queued: position ${at + 1}` };
+	}
+	return null;
+}
+
+/**
+ * The drain's candidates this round (D5): oldest first (`inFlight`, the tick's order) in `show`, `drainOrder` in `order` /
+ * `parallel`, with the queued workloads put in `queueOrder` into the positions queued workloads occupy, so the queue top
+ * is always tried before any queue member below it.
+ */
+export function drainCandidates(ledger: Ledger, now: string, config: RankConfig): string[] {
+	const base = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, now);
+	const queue = queueOrder(ledger, now).map((i) => i.workloadId);
+	const queued = new Set(queue);
+	let k = 0;
+	return base.map((id) => (queued.has(id) && k < queue.length ? queue[k++]! : id));
+}
+
+/**
+ * The drain's next pick (D5): the first of `drainCandidates` not yet tried whose predicate says launch and that the
+ * queue gate admits, or null. Two free slots therefore go to the top two queued workloads in one drain.
+ */
+export function drainPick(ledger: Ledger, tried: ReadonlySet<string>, cap: number, config: RankConfig): string | null {
+	const now = ledger.now();
+	return drainCandidates(ledger, now, config).find((id) => {
+		if (tried.has(id)) return false;
+		const rows = ledger.launchRows(id, cap);
+		return rows !== null && verdictOf(rows).launch && queueGate(ledger, rows, config) === null;
+	}) ?? null;
+}
+
 // ---- priority pause (PLAN wl-mv8wzytml878b4 D3) ----------------------------------------------------------------------
 
 export interface PreemptResult {
@@ -132,10 +225,12 @@ export interface PreemptResult {
 /**
  * Make room at cap for a Jo-ruled workload (D3), in one transaction that reads everything it decides on. Only in mode
  * `order`. `waiting` = the ruled (pinned) autonomous workloads not running whose own `verdictOf` with the cap lifted
- * launches, in rank order; `pending` = the live lanes whose priority stop is requested and not yet exited (slots on their
- * way). Pauses only for `waiting[pending.length]`: the lowest-ranked workload below it held by a live autonomous `lane-*`
- * with a `lane-ready:` and no `lane-stop:` of any reason, by writing `lane-stop: <L> requested priority-for-<X> by rank`
- * stamped `by`. The runner's stop path does the rest; the drain gives the freed slot to the top-ranked launchable workload.
+ * launches and that the intake queue's gate admits (PLAN wl-mvbcjadqgblr7k D6: a pinned queued workload waits only as
+ * the queue's launchable top), in rank order; `pending` = the live lanes whose priority stop is requested and not yet
+ * exited (slots on their way). Pauses only for `waiting[pending.length]`: the lowest-ranked workload below it held by a
+ * live autonomous `lane-*` with a `lane-ready:` and no `lane-stop:` of any reason, by writing `lane-stop: <L> requested
+ * priority-for-<X> by rank` stamped `by`. The runner's stop path does the rest; the drain gives the freed slot to the
+ * top-ranked launchable workload.
  */
 export function preemptFor(ledger: Ledger, now: string, cap: number, config: RankConfig, by: string): PreemptResult {
 	if (config.mode !== "order") return { paused: null, reason: `jevRank mode ${config.mode}: priority pause is off` };
@@ -146,7 +241,7 @@ export function preemptFor(ledger: Ledger, now: string, cap: number, config: Ran
 		const waiting = ranked.filter((i) => {
 			if (i.pinned === undefined || i.mode !== "autonomous" || i.state === "running") return false;
 			const rows = ledger.launchRows(i.workloadId, Infinity);
-			return rows !== null && verdictOf(rows).launch;
+			return rows !== null && verdictOf(rows).launch && queueGate(ledger, rows, config) === null;
 		});
 		const pending = live.filter((l) => priorityPausingOf(controlEntries(ledger.entries(l.workloadId, "assumption")))?.laneId === l.holder).length;
 		const x = waiting[pending];
