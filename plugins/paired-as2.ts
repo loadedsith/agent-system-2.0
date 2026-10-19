@@ -18,6 +18,13 @@
 //   one Seatbelt profile also denies the ledger and the hooks directory; a pair_run is refused when a
 //   fence target of its command would still be writable under that profile, or, where the clean shell
 //   is on, when the env its /bin/sh starts with carries a start hook.
+// - The run a pair_run made, kept when pairing stops after it. runVerb returns a run's `result` (its
+//   `runId` and real exit) only when pairing goes on; when its post-run link or supervisor check stops
+//   pairing, it returns the stop with no `result`, though the command ran and runEnd journaled its end.
+//   The bridge reads that `run-end` entry back and hands the adapter the run's result, marked
+//   `stopped`, so the observers (gates/src/pair-call.ts canonicalResult) record the real, failed run.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { shellStartReason } from "../gates/src/fence";
 import {
 	isPairMutation,
@@ -58,6 +65,32 @@ interface VerbResult {
 type ToolCallHandler = (event: { toolName: string }, ctx: OmpContext) => unknown;
 
 const refused = (name: string, why: string): VerbResult => ({ ok: false, text: `${name} refused: ${why}` });
+
+/**
+ * The result of run `runId` when the adapter ran it and then stopped pairing, read from the `run-end`
+ * entry runEnd (plugins/paired-coding/core/gate.mjs) appended to the session journal before the stop
+ * (lib/verbs.mjs runVerb, which journals in `journal.jsonl` and adds the run's timedOut and aborted);
+ * undefined when the journal holds no end of that run, so it never ran.
+ */
+function stoppedRun(sessionDir: string, runId: string): object | undefined {
+	let lines: string[];
+	try {
+		lines = readFileSync(join(sessionDir, "journal.jsonl"), "utf8").split("\n");
+	} catch {
+		return undefined;
+	}
+	for (let i = lines.length - 1; i >= 0; i--) {
+		let e: Record<string, unknown>;
+		try {
+			e = JSON.parse(lines[i]!) as Record<string, unknown>;
+		} catch {
+			continue; // a blank or torn line, as upstream's own reader skips it
+		}
+		if (e?.type !== "run-end" || e.runId !== runId) continue;
+		return { exitCode: typeof e.exitCode === "number" ? e.exitCode : null, timedOut: e.timedOut === true, aborted: e.aborted === true, runId, stopped: true };
+	}
+	return undefined;
+}
 
 /** The adapter's tool_call handler with the exact as2 lifecycle names allowed while pairing (C8). */
 function withLifecycleAllowance(adapterHandler: ToolCallHandler, env: Record<string, string | undefined>): ToolCallHandler {
@@ -114,7 +147,10 @@ function bridgedExecute(env: Record<string, string | undefined>): typeof execute
 				if (reasons.length > 0) return refused(name, shellStartReason(reasons));
 			}
 		}
-		return executeVerb(name, args, ctx);
+		const r = await executeVerb(name, args, ctx);
+		if (name !== "pair_run" || r.result !== undefined) return r;
+		const run = stoppedRun(ctx.sessionDir, ctx.runId!);
+		return run ? { ...r, result: run } : r;
 	};
 }
 

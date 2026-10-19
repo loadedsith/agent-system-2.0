@@ -4,13 +4,15 @@
 // runs it, against a temp ledger, a temp HOME and a temp git worktree.
 //   - pair_write and pair_edit into a path a write or edit may not touch get that write's or edit's own
 //     refusal (rows 9 and 10); a pair call the gates never saw, or whose arguments changed after they
-//     allowed it, is refused at execute and writes nothing.
+//     allowed it, is refused at execute and writes nothing; an agreed one with its arguments unchanged
+//     writes its exact bytes and leaves its write receipt.
 //   - a pair_run of a command bash would refuse gets bash's own refusal (row 6, sandbox-exec and a
 //     destructive git command outside scratch, with the reserved request recorded); a scratch-only
 //     exemption is refused, since the pairing sandbox is not that confinement.
 //   - an allowed pair_run runs, under the one pairing profile that also carries the fence's ledger deny.
 //   - a pair_run of a declared artifact writes the slice's outcome from the run's real exit, and a
-//     passing one its artifact-tree entry.
+//     passing one its artifact-tree entry; a run after which pairing stops (its post-run link check)
+//     still writes its failure and its bash receipt, and never a pass.
 //   - the as2 lifecycle tools are allowed while pairing; host mutation and unknown tools stay refused.
 //   - with the clean shell on, pair_run refuses to start a /bin/sh whose env carries a start hook.
 // The runs execute for real under /usr/bin/sandbox-exec. A process already inside a Seatbelt sandbox
@@ -18,7 +20,7 @@
 // so the assertions that need a run to finish are skipped there and say why in their title.
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import { bindPairedCoding } from "../../plugins/paired-as2";
@@ -30,6 +32,7 @@ import type { CleanShellCheck } from "../src/clean-shell";
 import { type FenceSettings, shellStartReason } from "../src/fence";
 import { PAIR_RUN_CONFINED_REASON } from "../src/pair-call";
 import { scratchRootFor } from "../src/scratch";
+import { gateSession } from "../src/session";
 import { CERTIFIED, commit, git, tmp } from "./helpers";
 
 const ON: FenceSettings = { enabled: true, autoBackground: true };
@@ -41,7 +44,7 @@ const RUN_SKIP = NESTED ? "" : " [skipped: this process already runs under a Sea
 type Handler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 type Result = { block?: boolean; reason?: string; input?: Record<string, unknown> } | undefined;
 interface Tool {
-	execute(id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: { text: string }[]; details?: unknown; isError?: boolean }>;
+	execute(id: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: { text: string }[]; details?: unknown; isError?: boolean }>;
 }
 
 /** Any zod builder chain the tools' parameter schemas use. */
@@ -140,12 +143,12 @@ async function lane(o: { branch?: string; cleanShell?: CleanShellCheck } = {}) {
 	};
 	await h.emit("session_start", { type: "session_start" }, ctx);
 	let n = 0;
-	const call = async (toolName: string, input: Record<string, unknown>, o2: { execInput?: Record<string, unknown>; skipCall?: boolean } = {}) => {
+	const call = async (toolName: string, input: Record<string, unknown>, o2: { execInput?: Record<string, unknown>; skipCall?: boolean; signal?: AbortSignal } = {}) => {
 		const toolCallId = `${sessionId}-${toolName}-${++n}`;
 		const gated = o2.skipCall ? undefined : await h.emit("tool_call", { type: "tool_call", toolName, toolCallId, input }, ctx);
 		if (gated?.block) return { refused: gated.reason ?? "", text: "", details: undefined as unknown, isError: true };
 		const params = o2.execInput ?? gated?.input ?? input;
-		const r = await h.tool(toolName).execute(toolCallId, params, undefined, undefined, ctx);
+		const r = await h.tool(toolName).execute(toolCallId, params, o2.signal, undefined, ctx);
 		await h.emit("tool_result", { type: "tool_result", toolName, toolCallId, input: params, content: r.content, details: r.details, isError: r.isError === true }, ctx);
 		return { refused: null, text: r.content.map((c) => c.text).join("\n"), details: r.details, isError: r.isError === true };
 	};
@@ -202,6 +205,26 @@ describe("pair_write and pair_edit are judged as the write and edit they are", (
 		expect(rewritten.text).toContain("are not the ones the P-11 gates checked");
 		expect(readFileSync(join(l.repo, "src/a.txt"), "utf8")).toBe("a\n");
 		expect(existsSync(join(l.repo, "src/b.txt"))).toBe(false);
+	});
+
+	test.skipIf(!NESTED)(`agreed, with the arguments the gates allowed: pair_write and pair_edit write their exact bytes, each with its write receipt${RUN_SKIP}`, async () => {
+		const l = await lane();
+		await l.open(["src/a.txt", "src/b.txt"]);
+		const root = realpathSync.native(l.repo);
+		const written = await l.call("pair_write", { path: "src/b.txt", content: "b\n\tsecond line\n" });
+		expect(written.refused).toBeNull();
+		expect(written.isError).toBe(false);
+		expect(written.text).toBe("Wrote src/b.txt.");
+		expect(readFileSync(join(l.repo, "src/b.txt"), "utf8")).toBe("b\n\tsecond line\n");
+		const edited = await l.call("pair_edit", { path: "src/a.txt", oldString: "a\n", newString: "a, edited\n" });
+		expect(edited.refused).toBeNull();
+		expect(edited.isError).toBe(false);
+		expect(edited.text).toBe("Edited src/a.txt.");
+		expect(readFileSync(join(l.repo, "src/a.txt"), "utf8")).toBe("a, edited\n");
+		expect(gateSession(l.ctx as never, l.env).history.filter((h) => h.kind === "write")).toEqual([
+			{ kind: "write", path: join(root, "src/b.txt") },
+			{ kind: "write", path: join(root, "src/a.txt") },
+		]);
 	});
 });
 
@@ -296,6 +319,54 @@ describe("a pair_run of a declared artifact records its real outcome", () => {
 		expect(bodies.map((b) => b.slice(0, 16))).toEqual(["artifact-failed:", "artifact-passed:"]);
 		expect(bodies[1]).toContain(`\`${command}\` exited 0`);
 		expect(artifactTrees(l.ledger, l.wl).map((t) => [t.sliceId, t.command])).toEqual([[l.sl, command]]);
+	});
+
+	test("a run after which pairing stops writes artifact-failed with its real exit and its bash receipt, and no tree", async () => {
+		const command = "exit 3";
+		const l = await declared(command);
+		await l.open(["src/link"]);
+		// A link appears where the run may write while it is in flight, so the adapter's post-run link
+		// check stops pairing after the run. The signal's first read is the adapter's, right after the
+		// spawn (plugins/paired-coding/lib/host-io.mjs runSandboxed); making the link there reproduces the
+		// stop even where sandbox-exec cannot run the command itself.
+		const link = join(l.repo, "src/link");
+		const signal = {
+			get aborted() {
+				if (!existsSync(link)) symlinkSync("a.txt", link);
+				return false;
+			},
+			addEventListener: () => {},
+			removeEventListener: () => {},
+		} as unknown as AbortSignal;
+		const run = await l.call("pair_run", { command }, { signal });
+		expect(run.refused).toBeNull();
+		expect(run.isError).toBe(true);
+		expect(run.text).toContain("pair_run refused: STOPPED: pair_run made a link or a .git entry");
+		expect(outcomes(l)).toHaveLength(1);
+		expect(outcomes(l)[0]).toStartWith("artifact-failed:");
+		const code = field(run.details, "exitCode");
+		expect(typeof code).toBe("number");
+		expect(code).not.toBe(0);
+		if (NESTED) expect(code).toBe(3);
+		expect(outcomes(l)[0]).toContain(`\`${command}\` exited ${code} (tool call ${l.sessionId}-pair_run-`);
+		expect(gateSession(l.ctx as never, l.env).history.at(-1)).toEqual({ kind: "bash", command, exitCode: code });
+		expect(artifactTrees(l.ledger, l.wl)).toEqual([]);
+	});
+
+	test.skipIf(!NESTED)(`a run that exits 0 and makes a link, so pairing stops, is a failure after a failure: no artifact-passed and no tree${RUN_SKIP}`, async () => {
+		const flag = join(tmp("pair-flag"), "ready");
+		const command = `test -f '${flag}' && ln -s a.txt src/link`;
+		const l = await declared(command);
+		await l.open(["src/link"]);
+		await l.call("pair_run", { command });
+		writeFileSync(flag, "");
+		const run = await l.call("pair_run", { command });
+		expect(run.text).toContain("pair_run refused: STOPPED:");
+		const bodies = outcomes(l);
+		expect(bodies.map((b) => b.slice(0, 16))).toEqual(["artifact-failed:", "artifact-failed:"]);
+		expect(bodies[1]).toContain(`\`${command}\` exited 1`);
+		expect(gateSession(l.ctx as never, l.env).history.at(-1)).toEqual({ kind: "bash", command, exitCode: 1 });
+		expect(artifactTrees(l.ledger, l.wl)).toEqual([]);
 	});
 });
 
