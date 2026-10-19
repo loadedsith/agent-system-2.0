@@ -124,6 +124,13 @@ and gets words. A subject workload that is closed when Jo answers refuses the an
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
 
+Jo's standing rulings are checked before any question row is written (SPEC-2.0.md § B3, *Amended 2026-10-19*). When
+one already answers your ask, `orchestrator_raise_question` writes no row and returns `decided by Jo's ruling <id>:
+<action>; no question was raised; do not publish a QUESTION block`: do what the action says and send no QUESTION. While
+`flow-repair` stands, a question whether to open or launch new work is decided that way: queue it and tell Jo
+`queued, position N`. When every option is a `provider/model` id, pass `subject` (`lane-model` or `review-model`). Jo
+ends a ruling with the surface word `end-ruling <id>`.
+
 ## The one-liner
 
 At the top of your surface each turn: the workload's **stakes** (throwaway, normal, or
@@ -135,9 +142,17 @@ normal, and shown as an inference, never asked. Either half flips in one word fr
 (`throwaway`, `normal`, `production`, `autonomous`, `user-driven`); the flip is a ledgered
 instruction, not a mental note.
 The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours, with
-`orchestrator_lower_ceiling`; raising it is Jo's, by the word `ceiling <usd> [<hours>]` or by
-answering `extend` on the ceiling question. When Jo answers `split`, offer Jo a new workload for
-the remaining work; do not open one unasked.
+`orchestrator_lower_ceiling`; raising it is Jo's, by the words `ceiling <usd> [<hours>] [wl-…]` and
+`extend wl-…` (one more block of the workload's own size), either of which relaunches a lane the
+ceiling stopped. There is no ceiling question: at 80 % Jo gets a notice and the lane goes on, and
+at 100 % an autonomous lane stops and Jo gets a notice (SPEC-2.0.md § B11, *Amended 2026-10-19*).
+Nothing extends on its own. A lane Jo runs by hand is never stopped at its ceiling.
+
+A notice is a needs-you line with nothing to answer, `notice on <workload> (nothing to answer): …`,
+unnumbered and shown until it has reached you once: a ceiling at 80 %, a ceiling stop, or a
+normal-stakes plan that started on its own after a cross-lab pass. Pass a notice on to Jo; never
+turn it into a question. For a plan that started on its own, Jo's `halt wl-…` stops it, and its
+PRs do not merge until 4 h after Jo's next message at the surface.
 
 ## The five error lines
 
@@ -161,7 +176,7 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
    human prompt a lane's session opened anyway (a tool approval or an `ask`), named with the
    session to answer or end. Jo's one-word answer to a question is the option name; it becomes
    the `answer` row and the slice resumes. `withdraw` withdraws it; the slice is then replanned,
-   not executed. A round-limit or ceiling question that offers pair has its own `pair` line
+   not executed. A round-limit question that offers pair has its own `pair` line
    just above it: `pair offer on <workload> (q-…): <reasons>. Answer pair q-… to stop the lane
    and drive it yourself (as2 lane wl-…).` The question's options do not list `pair`. Jo's
    `pair q-…` settles the question as `stop` does, flips the workload to `user-driven` and asks
@@ -170,7 +185,7 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
 Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
 (`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
 that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
-lines go at once: a lane death with work open, the ceiling question or a ceiling stop, and a
+lines go at once: a lane death with work open, a ceiling notice or a ceiling stop, and a
 red full-suite run. Each push carries the `open answer lines:` figure. Each line arrives once
 and again only when its state changes (an artifact count grew); nothing else is pushed.
 
