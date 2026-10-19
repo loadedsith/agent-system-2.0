@@ -48,7 +48,7 @@ const noGit: Pick<Input, "repo" | "git" | "orchestrators"> = { repo: "/nonexiste
 function run(over: Partial<Input> = {}): Report {
 	return check({
 		db, asOf: AS_OF, replay: true, liveLanes: live(`${fixture.waiting.wl} ${fixture.waiting.lane}`), lanesDirOf: () => "/nonexistent/lanes", ...noGit,
-		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, ...over,
+		backups: { dir: freshBackups, gapMs: BACKUP_GAP_MS }, cap: 3, ...over,
 	});
 }
 const keys = (r: Report) => r.findings.map((f) => f.key);
