@@ -28,7 +28,7 @@
 //          for a normal PR, then `gh api repos/<repo>/rules/branches/main` (D2: an active rule requires `as2/full-suite`
 //          strictly) and `gh api repos/<repo>/rulesets/<id>` per ruleset holding such a rule (one the merging account can
 //          never bypass). Prints `normal` or `production: <reason>` (`prStakes`), and `production: main protection
-//          unverified (<why>)` when a read fails, the rule is missing or bypassable (`mainProtectionGap`); exit 0 either way.
+//          unverified (<why>)` when a read fails, the rule is missing or bypassable (`protectionGap`); exit 0 either way.
 //          With --hold-ok (PLAN wl-mvbjiettjrfpxc D5, the brief of every train opened since), a PR whose own stakes are
 //          normal prints `hold: main protection unverified (<why>)` instead, and the train passes it over with no question.
 // list     the train's members (`trainMembers`: Jo's `train:` and the train tick's `train-board:`, PLAN wl-mvbjiettjrfpxc
@@ -39,7 +39,7 @@
 // MIGRATION.md, install/manifest.tsv and migration/items/*; 4 a conflict it cannot fix without losing an edit.
 // Nothing is written on 2, 3 or 4. No push, no ledger write; only order and stakes read the network (gh), and they write nothing.
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger } from "../../ledger/src/index";
-import { HOLD_PREFIX, mainProtectionGap, type PrStakes, prStakes, type StakesView, trainMembers } from "../src/merge-train";
+import { HOLD_PREFIX, type PrStakes, prStakes, protectionGap, type StakesView, trainMembers } from "../src/merge-train";
 import { checkItems, convertItems, EXIT_USAGE, type Outcome, resolveMerge, TrainExit, WORKLOAD_RE } from "../src/merge-train-resolve";
 import { DEFAULT_BRANCH, headsByBranch, type OpenHead, orderReport, prDeps, type StackPr } from "../src/merge-train-stack";
 
@@ -141,21 +141,6 @@ function order(repo: string, prs: number[]): Outcome {
 	return { out: [report.chain, JSON.stringify(report)], err };
 }
 
-/**
- * Why main's protection on `repo` is unverified, or null (D2, `mainProtectionGap`): `gh api repos/<repo>/rules/branches/main`,
- * then `gh api repos/<repo>/rulesets/<id>` for each ruleset holding a qualifying rule, as the gh identity the train merges
- * with. A failed read is a reason, never an exit: the PR is then production.
- */
-function protectionGap(repo: string): string | null {
-	let rules: unknown;
-	try {
-		rules = ghRead(["api", `repos/${repo}/rules/branches/${DEFAULT_BRANCH}`]);
-	} catch (err) {
-		return (err as Error).message;
-	}
-	return mainProtectionGap(rules, (id) => ghRead(["api", `repos/${repo}/rulesets/${id}`]));
-}
-
 /** The ledger the surface opens ($AGENT_SYSTEM_LEDGER_DB, else $HOME/.agent-system-2/ledger.db), read-only; a failed open is exit 2. */
 function openReadOnly(): Ledger {
 	const path = defaultLedgerPath(process.env);
@@ -188,9 +173,10 @@ function stakes(repo: string, n: number, holdOk: boolean): Outcome {
 		ledger.close();
 	}
 	if (s.stakes !== "normal") return { out: [`production: ${s.reason}`], err: [] };
-	const gap = protectionGap(repo);
-	if (gap === null) return { out: ["normal"], err: [] };
-	return { out: [holdOk ? `${HOLD_PREFIX} (${gap})` : `production: ${DEFAULT_BRANCH} protection unverified (${gap})`], err: [] };
+	// main's protection (D2, `protectionGap`, shared with the train tick): a failed read is a reason, never an exit.
+	const p = protectionGap(repo, ghRead);
+	if (p.state === "ok") return { out: ["normal"], err: [] };
+	return { out: [holdOk ? `${HOLD_PREFIX} (${p.text})` : `production: ${DEFAULT_BRANCH} protection unverified (${p.text})`], err: [] };
 }
 
 /** `list` (PLAN wl-mvbjiettjrfpxc D5): workload `wl`'s train members, `<n> jo` or `<n> board`, from the ledger read-only; exit 2 for no such workload. */

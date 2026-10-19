@@ -1,210 +1,21 @@
 // The merge train's tick (PLAN wl-mv8s8srodefytc rev 17.1 D9-D10, part 3): settles once, opens one fix workload per PR,
 // launches owners and the train, raises the failed-twice alert, files each alert once on jo-issues with the as2-train label,
-// re-sends it louder at 4 h and 8 h until acknowledged, and keeps acting while a question is open.
-// Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only.
+// re-sends it louder at 4 h and 8 h until acknowledged, and keeps acting while a question is open. Auto-boarding (PLAN
+// wl-mvbjiettjrfpxc D1, D3, D4, D6): the cutover, the live half of "a lane finished green", one skip row per head and reason,
+// boarding oldest close first, and a protection episode that clears and wakes the trains it held.
+// Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only
+// (surface/test/train-world.ts).
 import { describe, expect, test } from "bun:test";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
-import { recordRepo } from "../src/decision-log";
 import { errorLines } from "../src/errors";
-import { applyTrain, interpret } from "../src/input";
-import { controlEntries, decideLaunch, laneExitBody, launchFailedBody } from "../src/launch";
+import { controlEntries, laneExitBody, launchFailedBody } from "../src/launch";
 import {
-	fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainRetries, trainSliceId, type TrainTask,
+	fixBindings, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainPrs, trainRetries, trainSliceId,
 } from "../src/merge-train";
-import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
-import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
-import { clock, tempLedger, tmp } from "./helpers";
-
-const REPO = "thewolff/product";
-const TRAIN_LANE = "lane-train-1";
-const OWNER_LANE = "lane-owner-1";
-const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
-const H0 = "a".repeat(40);
-const H1 = "b".repeat(40);
-const H2 = "c".repeat(40);
-
-function checkout(): string {
-	const dir = tmp("train-tick-repo");
-	for (const args of [["init", "-q"], ["config", "remote.origin.url", `https://github.com/${REPO}.git`]]) {
-		const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "pipe", stderr: "pipe" });
-		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
-	}
-	return dir;
-}
-
-interface FakeIssue {
-	number: number;
-	url: string;
-	title: string;
-	body: string;
-	state: "OPEN" | "CLOSED";
-	labels: string[];
-	comments: string[];
-}
-
-/** One push to a branch as GitHub's repository activity lists it. */
-interface FakeActivity {
-	before: string;
-	after: string;
-	ref: string;
-	timestamp: string;
-	activity_type: string;
-}
-
-/**
- * gh as the tick calls it: PR views from `prs`, GitHub's push activity per branch from `activity`, and an issue tracker for
- * jo-issues. Listings are newest first and paged as GitHub pages them: `gh issue list` stops at `--limit`, `gh api` returns the
- * first page of `per_page`, or every page with `--paginate` (an array of pages with `--slurp`). `fail` makes a matching call exit 1.
- */
-function fakeGh() {
-	const prs = new Map<number, { head: string; branch: string }>();
-	const activity: FakeActivity[] = [];
-	const issues: FakeIssue[] = [];
-	const calls: string[][] = [];
-	let fail: ((args: string[]) => boolean) | null = null;
-	const ok = (stdout: unknown): GhResult => ({ code: 0, stdout: typeof stdout === "string" ? stdout : JSON.stringify(stdout), stderr: "" });
-	const flag = (args: string[], name: string) => {
-		const i = args.indexOf(name);
-		return i >= 0 ? args[i + 1]! : null;
-	};
-	/** `gh api`'s `-f key=value` fields. */
-	const fields = (args: string[]) => new Map(args.flatMap((a, i) => (args[i - 1] === "-f" ? [a.split("=", 2) as [string, string]] : [])));
-	const paged = (args: string[], items: unknown[]): GhResult => {
-		const per = Number(fields(args).get("per_page") ?? 30);
-		const pages: unknown[][] = [];
-		for (let i = 0; i === 0 || i < items.length; i += per) pages.push(items.slice(i, i + per));
-		if (!args.includes("--paginate")) return ok(pages[0]);
-		return args.includes("--slurp") ? ok(pages) : ok(pages.map((p) => JSON.stringify(p)).join(""));
-	};
-	const issue = (args: string[]) => issues.find((i) => i.number === Number(args[2]))!;
-	const gh = (args: string[]): GhResult => {
-		calls.push(args);
-		if (fail?.(args)) return { code: 1, stdout: "", stderr: "HTTP 502" };
-		const [noun, verb] = args;
-		if (noun === "pr" && verb === "view") {
-			const n = Number(args[2]);
-			const p = prs.get(n);
-			if (!p) return { code: 1, stdout: "", stderr: `no pull request ${n}` };
-			return ok({
-				number: n, headRefName: p.branch, headRefOid: p.head, isCrossRepository: false, headRepository: { name: "product" },
-				headRepositoryOwner: { login: "thewolff" }, state: "OPEN", body: "", mergedAt: null,
-			});
-		}
-		if (noun === "api" && verb === `repos/${REPO}/activity`) {
-			const ref = fields(args).get("ref");
-			return paged(args, activity.filter((a) => a.ref === ref).reverse());
-		}
-		if (noun === "api" && verb === `repos/${TRAIN_ALERT_REPO}/issues`) {
-			const label = fields(args).get("labels")!;
-			return paged(args, [...issues].sort((a, b) => b.number - a.number).filter((i) => i.labels.includes(label)).map((i) => ({ number: i.number, html_url: i.url, body: i.body, labels: i.labels.map((name) => ({ name })) })));
-		}
-		if (noun === "issue" && verb === "list") {
-			const listed = [...issues].sort((a, b) => b.number - a.number).filter((i) => i.labels.includes(flag(args, "--label")!)).slice(0, Number(flag(args, "--limit") ?? 30));
-			return ok(listed.map((i) => ({ number: i.number, url: i.url, body: i.body })));
-		}
-		if (noun === "issue" && verb === "create") {
-			const number = issues.length + 1;
-			const url = `https://github.com/${TRAIN_ALERT_REPO}/issues/${number}`;
-			issues.push({ number, url, title: flag(args, "--title")!, body: flag(args, "--body")!, state: "OPEN", labels: [flag(args, "--label")!], comments: [] });
-			return ok(`${url}\n`);
-		}
-		if (noun === "issue" && verb === "view") {
-			const i = issue(args);
-			return ok({ state: i.state, comments: i.comments.map((body) => ({ body })) });
-		}
-		if (noun === "issue" && verb === "comment") {
-			issue(args).comments.push(flag(args, "--body")!);
-			return ok("");
-		}
-		if (noun === "issue" && verb === "edit") {
-			const i = issue(args);
-			for (const l of flag(args, "--add-label")!.split(",")) if (!i.labels.includes(l)) i.labels.push(l);
-			return ok("");
-		}
-		if (noun === "issue" && verb === "close") {
-			issue(args).state = "CLOSED";
-			return ok("");
-		}
-		return { code: 1, stdout: "", stderr: `fake gh: unexpected ${args.join(" ")}` };
-	};
-	/** GitHub records a push of `sha` to `branch` at `at`. */
-	const pushed = (branch: string, sha: string, at: string) => {
-		const before = activity.filter((a) => a.ref === `refs/heads/${branch}`).at(-1)?.after ?? "0".repeat(40);
-		activity.push({ before, after: sha, ref: `refs/heads/${branch}`, timestamp: at, activity_type: "push" });
-	};
-	return { gh, prs, activity, pushed, issues, calls, failWhen: (f: ((args: string[]) => boolean) | null) => { fail = f; } };
-}
-
-/** A train on #101 and #106 held by TRAIN_LANE, the autonomous owner of #101, a fake gh and launcher, on one ledger with a settable clock. */
-function world() {
-	const c = clock();
-	const { ledger } = tempLedger(c.now);
-	const trainCheckout = checkout();
-	const cmd = interpret(ledger, "train 101 106");
-	if (cmd?.kind !== "train") throw new Error("not a train");
-	const train = applyTrain(ledger, cmd, trainCheckout).workloadId;
-	expect(ledger.claimWorkload(train, { by: LANE_STARTER_BY, holder: TRAIN_LANE, leaseMs: 600_000 }).won).toBe(true);
-	const owner = ledger.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header", stakes: "normal", mode: "autonomous" });
-	recordRepo(ledger, owner, checkout());
-	const branch = `wl/${owner}`;
-	const g = fakeGh();
-	g.prs.set(101, { head: H0, branch });
-	g.prs.set(106, { head: H0, branch: "feature/other" });
-	const launches: string[] = [];
-	const notes: string[] = [];
-	/** The fake launcher: lane.ts launch's reservation (decideLaunch consumes the request), with no process behind the lane. */
-	const launch = (wl: string) => {
-		launches.push(wl);
-		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
-		return r.ok ? { code: 0, line: `launched ${r.laneId}` } : { code: 1, line: r.reason };
-	};
-	const run = () => tick({ ledger, gh: g.gh, launch, notify: (_t, text) => { notes.push(text); return true; } });
-	/** The train lane's lane_train_return for PR `pr` at the fake PR's current head. */
-	const task = (pr: number, kind: TrainTask["kind"] = "red"): TrainTask => {
-		const p = g.prs.get(pr)!;
-		const view = { number: pr, headRefName: p.branch, headRefOid: p.head, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
-		const r = recordTrainTask(ledger, { train, by: TRAIN_LANE, pr, kind, detail: `run tr-x red at ${p.head}\nsrc/x.test.ts > case 1: boom`, view, trainRepo: REPO });
-		if (!r.ok) throw new Error(r.reason);
-		return r.task;
-	};
-	let seq = 0;
-	/** A runner request and result on the owner for PR `pr` at `sha`. */
-	const result = (pr: number, sha: string, verdict: TestRun["verdict"]) => {
-		const slice = ledger.addSlice({ by: OWNER_LANE, workloadId: owner, task: `suite #${pr}`, doneCondition: "green", inputs: `#${pr}` });
-		const runId = makeRunId(Date.parse(c.now()) + ++seq, "abcd");
-		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: owner, sliceId: slice, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice, by: OWNER_LANE }) });
-		ledger.recordEntry({
-			by: TEST_RUNNER_BY, workloadId: owner, sliceId: slice, kind: "assumption",
-			body: testRunBody({
-				runId, verdict, sha, pr, reason: null, headAtEnd: sha, base: null, mergeBase: null,
-				full: { pass: 1, fail: verdict === "red" ? 1 : 0, skip: 0, exit: verdict === "red" ? 1 : 0, ms: 10, error: null },
-				solo: [], failures: verdict === "red" ? [{ part: "full", name: "src/x.test.ts > case 1", firstError: "boom" }] : [], runDir: null, preflight: null,
-			}),
-		});
-	};
-	/** The owner pushes `sha` to PR `pr` (GitHub records it now) and its run there comes back `verdict`. */
-	const push = (pr: number, sha: string, verdict: TestRun["verdict"]) => {
-		const p = g.prs.get(pr)!;
-		p.head = sha;
-		g.pushed(p.branch, sha, c.now());
-		result(pr, sha, verdict);
-	};
-	const settles = () => ledger.entries(train).filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith("train-task-settled:"));
-	const creates = () => g.calls.filter((a) => a[0] === "issue" && a[1] === "create");
-	/** Attempts 1 and 2 on #101 both settled failed: the tick has raised the alert and filed its issue. */
-	const failTwice = () => {
-		task(101);
-		c.plusHours(0.05);
-		push(101, H1, "red");
-		run();
-		task(101);
-		c.plusHours(0.05);
-		push(101, H2, "red");
-		return run();
-	};
-	return { c, ledger, train, owner, g, launches, notes, run, task, push, settles, creates, failTwice };
-}
+import { makeRunId, testRequestedBody } from "../src/test-run";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { boardWorld, DECISION_LOG_FILE, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE, world } from "./train-world";
 
 describe("settles and deliveries (D8, D10)", () => {
 	test("a settle is written once across two ticks", () => {
@@ -720,5 +531,182 @@ describe("alert sends with an uncertain outcome (D9, review gtb-r1 findings 9 an
 		v.run();
 		expect(v.creates()).toEqual([]);
 		expect(alertEntries(v.ledger, v.train, q2).at(-1)).toBe(`train-alert: ${q2} level 1 sent ${filed.url}`);
+	});
+});
+
+describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () => {
+	test("R1: a lane finished green boards on the next pass: the tick opens a train, boards #n at G and launches it; the cutover is written once", () => {
+		const w = boardWorld();
+		expect(w.standing("train-autoboard:")).toHaveLength(1);
+		const wl = w.landing(117);
+		w.run();
+		const b = w.boards();
+		expect(b).toEqual([expect.objectContaining({ pr: 117, workload: wl, head: H0 })]);
+		expect(trainPrs(w.ledger.entries(b[0]!.train), w.ledger.instructions(b[0]!.train))).toEqual([117]);
+		expect(w.launches).toEqual([b[0]!.train]);
+		w.run();
+		expect(w.boards()).toHaveLength(1);
+		expect(w.standing("train-autoboard:")).toHaveLength(1);
+		expect(w.skips()).toEqual([]);
+	});
+
+	test("R1: a head ahead of G only by commits that each touch only .ai/decision-log/ boards at that head", () => {
+		const w = boardWorld();
+		const wl = w.landing(118);
+		w.g.prs.get(118)!.head = H2;
+		w.g.compares.set(`${H0}...${H2}`, { status: "ahead", commits: [H1, H2] });
+		w.g.commitFiles.set(H1, [DECISION_LOG_FILE]);
+		w.g.commitFiles.set(H2, [DECISION_LOG_FILE]);
+		w.run();
+		expect(w.boards()).toEqual([expect.objectContaining({ pr: 118, workload: wl, head: H2 })]);
+	});
+
+	test("R2: no board when the live half fails (a later commit touching code, a head behind G, base not main, a branch not wl/<W>, a fork) or the ledger half does (production); each leaves its reason", () => {
+		const w = boardWorld();
+		const code = w.landing(120);
+		w.g.prs.get(120)!.head = H1;
+		w.g.compares.set(`${H0}...${H1}`, { status: "ahead", commits: [H1] });
+		w.g.commitFiles.set(H1, [DECISION_LOG_FILE, "src/x.ts"]);
+		const behind = w.landing(121);
+		w.g.prs.get(121)!.head = H2;
+		w.g.compares.set(`${H0}...${H2}`, { status: "behind", commits: [] });
+		const base = w.landing(122);
+		w.g.prs.get(122)!.base = "release";
+		const branch = w.landing(123);
+		w.g.prs.get(123)!.branch = "feature/header";
+		const fork = w.landing(124);
+		w.g.prs.get(124)!.fork = true;
+		const production = w.landing(125, { stakes: "production" });
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.launches).toEqual([]);
+		const skipsOf = (wl: string) => w.skips().filter((s) => s.includes(`workload ${wl} `));
+		expect(skipsOf(code)).toEqual([`train-board-skip: workload ${code} pr 120 head ${H1} commit ${H1} after the green sha touches src/x.ts, not only .ai/decision-log/`]);
+		expect(skipsOf(behind)).toEqual([`train-board-skip: workload ${behind} pr 121 head ${H2} head ${H2} is not ahead of the green sha ${H0} (compare: behind)`]);
+		expect(skipsOf(base)).toEqual([`train-board-skip: workload ${base} pr 122 head ${H0} #122's base is release, not main`]);
+		expect(skipsOf(branch)).toEqual([`train-board-skip: workload ${branch} pr 123 head ${H0} #123's head branch feature/header is not wl/${branch}`]);
+		expect(skipsOf(fork)).toEqual([expect.stringMatching(new RegExp(`^train-board-skip: workload ${fork} pr 124 head ${H0} #124 is production: `))]);
+		expect(skipsOf(production)).toEqual([`train-board-skip: workload ${production} pr none head none stakes production`]);
+		expect(w.views(125)).toBe(0);
+	});
+
+	test("R17: a draft PR never boards; once it is ready for review it boards", () => {
+		const w = boardWorld();
+		const wl = w.landing(130);
+		w.g.prs.get(130)!.draft = true;
+		w.run();
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 130 head ${H0} #130 is a draft`]);
+		w.g.prs.get(130)!.draft = false;
+		w.run();
+		expect(w.boards()).toEqual([expect.objectContaining({ pr: 130, workload: wl, head: H0 })]);
+	});
+
+	test("R3: one skip row per head and reason across passes, a new head a new row; a PR seen MERGED ends its scan for good", () => {
+		const w = boardWorld();
+		const wl = w.landing(131);
+		const pr = w.g.prs.get(131)!;
+		pr.base = "release";
+		w.run();
+		w.run();
+		w.run();
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 131 head ${H0} #131's base is release, not main`]);
+		pr.head = H1;
+		w.run();
+		w.run();
+		expect(w.skips()).toEqual([
+			`train-board-skip: workload ${wl} pr 131 head ${H0} #131's base is release, not main`,
+			`train-board-skip: workload ${wl} pr 131 head ${H1} #131's base is release, not main`,
+		]);
+		pr.state = "MERGED";
+		w.run();
+		expect(w.skips().at(-1)).toBe(`train-board-skip: workload ${wl} pr 131 head ${H1} ended: #131 is MERGED on GitHub`);
+		const viewed = w.views(131);
+		// even a PR that looks boardable again is never read: W's scan ended
+		[pr.state, pr.base] = ["OPEN", "main"];
+		w.run();
+		w.run();
+		expect(w.views(131)).toBe(viewed);
+		expect(w.skips()).toHaveLength(3);
+		expect(w.boards()).toEqual([]);
+	});
+
+	test("R18: PRs boardable in one pass board oldest close first onto one train, and its members keep boarding order across passes", () => {
+		const w = boardWorld();
+		const first = w.landing(141);
+		const second = w.landing(140);
+		w.run();
+		const third = w.landing(139);
+		w.c.plusHours(0.1);
+		w.run();
+		const b = w.boards();
+		expect(b.map((x) => [x.pr, x.workload])).toEqual([[141, first], [140, second], [139, third]]);
+		expect(new Set(b.map((x) => x.train)).size).toBe(1);
+		expect(trainPrs(w.ledger.entries(b[0]!.train), w.ledger.instructions(b[0]!.train))).toEqual([141, 140, 139]);
+	});
+});
+
+describe("main's protection, verified again (PLAN wl-mvbjiettjrfpxc D6)", () => {
+	/** What these helpers read of a boarding world. */
+	interface World {
+		ledger: Ledger;
+		standing: (prefix: string) => string[];
+	}
+	/** The tick's protection rows on the standing workload, each as `<state> <text>`. */
+	const notices = (w: World) => w.standing("train-notice: protection").map((b) => b.slice(`train-notice: protection ${REPO} `.length));
+	const GAP = "no active rule on main requires status checks";
+	const ISSUE = `https://github.com/${TRAIN_ALERT_REPO}/issues/1`;
+	/** The train lane on `train` works #`pr` (its slice), passes it over for protection and exits released. */
+	const passOver = (w: World, train: string, pr: number) => {
+		const holder = w.ledger.workload(train)!.holder!;
+		w.ledger.addSlice({ by: holder, workloadId: train, id: trainSliceId(train, pr), task: `PR #${pr}`, doneCondition: "terminal", inputs: `#${pr}` });
+		w.ledger.recordEntry({ by: holder, workloadId: train, kind: "assumption", body: `train-error: pr ${pr} protection ${GAP}` });
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: train, kind: "assumption", body: laneExitBody(holder, { code: 0, signal: null, outcome: "released" }) });
+		w.ledger.releaseWorkload(train, { by: holder, holder });
+		return holder;
+	};
+
+	test("R11: a gap that verifies again clears its notice, closes its issue with a comment and wakes the train that passed a PR over; until then no backoff wake", () => {
+		const w = boardWorld();
+		w.g.main.rules = [];
+		w.landing(150);
+		w.run();
+		const train = w.boards()[0]!.train;
+		expect(w.launches).toEqual([train]);
+		expect(notices(w)).toEqual([`gap ${GAP}`, `raised ${GAP}`, `filed ${ISSUE}`]);
+		passOver(w, train, 150);
+		w.c.plusHours(1);
+		w.run();
+		w.run();
+		expect(w.launches).toEqual([train]);
+		w.g.main.rules = protectedRules();
+		w.run();
+		expect(notices(w).slice(3)).toEqual(["ok verified", `cleared verified again; ${ISSUE} closed`]);
+		expect(w.g.issues[0]).toMatchObject({ state: "CLOSED", closedWith: expect.stringContaining(`protection on ${REPO} verifies again`) });
+		expect(w.launches).toEqual([train, train]);
+		w.c.plusHours(1);
+		w.run();
+		expect(w.creates()).toHaveLength(1);
+		expect(notices(w)).toHaveLength(5);
+	});
+
+	test("R11: with no train left open the open episode is still read: verified again, it clears, closes its issue and leaves no needs-you line", () => {
+		const w = boardWorld();
+		w.g.main.rules = [];
+		w.landing(151);
+		w.run();
+		const train = w.boards()[0]!.train;
+		const holder = passOver(w, train, 151);
+		w.ledger.completeSlice(trainSliceId(train, 151), { by: holder, artifact: "left: protection" });
+		w.ledger.closeWorkload(train, { by: SURFACE_BY });
+		w.run();
+		expect(errorLines(w.ledger).filter((l) => l.kind === "train")).toHaveLength(1);
+		w.g.main.rules = protectedRules();
+		w.run();
+		expect(notices(w).slice(3)).toEqual(["ok verified", `cleared verified again; ${ISSUE} closed`]);
+		expect(w.g.issues[0]!.state).toBe("CLOSED");
+		expect(errorLines(w.ledger).filter((l) => l.kind === "train")).toEqual([]);
+		expect(w.boards()).toHaveLength(1);
 	});
 });

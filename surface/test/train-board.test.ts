@@ -13,7 +13,7 @@ import {
 	boundPrs, controlEntries, parseTrainBoard, planFirstBody, planQuestionBody, reservedPrefix, trainBoardBody, trainFixBody,
 } from "../src/launch";
 import {
-	actionable, AUTOBOARD_WINDOW_MS, autoboardCutover, boardLanding, isTrainOrFix, type Landing, landingReady, openTrains, TRAIN_DONE, trainAutoboardBody, trainMembers,
+	actionable, AUTOBOARD_WINDOW_MS, autoboardCutover, boardLanding, isTrainOrFix, type Landing, landingReady, openTrains, protectionGap, TRAIN_DONE, trainAutoboardBody, trainMembers,
 	trainPrs, trainSliceId,
 } from "../src/merge-train";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
@@ -329,5 +329,41 @@ describe("membership through train-board: (D2, R5)", () => {
 		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: fix, kind: "assumption", body: trainFixBody({ repo: ORIGIN, pr: 117, train: t, trainEntry: real }) });
 		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: fix, kind: "assumption", body: trainFixBody({ repo: ORIGIN, pr: 118, train: t, trainEntry: real }) });
 		expect(boundPrs(w.ledger.entries(fix), w.ledger.instructions(fix), w.ledger)).toEqual([{ pr: 117, by: real }]);
+	});
+});
+
+describe("main's protection read live (D6)", () => {
+	const RULES = `repos/${ORIGIN}/rules/branches/main`;
+	const rule = (over: Record<string, unknown> = {}, check: Record<string, unknown> = { context: "as2/full-suite" }) => ({
+		type: "required_status_checks", ruleset_id: 1, parameters: { strict_required_status_checks_policy: true, required_status_checks: [check], ...over },
+	});
+	/** gh as `protectionGap` reads it: the rules answer, and ruleset 1's bypass; a thrown value is a failed call. */
+	const gh = (rules: unknown, bypass: unknown = "never") => (args: string[]): unknown => {
+		if (args[1] === RULES) {
+			if (rules instanceof Error) throw rules;
+			return rules;
+		}
+		if (args[1] === `repos/${ORIGIN}/rulesets/1`) {
+			if (bypass instanceof Error) throw bypass;
+			return { id: 1, current_user_can_bypass: bypass };
+		}
+		throw new Error(`unexpected gh ${args.join(" ")}`);
+	};
+
+	test("R9: a strict, app-free as2/full-suite rule in a ruleset the merging account can never bypass is ok; each missing piece is a gap naming it", () => {
+		expect(protectionGap(ORIGIN, gh([rule()]))).toEqual({ state: "ok" });
+		expect(protectionGap(ORIGIN, gh([]))).toEqual({ state: "gap", text: "no active rule on main requires status checks" });
+		expect(protectionGap(ORIGIN, gh([rule({}, { context: "ci" })]))).toEqual({ state: "gap", text: "no required status check on main names as2/full-suite" });
+		expect(protectionGap(ORIGIN, gh([rule({}, { context: "as2/full-suite", integration_id: 15368 })])).state).toBe("gap");
+		expect(protectionGap(ORIGIN, gh([rule({ strict_required_status_checks_policy: false })]))).toEqual({
+			state: "gap", text: "the rule requiring as2/full-suite on main is not strict (a branch need not be up to date)",
+		});
+		expect(protectionGap(ORIGIN, gh([rule()], "always"))).toEqual({ state: "gap", text: "merging account can bypass ruleset 1 (always)" });
+	});
+
+	test("R9: a failed rules or ruleset read is unknown, never a gap", () => {
+		expect(protectionGap(ORIGIN, gh(new Error("gh api exited 1: HTTP 502")))).toEqual({ state: "unknown", text: "gh api exited 1: HTTP 502" });
+		expect(protectionGap(ORIGIN, gh({ message: "Not Found" }))).toEqual({ state: "unknown", text: "the rules read is not a list" });
+		expect(protectionGap(ORIGIN, gh([rule()], new Error("HTTP 403")))).toEqual({ state: "unknown", text: "ruleset 1 could not be read: HTTP 403" });
 	});
 });

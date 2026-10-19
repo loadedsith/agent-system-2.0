@@ -16,9 +16,11 @@
 // Auto-boarding (PLAN wl-mvbjiettjrfpxc D1-D3, D5): a train's members are Jo's `train:` bindings and the tick's `train-board:`
 // rows (`trainMembers`); `landingReady` is the ledger half of "a lane finished green", `boardLanding` puts a ready PR on its
 // repository's usable train (opening one when there is none), and `trainBrief` reads its members from `merge-train.ts list`.
+// Part 4 (PLAN wl-mvbjiettjrfpxc D1, D6, D7): the train tick's boarding scan (`autoboardCandidates`, `boardedWorkloads`,
+// `boardSkips`), main's protection read live (`protectionGap`) with its episodes, and the main-red notices, on the standing workload.
 import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import { meter } from "./rank-launch";
-import { type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainFix, planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody } from "./launch";
+import { type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainBoard, parseTrainFix, planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
@@ -226,49 +228,70 @@ export function taskOwner(view: StakesView, trainRepo: string, ledger: Pick<Ledg
 	return b.ok && b.w.status === "open" ? b.id : null;
 }
 
+/** Main's protection as read live (D2; PLAN wl-mvbjiettjrfpxc D6): `ok`, a `gap` the rules read names, or `unknown` when a read failed. */
+export type Protection = { state: "ok" } | { state: "gap" | "unknown"; text: string };
+
 /**
- * Why main's protection is unverified (D2), or null when it holds: among the active rules on main
- * (`gh api repos/<owner/repo>/rules/branches/main`, GitHub's "Get rules for a branch", which needs only metadata read), one
- * `required_status_checks` rule names FULL_SUITE_STATUS with no `integration_id` (the runner posts as no particular app),
- * is strict (`strict_required_status_checks_policy`: the branch must be up to date), and sits in a ruleset the merging
- * account cannot bypass: `readRuleset(<the rule's ruleset_id>)` (`gh api repos/<owner/repo>/rulesets/<id>`, run as the gh
- * identity that merges) answers `current_user_can_bypass: "never"`. A missing field, any other value, or a read that throws
- * (its message is the reason) leaves the rule unverified. Classic branch protection is not read: its `strict` needs
- * administration read, which the lanes' credentials lack, and "Get a branch" leaves it out. Without such a rule a
- * self-merge could land a head tested on an old main.
+ * Main's protection (D2) from its active rules (`gh api repos/<owner/repo>/rules/branches/main`, GitHub's "Get rules for a
+ * branch", which needs only metadata read): `ok` when one `required_status_checks` rule names FULL_SUITE_STATUS with no
+ * `integration_id` (the runner posts as no particular app), is strict (`strict_required_status_checks_policy`: the branch must
+ * be up to date), and sits in a ruleset the merging account cannot bypass: `readRuleset(<the rule's ruleset_id>)` (`gh api
+ * repos/<owner/repo>/rulesets/<id>`, run as the gh identity that merges) answers `current_user_can_bypass: "never"`. A missing
+ * rule, a non-strict or integration-bound one, or a ruleset the account can bypass is a `gap` naming it; a read that throws or
+ * a rules answer that is not a list is `unknown` (PLAN wl-mvbjiettjrfpxc D6: a failed read is never a gap), unless another
+ * ruleset already answers `never`. Classic branch protection is not read: its `strict` needs administration read, which the
+ * lanes' credentials lack, and "Get a branch" leaves it out. Without such a rule a self-merge could land a head tested on an old main.
  */
-export function mainProtectionGap(rules: unknown, readRuleset: (id: number) => unknown): string | null {
-	if (!Array.isArray(rules)) return "the rules read is not a list";
+export function mainProtectionGap(rules: unknown, readRuleset: (id: number) => unknown): Protection {
+	const gap = (text: string): Protection => ({ state: "gap", text });
+	if (!Array.isArray(rules)) return { state: "unknown", text: "the rules read is not a list" };
 	type Check = { type?: unknown; ruleset_id?: unknown; parameters?: { required_status_checks?: unknown; strict_required_status_checks_policy?: unknown } };
 	type Required = { context?: unknown; integration_id?: unknown } | null | undefined;
 	const checks = (rules as Check[]).filter((r) => r?.type === "required_status_checks");
-	if (checks.length === 0) return `no active rule on ${DEFAULT_BRANCH} requires status checks`;
+	if (checks.length === 0) return gap(`no active rule on ${DEFAULT_BRANCH} requires status checks`);
 	const named = checks
 		.map((rule) => ({ rule, full: (Array.isArray(rule.parameters?.required_status_checks) ? (rule.parameters!.required_status_checks as Required[]) : []).filter((c) => c?.context === FULL_SUITE_STATUS) }))
 		.filter((x) => x.full.length > 0);
-	if (named.length === 0) return `no required status check on ${DEFAULT_BRANCH} names ${FULL_SUITE_STATUS}`;
+	if (named.length === 0) return gap(`no required status check on ${DEFAULT_BRANCH} names ${FULL_SUITE_STATUS}`);
 	const open = named.filter((x) => x.full.some((c) => c!.integration_id === undefined || c!.integration_id === null));
-	if (open.length === 0) return `the required ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} must come from an integration (integration_id), not the test runner`;
+	if (open.length === 0) return gap(`the required ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} must come from an integration (integration_id), not the test runner`);
 	const strict = open.filter((x) => x.rule.parameters?.strict_required_status_checks_policy === true).map((x) => x.rule);
-	if (strict.length === 0) return `the rule requiring ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} is not strict (a branch need not be up to date)`;
+	if (strict.length === 0) return gap(`the rule requiring ${FULL_SUITE_STATUS} on ${DEFAULT_BRANCH} is not strict (a branch need not be up to date)`);
 	const gaps: string[] = [];
+	let unread = false;
 	for (const id of new Set(strict.map((r) => r.ruleset_id))) {
 		if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
 			gaps.push(`merging account can bypass ruleset ${String(id)} (no ruleset_id to read)`);
 			continue;
 		}
-		let value: string;
+		let ruleset: { current_user_can_bypass?: unknown } | null;
 		try {
-			const ruleset = readRuleset(id) as { current_user_can_bypass?: unknown } | null;
-			const bypass = ruleset?.current_user_can_bypass;
-			if (bypass === "never") return null;
-			value = bypass === undefined ? "no current_user_can_bypass" : String(bypass);
+			ruleset = readRuleset(id) as { current_user_can_bypass?: unknown } | null;
 		} catch (err) {
-			value = `unreadable: ${err instanceof Error ? err.message : String(err)}`;
+			unread = true;
+			gaps.push(`ruleset ${id} could not be read: ${err instanceof Error ? err.message : String(err)}`);
+			continue;
 		}
-		gaps.push(`merging account can bypass ruleset ${id} (${value})`);
+		const bypass = ruleset?.current_user_can_bypass;
+		if (bypass === "never") return { state: "ok" };
+		gaps.push(`merging account can bypass ruleset ${id} (${bypass === undefined ? "no current_user_can_bypass" : String(bypass)})`);
 	}
-	return gaps.join("; ");
+	return { state: unread ? "unknown" : "gap", text: gaps.join("; ") };
+}
+
+/**
+ * Main's protection on `repo` read live (D2, PLAN wl-mvbjiettjrfpxc D6; `mainProtectionGap`): `read` is gh's JSON for `args`,
+ * throwing on a failed call (the stakes script's and the train tick's gh): `api repos/<repo>/rules/branches/main`, then `api
+ * repos/<repo>/rulesets/<id>` per ruleset holding a qualifying rule. A rules read that throws is `unknown`, never a gap.
+ */
+export function protectionGap(repo: string, read: (args: string[]) => unknown): Protection {
+	let rules: unknown;
+	try {
+		rules = read(["api", `repos/${repo}/rules/branches/${DEFAULT_BRANCH}`]);
+	} catch (err) {
+		return { state: "unknown", text: err instanceof Error ? err.message : String(err) };
+	}
+	return mainProtectionGap(rules, (id) => read(["api", `repos/${repo}/rulesets/${id}`]));
 }
 
 /**
@@ -871,9 +894,12 @@ export interface TrainRetries {
  * or a task settle written after the train's last lane exit, a PR no lane has given its disposition slice since one exited,
  * a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last pass), or Jo's answer to (or
  * withdrawal of) the tick's own alert question (D9) after the last exit: no lane raised that question, so no resume follows it.
- * After a lane exit, also every PR `trainRetries` lists: a passed-over PR whose retry is due, and a head the train has not seen.
+ * After a lane exit, also every PR `trainRetries` lists: a passed-over PR whose retry is due, and a head the train has not seen;
+ * a PR in `heldPassOvers` (passed over for main's protection while its episode is open, PLAN wl-mvbjiettjrfpxc D6) waits instead.
  */
-export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly number[] = [], heads: ReadonlyMap<number, string> = new Map()): string[] {
+export function actionable(
+	ledger: Ledger, wl: string, mergedDeps: readonly number[] = [], heads: ReadonlyMap<number, string> = new Map(), heldPassOvers: ReadonlySet<number> = new Set(),
+): string[] {
 	const control = controlOf(ledger, wl);
 	const exit = control.filter((c) => c.prefix === "lane-exit").at(-1) ?? null;
 	const lastExit = exit?.createdAt ?? null;
@@ -895,7 +921,7 @@ export function actionable(ledger: Ledger, wl: string, mergedDeps: readonly numb
 		const slices = new Set(ledger.slices(wl).map((s) => s.id));
 		for (const n of prs) if (!slices.has(trainSliceId(wl, n))) out.push(`#${n} not yet worked`);
 		const r = trainRetries(ledger, wl, heads);
-		for (const p of r.passedOver) out.push(`#${p.pr} passed over ${p.count}x (train-error:), retry due`);
+		for (const p of r.passedOver) if (!heldPassOvers.has(p.pr)) out.push(`#${p.pr} passed over ${p.count}x (train-error:), retry due`);
 		for (const h of r.untested) out.push(`#${h.pr} head ${h.sha} untested by the train${h.woken > 0 ? ` after ${h.woken} wake(s), retry due` : ""}`);
 	}
 	for (const n of mergedDeps) if (prs.includes(n)) out.push(`#${n}'s dependency merged`);
@@ -1550,4 +1576,200 @@ export function boardLanding(
 		const entryId = ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body: board });
 		return { boarded: true, train, opened: true, entryId };
 	});
+}
+
+// ---- part 4: the tick's boarding scan and its Jo-facing notices (PLAN wl-mvbjiettjrfpxc D1, D6, D7) ---------------------
+
+/** The reason prefix of a `train-board-skip:` for a PR GitHub shows MERGED or CLOSED: its W is never scanned again (D1). */
+export const BOARD_ENDED = "ended:";
+const BOARD_SKIP_RE = /^train-board-skip: workload (wl-[a-z0-9]+) pr \S+ head \S+ ([\s\S]+)$/;
+
+/** The tick's earlier `train-board-skip:` rows on the standing workload (MERGE_TRAIN_BY): every body written, and each W whose PR ended. */
+export function boardSkips(ledger: Pick<Ledger, "entries">): { bodies: Set<string>; ended: Set<string> } {
+	const bodies = new Set<string>();
+	const ended = new Set<string>();
+	for (const e of ledger.entries(STANDING_WORKLOAD_ID, "assumption")) {
+		const m = e.created_by === MERGE_TRAIN_BY ? BOARD_SKIP_RE.exec(e.body) : null;
+		if (!m) continue;
+		bodies.add(e.body);
+		if (m[2]!.startsWith(BOARD_ENDED)) ended.add(m[1]!);
+	}
+	return { bodies, ended };
+}
+
+/** D1's scan: every workload closed within AUTOBOARD_WINDOW_MS, the standing one excepted, newest close first. */
+export function autoboardCandidates(ledger: Ledger): string[] {
+	const since = new Date(Date.parse(ledger.now()) - AUTOBOARD_WINDOW_MS).toISOString();
+	return ledger.db.query<{ id: string }, [string, string]>(
+		`SELECT id FROM workloads WHERE status = 'closed' AND closed_at >= ?1 AND id <> ?2 ORDER BY closed_at DESC, id DESC`,
+	).all(since, STANDING_WORKLOAD_ID).map((r) => r.id);
+}
+
+/**
+ * The workloads a merge-train `train-board:` still covers (D1): boarded on a train that is open, or that worked the PR (it has
+ * the PR's slice: merged, skipped or left). A board on a closed train without that slice is void (R16): its W is scanned again.
+ */
+export function boardedWorkloads(ledger: Ledger): Set<string> {
+	const out = new Set<string>();
+	const rows = ledger.db.query<{ workload_id: string; body: string }, [string]>(
+		`SELECT workload_id, body FROM entries WHERE created_by = ?1 AND kind = 'assumption' AND substr(body, 1, 12) = 'train-board:'`,
+	).all(MERGE_TRAIN_BY);
+	for (const r of rows) {
+		const b = parseTrainBoard(r.body.slice("train-board:".length).trim());
+		if (b === null) continue;
+		if (ledger.workload(r.workload_id)?.status === "open" || ledger.slice(trainSliceId(r.workload_id, b.pr))?.workload_id === r.workload_id) out.add(b.workload);
+	}
+	return out;
+}
+
+/** D6: an `unknown` read raises only once it is the newest read and at least this old. */
+export const PROTECTION_UNKNOWN_RAISE_MS = 10 * 60_000;
+/** D7: a train closed longer ago than this is no longer read for `main-red:` rows. */
+export const MAIN_RED_WINDOW_MS = 24 * 3_600_000;
+
+/**
+ * The rows of a protection episode (D6), on the standing workload as MERGE_TRAIN_BY: `ok`, `gap` and `unknown` record each change
+ * of the live read (a gap's changed text too); `raised` opens the episode (its needs-you line), `filed <issue url>` its jo-issues
+ * issue, `cleared <why>` ends it.
+ */
+export type ProtectionNoticeState = "ok" | "gap" | "unknown" | "raised" | "filed" | "cleared";
+
+/** `train-notice: protection <owner/repo> <state> <text>`. */
+export function protectionNoticeBody(repo: string, state: ProtectionNoticeState, text: string): string {
+	return `train-notice: protection ${repo.toLowerCase()} ${state} ${text.replace(/\s+/g, " ").trim()}`;
+}
+const PROTECTION_NOTICE_RE = /^protection ([^\s/]+\/[^\s/]+) (ok|gap|unknown|raised|filed|cleared) ([\s\S]+)$/;
+
+/** One `train-notice:` row. */
+export interface NoticeRow {
+	id: string;
+	createdAt: string;
+	state: string;
+	text: string;
+}
+
+/** One repository's protection episodes (D6), read from its `train-notice: protection` rows in order. */
+export interface ProtectionEpisode {
+	repo: string;
+	/** The newest read row (`ok`, `gap` or `unknown`); null before the first read. */
+	read: NoticeRow | null;
+	/** The open episode's `raised` row; null when no episode is open. */
+	raised: NoticeRow | null;
+	/** The open episode's jo-issues issue (`filed`); null before it is filed. */
+	issue: string | null;
+	/** The open episode's newest text: its newest gap or unknown row since `raised`, else `raised`'s own. */
+	text: string;
+}
+
+/** Every repository's protection episodes (D6), by lowercase `owner/repo`. */
+export function protectionEpisodes(ledger: Pick<Ledger, "entries">): Map<string, ProtectionEpisode> {
+	const out = new Map<string, ProtectionEpisode>();
+	for (const c of controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption"))) {
+		const m = c.prefix === "train-notice" ? PROTECTION_NOTICE_RE.exec(c.rest) : null;
+		if (!m) continue;
+		const row: NoticeRow = { id: c.id, createdAt: c.createdAt, state: m[2]!, text: m[3]! };
+		const ep = out.get(m[1]!) ?? { repo: m[1]!, read: null, raised: null, issue: null, text: "" };
+		out.set(ep.repo, ep);
+		if (row.state === "ok" || row.state === "gap" || row.state === "unknown") {
+			ep.read = row;
+			if (ep.raised && row.state !== "ok") ep.text = row.text;
+		} else if (row.state === "raised") {
+			[ep.raised, ep.issue, ep.text] = [row, null, row.text];
+		} else if (row.state === "filed") {
+			if (ep.raised) ep.issue = row.text;
+		} else {
+			[ep.raised, ep.issue, ep.text] = [null, null, ""];
+		}
+	}
+	return out;
+}
+
+/** `train-notice: main-red <url> raised run <id>`, `… filed <jo-issues url>` or `… cleared <why>` (D7), on the standing workload. */
+export function mainRedNoticeBody(url: string, state: "raised" | "filed" | "cleared", text: string): string {
+	return `train-notice: main-red ${url} ${state} ${text.replace(/\s+/g, " ").trim()}`;
+}
+const MAIN_RED_NOTICE_RE = /^main-red (\S+) (raised|filed|cleared) ([\s\S]+)$/;
+
+/** One main-red issue's notice (D7): raised once per url. */
+export interface MainRedNotice {
+	url: string;
+	raised: NoticeRow;
+	run: string;
+	/** The jo-issues issue (`filed`); null before it is filed. */
+	issue: string | null;
+	cleared: NoticeRow | null;
+}
+
+/** Every main-red notice (D7) by its issue url. */
+export function mainRedNotices(ledger: Pick<Ledger, "entries">): Map<string, MainRedNotice> {
+	const out = new Map<string, MainRedNotice>();
+	for (const c of controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption"))) {
+		const m = c.prefix === "train-notice" ? MAIN_RED_NOTICE_RE.exec(c.rest) : null;
+		if (!m) continue;
+		const row: NoticeRow = { id: c.id, createdAt: c.createdAt, state: m[2]!, text: m[3]! };
+		const n = out.get(m[1]!);
+		if (row.state === "raised") {
+			if (!n) out.set(m[1]!, { url: m[1]!, raised: row, run: row.text.replace(/^run /, ""), issue: null, cleared: null });
+		} else if (n && row.state === "filed") n.issue ??= row.text;
+		else if (n && row.state === "cleared") n.cleared ??= row;
+	}
+	return out;
+}
+
+const MAIN_RED_RE = /^main-red: (\S+) run (\S+)$/;
+
+/** A holder's `main-red: <url> run <id>` on a train (D7): `valid` when url is an issue on that train's own repository. */
+export interface MainRedRow {
+	train: string;
+	entryId: string;
+	url: string;
+	run: string;
+	repo: string | null;
+	valid: boolean;
+}
+
+/** Every holder `main-red:` row on a train open now or closed within MAIN_RED_WINDOW_MS (D7), oldest train first, in entry order. */
+export function mainRedRows(ledger: Ledger, ownerRepo: (checkout: string) => string | null = checkoutOwnerRepo): MainRedRow[] {
+	const since = new Date(Date.parse(ledger.now()) - MAIN_RED_WINDOW_MS).toISOString();
+	const out: MainRedRow[] = [];
+	for (const t of everyTrain(ledger)) {
+		const w = ledger.workload(t)!;
+		if (w.status === "closed" && w.closed_at! < since) continue;
+		const entries = ledger.entries(t);
+		const holders = holdersOf(entries, w.holder, ledger.holders(t));
+		let repo: string | null | undefined;
+		for (const e of entries) {
+			const m = e.kind === "assumption" && holders.includes(e.created_by) ? MAIN_RED_RE.exec(e.body.trim()) : null;
+			if (!m) continue;
+			if (repo === undefined) {
+				const checkout = trainCheckout(ledger, t);
+				repo = checkout === null ? null : ownerRepo(checkout);
+			}
+			const issue = /^https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/issues\/[1-9]\d*$/.exec(m[1]!);
+			out.push({ train: t, entryId: e.id, url: m[1]!, run: m[2]!, repo, valid: issue !== null && repo !== null && issue[1]!.toLowerCase() === repo.toLowerCase() });
+		}
+	}
+	return out;
+}
+
+const PROTECTION_PASS_RE = /^train-error:\s+pr\s+[1-9]\d*\s+protection\b/;
+
+/**
+ * The PRs of train `wl`, not terminal, whose newest holder pass-over (`train-error: pr <n> …`) is for main's protection (D5's
+ * `train-error: pr <n> protection <gap>`): D6 holds their backoff wake while the episode is open and wakes the train when it clears.
+ */
+export function protectionPassOvers(ledger: Ledger, wl: string): Set<number> {
+	const entries = ledger.entries(wl);
+	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
+	const newest = new Map<number, boolean>();
+	for (const e of entries) {
+		const p = e.kind === "assumption" && holders.includes(e.created_by) ? PASSED_OVER_RE.exec(e.body.trim()) : null;
+		if (p) newest.set(Number(p[1]), PROTECTION_PASS_RE.test(e.body.trim()));
+	}
+	const out = new Set<number>();
+	for (const [n, protection] of newest) {
+		const sl = ledger.slice(trainSliceId(wl, n));
+		if (protection && !(sl && (sl.state === "done" || sl.state === "cancelled"))) out.add(n);
+	}
+	return out;
 }
