@@ -11,6 +11,7 @@ import { onFire } from "../src/batch";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { laneExitBody } from "../src/launch";
+import { sendNotice } from "../src/notice";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
@@ -200,6 +201,28 @@ describe("the window: routine lines wait and go out together (D3)", () => {
 		expect(t.needsYou()).toHaveLength(1);
 		expect(t.needsYou()[0]!.message.content).toContain(`lane lane-x on ${wl} died`);
 		expect(t.lane.message(m)!.state).toBe("delivered");
+	});
+
+	test("a notice is routine: it waits for the window, is pushed once unnumbered, its message moves to delivered then, and nothing repeats it", async () => {
+		const t = await surface();
+		const { wl } = workloadWithSlice(t.lane);
+		const m = sendNotice(t.lane, { by: LANE_RUNNER_BY, workloadId: wl, body: "the plan started on its own" });
+		const line = errorLines(t.lane).find((l) => l.rowId === m)!;
+		expect(onFire(t.lane, line)).toBe(false);
+		t.poll();
+		t.minutes(3);
+		t.poll();
+		expect(t.needsYou()).toEqual([]);
+		expect(t.lane.message(m)!.state).toBe("held");
+		t.minutes(2);
+		t.poll();
+		expect(t.needsYou()).toHaveLength(1);
+		expect(t.needsYou()[0]!.message.content).toBe(`${NEEDS}\n- notice on ${wl} (nothing to answer): the plan started on its own\n\n${count(0)}`);
+		expect(t.lane.message(m)!.state).toBe("delivered");
+		t.minutes(10);
+		t.poll();
+		expect(t.needsYou()).toHaveLength(1);
+		expect(await t.jo("ok")).toBe(count(0));
 	});
 
 	test("a wake render clears the hold: the lines it carried are not pushed after it", async () => {

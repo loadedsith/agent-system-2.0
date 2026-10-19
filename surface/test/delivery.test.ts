@@ -10,6 +10,8 @@ import orchestratorSurface from "../index";
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { Delivered, consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
+import { sendNotice } from "../src/notice";
+import { Numbering } from "../src/numbering";
 import { laneExitBody, planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
@@ -81,6 +83,43 @@ describe("consumption: held orchestrator-bound rows behind a delivered line move
 		expect(ledger.message(toLane)!.state).toBe("held");
 		// the death was surfaced once: it is not a line any more
 		expect(errorLines(ledger).map((l) => l.kind)).toEqual(["artifact"]);
+	});
+});
+
+describe("a notice (PLAN wl-mvfkv7llkp7nk0 § 2, R14): a message row shown as an unanswerable needs-you line until delivered once", () => {
+	const questionRows = (ledger: Ledger) => ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM questions").get()!.n;
+
+	test("sendNotice writes a held notice: message to the orchestrator and no question row; its line is unnumbered and goes once consumed", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const id = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: `80 % of the ceiling; \`extend ${wl}\` adds one block` });
+		expect(ledger.message(id)).toMatchObject({ workload_id: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held", body: `notice: 80 % of the ceiling; \`extend ${wl}\` adds one block` });
+		expect(questionRows(ledger)).toBe(0);
+		const lines = new Numbering().assign(errorLines(ledger));
+		expect(lines).toEqual([{ kind: "notice", workloadId: wl, rowId: id, messageIds: [id], line: `notice on ${wl} (nothing to answer): 80 % of the ceiling; \`extend ${wl}\` adds one block` }]);
+		expect(consumeLines(ledger, lines)).toBe(1);
+		expect(ledger.message(id)!.state).toBe("delivered");
+		expect(errorLines(ledger)).toEqual([]);
+		expect(consumeLines(ledger, lines)).toBe(0);
+		expect(questionRows(ledger)).toBe(0);
+	});
+
+	test("a wake's consumption delivers it too: the render showed it, the next read does not", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const id = sendNotice(ledger, { by: LANE_RUNNER_BY, workloadId: wl, body: "line one\nline two" });
+		expect(errorLines(ledger).map((l) => l.line)).toEqual([`notice on ${wl} (nothing to answer): line one\n  line two`]);
+		expect(consumeAllToOrchestrator(ledger)).toBe(1);
+		expect(ledger.message(id)!.state).toBe("delivered");
+		expect(errorLines(ledger)).toEqual([]);
+	});
+
+	test("a `notice:` a lane that held the workload wrote is its own message, not a notice line", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		ledger.enqueue({ by: "lane-a", workloadId: wl, sender: "lane-a", recipient: ORCHESTRATOR_RECIPIENT, body: "notice: the plan started on its own" });
+		expect(errorLines(ledger)).toEqual([]);
 	});
 });
 
