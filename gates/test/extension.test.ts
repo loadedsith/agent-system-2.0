@@ -17,7 +17,7 @@ import reservedRow from "../extensions/r06-reserved";
 import p11Gates, { type GatesAPI } from "../index";
 import { DISPLAY_LINKS } from "../extensions/open-links";
 import { CONTRACT_MARKER } from "../src/rows/r02-contract";
-import { prepareLinkSession, sessionLinkOptions } from "../src/links";
+import { prepareLinkSession, sessionLinkOptions, setLinkRouter } from "../src/links";
 import { brief, commit, git, repoWithOrigin, tempLedger, testRecord, tmp } from "./helpers";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
@@ -169,6 +169,32 @@ describe("gates extension adapter", () => {
 
 		const dispatch = { toolName: "task", input: { tasks: [{ agent: "builder", task: brief() }] } };
 		expect(((await f.emit("tool_call", dispatch, ctx)) as { block: boolean }).block).toBe(true);
+	});
+
+	test("row 7 ledger questions never resolve legacy local handles in the waking lane", async () => {
+		const { ledger, wl, f, ctx } = await boundLane();
+		const root = tmp("wake-local");
+		const plan = join(root, "PLAN.md");
+		writeFileSync(plan, "unrelated waking lane plan");
+		Object.assign(ctx, { localProtocolOptions: { getArtifactsDir: () => root } });
+		const sl = ledger.slices(wl)[0]!.id;
+		ledger.raiseQuestion({ by: "old-lane", workloadId: wl, sliceId: sl, body: `Read local://PLAN.md or ${plan}`, options: ["yes", "no"] });
+		let locates = 0;
+		setLinkRouter({
+			async locate() { locates++; return plan; },
+			locateSync() { locates++; return plan; },
+		});
+		try {
+			const start = await f.emit("before_agent_start", { prompt: "go", systemPrompt: [] }, ctx) as { messages: { customType: string; content: string }[] };
+			const text = start.messages.find((m) => m.customType === "p11-wake")!.content;
+			expect(text).toContain("Read local://PLAN.md");
+			expect(text).not.toContain("[local://");
+			expect(text).toContain(`[${plan}](${pathToFileURL(plan).href})`);
+			expect(locates).toBe(0);
+		} finally {
+			setLinkRouter(undefined);
+			ledger.close();
+		}
 	});
 
 	test("row 7: a second turn with no tool calls is refused at its stop (astra review B3)", async () => {

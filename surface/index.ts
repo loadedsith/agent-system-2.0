@@ -55,16 +55,19 @@ async function hostJudge(ctx: Ctx): Promise<KindJudge> {
 }
 
 export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: SurfaceDeps = { judge: hostJudge }): Promise<void> {
+	// These producers read ledger bodies (including relays, questions and Applied echoes).
+	// Keep their unknown-origin handles literal; do not fall back to the emitting session.
+	const ledgerPi = linkedApi(pi, undefined, undefined, "ledger");
 	pi = linkedApi(pi);
-	surfaceInputRow(pi, env);
-	const textReady = wakeRow(pi, env, deps.loadText ?? hostText);
-	planPathRow(pi, env);
+	surfaceInputRow(ledgerPi, env);
+	const textReady = wakeRow(ledgerPi, env, deps.loadText ?? hostText);
+	planPathRow(ledgerPi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);
 	questionRow(pi, env);
 	rankRow(pi, env, deps);
-	laneRow(pi, env);
+	laneRow(ledgerPi, env);
 	laneToolsRow(pi, env);
 	// OMP awaits extension factories before restoring tool displays. Registration above remains synchronous.
 	return textReady;

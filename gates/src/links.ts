@@ -287,8 +287,12 @@ export function callerLocate(pi:LinkCommands,ctx:LinkContext,router:LinkRouter|u
  const rc=resolveContext(pi,ctx);
  return async handle=>handle.startsWith("skill://") ? skillPath(handle,rc) : HANDLE.test(handle) && router ? router.locate(handle,rc) : null;
 }
-export function syncHandles(text:string,pi:LinkCommands,ctx:LinkContext,router?:LinkRouter):Map<string,string> {
- const rc=resolveContext(pi,ctx), out=new Map<string,string>();
+/** Ledger bodies have no trustworthy session origin; never borrow the rendering caller's root. */
+export type LinkProvenance = "current-caller" | "ledger";
+export function syncHandles(text:string,pi:LinkCommands,ctx:LinkContext,router?:LinkRouter,provenance:LinkProvenance="current-caller"):Map<string,string> {
+ const out=new Map<string,string>();
+ if(provenance === "ledger") return out;
+ const rc=resolveContext(pi,ctx);
  for(const h of internalHandles(text)) { if(!/^(local|memory):\/\//.test(h)) continue; try { const p=router?.locateSync(h,rc); if(p) out.set(h,p); } catch { /* unresolved */ } }
  return out;
 }
@@ -342,12 +346,14 @@ export async function expandCallerHandles(text:string,pi:LinkCommands,ctx:LinkCo
  * Synchronous custom-message/notify adapter. The handler-local context lives in AsyncLocalStorage,
  * so concurrent sessions and timer callbacks never borrow another session's cwd or local root.
  * Passing ctx binds a tool's direct sendMessage call; omitting it wraps pi.on registrations.
+ * Ledger-reading producers explicitly select "ledger": unresolved handles stay literal, but
+ * stored absolute paths and URLs still link. Current-caller producers keep session-local lookup.
  */
-export function linkedApi<T extends object>(pi:T,ctx?:LinkContext,router?:LinkRouter):T {
+export function linkedApi<T extends object>(pi:T,ctx?:LinkContext,router?:LinkRouter,provenance:LinkProvenance="current-caller"):T {
  const current=new AsyncLocalStorage<LinkContext>();
  const commands=pi as T & LinkCommands;
- const options=(at:LinkContext,text:string):LinkOptions=>({...sessionLinkOptions(at),handles:syncHandles(text,commands,at,router ?? shared.router)});
- const message=(m:any,at:LinkContext):any=>typeof m?.content === "string" ? {...m,content:linkMarkdown(m.content,options(at,m.content))} : Array.isArray(m?.content) ? {...m,content:m.content.map((p:any)=>p.type === "text" ? {...p,text:linkMarkdown(p.text ?? "",options(at,p.text ?? ""))} : p)} : m;
+ const options=(at:LinkContext,text:string,source:LinkProvenance=provenance):LinkOptions=>({...sessionLinkOptions(at),handles:syncHandles(text,commands,at,router ?? shared.router,source)});
+ const message=(m:any,at:LinkContext,source:LinkProvenance=provenance):any=>typeof m?.content === "string" ? {...m,content:linkMarkdown(m.content,options(at,m.content,source))} : Array.isArray(m?.content) ? {...m,content:m.content.map((p:any)=>p.type === "text" ? {...p,text:linkMarkdown(p.text ?? "",options(at,p.text ?? "",source))} : p)} : m;
  const context=(at:any):any=>new Proxy(at,{get(target,key){
   const value=Reflect.get(target,key);
   if((key === "setTimeout" || key === "setInterval") && typeof value === "function") return (callback:(...args:any[])=>any,...args:any[])=>value.call(target,(...values:any[])=>current.run(at,()=>callback(...values)),...args);
@@ -359,7 +365,7 @@ export function linkedApi<T extends object>(pi:T,ctx?:LinkContext,router?:LinkRo
   if(key === "sendMessage") return (m:any,...args:any[])=>{const at=ctx ?? current.getStore(); return value.call(target,at ? message(m,at) : m,...args);};
   if(key === "registerTool") return (tool:any)=>value.call(target,{...tool,execute:(id:any,params:any,signal:any,onUpdate:any,at:any)=>current.run(at,async()=>{
    const result=await tool.execute(id,params,signal,onUpdate,context(at));
-   return tool.name === "orchestrator_ledger" ? message(result,at) : result;
+   return tool.name === "orchestrator_ledger" ? message(result,at,"ledger") : result;
   })});
   if(key === "on") return (event:string,handler:(event:any,ctx:any)=>any)=>value.call(target,event,(e:any,at:any)=>current.run(at,()=>{
    const result=handler(e,context(at));

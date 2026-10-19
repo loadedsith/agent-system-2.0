@@ -6,8 +6,9 @@ import type { LinkRouter } from "../../gates/src/links";
 import { setLinkRouter } from "../../gates/src/links";
 import { linkedApi } from "../src/linked-api";
 import orchestratorSurface from "../index";
+import { surfaceSession } from "../src/session";
 import type { FakeTool } from "./helpers";
-import { ctxOf, fakePi, loadTestText, notices, tempLedger, timeouts, tmp } from "./helpers";
+import { ctxOf, fakePi, loadTestText, notices, tempLedger, timeouts, timers, tmp } from "./helpers";
 
 // Runtime-selected installed host, the same discovery convention as plan-paths.test.ts.
 let host: string | null = null;
@@ -20,6 +21,147 @@ if (omp) {
 }
 
 describe("shared synchronous surface adapter", () => {
+	test("ledger consumers keep old local handles plain despite same-named lane and Ilex files", async () => {
+		timeouts.length = 0;
+		timers.length = 0;
+		const root = tmp("ledger-local-collision");
+		const lane = join(root, "lane"), ilex = join(root, "ilex");
+		for (const dir of [lane, ilex]) {
+			mkdirSync(join(dir, "local"), { recursive: true });
+			writeFileSync(join(dir, "local", "PLAN.md"), dir === lane ? "lane plan" : "unrelated Ilex plan");
+		}
+		const storedPath = join(lane, "local", "PLAN.md");
+		const storedTarget = new URL(`file://${storedPath}`).href;
+		const wrongTarget = new URL(`file://${join(ilex, "local", "PLAN.md")}`).href;
+		let syncCalls = 0;
+		const router: LinkRouter = {
+			async locate() { throw new Error("ledger rendering must not recover old sessions"); },
+			locateSync(handle, rc) {
+				syncCalls++;
+				return join(rc.localProtocolOptions!.getArtifactsDir!()!, "local", handle.split("://")[1]!);
+			},
+		};
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "fixture", brief: "Legacy handles", stakes: "normal", mode: "user-driven" });
+		const sl = ledger.addSlice({ by: "lane-old", workloadId: wl, task: "review", doneCondition: "reviewed", inputs: "legacy" });
+		const body = `local://PLAN.md memory://PLAN.md ${storedPath} https://example.com/plan`;
+		ledger.recordEntry({ by: "lane-old", workloadId: wl, kind: "assumption", body: `entry ${body}` });
+		ledger.raiseQuestion({ by: "lane-old", workloadId: wl, sliceId: sl, body: `question ${body}`, options: ["yes", "no"] });
+		ledger.enqueue({ by: "lane-old", workloadId: wl, sender: "lane-old", recipient: "orchestrator", body: `relay ${body}` });
+		const f = fakePi();
+		const env = { AGENT_SYSTEM_ROLE: "orchestrator", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_SURFACE_BATCH_MS: "0", HOME: "/nonexistent-home" };
+		const ctx = Object.assign(ctxOf({ cwd: ilex }), {
+			localProtocolOptions: { getArtifactsDir: () => ilex, getSessionId: () => "ilex" },
+		});
+		const plainHandles = (text: string) => {
+			expect(text).toContain("local://PLAN.md");
+			expect(text).toContain("memory://PLAN.md");
+			expect(text).not.toContain("[local://");
+			expect(text).not.toContain("[memory://");
+			expect(text).not.toContain(wrongTarget);
+		};
+		setLinkRouter(router);
+		try {
+			await orchestratorSurface(f.pi, env, { loadText: loadTestText });
+			await f.emit("session_start", {}, ctx);
+			for (const timer of timeouts.splice(0)) timer.fn();
+			const wake = f.sent.find((s) => s.message.customType === "surface-wake")!;
+			plainHandles(wake.message.content);
+			expect(wake.message.content).toContain("question local://PLAN.md");
+			await f.admit(wake, ctx);
+
+			const tool = f.tool("orchestrator_ledger") as FakeTool & {
+				renderResult(result: unknown): { render(width: number): string[] };
+			};
+			const read = await tool.execute("1", { workload: wl }, undefined, undefined, ctx);
+			plainHandles(read.content[0]!.text);
+			expect(read.content[0]!.text).toContain(`[${storedPath}](${storedTarget})`);
+			for (const origin of ["entry", "question", "relay"]) expect(read.content[0]!.text).toContain(`${origin} local://PLAN.md`);
+			expect(read.content[0]!.text).toContain("<https://example.com/plan>");
+			const display = tool.renderResult(read).render(10_000).join("\n");
+			plainHandles(display);
+			expect(display).toContain(`\x1b]8;;${storedTarget}\x07`);
+
+			// A fresh between-wake question, not just the initial wake/on-demand render.
+			ledger.raiseQuestion({ by: "lane-old", workloadId: wl, sliceId: sl, body: `later question ${body}`, options: ["yes", "no"] });
+			for (const timer of timers) timer.fn();
+			const needsYou = f.sent.find((s) => s.message.customType === "surface-needs-you")!;
+			plainHandles(needsYou.message.content);
+			expect(needsYou.message.content).toContain("later question local://PLAN.md");
+
+			await f.emit("input", { text: "pending", source: "interactive" }, ctx);
+			plainHandles(f.sent.find((s) => s.message.customType === "surface-pending")!.message.content);
+			const session = surfaceSession(ctx, env);
+			session.tickNotices.push(`tick ${body}`);
+			for (const timer of timers) timer.fn();
+			plainHandles(f.sent.find((s) => s.message.customType === "surface-notices")!.message.content);
+			session.notices.push(`applied ${body}`);
+			const turn = await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx) as { messages: { content: string }[] };
+			const returned = turn.messages.map((m) => m.content).join("\n");
+			plainHandles(returned);
+			expect(returned).toContain("## Applied from the surface since your last turn");
+			expect(returned).toContain("applied local://PLAN.md");
+			expect(syncCalls).toBe(0);
+
+			// Identical text outside the ledger boundary still belongs to this caller.
+			linkedApi(f.pi, ctx, router).sendMessage!({ customType: "current-caller", content: "local://PLAN.md", display: true });
+			expect(f.sent.at(-1)!.message.content).toBe(`[local://PLAN.md](${wrongTarget})`);
+			expect(syncCalls).toBe(1);
+		} finally {
+			setLinkRouter(undefined);
+			ledger.close();
+		}
+	});
+
+	test("new lane writes expand the original caller's handles before ledger rendering", async () => {
+		const root = tmp("lane-write-collision");
+		const lane = join(root, "lane"), ilex = join(root, "ilex");
+		for (const dir of [lane, ilex]) {
+			mkdirSync(join(dir, "local"), { recursive: true });
+			writeFileSync(join(dir, "local", "PLAN.md"), dir);
+		}
+		const original = join(lane, "local", "PLAN.md");
+		const { ledger, path } = tempLedger();
+		const laneId = "lane-original";
+		const wl = ledger.openWorkload({ by: "fixture", brief: "Original caller", stakes: "normal", mode: "user-driven" });
+		expect(ledger.claimWorkload(wl, { by: laneId, holder: laneId, leaseMs: 60_000 }).won).toBe(true);
+		const sl = ledger.addSlice({ by: laneId, workloadId: wl, task: "write", doneCondition: "stored", inputs: "handles" });
+		const f = fakePi();
+		const ctx = Object.assign(ctxOf({ cwd: lane }), {
+			localProtocolOptions: { getArtifactsDir: () => lane, getSessionId: () => laneId },
+		});
+		const callers: string[] = [];
+		setLinkRouter({
+			async locate(handle, rc) {
+				const dir = rc.localProtocolOptions!.getArtifactsDir!()!;
+				callers.push(dir);
+				const path = join(dir, "local", handle.slice("local://".length));
+				return existsSync(path) ? path : null;
+			},
+			locateSync() { throw new Error("storage uses the original caller's async lookup"); },
+		});
+		try {
+			await orchestratorSurface(f.pi, {
+				AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LANE_ID: laneId, AGENT_SYSTEM_WORKLOAD_ID: wl,
+				AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home",
+			}, { loadText: loadTestText });
+			const body = "local://PLAN.md local://missing.md";
+			for (const name of ["lane_record_entry", "lane_message", "lane_raise_question"]) {
+				await f.tool(name).execute("1", { body, slice: sl, options: ["yes", "no"] }, undefined, undefined, ctx);
+			}
+			const expanded = `${original} local://missing.md`;
+			expect(ledger.entries(wl).find((e) => e.body === expanded)).toBeDefined();
+			expect(ledger.inFlight().find((w) => w.workload.id === wl)!.pendingMessages.at(-1)!.body).toBe(expanded);
+			expect(ledger.questions(wl).at(-1)!.body).toBe(expanded);
+			expect(callers).toEqual(Array(6).fill(lane));
+			expect(expanded).not.toContain("file://");
+			expect(expanded).not.toContain("](");
+		} finally {
+			setLinkRouter(undefined);
+			ledger.close();
+		}
+	});
+
 	test.skipIf(host === null)("a real LocalProtocolHandler links a caller-local file before send returns, preserving A/B/C order and leaving artifact handles plain", async () => {
 		// Static imports cannot name the OMP install selected from PATH at runtime.
 		const [{ LocalProtocolHandler }, { parseInternalUrl }] = await Promise.all([

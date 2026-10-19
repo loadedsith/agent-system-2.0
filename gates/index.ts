@@ -133,13 +133,14 @@ export default function p11Gates(
 	cleanShell: CleanShellCheck | undefined = fenceSettings === hostFenceSettings ? hostCleanShell : undefined,
 ): void {
 	openLinks(pi);
+	const ledgerPi = linkedApi(pi, undefined, undefined, "ledger");
 	pi = linkedApi(pi);
 	contractRow(pi, env);
 	receiptsRow(pi, env);
 	askPolicyRow(pi, env);
 	orchestratorRoleRow(pi, env);
 	typedWrapperRow(pi);
-	wakeReadRow(pi, env);
+	wakeReadRow(ledgerPi, env);
 	tierNameRow(pi);
 	briefFieldsRow(pi, env);
 	questionRow(pi, env);
