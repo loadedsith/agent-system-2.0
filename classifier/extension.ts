@@ -132,8 +132,9 @@
  * The pair trigger (PLAN wl-mv67564rdkfvnk D1, D4; surface/src/pair-suggest.ts): when the installed profile's
  * `pairSuggest` switch covers the bound workload, a background jev call asks classifier/pair-signal-question.json's
  * `taste` and `ambiguous` about the brief (single-flight, three attempts at most, 10 s each) and writes one
- * `pair-signal:` or `pair-signal-failed:` stamped `classifier`. The round-limit question then also offers `pair`, with
- * a last `pair:` line and a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal.
+ * `pair-signal:` or `pair-signal-failed:` stamped `classifier`. The round-limit question then also stores `pair` as its
+ * last option, with a classifier-stamped `pair-offer:`, when `pairOffer` finds a signal; its body is unchanged (PLAN
+ * wl-mvb9mw00ycfjeo D1: the surface shows the offer on its own line).
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -1138,7 +1139,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 	}
 
 	/** D1 at the round-limit raise: the offer, or null; a failure to compute it never blocks the raise. */
-	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { line: string; signals: PairSignalId[] } | null {
+	function roundLimitPairOffer(ledger: RoutingLedger, workloadId: string, count: RoundCount, log: (line: string) => void): { signals: PairSignalId[] } | null {
 		try {
 			// deps.ledger() is the ledger module's Ledger at run time; the port (src/ledger-port.ts) names only what routing calls.
 			return pairOffer(ledger as unknown as PairLedger, workloadId, "round-limit", { config: readPairSuggestConfig(), count });
@@ -1520,12 +1521,11 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				const limit = effectiveRoundLimit(entries, instructions, stakes, sliceId);
 				if (count.failed < limit.total || openLimitQuestion(entries, ledger.questions(workloadId), sliceId)) return null;
 				const offer = roundLimitPairOffer(ledger, workloadId, count, log);
-				const body = roundLimitQuestionBody(sliceId, count, limit, stakes);
 				const questionId = ledger.raiseQuestion({
 					by: deps.laneId,
 					workloadId,
 					sliceId,
-					body: offer ? `${body}\n${offer.line}` : body,
+					body: roundLimitQuestionBody(sliceId, count, limit, stakes),
 					options: offer ? [...ROUND_LIMIT_OPTIONS, PAIR_OPTION] : [...ROUND_LIMIT_OPTIONS],
 				});
 				entry(reviewLimitBody(questionId, sliceId));
