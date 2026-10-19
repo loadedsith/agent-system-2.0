@@ -48,6 +48,7 @@ export const AUTHORITY: readonly AuthorityRow[] = [
 	jo("control-prefix", "superseded", "surface/src/launch.ts supersededBy"),
 	jo("control-prefix", "pair-taken", "surface/src/errors.ts; surface/src/pair-suggest.ts pairTakenQuestion"),
 	jo("control-prefix", "test-pr", "surface/src/launch.ts boundPrs"),
+	jo("control-prefix", "waive-pr", "surface/src/launch.ts waivedPrs; surface/src/test-run.ts close check"),
 	jo("control-prefix", "train", "surface/src/launch.ts boundPrs; surface/src/merge-train.ts trainPrs"),
 	jo("control-prefix", "scratch-removed", "gates/src/scratch.ts SCRATCH_ENTRY"),
 	jo("control-prefix", "scratch-remove-failed", "gates/src/scratch.ts SCRATCH_ENTRY"),
