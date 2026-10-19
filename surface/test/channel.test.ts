@@ -1031,6 +1031,45 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 		expect(JSON.parse(readFileSync(receipt, "utf8"))).toMatchObject({ id: e.id, seat: "Ilex" });
 	});
 
+	test("T20 a receipt whose archive is not yet published stays owed: an archive failure before an old consume, still failing at session_start, does not abandon the receipt once the archive lands (code review r4 #1)", async () => {
+		const mod = await drainModule();
+		expect(mod?.drainInbox).toBeInstanceOf(Function);
+		const t = surface();
+		ensureStandingWorkload(t.ledger);
+		const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000).toISOString();
+		const past = Ledger.open(t.path, { backup: false, backupOnOpen: false, clock: () => eightDaysAgo });
+		const e = envelope("consumed eight days ago while its archive could not be written");
+		const msgId = `msg-ch-${e.id}`;
+		t.publish(e);
+		const config = { senders: [PLUMB] };
+		const io = { ledger: past, config, root: t.root, pid: DEAD_PID, alive: () => true };
+		mod!.drainInbox(io);
+		mod!.confirmAsides(past, config, [msgId]);
+		const archive = join(t.root, "archive");
+		mkdirSync(archive, { recursive: true });
+		const receipt = join(t.root, "acks", `${e.id}.turn.json`);
+		chmodSync(archive, 0o555);
+		try {
+			try {
+				mod!.drainInbox(io);
+			} catch {
+				// The archive link fails; the claim stays for a later drain.
+			}
+			expect(mod!.consumeAsides(past, config)).toEqual([msgId]);
+			expect(t.fate(msgId)).toMatchObject({ ack: true, archive: false, turn: false, state: "consumed" });
+			// Eight days later the session starts while the archive is still unwritable: no receipt can be proven yet.
+			await t.start();
+			expect(existsSync(receipt)).toBe(false);
+		} finally {
+			chmodSync(archive, 0o755);
+		}
+		// The archive directory recovers: a later tick archives the claim and writes the eight-day-old receipt.
+		t.tick();
+		t.tick();
+		expect(t.fate(msgId)).toMatchObject({ archive: true, claimed: false });
+		expect(existsSync(receipt)).toBe(true);
+	});
+
 	test("T18 the refusal line says how far a withdrawn message had come: no row, a row with no confirmed aside, a confirmed aside, handled before its aside (code review r2 #3)", async () => {
 		const mod = await drainModule();
 		expect(mod?.drainInbox).toBeInstanceOf(Function);

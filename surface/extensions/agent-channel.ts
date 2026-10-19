@@ -281,27 +281,32 @@ const TURN_PROVEN_SEAT = "(not a launcher-started seat)";
  * Proof that `acks/<id>.json` is this drain's own for the channel message `msgId` (code review r2 #1): the message
  * was not withdrawn by a late collision, `archive/<id>.json` holds the bytes its `channel-in:` sha256 records, and the
  * ack passes the publication path's ack test (`ownAck`) against that archived envelope. A turn receipt at an id whose
- * ack is another seat's would tell that seat's sender its recipient acted. Returns the envelope id, or null.
+ * ack is another seat's would tell that seat's sender its recipient acted. Returns the envelope id; `PENDING` while
+ * the archive or the ack is not yet there (its publication can fail and be retried by a later drain, code review
+ * r4 #1), so the receipt stays owed; or null when no receipt is ever owed (withdrawn, or the files are another's).
  */
-function ownedAck(ledger: Ledger, root: string, msgId: string, withdrawn: ReadonlySet<string>): string | null {
+const PENDING = Symbol("pending");
+function ownedAck(ledger: Ledger, root: string, msgId: string, withdrawn: ReadonlySet<string>): string | typeof PENDING | null {
 	const m = ledger.message(msgId);
 	if (!m || withdrawn.has(msgId)) return null;
 	const rec = channelIn(ledger, msgId, m.sender);
 	if (!rec || msgIdOf(rec.envelopeId) !== msgId) return null;
 	const archived = readOrNull(join(root, "archive", `${rec.envelopeId}.json`));
-	if (archived === null || sha256(archived) !== rec.sha) return null;
+	if (archived === null) return PENDING;
+	if (sha256(archived) !== rec.sha) return null;
 	const ack = readOrNull(join(root, "acks", `${rec.envelopeId}.json`));
-	return ack !== null && ownAck(ack, JSON.parse(archived.toString("utf8")) as Envelope) ? rec.envelopeId : null;
+	if (ack === null) return PENDING;
+	return ownAck(ack, JSON.parse(archived.toString("utf8")) as Envelope) ? rec.envelopeId : null;
 }
 
 /**
  * The observed-turn receipt the sender's `seat_message` reads as `acted`: `acks/<id>.turn.json` for each channel
  * message in `msgIds` (moved to consumed at its confirming `message_end` inside a turn or at the next `agent_start`,
- * or found missing by the reconcile) whose ack is proven this drain's own (`ownedAck`); any other is skipped, and the
- * reconcile tries it again once its ack and archive exist. Tmp then `link`, so an existing receipt is never replaced
+ * or found missing by the reconcile) whose ack is proven this drain's own (`ownedAck`); one whose ack or archive is
+ * not there yet is counted owed, and any other is skipped. Tmp then `link`, so an existing receipt is never replaced
  * (EEXIST skips it); every error is swallowed, as the registry does: a receipt must never break the turn it reports.
- * Returns how many writes failed with an error, so the reconcile keeps an unbounded pass owed until one runs clean
- * (code review r3 #1).
+ * Returns how many receipts are still owed (a write error, or proof not yet published), so the reconcile keeps an
+ * unbounded pass owed until one leaves none (code review r3 #1, r4 #1).
  */
 export function writeTurnReceipts(ledger: Ledger, root: string, msgIds: readonly string[], pid: number): number {
 	if (msgIds.length === 0) return 0;
@@ -317,6 +322,10 @@ export function writeTurnReceipts(ledger: Ledger, root: string, msgIds: readonly
 		try {
 			const id = ownedAck(ledger, root, msgId, withdrawn);
 			if (id === null) continue;
+			if (id === PENDING) {
+				failed++;
+				continue;
+			}
 			const path = join(root, "acks", `${id}.turn.json`);
 			const tmp = `${path}.${pid}.${randomUUID()}.tmp`;
 			writeFileSync(tmp, `${JSON.stringify({ id, seat: TURN_SEAT, provenSeat: TURN_PROVEN_SEAT, pid, turnStartedAt })}\n`);
