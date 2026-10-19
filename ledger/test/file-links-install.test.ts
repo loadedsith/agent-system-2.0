@@ -2,7 +2,7 @@
 // system utilities, never the developer's herdr/ctx. Clicks run the manifest action against a
 // recording opener, so neither plugin registration nor an application launch can escape the test.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -14,7 +14,7 @@ let root: string;
 let bin: string;
 
 beforeAll(() => {
-	root = mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "as2-file-links-"));
+	root = realpathSync(mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "as2-file-links-")));
 	bin = join(root, "bin");
 	mkdirSync(bin);
 	symlinkSync(process.execPath, join(bin, "bun"));
@@ -114,22 +114,22 @@ function clickFixture(name: string) {
 }
 
 describe("herdr file-link action: decoded local paths, never shell commands", () => {
-	test("opens an existing file with spaces and URL metacharacters as exactly one argv after --", () => {
+	test("opens a safe document with the explicit text editor, preserving URL metacharacters in one argv", () => {
 		const fixture = clickFixture("existing-file");
 		const file = join(fixture.dir, "My Docs #100% ? (draft) ü.md");
 		writeFileSync(file, "plan\n");
 		const result = fixture.run(pathToFileURL(file).href);
 		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
-		expect(fixture.calls()).toEqual([["--", file]]);
+		expect(fixture.calls()).toEqual([["-t", "--", file]]);
 	});
 
-	test("opens only the immediate existing parent when the clicked file does not exist", () => {
+	test("reveals only the immediate existing parent when the clicked file does not exist", () => {
 		const fixture = clickFixture("parent-fallback");
 		const parent = join(fixture.dir, "My Docs");
 		mkdirSync(parent);
 		const result = fixture.run(pathToFileURL(join(parent, "not written yet.md")).href);
 		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
-		expect(fixture.calls()).toEqual([["--", parent]]);
+		expect(fixture.calls()).toEqual([["-R", "--", parent]]);
 	});
 
 	test("does not walk to an ancestor when the immediate parent does not exist", () => {
@@ -156,7 +156,7 @@ describe("herdr file-link action: decoded local paths, never shell commands", ()
 		const marker = join(fixture.dir, "INJECTED");
 		const result = fixture.run(pathToFileURL(file).href, { INJECTED: marker });
 		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
-		expect(fixture.calls()).toEqual([["--", file]]);
+		expect(fixture.calls()).toEqual([["-t", "--", file]]);
 		expect(existsSync(marker)).toBe(false);
 	});
 
@@ -166,6 +166,141 @@ describe("herdr file-link action: decoded local paths, never shell commands", ()
 		writeFileSync(file, "plan\n");
 		const result = fixture.run(pathToFileURL(file).href, { OPEN_EXIT: "9" });
 		expect(result.exitCode).toBe(9);
-		expect(fixture.calls()).toEqual([["--", file]]);
+		expect(fixture.calls()).toEqual([["-t", "--", file]]);
+	});
+
+	test("reveals existing directories rather than dispatching their default handler", () => {
+		const fixture = clickFixture("directory");
+		const directory = join(fixture.dir, "ordinary folder");
+		mkdirSync(directory);
+		const result = fixture.run(pathToFileURL(directory).href);
+		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+		expect(fixture.calls()).toEqual([["-R", "--", directory]]);
+	});
+
+	test("decodes percent escapes once and preserves newlines and option-looking filenames", () => {
+		const fixture = clickFixture("decode-once");
+		const file = join(fixture.dir, "-n %2F literal\nnotes.md");
+		writeFileSync(file, "notes\n");
+		const result = fixture.run(pathToFileURL(file).href);
+		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+		expect(fixture.calls()).toEqual([["-t", "--", file]]);
+	});
+
+	for (const [name, filename, content, mode] of [
+		["executable-document", "plan.md", "plain text\n", 0o755],
+		["non-executable-command", "run.command", "#!/bin/sh\nexit 0\n", 0o644],
+		["terminal-profile", "session.terminal", "<plist/>", 0o644],
+		["applescript", "run.scpt", "display dialog \"no\"\n", 0o644],
+		["shell-script", "run.sh", "echo no\n", 0o644],
+		["python-script", "run.py", "print(\"no\")\n", 0o644],
+		["disguised-script", "notes.md", "#!/bin/sh\nexit 0\n", 0o644],
+		["bom-disguised-script", "notes.txt", "\uFEFF#!/bin/sh\nexit 0\n", 0o644],
+		["disguised-binary", "notes.md", "\u007FELF\0binary", 0o644],
+		["extensionless-executable", "run", "\u007FELF\0binary", 0o755],
+		["unknown-document-type", "download.pdf", "%PDF-1.7\n", 0o644],
+	] as const) {
+		test(`only reveals ${name}, never opening or executing it`, () => {
+			const fixture = clickFixture(`abuse-${name}`);
+			const file = join(fixture.dir, filename);
+			writeFileSync(file, content);
+			chmodSync(file, mode);
+			const result = fixture.run(pathToFileURL(file).href);
+			expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+			expect(fixture.calls()).toEqual([["-R", "--", file]]);
+		});
+	}
+
+	test("reveals a document symlink instead of giving its referent to a text editor", () => {
+		const fixture = clickFixture("document-symlink");
+		const document = join(fixture.dir, "actual.md");
+		const link = join(fixture.dir, "linked.md");
+		writeFileSync(document, "notes\n");
+		symlinkSync(document, link);
+		const result = fixture.run(pathToFileURL(link).href);
+		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+		expect(fixture.calls()).toEqual([["-R", "--", link]]);
+	});
+
+	test("a symlinked ancestor cannot smuggle a document to the text editor", () => {
+		const fixture = clickFixture("directory-symlink");
+		const directory = join(fixture.dir, "actual");
+		const link = join(fixture.dir, "linked");
+		mkdirSync(directory);
+		writeFileSync(join(directory, "notes.md"), "notes\n");
+		symlinkSync(directory, link);
+		const file = join(link, "notes.md");
+		const result = fixture.run(pathToFileURL(file).href);
+		expect([result.exitCode, result.stderr.toString()]).toEqual([0, ""]);
+		expect(fixture.calls()).toEqual([["-R", "--", file]]);
+	});
+
+	for (const suffix of [".app", ".APP", ".bundle", ".framework", ".plugin", ".appex", ".xpc", ".prefPane", ".workflow", ".scptd"]) {
+		test(`refuses ${suffix} targets, descendants and missing-file fallback inside the bundle`, () => {
+			const fixture = clickFixture(`bundle-${suffix}`);
+			const bundle = join(fixture.dir, `Unsafe${suffix}`);
+			const contents = join(bundle, "Contents");
+			mkdirSync(contents, { recursive: true });
+			const document = join(contents, "notes.md");
+			writeFileSync(document, "notes\n");
+			for (const target of [bundle, contents, document, join(contents, "missing.md")]) {
+				const result = fixture.run(pathToFileURL(target).href);
+				expect(result.exitCode).toBe(1);
+				expect(result.stderr.toString()).toContain("bundle");
+			}
+			expect(fixture.calls()).toEqual([]);
+		});
+	}
+
+	test("recognizes a suffixless bundle by its Contents layout", () => {
+		const fixture = clickFixture("suffixless-bundle");
+		const bundle = join(fixture.dir, "Looks ordinary");
+		const contents = join(bundle, "Contents");
+		mkdirSync(contents, { recursive: true });
+		writeFileSync(join(contents, "Info.plist"), "<plist/>");
+		for (const target of [bundle, contents, join(contents, "missing.md")]) {
+			const result = fixture.run(pathToFileURL(target).href);
+			expect(result.exitCode).toBe(1);
+		}
+		expect(fixture.calls()).toEqual([]);
+	});
+
+	test("rejects file and directory symlinks hiding a bundle, including parent fallback", () => {
+		const fixture = clickFixture("symlink-bundle");
+		const bundle = join(fixture.dir, "Unsafe.app");
+		mkdirSync(bundle);
+		const document = join(bundle, "notes.md");
+		writeFileSync(document, "notes\n");
+		const directoryLink = join(fixture.dir, "ordinary");
+		const fileLink = join(fixture.dir, "ordinary.md");
+		symlinkSync(bundle, directoryLink);
+		symlinkSync(document, fileLink);
+		for (const target of [directoryLink, fileLink, join(directoryLink, "notes.md"), join(directoryLink, "missing.md")]) {
+			const result = fixture.run(pathToFileURL(target).href);
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr.toString()).toContain("bundle");
+		}
+		expect(fixture.calls()).toEqual([]);
+	});
+
+	test("refuses a dangling symlink rather than falling back to its safe parent", () => {
+		const fixture = clickFixture("dangling-link");
+		const link = join(fixture.dir, "notes.md");
+		symlinkSync(join(fixture.dir, "missing.command"), link);
+		expect(fixture.run(pathToFileURL(link).href).exitCode).toBe(1);
+		expect(fixture.calls()).toEqual([]);
+	});
+
+	test("a bundle-named symlink cannot bypass the lexical ancestor guard", () => {
+		const fixture = clickFixture("bundle-named-alias");
+		const directory = join(fixture.dir, "ordinary");
+		const alias = join(fixture.dir, "Misleading.app");
+		mkdirSync(directory);
+		writeFileSync(join(directory, "notes.md"), "notes\n");
+		symlinkSync(directory, alias);
+		for (const target of [alias, join(alias, "notes.md"), join(alias, "missing.md")]) {
+			expect(fixture.run(pathToFileURL(target).href).exitCode).toBe(1);
+		}
+		expect(fixture.calls()).toEqual([]);
 	});
 });
