@@ -12,29 +12,44 @@
 // `<id>.json.claimed-ilex-<pid>`, or quarantined when the stem is not an envelope id) and `<id>.json.claimed-ilex-<pid>`
 // (adopted, first, when the pid is this drain's or no longer alive). Every other name — the writer's
 // `<id>.json.<pid>.<uuid>.tmp`, `.invalid` files, anything unknown — is left as it is. Entry names come from the
-// directory listing, never from envelope text. Per claim, resumable from the first missing step:
-//   validate → collision boundary → record (once per id) → collision boundary → inject the aside → `channel-aside:`
-//   → ack (tmp + link, no replace) → archive (link, no replace) → unlink the claim.
+// directory listing, never from envelope text. A published `<id>.json` whose claim name this drain already holds waits
+// beside it (a rename would replace the claim) until that claim is archived. Per claim, resumable from the first
+// missing step:
+//   validate → collision boundary → record (once per id) → collision boundary → owed an aside … confirmed:
+//   `channel-aside:` → ack (tmp + link, no replace) → archive (link, no replace) → unlink the claim.
 // No step ever renames over or unlinks a file in `acks/` or `archive/`; quarantine is link + unlink, and a taken
-// `.invalid` name gets `<entry>.<uuid>.invalid` instead. The next `agent_start` after an aside moves its message to
-// `consumed` (the observed-turn receipt). Channel text never reaches `apply`, the typed FIFO or a Jo row (D6).
+// `.invalid` name gets `<entry>.<uuid>.invalid` instead. Channel text never reaches `apply`, the typed FIFO or a Jo
+// row (D6).
+//
+// The aside is confirmed, never assumed (D2: ack only after the aside reaches the model). OMP's sendMessage is
+// fire-and-forget, and a second aside sent while the first one's turn is starting is rejected ("Agent is already
+// processing", smoke (x)), so the drain itself records nothing at a send. Every channel message carries
+// `details.surfaceKey` (`channel:<msg ids>`), `details.renderSeq` and `details.msgIds`, as the wake row keys its pushes
+// (surface/extensions/wake.ts). A tick sends at most one aside, carrying the claims recorded and not yet confirmed;
+// a claim stays claimed and is resent at later idle ticks, PUSH_TRIES sends in all, and after that waits for Jo's
+// next turn, whose `before_agent_start` re-renders every unconfirmed claim as one keyed message. OMP's `message_end`
+// for a channel message (a turn's input, or an aside folded into context) records `channel-aside:` for the ids it
+// names and finishes their ack and archive; a crash in between leaves a claim the next drain resumes at the ack. A
+// message whose confirmation falls inside a turn (between `agent_start` and `agent_end`) moves to `consumed` then; one
+// folded in outside a turn moves at the next `agent_start` (the observed-turn receipt). At either moment the
+// registry's turn receipt `acks/<id>.turn.json` is written, so the sender's `seat_message` reports `acted`. The
+// `context` hook keeps, after the last assistant message, only the newest copy of a resent aside.
 //
 // The tools Ilex answers with (D4) are the tools section at the end of this file: `orchestrator_reply` writes an
 // envelope from `Ilex` into a configured sender's inbox (the registry's writer format, tmp + rename), and it and
 // `orchestrator_channel_done` walk the `re` messages to `acted-on`, each id checked to be that sender's own channel row
-// first. At the consumed transition the `agent_start` handler also writes the registry's turn receipt,
-// `acks/<id>.turn.json`, so the sender's `seat_message` reports `acted`.
+// first.
 import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import {
-	asideText, CHANNEL_ASIDE_TYPE, CHANNEL_DRAIN_MS, CHANNEL_MSG_PREFIX, type ChannelConfig, channelIn, consumeAsides, displayName, type Envelope, hasAside, ID_COLLISION, ILEX_SLUG,
-	mailboxRoot, msgIdOf, readChannelConfig, recordAside, recordMessage, recordOut, recordRefused, reRefusal, setChannelInForce, sha256, validateEnvelope,
+	asideText, CHANNEL_ASIDE_TYPE, CHANNEL_DRAIN_MS, CHANNEL_MSG_PREFIX, type ChannelConfig, channelIn, confirmAsides, consumeAsides, displayName, type Envelope, hasAside, ID_COLLISION,
+	ILEX_SLUG, mailboxRoot, msgIdOf, readChannelConfig, recordMessage, recordOut, recordRefused, reRefusal, setChannelInForce, sha256, validateEnvelope,
 } from "../src/channel";
 import { ensureStandingWorkload } from "../src/identity";
-import { surfaceSession } from "../src/session";
-import { CHANNEL_DONE_TOOL, CHANNEL_REPLY_TOOL, type Ctx, type SurfaceAPI, type ToolResult } from "../src/types";
+import { type SurfaceSession, surfaceSession } from "../src/session";
+import { CHANNEL_DONE_TOOL, CHANNEL_REPLY_TOOL, type Ctx, type HostMessage, PUSH_TRIES, type SurfaceAPI, type SurfaceMessage, type ToolResult } from "../src/types";
 
 /** The claim suffix this drain writes and adopts: the registry's `.claimed-<owner>` with owner `ilex-<pid>`. */
 const claimSuffix = (pid: number): string => `.claimed-${ILEX_SLUG}-${pid}`;
@@ -42,7 +57,7 @@ const CLAIMED = new RegExp(`^(.+\\.json)\\.claimed-${ILEX_SLUG}-([0-9]+)$`);
 const ENVELOPE_STEM = /^[0-9]+-[0-9a-f-]+$/i;
 
 /** The steps of one claim, in order; `DrainIO.after` sees each as it completes (the crash points a test stops at). */
-export type DrainStep = "recorded" | "injected" | "aside-recorded" | "acked" | "archive-linked";
+export type DrainStep = "recorded" | "acked" | "archive-linked";
 
 export interface DrainIO {
 	ledger: Ledger;
@@ -53,10 +68,20 @@ export interface DrainIO {
 	pid: number;
 	/** Is another drain's pid alive; a dead one's claims are adopted. */
 	alive(pid: number): boolean;
-	/** Inject the aside for one message. */
-	inject(content: string, msgId: string): void;
 	/** After each completed step of a claim; a throw here stops the drain there, as a crash would. */
 	after?(step: DrainStep, envelopeId: string): void;
+}
+
+/** A claim recorded and owed its aside: no `message_end` has confirmed it yet. `content` is its aside text. */
+export interface Unconfirmed {
+	msgId: string;
+	content: string;
+}
+
+/** One pass: the claims it worked on, and those still owed an aside, in the order the pass took them. */
+export interface Drained {
+	worked: string[];
+	unconfirmed: Unconfirmed[];
 }
 
 /** `process.kill(pid, 0)`: alive unless it fails with ESRCH (EPERM means alive, owned by someone else). */
@@ -117,24 +142,28 @@ function foreignDestination(root: string, e: Envelope, sha: string): boolean {
 	return archived !== null && sha256(archived) !== sha;
 }
 
-/** One claim, from its first missing step. `name` is the claim's directory entry, `entry` the `<id>.json` it was published as. */
-function processClaim(io: DrainIO, inbox: string, name: string, entry: string): void {
+/**
+ * One claim, from its first missing step. `name` is the claim's directory entry, `entry` the `<id>.json` it was
+ * published as. Returns the claim when it is owed an aside (recorded, not yet confirmed); it then stays claimed.
+ */
+function processClaim(io: DrainIO, inbox: string, name: string, entry: string): Unconfirmed | null {
 	const { ledger, root } = io;
 	const claim = join(inbox, name);
 	const bytes = readOrNull(claim);
-	if (bytes === null) return;
+	if (bytes === null) return null;
 	const v = validateEnvelope(bytes.toString("utf8"), entry, io.config);
 	if (!v.ok) {
 		quarantine(inbox, name, entry);
 		recordRefused(ledger, entry, v.from, v.reason);
-		return;
+		return null;
 	}
 	const { envelope: e, sender } = v;
 	const sha = sha256(bytes);
 	const msgId = msgIdOf(e.id);
-	const refuse = (withdraws: boolean): void => {
+	const refuse = (withdraws: boolean): null => {
 		quarantine(inbox, name, entry);
 		recordRefused(ledger, entry, e.from, ID_COLLISION, withdraws ? msgId : undefined);
+		return null;
 	};
 	if (ledger.message(msgId)) {
 		// Resume: the row must be this envelope's own (its sender's `channel-in:` with these bytes' sha256); else a reused id, which withdraws nothing.
@@ -146,11 +175,10 @@ function processClaim(io: DrainIO, inbox: string, name: string, entry: string): 
 		io.after?.("recorded", e.id);
 	}
 	if (!hasAside(ledger, msgId, sender.id)) {
+		// Owed its aside: the destinations are checked again right before every send (r5 #1), and nothing is written
+		// past this point until a `message_end` confirms the aside (`channel-aside:`).
 		if (foreignDestination(root, e, sha)) return refuse(true);
-		io.inject(asideText(sender.id, msgId, e.message), msgId);
-		io.after?.("injected", e.id);
-		recordAside(ledger, msgId, sender.id);
-		io.after?.("aside-recorded", e.id);
+		return { msgId, content: asideText(sender.id, msgId, e.message) };
 	}
 	// Publish the ack: tmp, then link with no replace; an existing ack passes only the ack test.
 	const acks = join(root, "acks");
@@ -179,28 +207,31 @@ function processClaim(io: DrainIO, inbox: string, name: string, entry: string): 
 	}
 	io.after?.("archive-linked", e.id);
 	unlinkSync(claim);
+	return null;
 }
 
 /**
  * One pass over `<root>/inbox/ilex/`: adoptable claims first (this pid's, or a dead pid's), then published `<id>.json`
- * names, each in name order. Returns the claims it worked on. A missing inbox is an empty one.
+ * names, each in name order. A missing inbox is an empty one.
  */
-export function drainInbox(io: DrainIO): string[] {
+export function drainInbox(io: DrainIO): Drained {
 	const inbox = join(io.root, "inbox", ILEX_SLUG);
 	let names: string[];
 	try {
 		names = readdirSync(inbox).sort();
 	} catch (err) {
-		if (code(err) === "ENOENT") return [];
+		if (code(err) === "ENOENT") return { worked: [], unconfirmed: [] };
 		throw err;
 	}
 	const worked: string[] = [];
+	const unconfirmed: Unconfirmed[] = [];
 	for (const name of names) {
 		const m = CLAIMED.exec(name);
 		if (!m) continue;
 		const pid = Number(m[2]);
 		if (pid !== io.pid && io.alive(pid)) continue;
-		processClaim(io, inbox, name, m[1]!);
+		const u = processClaim(io, inbox, name, m[1]!);
+		if (u) unconfirmed.push(u);
 		worked.push(name);
 	}
 	for (const entry of names) {
@@ -214,6 +245,9 @@ export function drainInbox(io: DrainIO): string[] {
 			continue;
 		}
 		const name = `${entry}${claimSuffix(io.pid)}`;
+		// This drain still holds a claim of the same id (owed its confirmation): a rename would replace it. The
+		// republished file waits; once that claim is archived, the next pass takes it (and refuses other bytes by sha256).
+		if (existsSync(join(inbox, name))) continue;
 		try {
 			renameSync(join(inbox, entry), join(inbox, name));
 		} catch (err) {
@@ -221,10 +255,11 @@ export function drainInbox(io: DrainIO): string[] {
 			if (code(err) === "ENOENT") continue;
 			throw err;
 		}
-		processClaim(io, inbox, name, entry);
+		const u = processClaim(io, inbox, name, entry);
+		if (u) unconfirmed.push(u);
 		worked.push(name);
 	}
-	return worked;
+	return { worked, unconfirmed };
 }
 
 /** The registry's turn-receipt shape (persistent-seat-registry.ts, its `agent_start` handler), written as Ilex. */
@@ -233,8 +268,9 @@ const TURN_PROVEN_SEAT = "(not a launcher-started seat)";
 
 /**
  * The observed-turn receipt the sender's `seat_message` reads as `acted`: `acks/<id>.turn.json` for each envelope whose
- * message this `agent_start` moved to consumed. Tmp then `link`, so an existing receipt is never replaced (EEXIST
- * skips it); every error is swallowed, as the registry does: a receipt must never break the turn it reports.
+ * message just moved to consumed (at its confirming `message_end` inside a turn, or at the next `agent_start`). Tmp
+ * then `link`, so an existing receipt is never replaced (EEXIST skips it); every error is swallowed, as the registry
+ * does: a receipt must never break the turn it reports.
  */
 export function writeTurnReceipts(root: string, envelopeIds: readonly string[], pid: number): void {
 	const turnStartedAt = new Date().toISOString();
@@ -280,24 +316,76 @@ function reIds(v: unknown): string[] | null {
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 const inactive = text("This session is not the orchestrator surface; nothing was written or sent.");
 
-export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
-	/** The senders each session drains for, by its session manager; absent while the channel is off or refused. */
-	const live = new WeakMap<object, ChannelConfig>();
+/** The key prefix of every channel message; the rest of the key names the msg ids it carries, so its resends share it. */
+const KEY_PREFIX = "channel:";
 
-	const drain = (ctx: Ctx, config: ChannelConfig): void => {
-		const s = surfaceSession(ctx, env);
+/** The msg ids a channel message carries and its render sequence, or null for any other message. */
+function channelPush(m: HostMessage): { msgIds: string[]; renderSeq: number } | null {
+	if (m.customType !== CHANNEL_ASIDE_TYPE) return null;
+	const d = m.details as { surfaceKey?: unknown; renderSeq?: unknown; msgIds?: unknown } | null | undefined;
+	if (!d || typeof d.surfaceKey !== "string" || !d.surfaceKey.startsWith(KEY_PREFIX) || typeof d.renderSeq !== "number" || !Array.isArray(d.msgIds)) return null;
+	const msgIds = d.msgIds.filter((x): x is string => typeof x === "string");
+	return msgIds.length > 0 ? { msgIds, renderSeq: d.renderSeq } : null;
+}
+
+/** One keyed channel message carrying `owed`: their aside texts in claim order, keyed by their ids, with a fresh render sequence. */
+function channelMessage(s: SurfaceSession, owed: readonly Unconfirmed[]): SurfaceMessage {
+	const msgIds = owed.map((u) => u.msgId);
+	return {
+		customType: CHANNEL_ASIDE_TYPE,
+		content: owed.map((u) => u.content).join("\n\n"),
+		display: true,
+		details: { surfaceKey: `${KEY_PREFIX}${msgIds.join(",")}`, renderSeq: s.nextSeq(), msgIds },
+	};
+}
+
+/** A session's channel while it is on. */
+interface Live {
+	config: ChannelConfig;
+	/** Sends so far per msg id still owed its confirmation (a ride on Jo's turn counts as one); its `message_end` clears it. */
+	tries: Map<string, number>;
+	/** Between `agent_start` and `agent_end`: a confirmation now falls inside a turn. */
+	inTurn: boolean;
+}
+
+export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+	/** Each session's channel, by its session manager; absent while the channel is off or refused. */
+	const live = new WeakMap<object, Live>();
+
+	/** One pass, or null when it stopped at a failing claim (told once; the next pass resumes there). */
+	const drain = (ctx: Ctx, l: Live): Drained | null => {
 		try {
-			drainInbox({
-				ledger: s.ledger(),
-				config,
-				root: mailboxRoot(env),
-				pid: process.pid,
-				alive: pidAlive,
-				inject: (content, msgId) => pi.sendMessage?.({ customType: CHANNEL_ASIDE_TYPE, content, display: true, details: { msgId } }, { deliverAs: "aside", triggerTurn: true }),
-			});
+			return drainInbox({ ledger: surfaceSession(ctx, env).ledger(), config: l.config, root: mailboxRoot(env), pid: process.pid, alive: pidAlive });
 		} catch (err) {
-			// A timer callback nothing handles: the drain stops at the failing claim and the next tick resumes it.
 			ctx.ui.notify(`agent channel: the drain stopped: ${err instanceof Error ? err.message : String(err)}`, "warning");
+			return null;
+		}
+	};
+
+	/**
+	 * The tick: one pass, then at most one aside, carrying the claims still owed one. A claim never sent goes out busy
+	 * or idle, as wake.ts sends a new notice batch: OMP queues an aside sent while it streams for the turn's next step
+	 * boundary (agent-session.ts:8676-8691), and the loop's last aside poll or #resumeStrandedIrcAsides (:1179-1221)
+	 * takes one that arrives after it. A resend goes out only while idle, as wake.ts resends, PUSH_TRIES sends in all:
+	 * the idle path is the one that drops an aside (:8726-8753, #promptAgentInitiatedMessage throws "Agent is already
+	 * processing" while another turn is starting), so an unconfirmed claim is retried there, once per tick, and a busy
+	 * tick never queues a second copy behind one that may still land. No send counts until its `message_end`.
+	 */
+	const tick = (ctx: Ctx, l: Live): void => {
+		const drained = drain(ctx, l);
+		if (!drained || !pi.sendMessage) return;
+		const idle = ctx.isIdle?.() !== false;
+		const owed = drained.unconfirmed.filter((u) => {
+			const sent = l.tries.get(u.msgId) ?? 0;
+			return sent < PUSH_TRIES && (idle || sent === 0);
+		});
+		if (owed.length === 0) return;
+		for (const u of owed) l.tries.set(u.msgId, (l.tries.get(u.msgId) ?? 0) + 1);
+		try {
+			pi.sendMessage(channelMessage(surfaceSession(ctx, env), owed), { deliverAs: "aside", triggerTurn: true });
+		} catch (err) {
+			// Counted as a send that did not land: the claims stay owed and the next idle tick resends them.
+			ctx.ui.notify(`agent channel: the aside could not be sent: ${err instanceof Error ? err.message : String(err)}`, "warning");
 		}
 	};
 
@@ -313,24 +401,89 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 		const ledger = s.ledger();
 		ensureStandingWorkload(ledger);
 		setChannelInForce(ledger, read.config);
-		live.set(ctx.sessionManager, read.config);
-		drain(ctx, read.config);
-		ctx.setInterval(() => drain(ctx, read.config), CHANNEL_DRAIN_MS);
+		const l: Live = { config: read.config, tries: new Map(), inTurn: false };
+		live.set(ctx.sessionManager, l);
+		tick(ctx, l);
+		ctx.setInterval(() => tick(ctx, l), CHANNEL_DRAIN_MS);
 		return undefined;
 	});
 
+	// Jo's turn (OMP runs no before_agent_start on an aside-started turn): every claim still owed its aside — never
+	// sent, in flight, or out of tries — rides the turn as one keyed message, as wake.ts re-renders a wake still in
+	// flight, and that message's `message_end` (a turn input) confirms them. The ride counts as one send.
+	pi.on("before_agent_start", (_e, ctx) => {
+		const l = live.get(ctx.sessionManager);
+		if (!l) return undefined;
+		const owed = drain(ctx, l)?.unconfirmed ?? [];
+		if (owed.length === 0) return undefined;
+		for (const u of owed) l.tries.set(u.msgId, 1);
+		return { message: channelMessage(surfaceSession(ctx, env), owed) };
+	});
+
 	pi.on("agent_start", (_e, ctx) => {
-		const config = live.get(ctx.sessionManager);
-		if (!config) return undefined;
+		const l = live.get(ctx.sessionManager);
+		if (!l) return undefined;
+		l.inTurn = true;
+		// The fold case: asides confirmed outside a turn (plan mode, after an Esc) are consumed at this turn's start.
 		let moved: string[];
 		try {
-			moved = consumeAsides(surfaceSession(ctx, env).ledger(), config);
+			moved = consumeAsides(surfaceSession(ctx, env).ledger(), l.config);
 		} catch (err) {
 			ctx.ui.notify(`agent channel: the consumed receipt could not be written: ${err instanceof Error ? err.message : String(err)}`, "warning");
 			return undefined;
 		}
 		writeTurnReceipts(mailboxRoot(env), moved.map((m) => m.slice(CHANNEL_MSG_PREFIX.length)), process.pid);
 		return undefined;
+	});
+
+	pi.on("agent_end", (_e, ctx) => {
+		const l = live.get(ctx.sessionManager);
+		if (l) l.inTurn = false;
+		return undefined;
+	});
+
+	// Confirmation: OMP emits message_end for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages,
+	// after agent_start) and for an aside it folds into context without a turn (agent-session.ts:1232-1235). The ids
+	// the message names get `channel-aside:` (and `consumed` with the turn receipt when inside a turn); their ack and
+	// archive follow at once. The entry is written first, so a crash before the archive leaves a claim the next tick
+	// resumes at the ack.
+	pi.on("message_end", (event, ctx) => {
+		const l = live.get(ctx.sessionManager);
+		const p = l ? channelPush(event.message) : null;
+		if (!l || !p) return undefined;
+		let consumed: string[];
+		try {
+			consumed = confirmAsides(surfaceSession(ctx, env).ledger(), l.config, p.msgIds, l.inTurn).consumed;
+		} catch (err) {
+			ctx.ui.notify(`agent channel: the aside's confirmation could not be recorded: ${err instanceof Error ? err.message : String(err)}`, "warning");
+			return undefined;
+		}
+		for (const id of p.msgIds) l.tries.delete(id);
+		writeTurnReceipts(mailboxRoot(env), consumed.map((m) => m.slice(CHANNEL_MSG_PREFIX.length)), process.pid);
+		drain(ctx, l);
+		return undefined;
+	});
+
+	// Duplicate guard: a resend, or a copy OMP deferred without a turn and the next prompt appended (the ACP branch,
+	// agent-session.ts:8746-8748), can reach the model more than once. After the last assistant message, newest first by
+	// render sequence, a channel message whose every msg id a newer kept one already carries is dropped. Other
+	// messages and earlier history are never touched.
+	pi.on("context", (event, ctx) => {
+		if (!live.has(ctx.sessionManager)) return undefined;
+		const { messages } = event;
+		const start = messages.findLastIndex((m) => m.role === "assistant") + 1;
+		const pushes = messages.slice(start).flatMap((m, i) => {
+			const p = channelPush(m);
+			return p ? [{ index: start + i, ...p }] : [];
+		});
+		pushes.sort((a, b) => b.renderSeq - a.renderSeq);
+		const carried = new Set<string>();
+		const dropped = new Set<number>();
+		for (const p of pushes) {
+			if (p.msgIds.every((id) => carried.has(id))) dropped.add(p.index);
+			else for (const id of p.msgIds) carried.add(id);
+		}
+		return dropped.size === 0 ? undefined : { messages: messages.filter((_m, i) => !dropped.has(i)) };
 	});
 
 	pi.on("session_shutdown", (_e, ctx) => {
@@ -349,9 +502,9 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 	const open = (ctx: Ctx): { ledger: Ledger; config: ChannelConfig } | ToolResult => {
 		const s = surfaceSession(ctx, env);
 		if (!s.active) return inactive;
-		const config = live.get(ctx.sessionManager);
-		if (!config) return refused("the agent channel is off in this session (no valid `channel` block in the profile config)");
-		return { ledger: s.ledger(), config };
+		const l = live.get(ctx.sessionManager);
+		if (!l) return refused("the agent channel is off in this session (no valid `channel` block in the profile config)");
+		return { ledger: s.ledger(), config: l.config };
 	};
 
 	pi.registerTool({

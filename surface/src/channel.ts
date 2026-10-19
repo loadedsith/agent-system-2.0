@@ -214,7 +214,7 @@ export function channelIn(ledger: Ledger, msgId: string, senderId: string): { sh
 	return m ? { sha: m[5]!, envelopeId: m[4]! } : null;
 }
 
-/** The message has its `channel-aside:` entry: its aside was injected. */
+/** The message has its `channel-aside:` entry: its aside reached the model (a `message_end` confirmed it, D2). */
 export function hasAside(ledger: Ledger, msgId: string, senderId: string): boolean {
 	return standingEntry(ledger, `${CHANNEL_ASIDE_PREFIX} ${msgId}`, channelBy(senderId)) !== null;
 }
@@ -353,13 +353,36 @@ export function recordMessage(ledger: Ledger, envelope: Envelope, sender: Channe
 	return msgId;
 }
 
-/** After the aside was injected: its `channel-aside:` entry, and held→delivered if the message is still held (F12), in one write. */
-export function recordAside(ledger: Ledger, msgId: string, senderId: string): void {
-	const by = channelBy(senderId);
+/**
+ * D2 confirmation, in one write: OMP emitted `message_end` for a channel message carrying `msgIds` (an aside, or Jo's
+ * turn message re-rendering unconfirmed ones), so its text reached the model. Each id that is a configured sender's
+ * channel row, not yet consumed, gets its `channel-aside:` entry (once) and held→delivered (F12); with `consume` (the
+ * `message_end` fell inside a turn) it also moves to `consumed`, the observed-turn receipt. Returns the ids that got
+ * their `channel-aside:` entry now, and the ids moved to consumed.
+ */
+export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: readonly string[], consume: boolean): { confirmed: string[]; consumed: string[] } {
+	const senders = new Set(config.senders.map((s) => channelBy(s.id)));
+	const confirmed: string[] = [];
+	const consumed: string[] = [];
 	ledger.write(() => {
-		ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${CHANNEL_ASIDE_PREFIX} ${msgId}` });
-		if (ledger.message(msgId)?.state === "held") ledger.advanceMessage(msgId, "delivered", { by });
+		for (const id of new Set(msgIds)) {
+			const m = ledger.message(id);
+			// Only a configured sender's own channel row on the standing workload (D6), not yet consumed.
+			if (!m || m.workload_id !== STANDING_WORKLOAD_ID || !id.startsWith(CHANNEL_MSG_PREFIX) || !senders.has(m.created_by) || m.created_by !== channelBy(m.sender)) continue;
+			if (m.state !== "held" && m.state !== "delivered") continue;
+			const by = channelBy(m.sender);
+			if (!hasAside(ledger, id, m.sender)) {
+				ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${CHANNEL_ASIDE_PREFIX} ${id}` });
+				confirmed.push(id);
+			}
+			if (m.state === "held") ledger.advanceMessage(id, "delivered", { by });
+			if (consume) {
+				ledger.advanceMessage(id, "consumed", { by });
+				consumed.push(id);
+			}
+		}
 	});
+	return { confirmed, consumed };
 }
 
 /** The channel rows of configured senders on the standing workload, oldest first. */
@@ -371,8 +394,9 @@ function channelMessages(ledger: Ledger, config: ChannelConfig): MessageRow[] {
 }
 
 /**
- * D2 Consumed: at an `agent_start`, every channel message whose aside was injected (`channel-aside:`) and that is not
- * yet consumed moves to `consumed`, one legal step at a time: the observed-turn receipt. Returns the ids moved.
+ * D2 Consumed, the fold case: at an `agent_start`, every channel message whose aside was confirmed (`channel-aside:`)
+ * outside a turn and is not yet consumed moves to `consumed`, one legal step at a time: the observed-turn receipt.
+ * Returns the ids moved.
  */
 export function consumeAsides(ledger: Ledger, config: ChannelConfig): string[] {
 	const moved: string[] = [];
