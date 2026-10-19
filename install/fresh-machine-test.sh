@@ -17,7 +17,10 @@
 # config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx server,
 # from that file, with decoy servers planted in the default profile's mcp.json and ~/.claude.json
 # not among them; and the profile's sessions directory is a named ctx `pi` history root under that
-# HOME's ctx data root, registered once however often install runs (M8 ctx wiring).
+# HOME's ctx data root, registered once however often install runs (M8 ctx wiring). And the clone's
+# plugins/test/by-hand-session.test.ts passes: a real `as2 lane` by-hand session under a profile
+# rendered by the clone's installer gets prompt.md, reads the 3 vendored skills from the clone and is
+# offered each pair tool once, while a hand, an autonomous lane and the orchestrator get none.
 # Also proves the refusals: an unmanifested file or any symbolic link under a machinery
 # directory fails install; a wrong, missing or duplicated ledger-schema row fails install; a
 # profile whose includeSkills differs from the manifest fails install and writes no profile; a
@@ -386,6 +389,13 @@ else
 	printf '%s\n' "$reinstall_out" | grep -qF "==> note: ctx is not on PATH" || die "ctx is absent and install did not say the root was not registered"
 	ok "ctx is not on PATH here; install said the root was not registered"
 fi
+
+step "3f. the by-hand lane session: \`as2 lane\` under a freshly rendered profile gets its prompt, the 3 vendored skills and the pair tools (PLAN-2 D6, R12)"
+# plugins/test/by-hand-session.test.ts runs the clone's bin/as2 lane by-hand path, an autonomous lane and the orchestrator
+# with the installed omp against a local stub model, under a HOME it renders with the clone's install.sh. It never skips.
+(cd "$CLONE" && env -i PATH="$PATH" HOME="$FAKE_HOME" TMPDIR="$WORK" bun test plugins/test/by-hand-session.test.ts) \
+	|| die "plugins/test/by-hand-session.test.ts failed in the clone"
+ok "the by-hand lane session receives prompt.md, lists the manifest's skills, reads the 3 vendored skills from the clone and is offered each pair tool once; the hand, the autonomous lane and the orchestrator get none"
 
 step "4. inspect the installed ledger with raw sqlite3"
 printf 'user_version=%s journal_mode=%s tables=%s triggers=%s integrity=%s\n' \

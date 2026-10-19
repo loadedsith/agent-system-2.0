@@ -1342,6 +1342,7 @@ plugins/paired-coding/package.json	data	-
 plugins/paired-coding/server/binding.mjs	module	-
 plugins/paired-coding/server/pair-server.mjs	module	-
 plugins/paired-coding/skills/paired-coding/SKILL.md	skill	-
+plugins/test/by-hand-session.test.ts	test	-
 plugins/test/loader.test.ts	test	-
 plugins/test/omp-host.ts	test	-
 plugins/test/paired-coding.test.ts	test	-
