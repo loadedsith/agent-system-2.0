@@ -15,11 +15,12 @@
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { channelInForce, fromOtherAgents } from "./channel";
 import { needsYouBullet } from "./delivery";
-import { type ErrorLine, errorLines, parseDue } from "./errors";
+import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
-import { ceilingOf, ceilingText } from "./input";
+import { ceilingOf, ceilingText, openPairOffer } from "./input";
 import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
+import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
 import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
@@ -120,11 +121,14 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		out.push("open questions:");
 		// A multi-line body keeps its lines under the bullet, indented as errorLines indents them (PLAN wl-muq22rnjcfrrpc D8);
 		// the plan question's body starts on the line beneath its q- id, so its path sits right under the line naming it (PLAN wl-mv61a8dh4aeneo D2).
+		// A stored `pair` is not listed; a valid offer is its own line beneath the question (PLAN wl-mvb9mw00ycfjeo D4).
 		const entries = ledger.entries(workload.id);
 		const valid = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(workload.id)));
 		for (const q of openQuestions) {
 			const body = q.body.split("\n").join("\n  ");
-			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${q.options.join(" / ")}`);
+			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${shownOptions(q.options).join(" / ")}`);
+			const offer = openPairOffer(ledger, q);
+			if (offer) out.push(`  ${pairOfferLine(wordsOf(ledger, workload.id, valid), q.id, workload.id, offer.signals)}`);
 		}
 	}
 	if (pendingMessages.length > 0) {

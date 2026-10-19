@@ -20,7 +20,8 @@
 //    lane's artifact observer in surface/extensions/lane.ts and P-11 row 8 for a refused push).
 // 4. a lane died: a `lane-died:` message still `held` (not yet surfaced once), or a lapsed lease no
 //    such row records yet (the surface records it before rendering).
-// 5. a lane waiting on a human: every open `question`, with its options; and every unresolved
+// 5. a lane waiting on a human: every open `question`, with its options (a stored `pair` left out, PLAN
+//    wl-mvb9mw00ycfjeo D2); and every unresolved
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
@@ -33,7 +34,13 @@
 //    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
 //    lane ended on purpose — parked, completed, released — and nothing holds the work or asks for a
 //    word. No `lane-died:` row exists for it (an intended end writes none), so nothing else says so.
-//    Keyed by the exit entry, so it is delivered once per ending, not once per poll.
+//    Keyed by the exit entry, so it is delivered once per ending, not once per poll. On a user-driven
+//    workload it offers the by-hand command (`continue it with as2 lane wl-…`), never a relaunch.
+// Pair (PLAN wl-mvb9mw00ycfjeo D4, D5): an open question whose `pair` offer is valid (`openPairOffer`,
+// surface/src/input.ts) has its offer line (state `offer`, unnumbered, row id the question's) right
+// before its own line. A taken pair (`takenPair`) shows `you took pair on …` with `as2 lane wl-…` on a
+// line of its own (state `taken`, row id the question's) where the workload's idle line would be, and
+// the idle line is not emitted for it then.
 // Test run: the newest held `test-run-failed:` the test runner sent about a workload no lane holds
 // under a live lease (MIGRATION.md item 24, PLAN § 2.5), shown once: delivery consumes it, a lane
 // taking the workload hides it, a `test-run:` green written after it clears it.
@@ -57,19 +64,20 @@
 // after the answerable line of the target it names and carrying that target's number (numbering.ts's second pass), never
 // one of its own; a proposal whose target no longer waits has no target line, so it is not shown. Each recent
 // `channel-refused:` is one unnumbered line after the scratch lines (it takes no word).
-import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
+import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
-import { isCeilingQuestion } from "./input";
-import { type ControlEntry, type ControlPrefix, controlEntries, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
+import { isCeilingQuestion, openPairOffer } from "./input";
+import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
+import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "proposal" | "channel-refused";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "pair" | "proposal" | "channel-refused";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -111,6 +119,49 @@ export interface ErrorOptions {
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+/** The longest workload words a line carries (`wordsOf`). */
+const WORDS_MAX = 60;
+
+/** One line of plain text: no backticks, whitespace collapsed, no trailing punctuation. */
+export function plain(s: string): string {
+	return s.replace(/`/g, "").replace(/\s+/g, " ").trim().replace(/[\s.,;:!?]+$/, "");
+}
+
+/** `s` cut to `n` characters at most, `…` marking the cut. */
+export const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, Math.max(0, n - 1)).trimEnd()}…` : s);
+
+/** A workload's control entries as the plan-question and done readers want them (holders included). */
+export function controlOf(ledger: Ledger, workloadId: string, holder: string | null): ControlEntry[] {
+	const entries = ledger.entries(workloadId);
+	return controlEntries(entries, holdersOf(entries, holder, ledger.holders(workloadId)));
+}
+
+/** A workload as Jo reads it in a line: the newest `done:` line, else the brief's first line, else the id; plain and clipped. */
+export function wordsOf(ledger: Ledger, workloadId: string, control: readonly ControlEntry[] | null = null): string {
+	const w = ledger.workload(workloadId);
+	if (!w) return workloadId;
+	const done = doneLine(control ?? controlOf(ledger, workloadId, w.holder));
+	return clip(plain(done ?? w.brief.split("\n")[0] ?? "") || workloadId, WORDS_MAX);
+}
+
+/**
+ * D5 (PLAN wl-mvb9mw00ycfjeo): the pair Jo took on a workload, from its assumption entries oldest first, or null. The
+ * newest surface-stamped `pair-taken:` (`controlEntries`) names the question; the lane it stopped is the one named by the
+ * `lane-stop: <lane> requested mode-flip by jo` written right after it in the same transaction (none when no lane held a
+ * live lease: a later `lane-stop:` is never taken for it). Null when a `lane-started:` of any other lane came after it:
+ * that lane continues the work (the stopped lane's own late write does not count). The caller checks the mode and the lease.
+ */
+function takenPair(entries: readonly EntryRow[]): { questionId: string } | null {
+	const control = controlEntries(entries);
+	const i = control.findLastIndex((c) => c.prefix === "pair-taken");
+	const questionId = i < 0 ? null : pairTakenQuestion(control[i]!.rest);
+	if (questionId === null) return null;
+	const next = entries[entries.findIndex((e) => e.id === control[i]!.id) + 1];
+	const stop = next === undefined ? undefined : control.find((c) => c.id === next.id);
+	const stopped = stop?.prefix === "lane-stop" && stop.rest === "requested mode-flip by jo" ? stop.laneId : null;
+	return control.slice(i + 1).some((c) => c.prefix === "lane-started" && c.laneId !== stopped) ? null : { questionId };
+}
 
 /** Hours between two ISO timestamps, unrounded. */
 export function hoursElapsed(from: string, to: string): number {
@@ -395,16 +446,22 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		if (unrecordedLapse(ledger, workload, now) && !trainRouted(windows, workload.holder_lease_until!, deathTimes)) {
 			died.push({ kind: "lane-died", workloadId: wl, rowId: wl, state: `${workload.holder}@${workload.holder_lease_until}`, line: `lane ${workload.holder} on ${label} died: lease lapsed ${workload.holder_lease_until}, ${workload.open_slices} open slice(s)` });
 		}
+		// D5: a taken pair, whatever else is open, while the workload is user-driven and no lane holds it under a live lease.
+		const laneLive = workload.holder?.startsWith("lane-") === true && (workload.holder_lease_until === null || workload.holder_lease_until >= now);
+		const taken = wl !== STANDING_WORKLOAD_ID && workload.mode === "user-driven" && !laneLive ? takenPair(ledger.entries(wl, "assumption")) : null;
+		if (taken) idle.push({ kind: "pair", workloadId: wl, rowId: taken.questionId, state: "taken", line: pairTakenLine(wordsOf(ledger, wl), taken.questionId, wl) });
 		let control: ControlEntry[] = [];
 		if (openQuestions.length > 0) {
 			const entries = ledger.entries(wl);
 			control = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl)));
-		} else if (wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !requests.some((r) => r.state.kind === "waiting")) {
+		} else if (!taken && wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !requests.some((r) => r.state.kind === "waiting")) {
 			// Item 68: no holder, no question, no reserved request — only an intended lane-exit: as the newest
 			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
 			// still the holder and is the lane-died line's; `lane-exit:` needs no holder list to validate.
+			// A user-driven workload has no relaunch: the line names the by-hand command (PLAN wl-mvb9mw00ycfjeo D5).
 			const ended = idleExit(controlEntries(ledger.entries(wl)));
-			if (ended && !trainRouted(windows, ended.createdAt)) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; relaunch, close, or instruct` });
+			const next = workload.mode === "user-driven" ? `continue it with ${byHandLine(wl)}, close, or instruct` : "relaunch, close, or instruct";
+			if (ended && !trainRouted(windows, ended.createdAt)) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
 		}
 		for (const q of openQuestions) {
 			if (wl === STANDING_WORKLOAD_ID) {
@@ -413,6 +470,9 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
+			// D4: a valid pair offer is its own line, right before its question's; the question lists its options less `pair` (D2).
+			const offer = openPairOffer(ledger, q);
+			if (offer) questions.push({ kind: "pair", workloadId: wl, rowId: q.id, state: "offer", line: pairOfferLine(wordsOf(ledger, wl, control), q.id, wl, offer.signals) });
 			const body = isPlanQuestionIn(control, q) ? `\n  ${q.body.split("\n").join("\n  ")}` : ` ${short(q.body, 120)}`;
 			// The stop at 100 % (PLAN wl-mv5msri070p0qo D3): the workload's newest lane-stop: accepted the ceiling at or after the question; a new state, so it is delivered again.
 			const stop = control.filter((c) => c.prefix === "lane-stop").at(-1);
@@ -425,7 +485,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			const state = stopped ? "stopped" : step ? `loud-${loud}` : null;
 			questions.push({
 				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
-				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
+				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${shownOptions(q.options).join(" / ")} (or \`withdraw\`)${stopped ? "; the lane stopped at the ceiling" : ""}`,
 			});
 		}
 		for (const w of openPromptWaits(ledger, wl)) {
