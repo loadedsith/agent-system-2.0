@@ -13,6 +13,7 @@ ledger/SCHEMA.md	doc	-
 ledger/schema.sql	ledger-schema	{ledger_db}
 ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
+ledger/src/authority.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
 ledger/test/facts.test.ts	test	-
