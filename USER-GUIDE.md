@@ -114,6 +114,26 @@ With one open workload the word applies to it. With several, add the id: `produc
   - `parallel`: `order`, plus a second lane may start beside a running one only when the two are in different git repositories, the remaining ceilings fit in `--budget` (0 or unset: no parallel start) and the merge order is clear. Anything unclear holds. Work in the same repository stays serial, because nothing yet declares and enforces which files a lane may write. No priority pause.
 - **Priority pause** (`order` only, and only for a workload you ruled): when every lane slot is full and a workload you ruled is waiting, the lowest-ranked running autonomous workload below it is stopped at its next poll to make room. Its line shows `priority-pausing for <X>`, then `priority-paused for <X> (relaunches when a slot reaches it)`. It relaunches by itself, resuming its session, once nothing ranked above it is waiting. It is never a *needs you* line: there is nothing for you to do. A Jev-only difference never pauses a running lane, an interactive lane is never paused, and a workload stopped at its ceiling is not priority-paused (raising its ceiling is still your word).
 
+### Intake queue
+
+- **When an ask queues:** a workload is *started but idle* when it is open, has had a launch attempt or a slice, and no lane holds it now (the standing workload and scheduled `due:` rows never count). While more of those exist than there are lane slots (`AGENT_SYSTEM_MAX_LANES`, default 3), a new ask is still opened, with its `done:`, repository, ceiling and Jev ask, but it goes into the intake queue instead of taking a slot. Ilex tells you `queued, position N`; the open result reads `queued, position N of M (rank order; moves as ranks change)`, or `queued, then started at once: …` when a slot took it during the open.
+- **Queue order is the rank order:** the Jev ranking above, filtered to queued workloads (your pins first, then Jev score, then unscored oldest first). No second score. The wake line and the one-liner carry `queued #N of M`; it is never a *needs you* line, since a queued ask waits by design.
+- **When a slot frees,** the top of the queue that can launch takes it, in every `rank-mode` (`show` included). Two free slots take the top two. A lower queued workload waits behind a higher one that can launch. The first launch attempt of any kind ends the queued state and the tag.
+- **`intake` on the open tool:** omitted, the cap rule above decides. `intake: "queue"` queues the ask whatever the count; while your flow-repair ruling (in-mvfiztvfi7ez28) stands, Ilex passes it for every ask that is not one of the flow fixes you named. `intake: "now"` opens past the cap only with the input id of your own words granting the exception, spent once; without one nothing is opened.
+- **Your word is never queued:** your launch word (`orchestrator_launch_lane`) and `as2 lane wl-…` start a queued workload at once and end its queued state.
+- **User-driven asks:** a queued user-driven ask keeps its place in the list, so you see it ranked, but never takes a lane slot. It leaves the queue when you run `as2 lane wl-…`, or when you flip it to autonomous (then it waits as an autonomous queued ask).
+- **Your flow signal is unchanged:** a queued ask stays a `status='open'` workload, so ROOT-CAUSE signal 2's open-workload count still counts it. The queue does not make that signal greener; only finished work does. The queued count is a separate, read-only read:
+
+  ```sh
+  sqlite3 -readonly "${AGENT_SYSTEM_LEDGER_DB:-$HOME/.agent-system-2/ledger.db}" "
+    SELECT count(*) AS queued FROM workloads w WHERE w.status = 'open' AND EXISTS (
+      SELECT 1 FROM entries q WHERE q.workload_id = w.id AND q.kind = 'assumption'
+        AND q.created_by = 'orchestrator-surface' AND q.body GLOB 'queued: *'
+        AND NOT EXISTS (SELECT 1 FROM entries l WHERE l.workload_id = w.id AND l.kind = 'assumption'
+          AND l.created_by = 'lane-starter' AND l.body GLOB 'launch: *'
+          AND (l.created_at > q.created_at OR (l.created_at = q.created_at AND l.rowid > q.rowid))));"
+  ```
+
 ## 4. Read the screen
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then the `Rank (Jev, …): …` line (section 3, Jev ranking), then `## open workloads` with one line per open workload: id, the brief's first line, the one-liner, the lane, slice counts, its `#n` needs-you numbers, open question ids and unread message count. Each ranked workload's line also carries `rank #n`, with `ruled` when you ruled it (scheduled `due:` rows have none), and a workload stopped for a higher one shows `priority-pausing for <X>` or `priority-paused for <X> (relaunches when a slot reaches it)`. A workload's full block comes from `orchestrator_ledger` with `workload: wl-…` (with no workload it renders every block).

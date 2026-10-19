@@ -16,10 +16,11 @@ import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
 import { ceilingOf, ceilingText, openPairOffer } from "./input";
-import { byHandLine, type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst, priorityPausedOf, priorityPausingOf } from "./launch";
+import { byHandLine, type ControlEntry, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst, priorityPausedOf, priorityPausingOf, queuedOf } from "./launch";
 import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
 import { currentGoals, livePins, parseAudit, rankDay, rankOpen, rankPosition } from "./rank";
+import { queuePosition } from "./rank-launch";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -52,6 +53,7 @@ export interface Rendered {
 
 /**
  * `stakes: normal (default …) · mode: autonomous` — one line, both halves flippable in one word; `plan first: …` when the flag stands (decision 15);
+ * `queued #N of M` while the workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D8, N from `queuePosition`);
  * the effective ceiling last (DESIGN-workload-ceiling.md § 2 item 5).
  */
 export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
@@ -59,7 +61,7 @@ export function oneLiner(ledger: Ledger, workload: WorkloadStatusRow): string {
 	return `${p.state} — flip either with one word: throwaway / normal / production, autonomous / user-driven · ceiling ${p.ceiling}`;
 }
 
-/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …] · ceiling $A / Bh` (a "which one?" candidate, surface/extensions/surface-input.ts). */
+/** The one-liner without its flip hint: `stakes: X · mode: Y[ · plan first: …][ · queued #N of M] · ceiling $A / Bh` (the wake line's core, and a "which one?" candidate, surface/extensions/surface-input.ts). */
 export function oneLinerCore(ledger: Ledger, workload: WorkloadStatusRow): string {
 	const p = oneLinerParts(ledger, workload);
 	return `${p.state} · ceiling ${p.ceiling}`;
@@ -72,9 +74,13 @@ function oneLinerParts(ledger: Ledger, workload: WorkloadStatusRow): { state: st
 	const lastEffective = effective[effective.length - 1];
 	const pending = lastFlip && lastFlip.body === workload.mode && !(lastEffective && lastEffective.body === workload.mode && lastEffective.created_at >= lastFlip.created_at);
 	const mode = pending ? `${workload.mode} (flip pending until the lane's tool policy matches)` : workload.mode;
-	const plan = planFirst(controlEntries(ledger.entries(workload.id, "assumption")));
+	const control = controlEntries(ledger.entries(workload.id, "assumption"));
+	const plan = planFirst(control);
 	const planPart = plan ? ` · plan first: ${plan.trigger}` : "";
-	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
+	// D8: the queue tag ends with the first launch attempt (`queuedOf`); never a needs-you line, a queued ask waits by design.
+	const queued = queuedOf(control) !== null ? queuePosition(ledger, workload.id, ledger.now()) : null;
+	const queuedPart = queued ? ` · queued #${queued.position} of ${queued.of}` : "";
+	return { state: `stakes: ${workload.stakes} · mode: ${mode}${planPart}${queuedPart}`, ceiling: ceilingText(ceilingOf(ledger, workload.id)) };
 }
 
 const when = (iso: string): string => iso.replace(/\.\d{3}Z$/, "Z");
