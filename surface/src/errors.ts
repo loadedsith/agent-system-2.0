@@ -43,6 +43,10 @@
 // is an over-cap one, and the standing workload whose newest `scratch-disk:` / `scratch-disk-ok:` by the daily sweep
 // (surface/scripts/scratch-sweep.ts) is a `scratch-disk:`. Advisory: nothing is refused for size; keyed by the entry,
 // so delivered once per crossing, and gone when the clearing entry is written.
+// Report (PLAN wl-mvbcjageg7o2yo § 2.6): on the standing workload, the newest valid `daily-report:` entry (writer DAILY_REPORT_BY,
+// surface/scripts/daily-report.ts) as one line while it is under REPORT_FRESH_HOURS old, keyed by its entry id, so the next day's
+// replaces it; from REPORT_FRESH_HOURS to REPORT_MISSED_DAYS old a `missed` line (a new state, delivered again), only while the job's
+// plist is installed (`reportJobInstalled`); past that, or with no entry at all, nothing. Older entries never render.
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
 // intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
@@ -52,6 +56,9 @@
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion } from "./input";
@@ -62,7 +69,19 @@ import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch";
+/** The daily report's launchd label (install/com.agent-system-2.daily-report.plist). */
+export const DAILY_REPORT_LABEL = "com.agent-system-2.daily-report";
+/** A report entry younger than this renders as the report line: two 07:00 runs across a DST change are 25 h apart, plus the run. */
+export const REPORT_FRESH_HOURS = 30;
+/** A report entry older than REPORT_FRESH_HOURS and younger than this renders as the missed line; older, nothing. */
+export const REPORT_MISSED_DAYS = 7;
+
+/** Whether the daily report's job is installed: its plist under `<home>/Library/LaunchAgents`. */
+export function reportPlistInstalled(home: string = homedir()): boolean {
+	return existsSync(join(home, "Library", "LaunchAgents", `${DAILY_REPORT_LABEL}.plist`));
+}
+
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "report";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -99,6 +118,8 @@ export interface ErrorLine {
 export interface ErrorOptions {
 	now?: string;
 	holdHours?: number;
+	/** Whether the daily report's job is installed (the missed line needs it); default `reportPlistInstalled()`. Called only when an entry is missed. */
+	reportJobInstalled?: () => boolean;
 }
 
 const short = (s: string, n = 90): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -337,7 +358,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines. */
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines, then the daily report's line. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -350,6 +371,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
 	const scratch: ErrorLine[] = [];
+	const report: ErrorLine[] = [];
 	const taskWindows = trainTaskWindows(ledger);
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
 		const windows = taskWindows.get(workload.id) ?? [];
@@ -426,8 +448,19 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 		if (wl === STANDING_WORKLOAD_ID) {
-			const disk = openScratchEntry(controlEntries(ledger.entries(wl, "assumption")), "scratch-disk", "scratch-disk-ok");
+			const control = controlEntries(ledger.entries(wl, "assumption"));
+			const disk = openScratchEntry(control, "scratch-disk", "scratch-disk-ok");
 			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
+			const newest = control.findLast((c) => c.prefix === "daily-report" && /^\d{4}-\d{2}-\d{2}\s/.test(c.rest));
+			const age = newest ? hoursElapsed(newest.createdAt, now) : Number.POSITIVE_INFINITY;
+			if (newest && age < REPORT_FRESH_HOURS) {
+				report.push({ kind: "report", workloadId: wl, rowId: newest.id, line: `daily self-heal report ${newest.rest}` });
+			} else if (newest && age < REPORT_MISSED_DAYS * 24 && (opts.reportJobInstalled ?? reportPlistInstalled)()) {
+				report.push({
+					kind: "report", workloadId: wl, rowId: newest.id, state: "missed",
+					line: `daily self-heal report missed: the newest is ${newest.rest.slice(0, 10)} (${hoursBetween(newest.createdAt, now)} h); check ${DAILY_REPORT_LABEL}`,
+				});
+			}
 		} else {
 			const entries = ledger.entries(wl, "assumption");
 			// The holders are read only when there is an over-cap line to validate.
@@ -437,5 +470,5 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due, ...scratch];
+	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due, ...scratch, ...report];
 }
