@@ -572,3 +572,26 @@ describe("output and the CLI", () => {
 		expect(invariants).toEqual(["dead-lane", "orphan-hand", "provider-refusal-loop", "stale-reserved", "stuck-question"]);
 	});
 });
+
+describe("ruling-miss (PLAN wl-mvfkv7llkp7nk0 § 1, R5)", () => {
+	test("a question an active ruling covers, raised past askJo after the rulings were built, is a finding; one no ruling covers, or raised before, is not", () => {
+		let now = "2026-10-18T12:00:00.000Z";
+		const path = join(mkdtempSync(join(tmpdir(), "inv-ruling-")), "ledger.db");
+		const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false, clock: () => now });
+		const wl = ledger.openWorkload({ by: "surface", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = () => ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Open the docs workload now?", options: ["open", "later"] });
+		now = "2026-10-20T12:00:00.000Z";
+		const missed = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Open the docs workload now?", options: ["open", "later"] });
+		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Ship it?", options: ["ship", "hold"] });
+		ledger.close();
+		const db = new Database(path, { readonly: true });
+		const noProbe: Probe<never> = { skipped: "not run" };
+		const r = check({ db, asOf: "2026-10-20T12:05:00.000Z", replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 } });
+		const misses = r.findings.filter((f) => f.invariant === "ruling-miss");
+		expect(misses.map((f) => [f.key, f.workload])).toEqual([[`ruling-miss:${missed}`, wl]]);
+		expect(misses[0]!.text).toContain("flow-repair");
+		expect(misses.some((f) => f.key.endsWith(before))).toBe(false);
+		db.close();
+	});
+});

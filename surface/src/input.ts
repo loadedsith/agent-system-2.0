@@ -83,9 +83,15 @@
 // alone and `train <q-…>`; every other `train …` line is the command or `refused`, never prose. A train word inside a
 // numbered batch is refused (`trainInBatch`). Jo's `skip` on a question on a train slice of PR n cancels that PR's open
 // train slices in the answer's transaction, keeping open one whose test run is live (`trainSkipClose`).
+//
+// Ending a standing ruling at once (PLAN wl-mvfkv7llkp7nk0 § 1, gates/src/rulings.ts): `end-ruling <ruling-id>` writes Jo's
+// instruction `end-ruling <id>` on the standing workload, which `endedRulings` reads, so every later question of that
+// ruling's kind goes to Jo again. One token, never an option word; an id `STANDING_RULINGS` does not hold, or a ruling
+// already ended, is `refused` with the reason, never prose.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
+import { END_RULING_WORD, endedRulings, endRulingBody, isRulingId, type RulingId, STANDING_RULINGS } from "../../gates/src/rulings";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
 	countRounds, effectiveRoundLimit, type FindingKind, type Findings, parseReviewLimit, REVIEW_ROUND_DEFAULTS, reviewLoopEndBody,
@@ -103,6 +109,7 @@ import {
 } from "./launch";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
+import { ensureStandingWorkload } from "./identity";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferLine, pairOfferStamp, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
 import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
@@ -133,6 +140,8 @@ export type Command =
 	| { kind: "train"; prs: number[] }
 	/** `train <wl-…> <N…>`: Jo adds these PRs to the open merge train `workloadId`. */
 	| { kind: "train-append"; workloadId: string; prs: number[] }
+	/** `end-ruling <ruling-id>`: Jo ends one standing ruling at once (gates/src/rulings.ts). */
+	| { kind: "end-ruling"; ruling: RulingId }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -183,6 +192,7 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	// One token each (D1, D2), so neither is ever read as an option word: `cancel` stays the plan question's.
 	if (word === "cancel-slice") return cancelSliceCommand(ledger, words.slice(1), heartbeatOf);
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
+	if (word === END_RULING_WORD) return endRulingCommand(ledger, words.slice(1));
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
 	// The command or `refused` at any length, except `train` alone and `train <q-…>`, which fall through to the answer path.
@@ -452,7 +462,7 @@ function looseWorkloadPair(text: string): boolean {
 	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!) && !ANSWER_ID.test(words[1]!);
 }
 
-/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels or the workload it supersedes; else null. */
+/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels, the workload it supersedes or the ruling it ends; else null. */
 function resolves(cmd: Command): string | null {
 	switch (cmd.kind) {
 		case "answer":
@@ -464,6 +474,8 @@ function resolves(cmd: Command): string | null {
 			return cmd.sliceId;
 		case "supersede":
 			return cmd.workloadId;
+		case "end-ruling":
+			return cmd.ruling;
 		default:
 			return null;
 	}
@@ -547,7 +559,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		const id = resolves(cmd);
 		if (id === null) return null;
 		if (first[id] !== undefined) {
-			const done = cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : "answered";
+			const done =
+				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "end-ruling" ? "ended" : "answered";
 			return `${id} is already ${done} on ${first[id]}; once per row`;
 		}
 		first[id] = where;
@@ -801,6 +814,20 @@ function supersedeCommand(ledger: Ledger, rest: readonly string[]): Command {
 	const [a, b] = rest as [string, string];
 	const why = supersedeRefusal(ledger, a, b);
 	return why === null ? { kind: "supersede", workloadId: a, by: b } : { kind: "refused", why };
+}
+
+/** Why `end-ruling <id>` cannot apply, or null: the id names a standing ruling Jo has not ended. `apply` checks it again. */
+function endRulingRefusal(ledger: Ledger, id: string): string | null {
+	if (!isRulingId(id)) return `${id} is no standing ruling (${STANDING_RULINGS.map((r) => r.id).join(", ")})`;
+	return endedRulings(ledger.instructions(STANDING_WORKLOAD_ID)).has(id) ? `the ruling ${id} is already ended` : null;
+}
+
+/** `end-ruling <ruling-id>` after the word: one id, `endRulingRefusal` clear; anything else is `refused` with the reason, never prose. */
+function endRulingCommand(ledger: Ledger, rest: readonly string[]): Command {
+	if (rest.length !== 1) return { kind: "refused", why: `end-ruling names one ruling: end-ruling <${STANDING_RULINGS.map((r) => r.id).join(" | ")}>` };
+	const id = rest[0]!.toLowerCase();
+	const why = endRulingRefusal(ledger, id);
+	return why === null ? { kind: "end-ruling", ruling: id as RulingId } : { kind: "refused", why };
 }
 
 /**
@@ -1264,6 +1291,16 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 					relaunch = "; no lane holds it live, so a relaunch is requested";
 				}
 				return `added ${cmd.prs.map((n) => `#${n}`).join(", ")} to merge train ${cmd.workloadId} (instruction ${id}); order ${trainPrs(ledger.entries(cmd.workloadId), ledger.instructions(cmd.workloadId)).join(", ")}${relaunch}`;
+			});
+		}
+		case "end-ruling": {
+			// Jo's instruction on the standing workload is the end (`endedRulings`); nothing else is written.
+			return ledger.write(() => {
+				const why = endRulingRefusal(ledger, cmd.ruling);
+				if (why !== null) throw new Error(why);
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: endRulingBody(cmd.ruling) });
+				return `Jo's ruling ${cmd.ruling} is ended (instruction ${id}); its questions go to you again`;
 			});
 		}
 		case "ambiguous":

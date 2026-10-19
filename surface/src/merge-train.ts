@@ -15,6 +15,7 @@
 // and wakes a train only when it is `actionable`; `trainTaskWindows` feeds surface/src/errors.ts `trainRouted`.
 import { type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainFix, prBindingInstructionBody, prBindings, type TrainFix, trainFixBody } from "./launch";
 import { type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
+import { askJo, raisedId } from "../../gates/src/rulings";
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
 import { ownerRepoOf, pushDestBody, SETTLING_VERDICTS, SHA_RE, testRuns } from "./test-run";
@@ -1098,7 +1099,9 @@ export function forkTaskAlert(ledger: Ledger, t: TrainTask, view: TaskView, repo
 		ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: t.train, kind: "assumption", body: trainTaskSettledBody(t.id, "failed", `fork ${fork}: no workload can push to ${view.headRefName}`) });
 		const sl = ensurePrSlice(ledger, t.train, t.pr);
 		if (openRetryQuestion(ledger, t.train, t.pr)) return null;
-		return ledger.raiseQuestion({ by: MERGE_TRAIN_BY, workloadId: t.train, sliceId: sl, body: trainForkQuestionBody(t, fork, view.headRefName), options: [...TRAIN_RETRY_OPTIONS] });
+		// PLAN wl-mvfkv7llkp7nk0 § 1: every raise goes through the standing rulings; none covers a train question.
+		const body = trainForkQuestionBody(t, fork, view.headRefName);
+		return raisedId(askJo(ledger, { by: MERGE_TRAIN_BY, workloadId: t.train, sliceId: sl, body, options: [...TRAIN_RETRY_OPTIONS] }, { asker: "train" }), `the fork question of PR #${t.pr}`);
 	});
 }
 
@@ -1303,6 +1306,7 @@ export function raiseTwiceFailed(ledger: Ledger, wl: string, d: TwiceFailed): st
 	return ledger.write(() => {
 		if (!twiceFailed(ledger, wl).some((x) => x.task.id === d.task.id)) return null;
 		const sl = ensurePrSlice(ledger, wl, d.pr);
-		return ledger.raiseQuestion({ by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: trainRetryQuestionBody(wl, d), options: [...TRAIN_RETRY_OPTIONS] });
+		const asked = askJo(ledger, { by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: trainRetryQuestionBody(wl, d), options: [...TRAIN_RETRY_OPTIONS] }, { asker: "train" });
+		return raisedId(asked, `the retry question of PR #${d.pr}`);
 	});
 }

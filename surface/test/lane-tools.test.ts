@@ -248,6 +248,70 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 	});
 });
 
+describe("lane_raise_question through Jo's standing rulings (PLAN wl-mvfkv7llkp7nk0 § 1, R1–R3)", () => {
+	// Inside the Kimi-out window, on the clock askJo reads.
+	const IN_WINDOW = new Date("2026-10-20T12:00:00-07:00");
+	const applied = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("ruling-applied:")).map((e) => [e.body, e.created_by]);
+
+	test("a question a ruling decides writes no question row, keeps the slice open, records the lane's ruling-applied entry and returns the decided text", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const reply = await call("lane_raise_question", { slice: sl, body: "Open the docs workload now or later?", options: ["open", "later"] });
+		expect(reply).toStartWith("decided by Jo's ruling flow-repair: queue it and tell Jo `queued, position N`");
+		expect(reply).toContain("no question was raised; do not publish a QUESTION block");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.slice(sl)!.state).toBe("open");
+		expect(applied(ledger, wl)).toEqual([[`ruling-applied: flow-repair kind open-workload slice ${sl} answer later`, "lane-t-1"]]);
+	});
+
+	test("merges: a normal-stakes lane's merge question is decided; a production lane's is raised", async () => {
+		const normal = laneFixture();
+		const sl = normal.ledger.addSlice({ by: "lane-t-1", workloadId: normal.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await normal.call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("decided by Jo's ruling merges");
+		expect(normal.ledger.questions(normal.wl)).toEqual([]);
+
+		const prod = laneFixture();
+		prod.ledger.setStakes(prod.wl, { by: SURFACE_BY, stakes: "production" });
+		const sp = prod.ledger.addSlice({ by: "lane-t-1", workloadId: prod.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await prod.call("lane_raise_question", { slice: sp, body: "PR #4 is green; merge it?", options: ["merge", "wait"] })).toContain("Raised question");
+		expect(applied(prod.ledger, prod.wl)).toEqual([]);
+	});
+
+	test("kimi-out: a same-lab question is decided in the window when the builders are known and exclude Kimi; with a Kimi builder it is raised", async () => {
+		setSystemTime(IN_WINDOW);
+		const ok = laneFixture();
+		ok.ledger.recordEntry({ by: "lane-t-1", workloadId: ok.wl, kind: "assumption", body: laneBuilderBody("anthropic", "lane-t-1", LANE_MODEL) });
+		const sl = ok.ledger.addSlice({ by: "lane-t-1", workloadId: ok.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await ok.call("lane_raise_question", { slice: sl, body: "Kimi is out; review same-lab?", options: [...PARK_OPTIONS] })).toContain("decided by Jo's ruling kimi-out: re-dispatch the review");
+		expect(ok.ledger.questions(ok.wl)).toEqual([]);
+
+		const kimi = laneFixture();
+		kimi.ledger.recordEntry({ by: "lane-t-1", workloadId: kimi.wl, kind: "assumption", body: laneBuilderBody("kimi", "lane-t-1", "moonshot/kimi-k3") });
+		const sk = kimi.ledger.addSlice({ by: "lane-t-1", workloadId: kimi.wl, task: "t", doneCondition: "d", inputs: "i" });
+		expect(await kimi.call("lane_raise_question", { slice: sk, body: "Kimi is out; review same-lab?", options: [...PARK_OPTIONS] })).toContain("Raised question");
+	});
+
+	test("a model question declares its subject: refused without one, decided as a lane-model question with it", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const options = [LANE_MODEL, "openai-codex/gpt-6.1-sol"];
+		expect(await call("lane_raise_question", { slice: sl, body: "Which model should this lane run on?", options })).toContain("declare `subject`");
+		expect(await call("lane_raise_question", { slice: sl, body: "Ship?", options: ["ship", "hold"], subject: "lane-model" })).toContain("only when every option");
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(await call("lane_raise_question", { slice: sl, body: "Which model should this lane run on?", options, subject: "lane-model" })).toContain(
+			`decided by Jo's ruling models: run the lane on ${LANE_MODEL}`,
+		);
+		expect(ledger.questions(wl)).toEqual([]);
+	});
+
+	test("a lane cannot forge ruling-applied: through lane_record_entry", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_record_entry", { body: "ruling-applied: merges kind merge slice sl-x answer train" })).toContain("`ruling-applied:` is written only when a standing ruling decides");
+		expect(ledger.entries(wl).length).toBe(before);
+	});
+});
+
 describe("lane_full_test (PLAN wl-muraerdsgw7gn4 § 2.1, § 4)", () => {
 	const REPO = join(import.meta.dir, "..", "..");
 	const LINE = "test-run tr-0abc1234wxyz runner 4242 sha " + "a".repeat(40) + " slice sl-full-x-1 log /runs/tr-0abc1234wxyz/runner.log";

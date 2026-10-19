@@ -21,14 +21,17 @@
 // (PLAN wl-mv5i3lulwwbbi8 D4). The plan question's check also reads the plan file once, at raise time:
 // its `## Requirements` section names each requirement's enforcer or says prompt-only, and the body's
 // `prompt-only:` lines list exactly the prompt-only ids (PLAN wl-mv8vwb04cy18n4 D1-D3); questions
-// already raised are never re-checked.
+// already raised are never re-checked. Every question goes through Jo's standing rulings (gates/src/rulings.ts `askJo`,
+// PLAN wl-mvfkv7llkp7nk0 § 1): one a ruling decides writes no question row, records the lane's `ruling-applied:` and
+// returns what to do instead; a question whose every option is a `provider/model` id declares its `subject`.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
 // `lane_record_entry` refuses the classifier's lines as well (`CLASSIFIER_MACHINERY_PREFIXES`: `hand-spawn:`,
 // `review-round:`, the same-lab and Kimi-out lines `review-same-lab:`, `review-same-lab-rule:`, `provider-refused:`
 // and the rest; PLAN wl-mv64rsqw2fcs1s D5, PLAN wl-mv5xay6bjp0268 § 2.6), so a lane cannot forge a settle or a round
-// verdict, grant itself same-lab or manufacture Kimi-out evidence.
+// verdict, grant itself same-lab or manufacture Kimi-out evidence; and it refuses `ruling-applied:`, which only
+// `askJo` writes, so a lane cannot claim a ruling decided a question it never asked.
 // `lane_full_test` asks the test runner (MIGRATION.md item 24; PLAN wl-muraerdsgw7gn4 § 2.1, § 4) to
 // run the suite outside the fence at a PR head: the lane names a PR and optionally an open slice,
 // nothing else, and the installed starter does the rest. A slice the runner was asked to settle is
@@ -43,6 +46,7 @@ import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
 } from "../../classifier/src/lab";
 import { countRounds, parseReviewLimit } from "../../classifier/src/rounds";
+import { type AskResult, askJo, decidedText, installedReviewModel, MODEL_SUBJECTS, type ModelSubject, RULING_APPLIED_PREFIX, subjectProblem } from "../../gates/src/rulings";
 import { gateSession } from "../../gates/src/session";
 import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
@@ -52,7 +56,7 @@ import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
 	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planFirst, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
-import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind } from "../src/merge-train";
+import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs } from "../src/merge-train";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
@@ -323,11 +327,17 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"1 to 3 `tradeoff: <one line>` lines; one `review: <verdict>, <model>, <absolute path to the verdict file>` line. " +
 			`The plan file carries one \`${PLAN_REQUIREMENTS_HEADING}\` section in this grammar:\n${PLAN_REQUIREMENTS_SHAPE}\n` +
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
-			"Until the plan is approved, a question offering approve on any other slice is refused.",
+			"Until the plan is approved, a question offering approve on any other slice is refused. " +
+			"Jo's standing rulings are checked first: a question one of them already answers is not raised, and the tool returns the ruling and what to do instead. " +
+			"When every option is a provider/model id, `subject` says what the model is for (lane-model or review-model); otherwise it is left out.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
 			options: z.array(z.string()).describe("At least two answers Jo can give in one word each."),
+			subject: z
+				.enum(MODEL_SUBJECTS)
+				.optional()
+				.describe("Required when every option is a provider/model id: lane-model (the model a lane runs on) or review-model (the model a review runs on)."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -397,11 +407,27 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				}
 			}
 			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
-			const id = ledger.write(() => {
-				const q = ledger.raiseQuestion({ by: o.own.laneId, workloadId, sliceId: slice, body, options });
-				if (plan) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(q) });
-				return q;
+			// PLAN wl-mvfkv7llkp7nk0 § 1: the standing rulings are checked first; a decided question writes no question row.
+			const subject = typeof params.subject === "string" && params.subject !== "" ? (params.subject as ModelSubject) : null;
+			const subjectWrong = subjectProblem(options, subject);
+			if (subjectWrong !== null) return text(`${subjectWrong}; nothing was asked.`);
+			const asked: AskResult = ledger.write(() => {
+				const r = askJo(
+					ledger,
+					{ by: o.own.laneId, workloadId, sliceId: slice, body, options, subject },
+					{
+						asker: "lane",
+						builders: builderLabs(ledger, workloadId),
+						stakes: o.own.workload.stakes,
+						train: trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0,
+						reviewModel: () => installedReviewModel(env),
+					},
+				);
+				if (plan && "raised" in r) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(r.raised) });
+				return r;
 			});
+			if ("decided" in asked) return text(`${decidedText(asked.decided)}.`, { ruling: asked.decided.ruling, answer: asked.decided.answer });
+			const id = asked.raised;
 			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });
 		},
 	});
@@ -429,6 +455,9 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const machinery = /^([a-z-]+):/.exec(body)?.[1];
 			if (machinery !== undefined && (CLASSIFIER_MACHINERY_PREFIXES as readonly string[]).includes(machinery)) {
 				return text(`A body opening with \`${machinery}:\` is a reserved control line the classifier writes; nothing was recorded. Say it in plain words.`);
+			}
+			if (machinery === RULING_APPLIED_PREFIX) {
+				return text(`A body opening with \`${RULING_APPLIED_PREFIX}:\` is written only when a standing ruling decides a raised question; nothing was recorded. Say it in plain words.`);
 			}
 			const signal = runnerSignal(body, "recorded");
 			if (signal) return signal;

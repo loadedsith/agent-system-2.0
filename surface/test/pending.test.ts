@@ -66,7 +66,7 @@ function fixture() {
 	const p = planQuestion(ledger, planBody("approve-with-changes"));
 	c.plusHours(1);
 	ensureStandingWorkload(ledger);
-	const qOrch = raiseOrchestratorQuestion(ledger, { body: "Merge #12 now or wait for the smoke run?", options: ["merge", "wait"], about: a.wl });
+	const qOrch = raiseOrchestratorQuestion(ledger, { body: "Merge #12 now or wait for the smoke run?", options: ["merge", "wait"], about: a.wl }).raised;
 	return { c, ledger, a, en, qPlain, qMarked, qCeiling, p, qOrch };
 }
 
@@ -278,7 +278,7 @@ describe("pending: which rows are covered", () => {
 		const { ledger } = tempLedger();
 		const standing = ensureStandingWorkload(ledger);
 		expect(standing).toBe(STANDING_WORKLOAD_ID);
-		const bare = raiseOrchestratorQuestion(ledger, { body: "Ship it?", options: ["ship", "hold"], about: null });
+		const bare = raiseOrchestratorQuestion(ledger, { body: "Ship it?", options: ["ship", "hold"], about: null }).raised;
 		const unbound = ledger.recordEntry({ by: "lane-4242", workloadId: standing, kind: "reserved-request", body: "deploy: fly deploy (P-11 row 6 refused tool call c1)" });
 		// a closed workload: its question answered, its slice done, a request still unanswered when it closed
 		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed one", stakes: "normal", mode: "autonomous" });
