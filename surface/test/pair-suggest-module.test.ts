@@ -11,9 +11,10 @@
 //       Ungated, no jev, no switch: A (from the workload's review rounds), B (with D2's +1), C only with another, over
 //       the rows written at or before `at` (D8).
 //   pairOffer(ledger: Ledger, workloadId: string, site: "round-limit" | "ceiling", ctx: { config: unknown; count?: RoundCount }):
-//       { line: string; signals: string[] } | null
+//       { signals: string[] } | null
 //       Gated by the switch, throwaway stakes and the autonomous mode; A from `ctx.count` at the round-limit site only;
-//       E / D1 from classifier-stamped `pair-signal:` entries at 0.70; D5's caps over `pair-offer:` entries; the D6 line.
+//       E / D1 from classifier-stamped `pair-signal:` entries at 0.70; D5's caps over `pair-offer:` entries. The offer
+//       carries no text since PLAN wl-mvb9mw00ycfjeo D1: the surface renders it from the `pair-offer:` entry.
 //   pairSuggestHealth(ledger: Ledger, laneId: string): number
 //       D8's `post-signal-failed-rounds`: failed review rounds plus ceiling `extend` answers on the lane's workload
 //       between its `lane-started:` and `lane-exit:`, after the lane's first mechanical eligibility moment; 0 with none.
@@ -54,11 +55,6 @@ function round(ledger: Ledger, wl: string, sl: string, n: number, blocking: numb
 }
 
 const sorted = (o: { signals: string[] } | null) => (o ? [...o.signals].map((s) => s.toLowerCase()).sort() : null);
-
-const ROUND_LIMIT_TAIL = (wl: string) =>
-	`Answering pair stops this review loop like stop and switches this workload to user-driven, so you steer the lane yourself (as2 lane ${wl}).`;
-const CEILING_TAIL = (wl: string) =>
-	`Answering pair is stop plus a switch to user-driven: the autonomous lane stops at the ceiling, and you continue it yourself (as2 lane ${wl}).`;
 
 describe("pairSuggestOn: the switch's one reader (D2)", () => {
 	test("off, all and a list", () => {
@@ -195,27 +191,25 @@ describe("pairOffer: gates, signals and the D6 line", () => {
 		entry(ledger, wl, CLASSIFIER_BY, "pair-signal: taste no 0.90 ambiguous yes 0.85 judge typesafe/jev-1.13.0 cost 0.0001");
 		const o = pairOffer(ledger, wl, "ceiling", { config: ON });
 		expect(sorted(o)).toEqual(["d1"]);
-		expect(o!.line).toStartWith("pair: ");
-		expect(o!.line).toEndWith(`. ${CEILING_TAIL(wl)}`);
 	});
 
-	test("D6 exact lines: E at the ceiling, B at the ceiling, A at the round limit", () => {
+	test("the offer is its signals alone: E at the ceiling, B at the ceiling, A at the round limit", () => {
 		const { ledger } = tempLedger();
 		const e = workloadWithSlice(ledger);
 		ledger.completeSlice(e.sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		TASTE("0.91")(ledger, e.wl);
-		expect(pairOffer(ledger, e.wl, "ceiling", { config: ON })).toEqual({ line: `pair: jev: UI/taste work (0.91). ${CEILING_TAIL(e.wl)}`, signals: ["e"] });
+		expect(pairOffer(ledger, e.wl, "ceiling", { config: ON })).toEqual({ signals: ["e"] });
 
 		const b = workloadWithSlice(ledger);
 		ledger.completeSlice(b.sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		for (let i = 0; i < 4; i++) steer(ledger, b.wl);
-		expect(pairOffer(ledger, b.wl, "ceiling", { config: ON })).toEqual({ line: `pair: 4 long steers from you since open. ${CEILING_TAIL(b.wl)}`, signals: ["b"] });
+		expect(pairOffer(ledger, b.wl, "ceiling", { config: ON })).toEqual({ signals: ["b"] });
 
 		const a = workloadWithSlice(ledger);
 		for (let n = 1; n <= 3; n++) round(ledger, a.wl, a.sl, n, 2);
 		const count = countRounds(ledger.entries(a.wl), a.sl);
 		const o = pairOffer(ledger, a.wl, "round-limit", { config: ON, count });
-		expect(o).toEqual({ line: `pair: blocking 2 → 2 → 2 over rounds 1–3. ${ROUND_LIMIT_TAIL(a.wl)}`, signals: ["a"] });
+		expect(o).toEqual({ signals: ["a"] });
 	});
 
 	test("A only at the round-limit site and only from a stalled count; a falling count offers nothing", () => {
@@ -244,8 +238,6 @@ describe("pairOffer: gates, signals and the D6 line", () => {
 		for (let i = 0; i < 3; i++) steer(ledger, withB.wl);
 		const o = pairOffer(ledger, withB.wl, "ceiling", { config: ON });
 		expect(sorted(o)).toEqual(["b", "c"]);
-		expect(o!.line).toContain("3 long steers from you since open");
-		expect(o!.line).toEndWith(`. ${CEILING_TAIL(withB.wl)}`);
 		expect(sorted(pairOffer(ledger, withB.wl, "round-limit", { config: ON, count: countRounds(ledger.entries(withB.wl), withB.sl) }))).toEqual(["b"]);
 		ledger.completeSlice(withB.sl, { by: "lane-a", artifact: "bun test → exit 0" });
 		expect(sorted(pairOffer(ledger, withB.wl, "ceiling", { config: ON }))).toEqual(["b"]);
@@ -256,7 +248,7 @@ describe("pairOffer: D5 caps", () => {
 	/** A ceiling question the runner raised earlier with an offer on `signals`, as the ceiling site writes it. */
 	function priorOffer(ledger: Ledger, wl: string, n: number, signals: string[]): string {
 		const sl = ledger.addSlice({ by: LANE_RUNNER_BY, workloadId: wl, id: `sl-ceiling-${wl.slice(3)}-${n}`, task: "ceiling", doneCondition: "Jo answers stop, extend or split", inputs: "spend" });
-		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "Ceiling.\npair: reasons.", options: [...CEILING_OPTIONS, "pair"] });
+		const q = ledger.raiseQuestion({ by: LANE_RUNNER_BY, workloadId: wl, sliceId: sl, body: "Ceiling.", options: [...CEILING_OPTIONS, "pair"] });
 		entry(ledger, wl, LANE_RUNNER_BY, `pair-offer: ${q} site ceiling signals ${signals.join(",")}`);
 		return q;
 	}

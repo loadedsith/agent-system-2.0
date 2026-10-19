@@ -631,6 +631,34 @@ astra. Kimi and Anthropic entries keep the deep row.
 - **End.** When the review-cost framework workload lands, or Jo says otherwise, the `openai` entry
   of `REVIEW_ROW_FROM` is deleted and deep reviews take the deep row again.
 
+**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 111; Jo, opening the work:
+*"okay, i would like you to have all the capabilities to perform any cross lab review that exists,
+how do we get that for you?"*; plan approved by Jo in in-mv5p8baa8fykn4; built in
+wl-mv5m7qvgkxhpj4). A lane runs every `skills/cross-model-review` mode (triad, quorum and its
+refutation stage, refute, doubt-driven) as a **panel**: one judge hand per lab, each pinned to its
+lab, then one synthesis hand (`classifier/src/panel.ts`; the lane steps are in the skill's
+*From an as2 lane* section).
+- **A separate, explicit dispatch.** A panel runs only from a `task` item carrying `panel: <run>`
+  (then `panel-synth: <run>`) on a judge slice. No review dispatch becomes a panel, and no panel
+  stands in for a review this section requires.
+- **The builder's lab is in it.** A panel's members are all three labs, the builders' labs
+  included; the lab rule above does not exclude a panel member, and the panel synthesis prefers a
+  lab that built nothing and names a builder lab in its report when it has to use one.
+- **Panel hands are reviews.** Every panel hand plans on `reviewRow`, as the gpt-6-sol amendment
+  above says, so a panel's OpenAI leg runs on the review row's OpenAI entry, gpt-6.1-sol since the
+  *Amended 2026-10-14* entry below.
+- **Never a review round, never the plan review.** Panel members write no `review-round:` entry
+  and a panel group is not counted by the review round limit; panels are bounded separately, at
+  most that limit's number of panels per slice, and `stop-reviews` stops them too. `panel:` and
+  `panel-synth:` are refused on the plan slice, so a panel never counts as the plan review (§ B6,
+  *Amended 2026-10-01 — plan review by another lab*).
+- **Ordinary builder exclusion unchanged.** Every review this section requires still runs off the
+  builders' labs, with the park, fan-out and read-only rules above; a panel member's settle feeds
+  the builder count exactly as a review hand's does.
+- **A missing leg is never substituted.** A lab with no usable leg is recorded missing or
+  excluded with its reason and named in the report; no other lab is spawned in its place, and a
+  full panel means a new panel, never a single replacement leg.
+
 **Amended 2026-10-14 — OpenAI reviews on gpt-6.1-sol** (Jo, ledger input `in-mv8qzqym1ihmv4`;
 built in wl-mv71x5rwdu7eo0). The strong row's OpenAI entry in `profile/config.yml` is now
 `openai-codex/gpt-6.1-sol`, replacing `openai-codex/gpt-6-sol`. Through `REVIEW_ROW_FROM` every
@@ -1087,7 +1115,11 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    failure, tees to a fixed log path; the ledger row that handed it over records the log path;
    the script's exit writes a row (exit code, log path). **The lane listens**, not the hand: the
    hand that wrote the script may be closed when Jo runs it; the lane is bound to the workload
-   for its life (P-2, P-5). A non-zero exit is one of B3's error lines.
+   for its life (P-2, P-5). A non-zero exit is one of B3's error lines. One named exception
+   (amended 2026-10-17, `migration/items/pair-offer-own-line.md`, the exception MIGRATION.md
+   item 52 asked for): the orchestrator may give Jo the by-hand `as2 lane wl-…` line that
+   continues a user-driven workload, bare, in plain text or inline code, never inside a shell
+   fence. It names the lane Jo starts in his own terminal; there is no script to log.
 3. **Mechanical, not prose — the OMP settings and the gate.** *Ask before acting*: a lane runs
    under `tools.approvalMode: write` with per-tool `tools.approval` overrides
    (`omp://approval-mode.md:14-30`) in the profile template (B8 machinery). *Ask as a
@@ -1102,7 +1134,10 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    since OMP does not retract streamed text (amended 2026-10-07, MIGRATION.md item 37). One
    marker shows per prompt: a later hold in the same prompt (a refused rewrite) shows "…" in
    each text block instead, and still blocks with its full reason and original; the marker
-   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08).
+   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08). The
+   item 2 exception passes the gate: on the orchestrator, row 1 lets the bare `as2 lane wl-…`
+   line through in prose and in inline code and still refuses it inside a shell fence (amended
+   2026-10-17, `migration/items/pair-offer-own-line.md`, MIGRATION.md item 52).
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.
