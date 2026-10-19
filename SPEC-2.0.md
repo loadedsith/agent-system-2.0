@@ -512,8 +512,8 @@ review process for workload output (`grep review|approv` 2026-09-23: no requirem
 "approved" was undefined.
 
 **Amended 2026-10-19 — the merge train lands a normal lane's PR** (`migration/items/merge-train-auto-board.md`;
-jo-issues #132; Jo, ledger input `in-mvbjiylsgdtqf4`: autonomous merging by agents goes to the front of
-the queue; built in wl-mvbjiettjrfpxc, plan revision 6). This amends the normal row above and the
+jo-issues #132; Jo, ledger input `in-mvbjiylsgdtqf4`: "it is of the utmost importance to me that agents can
+merge autonomsly"; built in wl-mvbjiettjrfpxc, plan revision 6). This amends the normal row above and the
 completion rule of `DESIGN-lane-launcher.md` decision 11 (on this repository a lane never merges: Jo
 integrates). An autonomous normal-stakes lane on a repository the test runner serves
 (`testRunner.repos`), a merge train or train fix lane excepted, never asks Jo to integrate. A
