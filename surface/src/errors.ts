@@ -271,7 +271,7 @@ function repeatNote(r: ReservedRequest, all: readonly ReservedRequest[]): string
 function idleExit(control: readonly ControlEntry[]): { id: string; laneId: string; outcome: string; createdAt: string } | null {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
-		if (c.laneId === null || c.prefix === "spend" || c.prefix === "ctx-index") continue;
+		if (c.laneId === null || c.prefix === "spend" || c.prefix === "ctx-index" || c.prefix === "lane-metrics") continue;
 		if (c.prefix !== "lane-exit") return null;
 		const exit = laneExit(control, c.laneId);
 		return exit && isIntendedOutcome(exit.outcome) ? { id: c.id, laneId: c.laneId, outcome: exit.outcome, createdAt: c.createdAt } : null;
