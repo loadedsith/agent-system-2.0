@@ -197,8 +197,8 @@ export function compactionLoop(sessions: readonly CompactionSession[], w: Window
 }
 
 /**
- * hand-lab: a `review no` hand whose routing ran on a lab other than the workload's newest lane
- * `builder-lab:` before the spawn. The spawn is the newest `hand-spawn:` on the routing's
+ * hand-lab: a `review no` hand whose routing ran on a lab other than its own lane's newest
+ * `builder-lab:` before the spawn (another lane's builder lab says nothing about this hand). The spawn is the newest `hand-spawn:` on the routing's
  * workload with the routing's session root and spawn key, at or before the routing row. A model
  * on an unknown provider proves nothing and is not counted.
  */
@@ -211,7 +211,7 @@ export function handLab(spawns: readonly HandSpawn[], labs: readonly BuilderLab[
 			.reduce<HandSpawn | null>((a, s) => (a === null || ms(s.at) >= ms(a.at) ? s : a), null);
 		if (spawn === null || spawn.review) continue;
 		const lab = labs
-			.filter((l) => l.workloadId === r.workloadId && ms(l.at) <= ms(spawn.at))
+			.filter((l) => l.workloadId === r.workloadId && l.laneId === spawn.laneId && ms(l.at) <= ms(spawn.at))
 			.reduce<BuilderLab | null>((a, l) => (a === null || ms(l.at) >= ms(a.at) ? l : a), null);
 		if (lab === null) continue;
 		const off = r.ranModels.filter((m) => {

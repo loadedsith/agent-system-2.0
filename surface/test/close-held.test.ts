@@ -5,7 +5,7 @@
 // untracked in a scratch checkout and touches no git (close-entry.test.ts (d)).
 import { afterAll, describe, expect, test } from "bun:test";
 import { realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
@@ -14,7 +14,15 @@ import { ORCHESTRATOR_RECIPIENT, SURFACE_BY, type SurfaceAPI } from "../src/type
 import { clock, tempLedger, tmp } from "./helpers";
 
 const roots: string[] = [];
+const ledgers: Ledger[] = [];
 afterAll(() => {
+	for (const l of ledgers) {
+		try {
+			l.close();
+		} catch {
+			// already closed
+		}
+	}
 	for (const r of roots) rmSync(r, { recursive: true, force: true });
 });
 
@@ -35,7 +43,9 @@ function closable(): Closable {
 	roots.push(root);
 	writeFileSync(join(root, "config.yml"), "setupVersion: 2\n");
 	const c = clock("2026-10-01T10:00:00.000Z");
-	const { ledger } = tempLedger(c.now);
+	const { ledger, path } = tempLedger(c.now);
+	ledgers.push(ledger);
+	roots.push(dirname(path));
 	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Placeholder brief", stakes: "normal", mode: "autonomous" });
 	recordRepo(ledger, wl, root);
 	return { ledger, wl, work: root, env: { [TEST_RUNNER_CONFIG_ENV]: join(root, "config.yml") }, c };

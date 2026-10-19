@@ -541,7 +541,7 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 	const reportLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.daily-report.plist"), "utf8"))?.[1] ?? "";
 	const reportService = `gui/${process.getuid?.() ?? 0}/${reportLabel}`;
 
-	test("--daily-report writes a plist that lints, runs daily-report.ts at 07:00 with the profile in its environment, and bootstraps it", () => {
+	test.if(process.platform === "darwin")("--daily-report writes a plist that lints, runs daily-report.ts at 07:00 with the profile in its environment, and bootstraps it", () => {
 		expect(reportLabel).toBe("com.agent-system-2.daily-report");
 		const home = join(root, "home-daily-report-on");
 		mkdirSync(home, { recursive: true });

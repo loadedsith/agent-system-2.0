@@ -7,7 +7,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, utimesSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { JETSAM_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
+import { handLab, JETSAM_UNREADABLE, runDetectors } from "../src/selfheal/detectors";
 import { readDetectorInputs } from "../src/selfheal/read";
 import type { DetectorId, Finding, Window } from "../src/selfheal/types";
 import { clock, tempLedger, tmp } from "./helpers";
@@ -49,6 +49,7 @@ afterAll(() => {
 function world(o: { ledgerFixtures?: string[]; orchestrator?: string[]; lanes?: { fixture: string; path: string }[]; jetsam?: string[] } = {}) {
 	const c = clock("2026-10-01T00:00:00.000Z");
 	const { ledger, path } = tempLedger(c.now);
+	cleanup.push(dirname(path));
 	const rows = (o.ledgerFixtures ?? [])
 		.flatMap((f) => (JSON.parse(readFileSync(join(FIXTURES, f), "utf8")) as { rows: Row[] }).rows)
 		.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
@@ -190,6 +191,19 @@ describe("hand-lab (R4)", () => {
 	test("quiet when the window ends before the routing rows, though the spawns fall inside it", async () => {
 		const x = world({ ledgerFixtures: ["hand-lab.json"] });
 		expect(await x.run(w("2026-10-14T01:50:00.000Z", "2026-10-14T01:59:00.000Z"))).toEqual([]);
+	});
+
+	test("compares a hand with its own lane's builder-lab, never a newer one written by another lane on the workload", () => {
+		const spawn = (laneId: string, key: string) => ({ entryId: `en-${key}`, workloadId: "wl-x", laneId, at: "2026-10-14T01:10:00.000Z", sessionRoot: "root", spawnKey: key, review: false });
+		const route = (key: string, model: string) => ({ id: `rt-${key}`, workloadId: "wl-x", sessionRoot: "root", spawnKey: key, ranModels: [model], at: "2026-10-14T01:20:00.000Z" });
+		const labs = [
+			{ entryId: "en-lab-a", workloadId: "wl-x", laneId: "lane-x-1", at: "2026-10-14T01:00:00.000Z", lab: "openai" },
+			{ entryId: "en-lab-b", workloadId: "wl-x", laneId: "lane-x-2", at: "2026-10-14T01:05:00.000Z", lab: "anthropic" },
+		];
+		const same = handLab([spawn("lane-x-1", "sl-same")], labs, [route("sl-same", "openai-codex/gpt-6.1-sol")]);
+		expect(same).toEqual([]);
+		const off = handLab([spawn("lane-x-1", "sl-off")], labs, [route("sl-off", "anthropic/claude-opus-5-5")]);
+		expect(off.map((f) => [f.laneId, f.evidence])).toEqual([["lane-x-1", "routing rt-sl-off, hand-spawn en-sl-off, builder-lab en-lab-a"]]);
 	});
 });
 
