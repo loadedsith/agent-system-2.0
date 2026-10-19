@@ -3,10 +3,12 @@
 // line carrying its text and key, again only when its key changes; a skip surfaces only when it holds
 // on two runs in a row; the surfaced keys live on the ledger, recorded only once the line is delivered
 // (a confirmed push or Jo's turn), so a restart neither re-announces a delivered key nor loses one a
-// crash caught between queue and delivery;
-// and silent-orchestrator does not read the timer's own records as the orchestrator speaking. The test
-// fires the timers (helpers.ts `timers`: [0] the poll, [1] the invariant timer) and replaces the
-// session's report with a fixed one, except the last test, which runs the real check over a ledger.
+// crash caught between queue and delivery, and a line delivered decorated (a plan path beneath it) is
+// still matched; silent-orchestrator does not read the timer's own records, nor the noon flow-signals
+// line, as the orchestrator speaking; and the timer writes the noon flow-signals line once a Pacific date
+// (PLAN wl-mv654hoqwpfhmo § 3a). The test fires the timers (helpers.ts `timers`: [0] the poll, [1] the
+// invariant timer) and replaces the session's report with a fixed one, except where it runs the real check
+// over a ledger (silent-orchestrator) or the session's own live report (the noon line).
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { writeFileSync } from "node:fs";
@@ -20,6 +22,8 @@ import { planFirstBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
 import { INVARIANT_MS, INVARIANT_SURFACED_PREFIX, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, type Sent, tempLedger, timeouts, timers, tmp, workloadWithSlice } from "./helpers";
+import { errorLines } from "../src/errors";
+import { FLOW_SIGNALS_BY } from "../src/launch";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -36,8 +40,8 @@ const finding = (key: string, invariant: Invariant = "stuck-question", text = "Q
 const report = (findings: Finding[], skipped: Skip[] = []): Report =>
 	({ asOf: "2026-10-11T19:00:00.000Z", replay: false, liveLanes: [], reviewsInFlight: [], orphanReviews: [], findings, skipped, elapsedMs: 1 });
 
-/** An orchestrator surface on a fake host, past its first wake (Jo's turn took it), with the invariant report fixed to `current.report`. */
-async function surface(e: Record<string, string> = env()) {
+/** An orchestrator surface on a fake host, past its first wake (Jo's turn took it), with the invariant report fixed to `current.report` (`live`: the session's own live report). */
+async function surface(e: Record<string, string> = env(), o: { live?: boolean } = {}) {
 	timers.length = 0;
 	timeouts.length = 0;
 	const f = fakePi(undefined, { exec: true });
@@ -45,7 +49,7 @@ async function surface(e: Record<string, string> = env()) {
 	const ctx = ctxOf();
 	const current = { report: report([]) };
 	const s = surfaceSession(ctx, e);
-	s.invariantReport = () => current.report;
+	if (!o.live) s.invariantReport = () => current.report;
 	await f.emit("session_start", { type: "session_start" }, ctx);
 	await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx);
 	const notices = () => f.sent.filter((x) => x.message.customType === "surface-notices");
@@ -338,24 +342,82 @@ describe("the invariant timer (MIGRATION.md item 104)", () => {
 });
 
 describe("silent-orchestrator and the timer's own records", () => {
-	test("an invariant-surfaced record on the standing workload is not the orchestrator speaking", () => {
+	test("an invariant-surfaced record or a flow-signals line on the standing workload is not the orchestrator speaking", () => {
 		const c = clock("2026-10-11T12:00:00.000Z");
 		const { ledger, path } = tempLedger(c.now);
 		ensureStandingWorkload(ledger);
 		const said = ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "wake-read", body: "resuming" });
 		c.plusHours(3);
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${INVARIANT_SURFACED_PREFIX} stuck-question:q-1` });
+		ledger.recordEntry({ by: FLOW_SIGNALS_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: "flow-signals: 2026-10-11 open 0/6 quiet 0/3 dead 0/3 questions 0/20 provider 0,0/0,5 net 0-0 green 5/5 streak 1 cap 3 cap-source env source timer" });
 		ledger.close();
 		const db = new Database(path, { readonly: true });
 		try {
 			const r = check({
 				// Live (not replay): replay would drop a live lane whose lane-started: the ledger lacks.
 				db, asOf: c.now(), replay: false, liveLanes: { found: new Set(["wl-a lane-a-1"]) }, lanesDirOf: () => "/nonexistent/lanes",
-				repo: "/nonexistent/checkout", git: null, orchestrators: () => ({ skipped: "not run here" }), backups: { dir: tmp("backups"), gapMs: BACKUP_GAP_MS },
+				repo: "/nonexistent/checkout", git: null, orchestrators: () => ({ skipped: "not run here" }), backups: { dir: tmp("backups"), gapMs: BACKUP_GAP_MS }, cap: 3,
 			});
 			expect(r.findings.filter((f) => f.invariant === "silent-orchestrator").map((f) => f.key)).toEqual([`silent-orchestrator:${said}`]);
 		} finally {
 			db.close();
 		}
+	});
+});
+
+describe("the noon flow-signals line (PLAN wl-mv654hoqwpfhmo § 3a)", () => {
+	const flowLines = (path: string) => {
+		const db = new Database(path, { readonly: true });
+		try {
+			return db.query<{ body: string; created_by: string }, []>("SELECT body, created_by FROM entries WHERE body LIKE 'flow-signals:%' ORDER BY created_at, rowid").all();
+		} finally {
+			db.close();
+		}
+	};
+
+	test("with the live report: a red flow finding before noon queues no line and records no key; the first tick at or after 12:00 Pacific writes one line with the orchestrator's cap, and no later tick writes another", async () => {
+		const e = env({ AGENT_SYSTEM_MAX_LANES: "5" });
+		const path = e.AGENT_SYSTEM_LEDGER_DB!;
+		const l = Ledger.open(path, { backup: false, backupOnOpen: false, clock: () => "2026-10-14T15:00:00.000Z" });
+		ensureStandingWorkload(l);
+		for (let i = 0; i < 11; i++) l.openWorkload({ by: "orchestrator", brief: `pile ${i}`, stakes: "normal", mode: "autonomous" });
+		l.close();
+		const a = await surface(e, { live: true });
+
+		a.s.now = () => "2026-10-14T18:59:59.000Z"; // 11:59:59 PDT
+		expect(a.s.invariantReport().findings.filter((f) => f.invariant === "flow-open").map((f) => f.key)).toEqual(["flow-open:2026-10-14"]);
+		const before = await a.tick();
+		expect(before.map((m) => String(m.message.content)).join("\n")).not.toContain("flow-");
+		expect(a.s.tickNotices.join("\n")).not.toContain("flow-");
+		expect(surfacedIn(path).filter((k) => k.startsWith("flow-"))).toEqual([]);
+		expect(flowLines(path)).toEqual([]);
+
+		a.s.now = () => "2026-10-14T19:00:00.000Z"; // 12:00 PDT
+		await a.tick();
+		a.s.now = () => "2026-10-14T19:10:00.000Z";
+		await a.tick();
+		const lines = flowLines(path);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]!.created_by).toBe(FLOW_SIGNALS_BY);
+		expect(lines[0]!.body).toBe("flow-signals: 2026-10-14 open 11/10 quiet 0/5 dead 0/5 questions 0/20 provider 0,0/0,5 net 0-0 green 4/5 streak 0 cap 5 cap-source env source timer");
+		expect(surfacedIn(path).filter((k) => k.startsWith("flow-"))).toEqual([]);
+
+		// Jo hears it as one needs-you line, today only.
+		const ledger = Ledger.open(path, { backup: false, backupOnOpen: false });
+		try {
+			const flow = (now: string) => errorLines(ledger, undefined, { now }).filter((x) => x.kind === "flow").map((x) => x.line);
+			expect(flow("2026-10-14T19:10:00.000Z")).toEqual([`flow signals (ROOT-CAUSE § 5) for ${lines[0]!.body.slice("flow-signals: ".length)}`]);
+			expect(flow("2026-10-15T08:00:00.000Z")).toEqual([]);
+		} finally {
+			ledger.close();
+		}
+	});
+
+	test("without AGENT_SYSTEM_MAX_LANES the line says cap 3 cap-source default", async () => {
+		const a = await surface(env(), { live: true });
+		ensureStandingWorkload(a.s.ledger());
+		a.s.now = () => "2026-10-14T19:30:00.000Z";
+		await a.tick();
+		expect(flowLines(a.e.AGENT_SYSTEM_LEDGER_DB!).map((x) => x.body.replace(/^.* (cap .*)$/, "$1"))).toEqual(["cap 3 cap-source default source timer"]);
 	});
 });

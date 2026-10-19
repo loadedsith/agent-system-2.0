@@ -24,17 +24,22 @@
 //
 // checkout-behind-main, process-older-than-head and ff-lull are told to Jo like every other finding;
 // nothing here fast-forwards or restarts anything.
+//
+// The five flow-* findings (FLOW_INVARIANTS, surface/src/flow.ts) are never told one by one: Jo hears them once a day in
+// the noon `flow-signals:` line, which the timer writes (`writeNoonFlow`) at its first tick at or after 12:00 Pacific on a
+// date with none, from the same report, judged against this process's lane cap (`laneCap(env)`, the launcher's).
 import { Database } from "bun:sqlite";
 import { dirname, join } from "node:path";
 import { backupNamespace } from "../../ledger/src/index";
 import type { Ledger } from "../../ledger/src/index";
 import { BACKUP_GAP_MS, check, gitIn, type Invariant, liveLanesFromPgrep, orchestratorsFromPs, type Report } from "../scripts/invariants";
+import { type CapSource, FLOW_INVARIANTS, flowEntries, lineDate, NOON_S, pacificSeconds, writeFlowSignals } from "./flow";
 import { ensureStandingWorkload } from "./identity";
 import { laneDir } from "./launch";
 import { INVARIANT_SURFACED_PREFIX, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
-/** The report over the ledger at `ledgerPath` now, live (git, pgrep, ps on this machine), for the checkout at `repo`. */
-export function liveReport(ledgerPath: string, repo: string, asOf: string, home: string): Report {
+/** The report over the ledger at `ledgerPath` now, live (git, pgrep, ps on this machine), for the checkout at `repo`, with the flow signals judged against lane cap `cap`. */
+export function liveReport(ledgerPath: string, repo: string, asOf: string, home: string, cap: number): Report {
 	const db = new Database(ledgerPath, { readonly: true });
 	try {
 		return check({
@@ -48,6 +53,7 @@ export function liveReport(ledgerPath: string, repo: string, asOf: string, home:
 			orchestrators: () => orchestratorsFromPs(repo),
 			// The directory Ledger.open's default backup policy writes (surface/scripts/invariants.ts main does the same).
 			backups: { dir: join(dirname(ledgerPath), "backups", backupNamespace(ledgerPath)), gapMs: BACKUP_GAP_MS },
+			cap,
 		});
 	} finally {
 		db.close();
@@ -77,7 +83,7 @@ export function newInvariantLines(ledger: Ledger, report: Report, previousSkips:
 	for (const keys of pending.values()) for (const k of keys) told.add(k);
 	const lines: string[] = [];
 	for (const f of report.findings) {
-		if (told.has(f.key)) continue;
+		if (told.has(f.key) || (FLOW_INVARIANTS as readonly string[]).includes(f.invariant)) continue;
 		told.add(f.key);
 		const line = oneLine(`needs you: invariant ${f.invariant} on ${f.workload} since ${f.since}: ${f.text} (key ${f.key})`);
 		pending.set(line, [f.key]);
@@ -105,6 +111,19 @@ export function newInvariantLines(ledger: Ledger, report: Report, previousSkips:
 }
 
 const oneLine = (text: string): string => text.replace(/\s*\n\s*/g, " ");
+
+/**
+ * The noon line: when `report` (a live one, carrying its flow signals) is at or after 12:00 Pacific and its Pacific date has
+ * no `flow-signals:` entry, write one with `source timer` and `capSource` (where this process's cap came from). The read
+ * here only spares a write transaction on every later tick; `writeFlowSignals` checks again inside its transaction, so the
+ * fallback job racing this writes one line. Returns the entry id written, or null.
+ */
+export function writeNoonFlow(ledger: Ledger, report: Report, capSource: CapSource): string | null {
+	const f = report.flow;
+	if (!f || pacificSeconds(f.asOf) < NOON_S) return null;
+	if (flowEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).some((e) => lineDate(e.body) === f.date)) return null;
+	return writeFlowSignals(ledger, f, { capSource, source: "timer" }).entry;
+}
 
 /**
  * Record the keys of every pending invariant line among `delivered` as surfaced, and drop them from `pending`. Other lines are ignored.

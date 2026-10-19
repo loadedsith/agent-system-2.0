@@ -68,7 +68,8 @@ import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingTex
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
-import { confirmInvariantLines, newInvariantLines } from "../src/invariant-watch";
+import { confirmInvariantLines, newInvariantLines, writeNoonFlow } from "../src/invariant-watch";
+import { laneCapSource } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
 import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
@@ -465,22 +466,27 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * push the queue. Each line is queued through `tick()`, the one decoration point (plan paths beneath
 	 * it); `invariantPending` keeps the undecorated line, which delivery matches by first line. A run
 	 * that fails is told once per distinct failure, and breaks any skip streak: the run before the next
-	 * one is the failed one, which skipped nothing.
+	 * one is the failed one, which skipped nothing. At or after noon Pacific the same report writes the
+	 * day's `flow-signals:` line once (PLAN wl-mv654hoqwpfhmo § 3a), which errorLines then shows Jo.
 	 */
 	const invariantTick = (s: SurfaceSession, ctx: Ctx): void => {
 		if (!s.active) return;
+		let failure: string | null = null;
 		try {
-			const lines = newInvariantLines(s.ledger(), s.invariantReport(), s.invariantSkips, s.invariantPending);
-			s.invariantFailure = null;
+			const report = s.invariantReport();
+			const lines = newInvariantLines(s.ledger(), report, s.invariantSkips, s.invariantPending);
 			for (const line of lines) tick(s, ctx, line);
+			try {
+				writeNoonFlow(s.ledger(), report, laneCapSource(s.env));
+			} catch (err) {
+				failure = `tick: the noon flow-signals write failed: ${String(err)}`;
+			}
 		} catch (err) {
 			s.invariantSkips.clear();
-			const failure = `tick: the invariant report failed: ${String(err)}`;
-			if (s.invariantFailure !== failure) {
-				s.invariantFailure = failure;
-				tick(s, ctx, failure);
-			}
+			failure = `tick: the invariant report failed: ${String(err)}`;
 		}
+		if (failure !== null && s.invariantFailure !== failure) tick(s, ctx, failure);
+		s.invariantFailure = failure;
 		pushNotices(s, ctx, false);
 	};
 

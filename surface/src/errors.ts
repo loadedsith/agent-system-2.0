@@ -43,6 +43,9 @@
 // is an over-cap one, and the standing workload whose newest `scratch-disk:` / `scratch-disk-ok:` by the daily sweep
 // (surface/scripts/scratch-sweep.ts) is a `scratch-disk:`. Advisory: nothing is refused for size; keyed by the entry,
 // so delivered once per crossing, and gone when the clearing entry is written.
+// Flow (PLAN wl-mv654hoqwpfhmo § 3a): the standing workload's `flow-signals:` line for the current Pacific date (the noon
+// line the invariant timer or the fallback job writes, surface/src/flow.ts), one line keyed by its entry, so delivered once a
+// day and gone at the next Pacific midnight.
 // Train-aware routing (PLAN wl-mv8s8srodefytc rev 17.1 D9 F16): on a workload that owns a train task (surface/src/merge-train.ts
 // `trainTaskWindows`), the first lane death inside a task's window (from the `train-task:` to its settle, or still open) and an
 // intended exit inside one are not shown: the task counts them (D8) and the train tick relaunches the owner (`trainRouted`). The
@@ -60,9 +63,10 @@ import { type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainTaskWindows 
 import { questionSubject } from "./orchestrator-question";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
+import { pacificDate } from "./flow";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "flow";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -337,7 +341,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines. */
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the due rows, then the scratch lines, then today's flow-signals line. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -350,6 +354,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const questions: ErrorLine[] = [];
 	const due: ErrorLine[] = [];
 	const scratch: ErrorLine[] = [];
+	const flow: ErrorLine[] = [];
 	const taskWindows = trainTaskWindows(ledger);
 	for (const { workload, slices, openQuestions, pendingMessages } of inFlight) {
 		const windows = taskWindows.get(workload.id) ?? [];
@@ -426,8 +431,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			due.push({ kind: "due", workloadId: wl, rowId: wl, line: `scheduled and past due (${scheduled.due}): ${short(scheduled.text, 120)} — close ${wl} with a receipt when done` });
 		}
 		if (wl === STANDING_WORKLOAD_ID) {
-			const disk = openScratchEntry(controlEntries(ledger.entries(wl, "assumption")), "scratch-disk", "scratch-disk-ok");
+			const control = controlEntries(ledger.entries(wl, "assumption"));
+			const disk = openScratchEntry(control, "scratch-disk", "scratch-disk-ok");
 			if (disk) scratch.push({ kind: "scratch", workloadId: wl, rowId: disk.id, line: `scratch disk: ${disk.rest} — the daily sweep clears this line once the total is back under` });
+			const today = pacificDate(now);
+			const signals = control.findLast((c) => c.prefix === "flow-signals" && c.rest.startsWith(`${today} `));
+			if (signals) flow.push({ kind: "flow", workloadId: wl, rowId: signals.id, line: `flow signals (ROOT-CAUSE § 5) for ${signals.rest}` });
 		} else {
 			const entries = ledger.entries(wl, "assumption");
 			// The holders are read only when there is an over-cap line to validate.
@@ -437,5 +446,5 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due, ...scratch];
+	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...due, ...scratch, ...flow];
 }

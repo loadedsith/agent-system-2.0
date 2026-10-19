@@ -10,6 +10,7 @@ import { defaultLedgerPath } from "../../ledger/src/locality";
 import type { Invariant, Report } from "../scripts/invariants";
 import { Delivered } from "./delivery";
 import { liveReport } from "./invariant-watch";
+import { laneCap } from "./launch";
 import { Numbering } from "./numbering";
 import { BATCH_MS, BATCH_MS_ENV, type Ctx, INVARIANT_MS, INVARIANT_MS_ENV, POLL_MS, POLL_MS_ENV, QUIET_MS, QUIET_MS_ENV, ROLE_ENV, SURFACE_TOOLS, VOICE_ENV, WAKE_PUSH_MS, WAKE_PUSH_MS_ENV, WAKE_READ_TOOL } from "./types";
 
@@ -140,8 +141,11 @@ export class SurfaceSession {
 	readonly invariantPending = new Map<string, string[]>();
 	/** The last failure of the invariant run told as a tick line: the same failure is told once until it changes or a run succeeds. */
 	invariantFailure: string | null = null;
-	/** The invariant report, run at each invariant tick; tests replace it. Default: `liveReport` over this session's ledger and the as2 checkout. */
-	invariantReport: () => Report = () => liveReport(this.ledger().path, REPO_ROOT, this.now(), this.env.HOME || homedir());
+	/**
+	 * The invariant report, run at each invariant tick; tests replace it. Default: `liveReport` over this session's ledger and the as2
+	 * checkout, its flow signals judged against this process's lane cap (`laneCap(env)`, the launcher's: PLAN wl-mv654hoqwpfhmo § 3a).
+	 */
+	invariantReport: () => Report = () => liveReport(this.ledger().path, REPO_ROOT, this.now(), this.env.HOME || homedir(), laneCap(this.env));
 	/** The clock the surface reads the ledger at; tests move it. */
 	now: () => string = () => new Date().toISOString();
 	#ledger: Ledger | null = null;
