@@ -2,7 +2,7 @@
 title: A pair offer is its own line, and a taken pair names the next step as a bare `as2 lane wl-…` line
 status: building
 workload: wl-mvb9mw00ycfjeo
-pr: none
+pr: 243
 ---
 Jo's issue 53 (jo-issues #53). The pair-suggest trigger (`migration/items/pair-suggest-trigger.md`) offered pair as a fourth option and a last body line, `pair: <reasons>. <tail>`. The needs-you line cuts a question body at 120 characters, so that last line never showed, and `pair` was only the fourth word of `answer with one word: extend / accept / stop / pair`. Jo saw the offer about 1 time in 14. After a taken pair, `as2 lane wl-…` sat mid-sentence in the receipt with a second by-hand sentence appended, and the workload then showed the generic idle line ending `relaunch, close, or instruct`. Ilex graded that line as nothing. Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvb9mw00ycfjeo/PLAN.md` (rev 6).
 
