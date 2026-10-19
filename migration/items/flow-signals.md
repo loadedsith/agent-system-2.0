@@ -2,9 +2,9 @@
 title: The five flow signals from ROOT-CAUSE § 5, written once a day at noon Pacific
 status: building
 workload: wl-mv654hoqwpfhmo
-pr: none
+pr: 248
 ---
-**Built on branch `wl/wl-mv654hoqwpfhmo-flow`.** Workload `wl-mv654hoqwpfhmo`, PR-F of PLAN.md § 3a (revision 14, approved by Jo). It carries Plumb's invariant timer (MIGRATION.md item 104, PR #70, `plumb/invariant-timer`) merged with its commits kept; item 104's own line in MIGRATION.md keeps #70's edit, and what is new is here.
+**Built on branch `wl/wl-mv654hoqwpfhmo-flow`, PR #248.** Workload `wl-mv654hoqwpfhmo`, PR-F of PLAN.md § 3a (revision 14, approved by Jo). It carries Plumb's invariant timer (MIGRATION.md item 104, PR #70, `plumb/invariant-timer`) merged with its commits kept; item 104's own line in MIGRATION.md keeps #70's edit, and what is new is here.
 
 Switch: none — observation only; Jo q-mvfl9h64q7ivpc
 
