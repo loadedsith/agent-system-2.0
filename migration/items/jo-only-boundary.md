@@ -2,7 +2,7 @@
 title: The Jo-only boundary, accident grade: agents cannot write Jo's rows or open the ledger outside their tools
 status: building
 workload: wl-mv654hoqwpfhmo
-pr: none
+pr: 261
 ---
 **Built on branch `wl/wl-mv654hoqwpfhmo-auth` (PR-C of workload `wl-mv654hoqwpfhmo`, production stakes, plan revision 14 at `~/agent-scratch/agent-system-2.0/wl-mv654hoqwpfhmo/PLAN.md` § 6, approved by Jo).** Some ledger rows carry Jo's authority: every `instructions` row authored `jo` and written by the surface (answers, withdrawals, mode flips, and the words `stakes:`, `ceiling:`, `rounds`, `stop-reviews`, approve / deny, `cap`, `switch`), and every control prefix only the surface writes (`plan:`, `done:`, `repo:`, `ceiling:`, `launch-requested:`, `lane-model:`, `cap:`, `switch:`, …). Until now a lane or hand could write any of them with the stamp `orchestrator-surface` from eval or a script, and the readers took it as Jo's word. `ledger/src/authority.ts` is now the one table of those rows (`AUTHORITY`, each with the reader that trusts it) and the one predicate the readers use (`joAuthority`: author `jo` and stamp `orchestrator-surface`). Row 11's direct channel (author `jo`, the lane's own stamp) is listed there as Jo's words, not Jo's authority.
 
