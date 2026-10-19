@@ -12,8 +12,9 @@
  *
  * Jo's ruling (q-mvfor0be7rezgg, `transcript`): when the yield payload and the `.md` both give
  * `unknown`, `handFindings` reads the hand's final assistant text from its session file: the text
- * parts of the assistant messages after the last user message, joined in order. The sessions below
- * are built from the fixtures in the layouts A10 found.
+ * parts of the assistant messages after the last user message and after the last assistant message
+ * that calls a tool other than `yield` (OMP's harvest rule), joined in order. The sessions below are
+ * built from the fixtures in the layouts A10 found.
  *
  * Sources (session file under ~/.agent-system-2/lanes/, ledger `review-round:` entry; "message n of m"
  * counts the session's assistant messages from 0):
@@ -65,6 +66,7 @@ const message = (m: unknown) => JSON.stringify({ type: "message", message: m });
 const user = (t: string) => message({ role: "user", content: [text(t)] });
 const assistant = (...content: Part[]) => message({ role: "assistant", provider: "moonshot", model: "kimi-k3", stopReason: "stop", content });
 const toolResult = (name: string) => message({ role: "toolResult", toolCallId: `call-${name}`, toolName: name, content: [text("ok")] });
+const developer = (t: string) => message({ role: "developer", content: [text(t)] });
 /** The review brief as the classifier sends it: its findings paragraph carries an example block. */
 const BRIEF = user(`workload: wl-x\ntask: review the change${REVIEW_FINDINGS_PARAGRAPH}`);
 
@@ -172,6 +174,47 @@ describe("handFindings reads the hand's final assistant text (Jo, q-mvfor0be7rez
 		expect(counted(handFindings(null, hand([BRIEF, assistant(text("draft")), user("Resend your report."), assistant(block)]), AGENT)).counts).toEqual(RUNNER);
 	});
 
+	test("a developer reminder between the block turn and a yield-only turn does not reset the window", () => {
+		const root = hand([
+			BRIEF,
+			assistant(thinking, call("bash")),
+			toolResult("bash"),
+			assistant(thinking, text(fixture("kimi-transcript-runner.md"))),
+			developer("You stopped without calling yield. Call yield with your result."),
+			assistant(thinking, call("yield")),
+			toolResult("yield"),
+		]);
+		expect(counted(handFindings(fixture("kimi-delivered-objects.json"), root, AGENT)).counts).toEqual(RUNNER);
+	});
+
+	test("a block that later tool work superseded is not read (OMP's harvest rule)", () => {
+		const block = text(fixture("kimi-transcript-runner.md"));
+		const sessions: [string, string[]][] = [
+			// A draft: block and yield, then the verdict file revised, then a yield with no block.
+			["draft, revised, yield without block", [BRIEF, assistant(block, call("yield")), toolResult("yield"), assistant(call("bash")), toolResult("bash"), assistant(text("Revising the verdict."), call("write")), toolResult("write"), assistant(text("Revised; the findings are in the verdict file."), call("yield")), toolResult("yield")]],
+			// The block in the same turn as a work call: that turn's own text is stale too.
+			["block beside a work call, then yield-only", [BRIEF, assistant(block, call("bash")), toolResult("bash"), assistant(call("yield")), toolResult("yield")]],
+		];
+		for (const [name, lines] of sessions) {
+			expect({ name, got: handFindings(fixture("kimi-noblock-objects.json"), hand(lines), AGENT) }).toEqual({ name, got: UNKNOWN });
+		}
+		// A new block after the work is read in place of the draft's.
+		const redone = hand([BRIEF, assistant(block, call("yield")), toolResult("yield"), assistant(call("write")), toolResult("write"), assistant(text(fixture("kimi-transcript-empty.md")), call("yield")), toolResult("yield")]);
+		expect(counted(handFindings(null, redone, AGENT)).counts).toEqual(NONE);
+	});
+
+	test("the brief's example block echoed before tool work is not read", () => {
+		const root = hand([
+			BRIEF,
+			assistant(thinking, text(`I will review the change and end with this block:${REVIEW_FINDINGS_PARAGRAPH}`)),
+			assistant(thinking, call("read")),
+			toolResult("read"),
+			assistant(text(fixture("kimi-noblock-objects.json")), call("yield")),
+			toolResult("yield"),
+		]);
+		expect(handFindings(fixture("kimi-noblock-objects.json"), root, AGENT)).toBe(UNKNOWN);
+	});
+
 	test("a final text with no valid block stays unknown, and a malformed last block hides an earlier valid one", () => {
 		const finals: [string, Part[]][] = [
 			["kimi-transcript-bad-kind.md", [text(fixture("kimi-transcript-bad-kind.md"))]],
@@ -199,8 +242,20 @@ describe("handFindings reads the hand's final assistant text (Jo, q-mvfor0be7rez
 });
 
 describe("the findings paragraph appended to review briefs", () => {
-	test("it carries a complete example block that parseFindings parses", () => {
-		expect(parseFindings(REVIEW_FINDINGS_PARAGRAPH)).not.toBe(UNKNOWN);
+	const example = REVIEW_FINDINGS_PARAGRAPH.slice(REVIEW_FINDINGS_PARAGRAPH.lastIndexOf("```review-findings"));
+
+	test("it ends with one complete fenced example block and names the empty list in its prose", () => {
+		expect(example.startsWith("```review-findings\n")).toBe(true);
+		expect(example.endsWith("\n```")).toBe(true);
+		expect(REVIEW_FINDINGS_PARAGRAPH.slice(0, -example.length)).toContain('{"findings":[]}');
+	});
+
+	test("a verbatim copy of the example block fails safe: it parses with a blocking finding", () => {
+		const blocking = (f: FindingsOrUnknown) => Object.values(counted(f).counts.blocking).reduce((a, n) => a + (n ?? 0), 0);
+		expect(blocking(parseFindings(example))).toBeGreaterThanOrEqual(1);
+		expect(blocking(parseFindings(`Review done.\n\n${example}`))).toBeGreaterThanOrEqual(1);
+		// Copied as the hand's final text, the session source reads it the same way.
+		expect(blocking(handFindings(null, hand([BRIEF, assistant(text(`Review done.\n\n${example}`), call("yield")), toolResult("yield")]), AGENT))).toBeGreaterThanOrEqual(1);
 	});
 });
 

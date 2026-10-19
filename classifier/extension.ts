@@ -702,18 +702,19 @@ function effectiveStakes(brief: Stakes | null, workload: Stakes | null): Stakes 
 /**
  * D9: the fixed paragraph appended to every review item's brief. Its first line names no § B9 field
  * (gates/src/rows/r05-brief-fields.ts reads the first occurrence of each), so row 5 reads the brief
- * as before. It ends with one complete block `parseFindings` parses (PLAN wl-mv654hoqwpfhmo § 10): the
- * empty list, so a reply that copies it verbatim reports no finding it did not make.
+ * as before. It ends with one complete block `parseFindings` parses (PLAN wl-mv654hoqwpfhmo § 10): a
+ * placeholder holding one blocking finding, so a reply that copies it verbatim fails the round
+ * visibly instead of reading as a clean review.
  */
 export const REVIEW_FINDINGS_PARAGRAPH = [
 	"",
 	"",
 	"Findings block (agent-system 2.0 review round limit): end your final report with one fenced code block whose info string is review-findings, holding JSON",
 	'{"findings":[{"severity":"blocking|major|minor","kind":"correctness|security|tests|design|docs|other","title":"…"}]}',
-	"with one entry per finding you report and an empty list when there is none. Only the last such block is read; a missing or malformed block fails the review round.",
-	"The complete block for a review with no findings, fences included (each finding you report adds one entry of the shape above to the list):",
+	'with one entry per finding you report; when there is none, the block holds the empty list, {"findings":[]}. Only the last such block is read; a missing or malformed block fails the review round.',
+	"The complete block, fences included, with a placeholder entry: replace the entry with your findings, or the list with the empty one. Copied as it stands, it reports one blocking finding.",
 	"```review-findings",
-	'{"findings":[]}',
+	'{"findings":[{"severity":"blocking","kind":"other","title":"placeholder: replace this entry with your findings, or send an empty list when there are none"}]}',
 	"```",
 ].join("\n");
 
@@ -752,15 +753,21 @@ function findingsIn(text: string | null): FindingsOrUnknown {
 
 /**
  * PLAN wl-mv654hoqwpfhmo § 10 (Jo, q-mvfor0be7rezgg): a hand's final assistant text, read from its
- * session file: the text parts of every assistant message after the last user message, in session
- * order, one per line, so a block split around the yield call (its closing fence a text part of its
- * own) rejoins. Nothing before the last user message is read: not the brief and its example block,
- * not a reply an earlier user message superseded. A session with no user message reads as "".
+ * session file: the text parts of the assistant messages after the last user message and after the
+ * last assistant message that calls a tool other than `yield`, in session order, one per line. That
+ * is OMP's harvest rule (task/executor.ts, `startedMoreWork`): a turn that starts more work makes
+ * every earlier report text stale, its own text included. So a block split around the yield call (its
+ * closing fence a text part of its own) rejoins, a block turn followed by a `developer` reminder and a
+ * yield-only turn is read, and nothing before the window is: not the brief and its example block, not
+ * a reply an earlier user message superseded, not a draft or an echo that later tool work superseded.
+ * A session with no user message reads as "".
  */
 function finalAssistantText(session: string): string {
 	let texts: string[] = [];
 	let replied = false;
 	for (const line of session.split("\n")) {
+		// Most lines (custom rows, usage, the session header) are not message records: skip them unparsed.
+		if (!line.includes('"type":"message"')) continue;
 		let record: unknown;
 		try {
 			record = JSON.parse(line);
@@ -775,6 +782,11 @@ function finalAssistantText(session: string): string {
 			texts = [];
 			replied = true;
 		} else if (role === "assistant" && replied) {
+			// OMP's `startedMoreWork`: the message calls a tool other than `yield`.
+			if (Array.isArray(content) && content.some(part => typeof part === "object" && part !== null && part.type === "toolCall" && part.name !== "yield")) {
+				texts = [];
+				continue;
+			}
 			const text = messageText(content);
 			if (text) texts.push(text);
 		}
