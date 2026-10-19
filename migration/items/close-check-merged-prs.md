@@ -2,9 +2,9 @@
 title: The close check takes only this workload's push-dest PRs, and a merged PR passes on a green main or Jo's waive-pr
 status: building
 workload: wl-mvfjen3q5mqi2o
-pr: none
+pr: 250
 ---
-**Built on branch `wl/wl-mvfjen3q5mqi2o`.** Workload `wl-mvfjen3q5mqi2o` (normal stakes, plan at `~/agent-scratch/agent-system-2.0/wl-mvfjen3q5mqi2o/PLAN.md`, approved by Jo). Closes issue #223. It changes item 24's close freshness check (`closeFreshness`, `surface/src/test-run.ts`; the close set in `surface/src/close-entry.ts`).
+**Built on branch `wl/wl-mvfjen3q5mqi2o`, PR #250.** Workload `wl-mvfjen3q5mqi2o` (normal stakes, plan at `~/agent-scratch/agent-system-2.0/wl-mvfjen3q5mqi2o/PLAN.md`, approved by Jo). Closes issue #223. It changes item 24's close freshness check (`closeFreshness`, `surface/src/test-run.ts`; the close set in `surface/src/close-entry.ts`).
 
 **Evidence.** Two finished workloads could not close, and the refusal told each to do something that cannot work. (1) Issue #223: the merge train `wl-mva2bas9070hkw` wrote a `push-dest:` for `wl/wl-mv8s8srodefytc`, so its close set picked up #156 and #220, another workload's PRs merged hours before the train pushed. The close refused with `PR #156 has no test-run result: call lane_full_test`, and the runner refuses merged PRs. (2) The bindfix workload `wl-mv5qdfvv82ivwg`: PR #104 merged at 393797a, a later merge of origin/main (merge commit c5585a6). The lane's last green was 4a1c9ce. The close refused with `PR #104's head 393797a is not the green 4a1c9ce: commit 393797a is a merge; call lane_full_test`. Running the suite at the old merge commit is no way out either: the runner's preflight refuses a tree whose test-exec bundle inputs differ from the installed bundle.
 
