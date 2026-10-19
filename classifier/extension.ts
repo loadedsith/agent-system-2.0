@@ -714,7 +714,7 @@ export const REVIEW_FINDINGS_PARAGRAPH = [
 	'with one entry per finding you report; when there is none, the block holds the empty list, {"findings":[]}. Only the last such block is read; a missing or malformed block fails the review round.',
 	"The complete block, fences included, with a placeholder entry: replace the entry with your findings, or the list with the empty one. Copied as it stands, it reports one blocking finding.",
 	"```review-findings",
-	'{"findings":[{"severity":"blocking","kind":"other","title":"placeholder: replace this entry with your findings, or send an empty list when there are none"}]}',
+	'{"findings":[{"severity":"blocking","kind":"other","title":"unreplaced placeholder from the brief\'s example block: the reviewer sent no findings of its own"}]}',
 	"```",
 ].join("\n");
 
