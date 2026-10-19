@@ -667,11 +667,11 @@ describe("the train skip in the close check (§ 1)", () => {
 	function pr101(ledger: Ledger, wl: string, over: Partial<ClosePr> = {}): ClosePr {
 		return {
 			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A },
-			headCompare: null, candidateCompare: null, waivedRun: null,
+			headCompare: null, candidateCompare: null, waivedRun: null, onTrain: false, mergeCommit: null, cover: null, waivedByJo: null,
 			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl)), ...over,
 		};
 	}
-	const facts = (prs: ClosePr[]) => ({ failure: null, branch: "wl/wl-t", candidate: { sha: SHA_B, changed: [] }, prs });
+	const facts = (prs: ClosePr[]) => ({ failure: null, branch: "wl/wl-t", defaultBranch: "main", candidate: { sha: SHA_B, changed: [] }, prs });
 
 	test("an OPEN red PR Jo skipped on the train passes, named in the why", () => {
 		const { ledger, wl } = train();
