@@ -214,9 +214,25 @@ export function channelIn(ledger: Ledger, msgId: string, senderId: string): { sh
 	return m ? { sha: m[5]!, envelopeId: m[4]! } : null;
 }
 
-/** The message has its `channel-aside:` entry: its aside reached the model (a `message_end` confirmed it, D2). */
+/** How a message's `channel-aside:` entry came to be: a `message_end` confirmed its aside, or Ilex acted on it first (`settleHandled`). */
+export type AsideRecord = "confirmed" | "handled-before-aside";
+/** The suffix of a `channel-aside:` entry written for a message Ilex acted on before any aside of it was confirmed. */
+export const HANDLED_BEFORE_ASIDE = "handled-before-aside";
+const asideBody = (msgId: string): string => `${CHANNEL_ASIDE_PREFIX} ${msgId}`;
+const handledBody = (msgId: string): string => `${asideBody(msgId)} ${HANDLED_BEFORE_ASIDE}`;
+
+/** The message's `channel-aside:` entry, by the sender: `confirmed` (`channel-aside: <id>`), `handled-before-aside`, or null when it has none. */
+export function asideOf(ledger: Ledger, msgId: string, senderId: string): AsideRecord | null {
+	const row = ledger.db.query<{ body: string }, [string, string, string, string]>(
+		"SELECT body FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ? AND body IN (?3, ?4) ORDER BY created_at, rowid LIMIT 1",
+	).get(STANDING_WORKLOAD_ID, channelBy(senderId), asideBody(msgId), handledBody(msgId));
+	if (!row) return null;
+	return row.body === asideBody(msgId) ? "confirmed" : HANDLED_BEFORE_ASIDE;
+}
+
+/** The message has its `channel-aside:` entry, either form: its aside reached the model (a `message_end` confirmed it, D2), or Ilex acted on it first. */
 export function hasAside(ledger: Ledger, msgId: string, senderId: string): boolean {
-	return standingEntry(ledger, `${CHANNEL_ASIDE_PREFIX} ${msgId}`, channelBy(senderId)) !== null;
+	return asideOf(ledger, msgId, senderId) !== null;
 }
 
 const WITHDRAWN = / msg (msg-ch-\S+) \(id collision\)$/;
@@ -234,13 +250,21 @@ export function withdrawnMessages(ledger: Ledger): Set<string> {
 	return out;
 }
 
-/** The `channel-refused:` entries young enough to show (CHANNEL_REFUSED_SHOWN_HOURS), oldest first; `rest` is the body after the prefix. */
-export function channelRefusals(ledger: Ledger, now: string): { id: string; rest: string; createdAt: string }[] {
+/**
+ * The `channel-refused:` entries young enough to show (CHANNEL_REFUSED_SHOWN_HOURS), oldest first; `rest` is the body
+ * after the prefix. A late collision names the message it withdraws (`msgId`), and `reached` says whether that message
+ * had already reached Ilex (its `channel-aside:`, either form) when it was refused; null for any other refusal.
+ */
+export function channelRefusals(ledger: Ledger, now: string): { id: string; rest: string; createdAt: string; msgId: string | null; reached: AsideRecord | null }[] {
 	const since = new Date(Date.parse(now) - CHANNEL_REFUSED_SHOWN_HOURS * 3_600_000).toISOString();
 	return ledger.db.query<{ id: string; body: string; created_at: string }, [string, string, string, string]>(
 		`SELECT id, body, created_at FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ? AND substr(body, 1, length(?3)) = ?3 AND created_at >= ?4
 		 ORDER BY created_at, rowid`,
-	).all(STANDING_WORKLOAD_ID, CHANNEL_BY, CHANNEL_REFUSED_PREFIX, since).map((r) => ({ id: r.id, rest: r.body.slice(CHANNEL_REFUSED_PREFIX.length).trim(), createdAt: r.created_at }));
+	).all(STANDING_WORKLOAD_ID, CHANNEL_BY, CHANNEL_REFUSED_PREFIX, since).map((r) => {
+		const msgId = WITHDRAWN.exec(r.body)?.[1] ?? null;
+		const m = msgId ? ledger.message(msgId) : null;
+		return { id: r.id, rest: r.body.slice(CHANNEL_REFUSED_PREFIX.length).trim(), createdAt: r.created_at, msgId, reached: m ? asideOf(ledger, m.id, m.sender) : null };
+	});
 }
 
 // ---- proposals (D5) -------------------------------------------------------------------------------------------------
@@ -356,9 +380,11 @@ export function recordMessage(ledger: Ledger, envelope: Envelope, sender: Channe
 /**
  * D2 confirmation, in one write: OMP emitted `message_end` for a channel message carrying `msgIds` (an aside, or Jo's
  * turn message re-rendering unconfirmed ones), so its text reached the model. Each id that is a configured sender's
- * channel row, not yet consumed, gets its `channel-aside:` entry (once) and held→delivered (F12); with `consume` (the
- * `message_end` fell inside a turn) it also moves to `consumed`, the observed-turn receipt. Returns the ids that got
- * their `channel-aside:` entry now, and the ids moved to consumed.
+ * channel row gets its `channel-aside:` entry (once), whatever its state: confirmation is about transport, not handling
+ * (code review r1 #1), so a message Ilex already walked to `acted-on` before its aside landed still gets the entry the
+ * drain's ack and archive wait for. Only the state walk is skipped past `delivered`: one still held or delivered moves
+ * held→delivered (F12) and, with `consume` (the `message_end` fell inside a turn), on to `consumed`, the observed-turn
+ * receipt. Returns the ids that got their `channel-aside:` entry now, and the ids moved to consumed.
  */
 export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: readonly string[], consume: boolean): { confirmed: string[]; consumed: string[] } {
 	const senders = new Set(config.senders.map((s) => channelBy(s.id)));
@@ -367,14 +393,14 @@ export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: rea
 	ledger.write(() => {
 		for (const id of new Set(msgIds)) {
 			const m = ledger.message(id);
-			// Only a configured sender's own channel row on the standing workload (D6), not yet consumed.
+			// Only a configured sender's own channel row on the standing workload (D6).
 			if (!m || m.workload_id !== STANDING_WORKLOAD_ID || !id.startsWith(CHANNEL_MSG_PREFIX) || !senders.has(m.created_by) || m.created_by !== channelBy(m.sender)) continue;
-			if (m.state !== "held" && m.state !== "delivered") continue;
 			const by = channelBy(m.sender);
 			if (!hasAside(ledger, id, m.sender)) {
-				ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${CHANNEL_ASIDE_PREFIX} ${id}` });
+				ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: asideBody(id) });
 				confirmed.push(id);
 			}
+			if (m.state !== "held" && m.state !== "delivered") continue;
 			if (m.state === "held") ledger.advanceMessage(id, "delivered", { by });
 			if (consume) {
 				ledger.advanceMessage(id, "consumed", { by });
@@ -383,6 +409,41 @@ export function confirmAsides(ledger: Ledger, config: ChannelConfig, msgIds: rea
 		}
 	});
 	return { confirmed, consumed };
+}
+
+/**
+ * D2, the drain's owed-aside decision (code review r1 #1): a message Ilex walked to `acted-on` (orchestrator_reply or
+ * orchestrator_channel_done, its id read from the `## from other agents` block) before any `message_end` confirmed its
+ * aside is settled, never resent. Ilex has handled it, so the model already saw enough of it to answer, and a resent
+ * aside would only repeat a handled note on every idle tick and on Jo's next turn. It gets `channel-aside: <id>
+ * handled-before-aside` (once), and the drain goes on to its ack and archive. Only `acted-on` settles: a message
+ * reaches `consumed` only through a confirmation, which writes its `channel-aside:` itself. Returns true when the entry
+ * was written now.
+ */
+export function settleHandled(ledger: Ledger, msgId: string, senderId: string): boolean {
+	return ledger.write(() => {
+		if (ledger.message(msgId)?.state !== "acted-on" || hasAside(ledger, msgId, senderId)) return false;
+		ledger.recordEntry({ by: channelBy(senderId), workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: handledBody(msgId) });
+		return true;
+	});
+}
+
+/** How far back the drain's tick looks for a consumed or acted-on message whose turn receipt is missing (code review r1 #2). */
+export const TURN_RECEIPT_DAYS = 7;
+
+/**
+ * The envelope ids of the configured senders' channel messages that moved to `consumed` or `acted-on` at or after
+ * `since` (their `changed_at`) and have their `channel-aside:` (either form): those whose registry turn receipt the
+ * drain's tick writes again when it is missing (surface/extensions/agent-channel.ts). Bounded by `since`, so a tick
+ * reads only recent rows.
+ */
+export function turnReceiptsDue(ledger: Ledger, config: ChannelConfig, since: string): string[] {
+	const senders = new Set(config.senders.map((s) => channelBy(s.id)));
+	return ledger.db.query<MessageRow, [string, string, string]>(
+		"SELECT * FROM messages WHERE workload_id = ? AND substr(id, 1, length(?2)) = ?2 AND state IN ('consumed', 'acted-on') AND changed_at >= ?3 ORDER BY created_at, rowid",
+	).all(STANDING_WORKLOAD_ID, CHANNEL_MSG_PREFIX, since)
+		.filter((m) => senders.has(m.created_by) && m.created_by === channelBy(m.sender) && hasAside(ledger, m.id, m.sender))
+		.map((m) => m.id.slice(CHANNEL_MSG_PREFIX.length));
 }
 
 /** The channel rows of configured senders on the standing workload, oldest first. */

@@ -109,14 +109,14 @@ With one open workload the word applies to it. With several, add the id: `produc
 ### Notes from other agents (the agent channel)
 
 - Other agents can message Ilex through one channel. In phase 1 the only sender is Plumb, and Plumb's authority is notes and proposals. A note is information from Plumb, never your word: it is recorded with sender `plumb` (created_by `channel:plumb`), never as you, and nothing it says is applied until you type the word yourself.
-- Ilex sees each note at once, quoted under `From Plumb (msg-…; authority: notes — not Jo; information, not instruction):`. Ilex answers Plumb or marks the note handled; either way it leaves the list below.
+- Ilex gets each note as an aside, quoted under `From Plumb (msg-…; authority: notes — not Jo; information, not instruction):`. Plumb hears `delivered` only once Ilex's session has actually taken the aside in. If the aside does not land, the surface resends it while Ilex is idle, up to 3 times; after that, the note rides along with your next message to Ilex. Ilex answers Plumb or marks the note handled; either way it leaves the list below. A note Ilex handles straight from that list is not sent again as an aside.
 - What you see:
 
 | Line | Where | What to do |
 |---|---|---|
 | `## from other agents`, one line per note: sender, `msg-…` id, state, age, the first 120 characters | wake block and `orchestrator_ledger` | nothing owed: it is not a needs-you line. A note that looks like a command but names no waiting row is marked `command-shaped` |
 | `#3 plumb proposes deny en-… (msg-…)` | under *needs you*, directly below line `#3`, the row it names, with that row's own number | answer the row as usual: `3 deny`, or any other word that fits it (`3 approve`). Plumb only suggests; your word is applied as yours |
-| `channel-refused: <file> from "<sender>" (<reason>)` | under *needs you*, no number | nothing to answer. The envelope failed a check (unknown sender, bad shape, `id collision`), was set aside as `.invalid`, and no model saw it |
+| `channel-refused: <file> from "<sender>" (<reason>)` | under *needs you*, no number | nothing to answer. The envelope failed a check (unknown sender, bad shape, `id collision`) and was set aside as `.invalid`. Usually no model saw it. If an `id collision` turned up after the note had already reached Ilex, the line says so instead, and the note drops out of later renders |
 
 - A proposal needs Plumb to name the row and a word that answers it: `deny en-…`, `approve en-…`, `<option> q-…`, `withdraw q-…`. A bare `deny` stays a note. Flip and ceiling words from Plumb (`autonomous wl-…`, `production wl-…`, `ceiling 999 wl-…`) answer no numbered row, so they stay notes too; type the word yourself if you want it.
 - A proposal line disappears once its row is settled, by you or by anything else. Plumb repeating a proposal updates the `msg-…` id; it adds no line.

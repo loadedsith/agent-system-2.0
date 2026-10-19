@@ -7,7 +7,7 @@
 // another process would, through a guarded import so a tree without it fails by assertion.
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
@@ -39,6 +39,7 @@ type Drained = { worked: string[]; unconfirmed: { msgId: string; content: string
 type DrainModule = {
 	drainInbox: (io: Record<string, unknown>) => Drained;
 	confirmAsides: (ledger: Ledger, config: unknown, msgIds: string[], consume: boolean) => { confirmed: string[]; consumed: string[] };
+	turnReceiptsDue: (ledger: Ledger, config: unknown, since: string) => string[];
 };
 
 /**
@@ -137,7 +138,20 @@ function surface(config: string | null = CONFIG) {
 	};
 	const channelRows = () => ledger.db.query<{ id: string; state: string; sender: string; recipient: string; created_by: string; body: string; workload_id: string }, []>("SELECT * FROM messages WHERE id GLOB 'msg-ch-*' ORDER BY rowid").all();
 	const entriesWith = (prefix: string) => ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.body.startsWith(prefix));
-	return { ledger, path, env, f, ctx, s, root, inbox, start, tick, channelTimers, turn, type, agentStart, read, asides, publish, channelRows, entriesWith, atInject };
+	/** What the mailbox and the ledger say about one message: its `channel-aside:` (either form), ack, archive, turn receipt, claim and state. */
+	const fate = (msgId: string) => {
+		const id = msgId.slice("msg-ch-".length);
+		return {
+			msgId,
+			aside: entriesWith("channel-aside:").some((x) => x.body === `channel-aside: ${msgId}` || x.body === `channel-aside: ${msgId} handled-before-aside`),
+			ack: existsSync(join(root, "acks", `${id}.json`)),
+			archive: existsSync(join(root, "archive", `${id}.json`)),
+			turn: existsSync(join(root, "acks", `${id}.turn.json`)),
+			claimed: existsSync(join(inbox, `${id}.json.claimed-ilex-${process.pid}`)),
+			state: ledger.message(msgId)?.state,
+		};
+	};
+	return { ledger, path, env, f, ctx, s, root, inbox, start, tick, channelTimers, turn, type, agentStart, read, asides, publish, channelRows, entriesWith, fate, atInject };
 }
 
 /** An envelope exactly as enqueuePersistentSeatMessage writes one: the roster's display spelling in `from` and `to`. */
@@ -453,6 +467,10 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 				expect(text).not.toContain(`- ${msgId} from plumb`);
 				expect(text).not.toContain("plumb proposes");
 			}
+			// Its aside never reached the model, so the refusal line says nothing did (code review r1 #3).
+			const refusedLines = errorLines(t.s().ledger()).filter((l) => l.kind === "channel-refused").map((l) => l.line);
+			expect(refusedLines).toHaveLength(1);
+			expect(refusedLines[0]).toContain("quarantined in inbox/ilex as .invalid, nothing reached the model");
 		});
 
 		test("T5 a foreign ack placed after the aside: refused at publication, the ack byte-identical, no archive", async () => {
@@ -476,6 +494,11 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 			expect(existsSync(join(t.root, "archive", `${e.id}.json`))).toBe(false);
 			expect(readdirSync(t.inbox)).toEqual([`${e.id}.json.invalid`]);
 			expect(t.entriesWith("channel-refused:").map((r) => r.body)).toEqual([`channel-refused: ${e.id}.json from "Plumb" msg msg-ch-${e.id} (id collision)`]);
+			// Its aside had reached the model before the collision refused it: the line says so, not "nothing reached the model" (code review r1 #3).
+			const refusedLines = errorLines(t.s().ledger()).filter((l) => l.kind === "channel-refused").map((l) => l.line);
+			expect(refusedLines).toHaveLength(1);
+			expect(refusedLines[0]).toContain(`quarantined in inbox/ilex as .invalid, msg-ch-${e.id}'s aside had already reached Ilex; it is withdrawn from later renders`);
+			expect(refusedLines[0]).not.toContain("nothing reached the model");
 		});
 	});
 
@@ -711,19 +734,7 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 		};
 		const ids = (sends: Sent[]) => sends.flatMap((s) => asideMsgIds(s.message.details));
 		const msg = (e: Envelope) => `msg-ch-${e.id}`;
-		/** What the mailbox and the ledger say about one message: its `channel-aside:`, ack, archive, turn receipt, claim and state. */
-		const fate = (msgId: string) => {
-			const id = msgId.slice("msg-ch-".length);
-			return {
-				msgId,
-				aside: t.entriesWith("channel-aside:").some((x) => x.body === `channel-aside: ${msgId}`),
-				ack: existsSync(join(t.root, "acks", `${id}.json`)),
-				archive: existsSync(join(t.root, "archive", `${id}.json`)),
-				turn: existsSync(join(t.root, "acks", `${id}.turn.json`)),
-				claimed: existsSync(join(t.inbox, `${id}.json.claimed-ilex-${process.pid}`)),
-				state: t.ledger.message(msgId)?.state,
-			};
-		};
+		const fate = t.fate;
 		const unconfirmed = (msgId: string) => ({ msgId, aside: false, ack: false, archive: false, turn: false, claimed: true, state: "held" });
 		const delivered = (msgId: string) => ({ msgId, aside: true, ack: true, archive: true, turn: true, claimed: false, state: "consumed" });
 
@@ -802,6 +813,74 @@ describe("agent channel (PLAN wl-mv8vx7wdj5nx1c)", () => {
 			copy(rt.dropped[0]!), { role: "assistant", content: [] }, copy(rt.dropped[0]!), older, { role: "custom", customType: "surface-notices", content: "n" }, copy(rt.accepted[0]!), copy(resent),
 		];
 		expect(await t.f.context(messages, t.ctx)).toEqual([messages[0], messages[1], messages[4], messages[5], messages[6]]);
+	});
+
+	test("T14 reply before the aside is confirmed: a message Ilex acts on before any message_end is settled, acked and archived, never resent; a late message_end still records its channel-aside and settles it", async () => {
+		const t = surface();
+		await t.start();
+		const done = (re: string[]) => t.f.tool("orchestrator_channel_done").execute("1", { re }, undefined, undefined, t.ctx);
+		const msg = (e: Envelope) => `msg-ch-${e.id}`;
+		const bodies = (msgId: string) => t.entriesWith("channel-aside:").filter((x) => x.body.startsWith(`channel-aside: ${msgId}`)).map((x) => x.body);
+		const settled = (msgId: string) => ({ msgId, aside: true, ack: true, archive: true, turn: true, claimed: false, state: "acted-on" });
+
+		// (1) The first send is dropped (the runtime never admits it, so no message_end). Ilex reads the note from the
+		// `## from other agents` block and marks it done: the next pass settles it instead of resending it.
+		const dropped = envelope("dropped, then handled from the block");
+		t.publish(dropped);
+		t.tick();
+		expect(t.asides()).toHaveLength(1);
+		expect(t.fate(msg(dropped))).toEqual({ msgId: msg(dropped), aside: false, ack: false, archive: false, turn: false, claimed: true, state: "held" });
+		await done([msg(dropped)]);
+		expect(t.ledger.message(msg(dropped))!.state).toBe("acted-on");
+		t.tick();
+		expect(t.fate(msg(dropped))).toEqual(settled(msg(dropped)));
+		expect(bodies(msg(dropped))).toEqual([`channel-aside: ${msg(dropped)} handled-before-aside`]);
+		expect(JSON.parse(readFileSync(join(t.root, "acks", `${dropped.id}.json`), "utf8"))).toMatchObject({ id: dropped.id, from: "Plumb", to: "Ilex" });
+		// No resends: idle ticks past PUSH_TRIES send nothing more, and Jo's next turn carries no channel message.
+		for (let i = 0; i < PUSH_TRIES + 2; i++) t.tick();
+		expect(t.asides()).toHaveLength(1);
+		const ride = (await t.turn("anything new?")).messages.filter((m) => m.customType === "agent-channel");
+		expect(ride).toEqual([]);
+		expect(readdirSync(t.inbox)).toEqual([]);
+
+		// (2) The aside is sent and Ilex marks the message done before its message_end arrives: the late message_end still
+		// records the plain `channel-aside:` (confirmation is transport, not handling), with no state walk, and settles the claim.
+		const late = envelope("its aside lands after Ilex marked it done");
+		t.publish(late);
+		t.tick();
+		const sent = t.asides().at(-1)!;
+		expect(asideMsgIds(sent.message.details)).toEqual([msg(late)]);
+		await done([msg(late)]);
+		await t.f.admit(sent, t.ctx);
+		expect(bodies(msg(late))).toEqual([`channel-aside: ${msg(late)}`]);
+		expect(t.fate(msg(late))).toEqual({ ...settled(msg(late)), turn: false });
+		t.tick();
+		expect(t.fate(msg(late))).toEqual(settled(msg(late)));
+		expect(t.asides()).toHaveLength(2);
+	});
+
+	test("T15 a lost turn receipt is written again at the next tick, for a consumed message with its channel-aside and ack; the scan is bounded by changed_at", async () => {
+		const mod = await drainModule();
+		const t = surface();
+		await t.start();
+		const e = envelope("consumed, then its turn receipt is lost");
+		const msgId = `msg-ch-${e.id}`;
+		t.publish(e);
+		t.tick();
+		await t.agentStart();
+		await t.f.admit(t.asides()[0]!, t.ctx);
+		await t.f.emit("agent_end", { type: "agent_end" }, t.ctx);
+		expect(t.fate(msgId)).toEqual({ msgId, aside: true, ack: true, archive: true, turn: true, claimed: false, state: "consumed" });
+		// A crash between the consumed commit and the receipt write, or a swallowed write error: the receipt is gone.
+		const receipt = join(t.root, "acks", `${e.id}.turn.json`);
+		unlinkSync(receipt);
+		t.tick();
+		expect(existsSync(receipt)).toBe(true);
+		expect(JSON.parse(readFileSync(receipt, "utf8"))).toMatchObject({ id: e.id, seat: "Ilex", pid: process.pid });
+		// The scan reads only rows that moved at or after its bound.
+		const config = { senders: [PLUMB] };
+		expect(mod!.turnReceiptsDue(t.ledger, config, new Date(Date.now() - 60_000).toISOString())).toEqual([e.id]);
+		expect(mod!.turnReceiptsDue(t.ledger, config, new Date(Date.now() + 60_000).toISOString())).toEqual([]);
 	});
 });
 

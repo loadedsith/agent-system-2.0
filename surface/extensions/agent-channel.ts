@@ -15,8 +15,8 @@
 // directory listing, never from envelope text. A published `<id>.json` whose claim name this drain already holds waits
 // beside it (a rename would replace the claim) until that claim is archived. Per claim, resumable from the first
 // missing step:
-//   validate → collision boundary → record (once per id) → collision boundary → owed an aside … confirmed:
-//   `channel-aside:` → ack (tmp + link, no replace) → archive (link, no replace) → unlink the claim.
+//   validate → collision boundary → record (once per id) → collision boundary → owed an aside … confirmed (or acted on
+//   first): `channel-aside:` → ack (tmp + link, no replace) → archive (link, no replace) → unlink the claim.
 // No step ever renames over or unlinks a file in `acks/` or `archive/`; quarantine is link + unlink, and a taken
 // `.invalid` name gets `<entry>.<uuid>.invalid` instead. Channel text never reaches `apply`, the typed FIFO or a Jo
 // row (D6).
@@ -29,11 +29,15 @@
 // a claim stays claimed and is resent at later idle ticks, PUSH_TRIES sends in all, and after that waits for Jo's
 // next turn, whose `before_agent_start` re-renders every unconfirmed claim as one keyed message. OMP's `message_end`
 // for a channel message (a turn's input, or an aside folded into context) records `channel-aside:` for the ids it
-// names and finishes their ack and archive; a crash in between leaves a claim the next drain resumes at the ack. A
-// message whose confirmation falls inside a turn (between `agent_start` and `agent_end`) moves to `consumed` then; one
-// folded in outside a turn moves at the next `agent_start` (the observed-turn receipt). At either moment the
-// registry's turn receipt `acks/<id>.turn.json` is written, so the sender's `seat_message` reports `acted`. The
-// `context` hook keeps, after the last assistant message, only the newest copy of a resent aside.
+// names, whatever their state, and finishes their ack and archive; a crash in between leaves a claim the next drain
+// resumes at the ack. A message Ilex walks to `acted-on` (the reply or done tool, its id read from the block) before
+// any confirmation is settled at the next pass instead of resent: `channel-aside: <id> handled-before-aside`, then its
+// ack and archive (code review r1 #1). A message whose confirmation falls inside a turn (between `agent_start` and
+// `agent_end`) moves to `consumed` then; one folded in outside a turn moves at the next `agent_start` (the
+// observed-turn receipt). At either moment the registry's turn receipt `acks/<id>.turn.json` is written, so the
+// sender's `seat_message` reports `acted`; each tick writes it again where it is missing for a recent consumed or
+// acted-on message with its aside entry and its ack (code review r1 #2). The `context` hook keeps, after the last
+// assistant message, only the newest copy of a resent aside.
 //
 // The tools Ilex answers with (D4) are the tools section at the end of this file: `orchestrator_reply` writes an
 // envelope from `Ilex` into a configured sender's inbox (the registry's writer format, tmp + rename), and it and
@@ -45,7 +49,8 @@ import { join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
 import {
 	asideText, CHANNEL_ASIDE_TYPE, CHANNEL_DRAIN_MS, CHANNEL_MSG_PREFIX, type ChannelConfig, channelIn, confirmAsides, consumeAsides, displayName, type Envelope, hasAside, ID_COLLISION,
-	ILEX_SLUG, mailboxRoot, msgIdOf, readChannelConfig, recordMessage, recordOut, recordRefused, reRefusal, setChannelInForce, sha256, validateEnvelope,
+	ILEX_SLUG, mailboxRoot, msgIdOf, readChannelConfig, recordMessage, recordOut, recordRefused, reRefusal, setChannelInForce, settleHandled, sha256, TURN_RECEIPT_DAYS, turnReceiptsDue,
+	validateEnvelope,
 } from "../src/channel";
 import { ensureStandingWorkload } from "../src/identity";
 import { type SurfaceSession, surfaceSession } from "../src/session";
@@ -174,7 +179,9 @@ function processClaim(io: DrainIO, inbox: string, name: string, entry: string): 
 		recordMessage(ledger, e, sender, sha);
 		io.after?.("recorded", e.id);
 	}
-	if (!hasAside(ledger, msgId, sender.id)) {
+	// The owed-aside decision: a message Ilex already acted on is settled rather than resent (settleHandled, code review
+	// r1 #1), and goes on to its ack and archive below like a confirmed one.
+	if (!hasAside(ledger, msgId, sender.id) && !settleHandled(ledger, msgId, sender.id)) {
 		// Owed its aside: the destinations are checked again right before every send (r5 #1), and nothing is written
 		// past this point until a `message_end` confirms the aside (`channel-aside:`).
 		if (foreignDestination(root, e, sha)) return refuse(true);
@@ -363,16 +370,38 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 	};
 
 	/**
-	 * The tick: one pass, then at most one aside, carrying the claims still owed one. A claim never sent goes out busy
-	 * or idle, as wake.ts sends a new notice batch: OMP queues an aside sent while it streams for the turn's next step
-	 * boundary (agent-session.ts:8676-8691), and the loop's last aside poll or #resumeStrandedIrcAsides (:1179-1221)
-	 * takes one that arrives after it. A resend goes out only while idle, as wake.ts resends, PUSH_TRIES sends in all:
-	 * the idle path is the one that drops an aside (:8726-8753, #promptAgentInitiatedMessage throws "Agent is already
-	 * processing" while another turn is starting), so an unconfirmed claim is retried there, once per tick, and a busy
+	 * The turn receipt is recoverable (code review r1 #2): `consumed` commits before `acks/<id>.turn.json` is written,
+	 * and a receipt write swallows its errors, so a crash or a failed write in between would lose it for good. Each tick
+	 * writes it again for every channel message that moved to consumed or acted-on in the last TURN_RECEIPT_DAYS, has
+	 * its `channel-aside:` and its ack, and has no turn receipt: no-replace, and every error swallowed, as at the first
+	 * write (a receipt must never break the drain). The registry never unlinks an ack or a turn receipt, so a written
+	 * one stays and the next tick finds nothing to do.
+	 */
+	const reconcileTurnReceipts = (ctx: Ctx, l: Live): void => {
+		try {
+			const ledger = surfaceSession(ctx, env).ledger();
+			const root = mailboxRoot(env);
+			const since = new Date(Date.parse(ledger.now()) - TURN_RECEIPT_DAYS * 86_400_000).toISOString();
+			const missing = turnReceiptsDue(ledger, l.config, since).filter((id) => existsSync(join(root, "acks", `${id}.json`)) && !existsSync(join(root, "acks", `${id}.turn.json`)));
+			writeTurnReceipts(root, missing, process.pid);
+		} catch {
+			// Diagnostic only, as writeTurnReceipts: the next tick tries again.
+		}
+	};
+
+	/**
+	 * The tick: one pass, the turn-receipt reconcile, then at most one aside, carrying the claims still owed one. A
+	 * claim never sent goes out busy or idle, as wake.ts sends a new notice batch: OMP queues an aside sent while it
+	 * streams for the turn's next step boundary (agent-session.ts:8676-8691), and the loop's last aside poll or
+	 * #resumeStrandedIrcAsides (:1179-1221) takes one that arrives after it. A resend goes out only while idle, as
+	 * wake.ts resends, PUSH_TRIES sends in all: the idle path is the one that drops an aside (:8726-8753,
+	 * #promptAgentInitiatedMessage throws "Agent is already processing" while another turn is starting), so an
+	 * unconfirmed claim is retried there, once per tick, and a busy
 	 * tick never queues a second copy behind one that may still land. No send counts until its `message_end`.
 	 */
 	const tick = (ctx: Ctx, l: Live): void => {
 		const drained = drain(ctx, l);
+		reconcileTurnReceipts(ctx, l);
 		if (!drained || !pi.sendMessage) return;
 		const idle = ctx.isIdle?.() !== false;
 		const owed = drained.unconfirmed.filter((u) => {
@@ -444,9 +473,10 @@ export default function agentChannelRow(pi: SurfaceAPI, env: Record<string, stri
 
 	// Confirmation: OMP emits message_end for a turn's input messages (pi-agent-core agent-loop.ts emitInputMessages,
 	// after agent_start) and for an aside it folds into context without a turn (agent-session.ts:1232-1235). The ids
-	// the message names get `channel-aside:` (and `consumed` with the turn receipt when inside a turn); their ack and
-	// archive follow at once. The entry is written first, so a crash before the archive leaves a claim the next tick
-	// resumes at the ack.
+	// the message names get `channel-aside:` whatever their state (one Ilex already acted on included, code review r1
+	// #1), and `consumed` with the turn receipt when inside a turn and not yet past delivered; their ack and archive
+	// follow at once. The entry is written first, so a crash before the archive leaves a claim the next tick resumes at
+	// the ack.
 	pi.on("message_end", (event, ctx) => {
 		const l = live.get(ctx.sessionManager);
 		const p = l ? channelPush(event.message) : null;
