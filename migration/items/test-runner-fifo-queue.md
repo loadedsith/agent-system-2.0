@@ -2,9 +2,9 @@
 title: Queued full-suite runs take the runner lock oldest request first
 status: building
 workload: wl-mvfutg9edknu2o
-pr: none
+pr: 266
 ---
-**Built on branch `wl/wl-mvfutg9edknu2o`.** Workload `wl-mvfutg9edknu2o` (normal stakes, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mvfutg9edknu2o/PLAN.md`, approved by Jo). It changes item 24's run lock (`Runner.acquire`, `surface/scripts/test-runner.ts`).
+**Built on branch `wl/wl-mvfutg9edknu2o`, PR #266.** Workload `wl-mvfutg9edknu2o` (normal stakes, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mvfutg9edknu2o/PLAN.md`, approved by Jo). It changes item 24's run lock (`Runner.acquire`, `surface/scripts/test-runner.ts`).
 
 **Evidence.** A run waiting for the runs.db lock polled every 2 s, and whichever waiter polled first after a release took it. No waiter knew about any other. Jo saw runs requested around 21:2xZ and at 21:32Z passed over for more than 75 minutes by later requests (`msg-mvftk96yh3o4jk`, `msg-mvfuekpqr1siyo`).
 
