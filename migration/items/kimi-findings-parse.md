@@ -2,7 +2,7 @@
 title: A review hand's findings block is read from its final assistant text when its yield and its .md carry none, and the review brief shows a complete block
 status: building
 workload: wl-mv654hoqwpfhmo
-pr: none
+pr: 263
 ---
 Workload `wl-mv654hoqwpfhmo` (production stakes), PR-K of its plan (`~/agent-scratch/agent-system-2.0/wl-mv654hoqwpfhmo/PLAN.md` § 10, approved by Jo). Item 9 of the plan's brief asks to fix the Kimi parse first: Kimi review rounds were recorded `blocking unknown` far more often than OpenAI's.
 
