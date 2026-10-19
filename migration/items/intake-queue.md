@@ -2,7 +2,7 @@
 title: Intake queue
 status: open
 workload: wl-mvbcjadqgblr7k
-pr:
+pr: 264
 ---
 **Stacks on PR #158 (`migration/items/rank-ordered-launch.md`) and merges after it.** Workload `wl-mvbcjadqgblr7k` (plan rev 3 at `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvbcjadqgblr7k/PLAN.md`, D1–D9). Its branch is cut from PR #158's branch and uses #158's `rankOpen`, rank gate and drain order unchanged in shape. It adds the intake queue, which #158 does not have: a new ask waits in rank order while the started work outnumbers the lane slots, instead of opening one more workload that competes for a slot.
 
