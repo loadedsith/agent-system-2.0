@@ -954,6 +954,20 @@ describe("PLAN wl-mvfjen3q5mqi2o D1: a push-dest: branch's PR is in the close se
 		expectRefused(w, x, await close(w, x), `the close check could not answer: ${w.work} is a shallow clone, so git cannot say whether PR #156 on ${SHARED} carries the pushed eeeeeee`, null);
 	}, 20_000);
 
+	test("(b) in a shallow clone a no from merge-base is not an answer either: a boundary between the pushed sha and a PR head refuses", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		// This workload pushed b1; #220 (b2) and #221 (p) both descend from it. A shallow boundary at b2 hides that from git.
+		const { b1, b2 } = trainShape(w, x, "OPEN");
+		pushDest(x, "origin", SHARED, b1);
+		g(w, w.work, "fetch", "-q", "origin", SHARED);
+		writeFileSync(join(w.work, ".git", "shallow"), `${b2}\n`);
+		expect(g(w, w.work, "rev-parse", "--is-shallow-repository")).toBe("true");
+
+		expectRefused(w, x, await close(w, x), `the close check could not answer: ${w.work} is a shallow clone, so git cannot say whether PR #220 on ${SHARED} carries the pushed ${s7(b1)}`, null);
+	}, 20_000);
+
 	test("(d) a push-dest PR that carries the pushed sha is in the set and still needs its own green; a test-requested: still brings in a dropped PR", async () => {
 		const w = world();
 		withOrigin(w);

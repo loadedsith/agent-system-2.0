@@ -587,28 +587,31 @@ async function gatherCloseSet(exec: Exec, ledger: Ledger, id: string, repo: stri
 		pushed.set(d.branch, shas);
 	}
 	let shallow: boolean | null = null;
+	const isShallow = async (): Promise<boolean> => {
+		if (shallow === null) {
+			const s = await ok("git rev-parse --is-shallow-repository", ["rev-parse", "--is-shallow-repository"]);
+			if (s.out !== "true" && s.out !== "false") throw new Unanswered(`git rev-parse --is-shallow-repository printed ${s.out.split("\n")[0] || "nothing"}`);
+			shallow = s.out === "true";
+		}
+		return shallow;
+	};
 	// D1: the PR's head contains one of `shas`. Only an answered `git merge-base --is-ancestor` decides (0 keeps, 1 drops). A missing
-	// sha first fetches refs/pull/<N>/head; a pushed sha still missing is an answered no only in a clone that is not shallow.
+	// sha first fetches refs/pull/<N>/head. Every no (a pushed sha still missing, or exit 1) is an answer only in a clone that is not
+	// shallow: a shallow boundary hides history, so a negative there refuses (review sl-closefix-review r1).
 	const carriesPush = async (pr: PrHead, shas: readonly string[]): Promise<boolean> => {
 		let missing = !(await hasCommit(exec, top, pr.headSha));
 		for (const p of shas) if (!missing && !(await hasCommit(exec, top, p))) missing = true;
 		if (missing) await ok(`git fetch origin refs/pull/${pr.number}/head`, ["fetch", "--quiet", "origin", `refs/pull/${pr.number}/head`], NETWORK_MS);
 		if (!(await hasCommit(exec, top, pr.headSha))) throw new Unanswered(`commit ${sha7(pr.headSha)} of PR #${pr.number} is not in ${top} even after fetching refs/pull/${pr.number}/head`);
 		for (const p of shas) {
-			if (!(await hasCommit(exec, top, p))) {
-				if (shallow === null) {
-					const s = await ok("git rev-parse --is-shallow-repository", ["rev-parse", "--is-shallow-repository"]);
-					if (s.out !== "true" && s.out !== "false") throw new Unanswered(`git rev-parse --is-shallow-repository printed ${s.out.split("\n")[0] || "nothing"}`);
-					shallow = s.out === "true";
-				}
-				if (shallow) {
-					throw new Unanswered(`${top} is a shallow clone, so git cannot say whether PR #${pr.number} on ${pr.headRefName} carries the pushed ${sha7(p)}`);
-				}
-				continue;
+			if (await hasCommit(exec, top, p)) {
+				const r = await git(exec, top, ["merge-base", "--is-ancestor", p, pr.headSha]);
+				if (r.code === 0) return true;
+				if (r.code !== 1) throw new Unanswered(failed("git merge-base --is-ancestor", r));
 			}
-			const r = await git(exec, top, ["merge-base", "--is-ancestor", p, pr.headSha]);
-			if (r.code === 0) return true;
-			if (r.code !== 1) throw new Unanswered(failed("git merge-base --is-ancestor", r));
+			if (await isShallow()) {
+				throw new Unanswered(`${top} is a shallow clone, so git cannot say whether PR #${pr.number} on ${pr.headRefName} carries the pushed ${sha7(p)}`);
+			}
 		}
 		return false;
 	};
