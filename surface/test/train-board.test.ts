@@ -366,4 +366,17 @@ describe("main's protection read live (D6)", () => {
 		expect(protectionGap(ORIGIN, gh({ message: "Not Found" }))).toEqual({ state: "unknown", text: "the rules read is not a list" });
 		expect(protectionGap(ORIGIN, gh([rule()], new Error("HTTP 403")))).toEqual({ state: "unknown", text: "ruleset 1 could not be read: HTTP 403" });
 	});
+
+	test("R9: a ruleset answer with no usable current_user_can_bypass is unknown, never a gap (review wl-mvbjiettjrfpxc r1 #3)", () => {
+		/** gh answering ruleset 1 with `answer` whole, over a qualifying rule. */
+		const read = (answer: unknown) => (args: string[]): unknown => (args[1] === `repos/${ORIGIN}/rulesets/1` ? answer : gh([rule()])(args));
+		const unusable: [unknown, string][] = [
+			[null, "none"], [{ message: "Not Found" }, "none"], [{ id: 1 }, "none"], [{ id: 1, current_user_can_bypass: null }, "null"],
+			[{ id: 1, current_user_can_bypass: 1 }, "1"], [{ id: 1, current_user_can_bypass: "sometimes" }, `"sometimes"`],
+		];
+		for (const [answer, shown] of unusable) {
+			expect(protectionGap(ORIGIN, read(answer))).toEqual({ state: "unknown", text: `ruleset 1 gave no usable current_user_can_bypass (${shown})` });
+		}
+		expect(protectionGap(ORIGIN, gh([rule()], "exempt"))).toEqual({ state: "gap", text: "merging account can bypass ruleset 1 (exempt)" });
+	});
 });

@@ -53,12 +53,24 @@ interface FakeActivity {
 	activity_type: string;
 }
 
+/** One file of a commit as GitHub's get-a-commit lists it (a diff entry); a rename carries the path it came from. */
+export interface FakeDiffEntry {
+	filename: string;
+	status: string;
+	previous_filename?: string;
+}
+/** Files per page of GitHub's get-a-commit listing, and the most it lists across pages. */
+export const COMMIT_FILES_PER_PAGE = 300;
+export const COMMIT_FILES_CAP = 3000;
+
 /**
  * gh as the tick calls it: PR views from `prs`, GitHub's push activity per branch from `activity`, and an issue tracker for
  * jo-issues. Listings are newest first and paged as GitHub pages them: `gh issue list` stops at `--limit`, `gh api` returns the
  * first page of `per_page`, or every page with `--paginate` (an array of pages with `--slurp`). `fail` makes a matching call exit 1.
  * For boarding and main's protection (PLAN wl-mvbjiettjrfpxc D1, D6): a PR's state, base, draft flag and fork flag; main's rules
- * (`rules`, protected unless set; null answers 404) and ruleset 1's bypass; `compares` by `<base>...<head>` and each commit's files.
+ * (`rules`, protected unless set; null answers 404) and ruleset 1's bypass; `compares`
+ * by `<base>...<head>` and each commit's files (a path, or a diff entry with `status` and `previous_filename`), listed as GitHub
+ * lists them: COMMIT_FILES_PER_PAGE per page, each page the commit object again, at most COMMIT_FILES_CAP in all.
  */
 export function fakeGh() {
 	const prs = new Map<number, { head: string; branch: string; state?: string; base?: string; draft?: boolean; fork?: boolean }>();
@@ -66,7 +78,7 @@ export function fakeGh() {
 	const issues: FakeIssue[] = [];
 	const calls: string[][] = [];
 	const compares = new Map<string, { status: string; commits: string[] }>();
-	const commitFiles = new Map<string, string[]>();
+	const commitFiles = new Map<string, (string | FakeDiffEntry)[]>();
 	/** Issues on REPO itself (a holder's main-red issue), by number. */
 	const repoIssues = new Map<number, "OPEN" | "CLOSED">();
 	const main: { rules: unknown; bypass: string } = { rules: protectedRules(), bypass: "never" };
@@ -108,8 +120,14 @@ export function fakeGh() {
 			return c ? ok({ status: c.status, total_commits: c.commits.length, commits: c.commits.map((sha) => ({ sha })) }) : { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
 		}
 		if (noun === "api" && verb?.startsWith(`repos/${REPO}/commits/`)) {
-			const files = commitFiles.get(verb.slice(`repos/${REPO}/commits/`.length));
-			return files ? ok({ files: files.map((filename) => ({ filename })) }) : { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+			const sha = verb.slice(`repos/${REPO}/commits/`.length);
+			const files = commitFiles.get(sha);
+			if (!files) return { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+			const entries = files.slice(0, COMMIT_FILES_CAP).map((f) => (typeof f === "string" ? { filename: f, status: "modified" } : f));
+			const pages: unknown[] = [];
+			for (let i = 0; i === 0 || i < entries.length; i += COMMIT_FILES_PER_PAGE) pages.push({ sha, files: entries.slice(i, i + COMMIT_FILES_PER_PAGE) });
+			if (!args.includes("--paginate")) return ok(pages[0]);
+			return args.includes("--slurp") ? ok(pages) : ok(pages.map((p) => JSON.stringify(p)).join(""));
 		}
 		if (noun === "api" && verb === `repos/${REPO}/activity`) {
 			const ref = fields(args).get("ref");

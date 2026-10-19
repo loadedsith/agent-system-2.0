@@ -231,15 +231,20 @@ export function taskOwner(view: StakesView, trainRepo: string, ledger: Pick<Ledg
 /** Main's protection as read live (D2; PLAN wl-mvbjiettjrfpxc D6): `ok`, a `gap` the rules read names, or `unknown` when a read failed. */
 export type Protection = { state: "ok" } | { state: "gap" | "unknown"; text: string };
 
+/** The values GitHub documents for a ruleset's `current_user_can_bypass` (repos/rules, "Get a repository ruleset"). */
+const BYPASS_MODES: Record<string, true> = { always: true, pull_requests_only: true, never: true, exempt: true };
+
 /**
  * Main's protection (D2) from its active rules (`gh api repos/<owner/repo>/rules/branches/main`, GitHub's "Get rules for a
  * branch", which needs only metadata read): `ok` when one `required_status_checks` rule names FULL_SUITE_STATUS with no
  * `integration_id` (the runner posts as no particular app), is strict (`strict_required_status_checks_policy`: the branch must
  * be up to date), and sits in a ruleset the merging account cannot bypass: `readRuleset(<the rule's ruleset_id>)` (`gh api
  * repos/<owner/repo>/rulesets/<id>`, run as the gh identity that merges) answers `current_user_can_bypass: "never"`. A missing
- * rule, a non-strict or integration-bound one, or a ruleset the account can bypass is a `gap` naming it; a read that throws or
- * a rules answer that is not a list is `unknown` (PLAN wl-mvbjiettjrfpxc D6: a failed read is never a gap), unless another
- * ruleset already answers `never`. Classic branch protection is not read: its `strict` needs administration read, which the
+ * rule, a non-strict or integration-bound one, or a ruleset the account can bypass is a `gap` naming it; a read that throws,
+ * a rules answer that is not a list, or a ruleset answer with no `current_user_can_bypass` GitHub documents (`always`,
+ * `pull_requests_only`, `never`, `exempt`: null, `{message: "Not Found"}`, a wrong type) is `unknown` (PLAN wl-mvbjiettjrfpxc
+ * D6: a failed read is never a gap; review wl-mvbjiettjrfpxc r1 #3), unless another ruleset already answers `never`.
+ * Classic branch protection is not read: its `strict` needs administration read, which the
  * lanes' credentials lack, and "Get a branch" leaves it out. Without such a rule a self-merge could land a head tested on an old main.
  */
 export function mainProtectionGap(rules: unknown, readRuleset: (id: number) => unknown): Protection {
@@ -274,7 +279,12 @@ export function mainProtectionGap(rules: unknown, readRuleset: (id: number) => u
 		}
 		const bypass = ruleset?.current_user_can_bypass;
 		if (bypass === "never") return { state: "ok" };
-		gaps.push(`merging account can bypass ruleset ${id} (${bypass === undefined ? "no current_user_can_bypass" : String(bypass)})`);
+		if (typeof bypass !== "string" || BYPASS_MODES[bypass] !== true) {
+			unread = true;
+			gaps.push(`ruleset ${id} gave no usable current_user_can_bypass (${bypass === undefined ? "none" : JSON.stringify(bypass)})`);
+			continue;
+		}
+		gaps.push(`merging account can bypass ruleset ${id} (${bypass})`);
 	}
 	return { state: unread ? "unknown" : "gap", text: gaps.join("; ") };
 }
@@ -862,7 +872,8 @@ export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): st
 /**
  * The tick's retry of a PR the train passed over with `train-error: pr <n> …` (a second runner error or refused merge, or a
  * head branch with a live lane; D10, "the tick retries it"): the train is woken this long after its lane exited, doubling with
- * each pass-over of that PR since its newest task settle or Jo's newest `train`, up to TRAIN_RETRY_MAX_MS. So a transient error
+ * each pass-over of that PR since its newest task settle or its own newest membership entry (Jo's `train:` naming it, or its
+ * `train-board:`), up to TRAIN_RETRY_MAX_MS. So a transient error
  * is retried within 15 min, and a PR that keeps failing costs one train launch every 4 h, not one per 5-minute tick.
  */
 export const TRAIN_RETRY_BASE_MS = 15 * 60_000;
@@ -936,7 +947,8 @@ export function actionable(
  * What wakes released train `wl` for its unfinished PRs (D10 "the tick retries it"; empty while no lane has exited). Only a
  * PR that is not terminal, has no unsettled task (its owner is on it) and no open question on its slice (Jo decides) counts:
  * - passed over: the train wrote `train-error: pr <n> …` (a holder's entry) before its last lane exit, and TRAIN_RETRY_BASE_MS,
- *   doubled per pass-over since the PR's newest settle or Jo's newest `train`, has passed since that exit;
+ *   doubled per pass-over since the PR's newest settle or its own newest membership entry (Jo's `train:` naming it, or its
+ *   `train-board:`; another PR's entry resets nothing, review wl-mvbjiettjrfpxc r1 #1), has passed since that exit;
  * - untested: the PR came back from its owner (a settled task) and its head in `heads` (the tick's `gh pr view`) is one the
  *   train has not worked: no train run requested at it, not a task's head, not the sha a settle names, and no `train-error:
  *   pr <n>` from a holder since the tick's newest `train-head-woken:` for it. A wake is not the work: a head woken k times is
@@ -967,7 +979,7 @@ export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<numb
 	const lastEnd = control.filter((c) => c.prefix === "lane-exit" || c.prefix === "launch-failed").at(-1)!;
 	const trainRuns = testRuns(entries);
 	const instructions = ledger.instructions(wl);
-	const newestBinding = Math.max(-1, ...trainBindings(entries, instructions).map((b) => at(b.entryId)));
+	const bindings = trainBindings(entries, instructions);
 	const tasks = parseTrainTasks(wl, control);
 	const settles = taskSettles(control);
 	const questions = ledger.questions(wl);
@@ -978,7 +990,8 @@ export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<numb
 		const mine = tasks.filter((t) => t.pr === n);
 		if (mine.some((t) => !settles.has(t.id))) continue;
 		const settled = mine.flatMap((t) => settles.get(t.id) ?? []);
-		const since = Math.max(newestBinding, ...settled.map((s) => at(s.entryId)));
+		const joined = Math.max(-1, ...bindings.filter((b) => b.prs.includes(n)).map((b) => at(b.entryId)));
+		const since = Math.max(joined, ...settled.map((s) => at(s.entryId)));
 		const over = passed.filter((p) => p.pr === n && p.i > since);
 		if (over.length > 0 && over.at(-1)!.i < at(exit.id)) {
 			const wait = Math.min(TRAIN_RETRY_BASE_MS * 2 ** (over.length - 1), TRAIN_RETRY_MAX_MS);

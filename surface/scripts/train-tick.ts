@@ -405,11 +405,16 @@ function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (li
 	return ready;
 }
 
+/** GitHub's get-a-commit lists at most this many files across its pages (300 a page): a commit listing this many may have more. */
+const COMMIT_FILES_CAP = 3000;
+
 /**
  * D1's live half for ready landing `l`: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` shows it OPEN, no
  * draft, based on main, its head branch exactly `wl/<W>` with `prStakes` normal (same repository, no fork); and its head is the
  * green sha G, or ahead of G (`gh api repos/<r>/compare/<G>...<head>`) only by commits each touching only .ai/decision-log/
- * (`gh api repos/<r>/commits/<sha>`, each commit's own files, never the net diff). A failed or unreadable gh call throws.
+ * (`gh api repos/<r>/commits/<sha> --paginate --slurp`, each commit's own files over every page, never the net diff; a rename's
+ * `previous_filename` too, review wl-mvbjiettjrfpxc r1 #2). A commit listing COMMIT_FILES_CAP files may have more GitHub does not
+ * list, so it never boards. A failed or unreadable gh call throws.
  */
 function liveHalf(ledger: Ledger, l: Extract<Landing, { ready: true }>, ghJson: (args: string[]) => unknown): { ok: true; head: string } | { ok: false; head: string | null; reason: string } {
 	const v = ghJson(["pr", "view", String(l.pr), "-R", l.repo, "--json", `${TASK_VIEW_FIELDS},state,baseRefName,isDraft`]);
@@ -436,10 +441,19 @@ function liveHalf(ledger: Ledger, l: Extract<Landing, { ready: true }>, ghJson: 
 	for (const c of commits as unknown[]) {
 		const sha = field(c, "sha");
 		if (typeof sha !== "string" || !SHA_RE.test(sha)) throw new GhError(`gh api repos/${l.repo}/compare listed a commit with no sha`);
-		const files = field(ghJson(["api", `repos/${l.repo}/commits/${sha}`]), "files");
-		if (!Array.isArray(files)) throw new GhError(`gh api repos/${l.repo}/commits/${sha} returned an unexpected shape`);
-		const other = (files as unknown[]).map((f) => field(f, "filename")).find((f) => typeof f !== "string" || !f.startsWith(DECISION_LOG_DIR));
-		if (other !== undefined) return no(`commit ${sha} after the green sha touches ${String(other)}, not only ${DECISION_LOG_DIR}`);
+		// Every page of the commit's files: an array of pages, each the commit object with its share of `files`.
+		const pages = ghJson(["api", `repos/${l.repo}/commits/${sha}`, "--paginate", "--slurp"]);
+		const files = Array.isArray(pages) && pages.length > 0 ? (pages as unknown[]).map((p) => field(p, "files")) : null;
+		if (files === null || !files.every(Array.isArray)) throw new GhError(`gh api repos/${l.repo}/commits/${sha} returned an unexpected shape`);
+		const entries = (files as unknown[][]).flat();
+		if (entries.length >= COMMIT_FILES_CAP) return no(`commit ${sha} after the green sha lists ${entries.length} files, the most GitHub lists; its other files cannot be read`);
+		for (const f of entries) {
+			// A rename touches the path it left as well as the one it made; a rename that names no previous path fails closed.
+			const prev = field(f, "previous_filename");
+			const paths = [field(f, "filename"), ...(prev !== undefined || field(f, "status") === "renamed" ? [prev] : [])];
+			const i = paths.findIndex((p) => typeof p !== "string" || !p.startsWith(DECISION_LOG_DIR));
+			if (i >= 0) return no(`commit ${sha} after the green sha touches ${String(paths[i])}, not only ${DECISION_LOG_DIR}`);
+		}
 	}
 	return { ok: true, head };
 }

@@ -9,13 +9,15 @@ import { describe, expect, test } from "bun:test";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { errorLines } from "../src/errors";
-import { controlEntries, laneExitBody, launchFailedBody } from "../src/launch";
+import { controlEntries, laneExitBody, launchFailedBody, trainBoardBody } from "../src/launch";
 import {
 	fixBindings, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainPrs, trainRetries, trainSliceId,
 } from "../src/merge-train";
 import { makeRunId, testRequestedBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { boardWorld, DECISION_LOG_FILE, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE, world } from "./train-world";
+import {
+	boardWorld, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE, world,
+} from "./train-world";
 
 describe("settles and deliveries (D8, D10)", () => {
 	test("a settle is written once across two ticks", () => {
@@ -252,6 +254,22 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		w.c.plusHours(0.12); // 31 min
 		w.run();
 		expect(trainLaunches(w)).toBe(2);
+	});
+
+	test("a board of another PR between a pass-over and the lane's exit keeps the passed-over PR's retry (review wl-mvbjiettjrfpxc r1 #1)", () => {
+		const w = world();
+		worked(w, TRAIN_LANE);
+		w.ledger.recordEntry({ by: TRAIN_LANE, workloadId: w.train, kind: "assumption", body: "train-error: pr 101 merge-refused HTTP 502" });
+		// the tick boards #102 while the lane is on another member; the lane's final reread works #102, then it exits released
+		w.g.prs.set(102, { head: H0, branch: "feature/boarded" });
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: w.train, kind: "assumption", body: trainBoardBody({ pr: 102, workload: w.owner, head: H0, run: null, review: null }) });
+		const sl = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 102), task: "PR #102", doneCondition: "terminal", inputs: "#102" });
+		w.ledger.completeSlice(sl, { by: TRAIN_LANE, artifact: "merged" });
+		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(TRAIN_LANE, { code: 0, signal: null, outcome: "released" }) });
+		w.c.plusHours(0.3); // 18 min: #101's first retry wait has passed
+		expect(trainRetries(w.ledger, w.train, new Map())).toEqual({ passedOver: [{ pr: 101, count: 1 }], untested: [] });
+		w.run();
+		expect(trainLaunches(w)).toBe(1);
 	});
 
 	/** #101's task settles fixed at H1 and the train consumes it; then the head moves to H2 and the tick wakes the train for it once. */
@@ -588,6 +606,45 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		expect(skipsOf(fork)).toEqual([expect.stringMatching(new RegExp(`^train-board-skip: workload ${fork} pr 124 head ${H0} #124 is production: `))]);
 		expect(skipsOf(production)).toEqual([`train-board-skip: workload ${production} pr none head none stakes production`]);
 		expect(w.views(125)).toBe(0);
+	});
+
+	/** A boarding world with landing `pr` whose head `head` is one commit ahead of G, that commit's files `files` as GitHub lists them. */
+	const aheadBy = (pr: number, head: string, files: (string | FakeDiffEntry)[]) => {
+		const w = boardWorld();
+		const wl = w.landing(pr);
+		w.g.prs.get(pr)!.head = head;
+		w.g.compares.set(`${H0}...${head}`, { status: "ahead", commits: [head] });
+		w.g.commitFiles.set(head, files);
+		return { w, wl };
+	};
+	const logs = (n: number) => Array.from({ length: n }, (_, i) => `.ai/decision-log/2026-10-01--1000--jev--note-${i}.md`);
+
+	test("R2: a commit after G whose code file is on a later page of its files never boards (review wl-mvbjiettjrfpxc r1 #2)", () => {
+		const { w, wl } = aheadBy(126, H1, [...logs(COMMIT_FILES_PER_PAGE), "src/late.ts"]);
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.launches).toEqual([]);
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 126 head ${H1} commit ${H1} after the green sha touches src/late.ts, not only .ai/decision-log/`]);
+	});
+
+	test("R2: a commit after G renaming a file from outside .ai/decision-log/ into it never boards (review wl-mvbjiettjrfpxc r1 #2)", () => {
+		const { w, wl } = aheadBy(127, H2, [{ filename: DECISION_LOG_FILE, status: "renamed", previous_filename: "src/notes.md" }]);
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.launches).toEqual([]);
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 127 head ${H2} commit ${H2} after the green sha touches src/notes.md, not only .ai/decision-log/`]);
+	});
+
+	test("R2: a commit after G listing as many files as GitHub lists may have more, so it never boards; a rename within .ai/decision-log/ boards", () => {
+		const { w, wl } = aheadBy(128, H1, logs(COMMIT_FILES_CAP));
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.skips()).toEqual([
+			`train-board-skip: workload ${wl} pr 128 head ${H1} commit ${H1} after the green sha lists ${COMMIT_FILES_CAP} files, the most GitHub lists; its other files cannot be read`,
+		]);
+		const { w: v, wl: within } = aheadBy(129, H2, [...logs(COMMIT_FILES_PER_PAGE), { filename: DECISION_LOG_FILE, status: "renamed", previous_filename: ".ai/decision-log/old.md" }]);
+		v.run();
+		expect(v.boards()).toEqual([expect.objectContaining({ pr: 129, workload: within, head: H2 })]);
 	});
 
 	test("R17: a draft PR never boards; once it is ready for review it boards", () => {
