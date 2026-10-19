@@ -84,7 +84,7 @@ export const CONTROL_PREFIXES = [
 	"launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop",
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
-	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "train",
+	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
@@ -144,6 +144,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `test-pr: <N> [<N> …] <instruction id>` is the surface's alone: Jo's `test-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
  * PLAN wl-mv5qdfvv82ivwg § 2), on that workload, naming Jo's instruction written first in the same transaction; `boundPrs`
  * reads it and the test runner admits the named PRs for a run with no push (migration/items/test-pr-binds-named-prs.md).
+ * `waive-pr: <N> [<N> …] <instruction id>` is the surface's alone too: Jo's `waive-pr <wl-…> <N> [<N> …]` (surface/src/input.ts,
+ * PLAN wl-mvfjen3q5mqi2o D3), on that workload, naming Jo's instruction `waive-pr <wl> <N…>` written first in the same transaction;
+ * `waivedPrs` reads it for the close check (a MERGED PR nothing covers passes on it). `boundPrs` never reads it: a waiver admits no test run.
  * `train: <N> [<N> …] <instruction id>` is the surface's alone too: Jo's `train <N…>` opening a merge train or `train <wl-…> <N…>`
  * adding to one (surface/src/input.ts, PLAN wl-mv8s8srodefytc § 1), naming Jo's instruction `train <wl> <N…>` written first in the
  * same transaction; `boundPrs` admits its PRs as it does `test-pr:`'s, and surface/src/merge-train.ts reads the train's order from it.
@@ -195,6 +198,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	superseded: [SURFACE_BY],
 	"pair-taken": [SURFACE_BY],
 	"test-pr": [SURFACE_BY],
+	"waive-pr": [SURFACE_BY],
 	train: [SURFACE_BY],
 	"train-task": [],
 	"train-task-settled": [MERGE_TRAIN_BY],
@@ -1142,8 +1146,11 @@ export function supersededBy(entries: readonly EntryRow[], instructions: readonl
 	return null;
 }
 
-/** The words Jo types to bind PRs to a workload: `test-pr` (a test run with no push) and `train` (a merge train, surface/src/merge-train.ts). */
-export type PrBindingWord = "test-pr" | "train";
+/**
+ * The words Jo types to bind PRs to a workload: `test-pr` (a test run with no push), `train` (a merge train,
+ * surface/src/merge-train.ts) and `waive-pr` (a merged PR the close check passes with no covering green, PLAN wl-mvfjen3q5mqi2o D3).
+ */
+export type PrBindingWord = "test-pr" | "train" | "waive-pr";
 /** Jo's instruction body for a PR binding: `<word> <wl> <N…>`, the body its control entry names. */
 export function prBindingInstructionBody(word: PrBindingWord, workloadId: string, prs: readonly number[]): string {
 	return `${word} ${workloadId} ${prs.join(" ")}`;
@@ -1155,6 +1162,14 @@ export function testPrInstructionBody(workloadId: string, prs: readonly number[]
 /** `test-pr: <N> [<N> …] <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
 export function testPrBody(prs: readonly number[], instructionId: string): string {
 	return `test-pr: ${prs.join(" ")} ${instructionId}`;
+}
+/** Jo's words for `waive-pr <wl-…> <N> [<N> …]` (PLAN wl-mvfjen3q5mqi2o D3): the instruction body that `waive-pr:` names. */
+export function waivePrInstructionBody(workloadId: string, prs: readonly number[]): string {
+	return prBindingInstructionBody("waive-pr", workloadId, prs);
+}
+/** `waive-pr: <N> [<N> …] <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
+export function waivePrBody(prs: readonly number[], instructionId: string): string {
+	return `waive-pr: ${prs.join(" ")} ${instructionId}`;
 }
 
 /** One valid binding entry: the PR numbers in Jo's order, Jo's instruction it names, and the entry itself. */
@@ -1176,7 +1191,7 @@ export interface PrBinding {
 export function prBindings(entries: readonly EntryRow[], instructions: readonly InstructionRow[], words: readonly PrBindingWord[]): PrBinding[] {
 	const out: PrBinding[] = [];
 	for (const c of controlEntries(entries)) {
-		if (c.prefix !== "test-pr" && c.prefix !== "train") continue;
+		if (c.prefix !== "test-pr" && c.prefix !== "train" && c.prefix !== "waive-pr") continue;
 		const word: PrBindingWord = c.prefix;
 		if (!words.includes(word)) continue;
 		const tokens = c.rest.split(/\s+/);
@@ -1230,6 +1245,19 @@ export function boundPrs(
 		if (f === null || out.some((x) => x.pr === f.pr)) continue;
 		const b = prBindings(trains.entries(f.train), trains.instructions(f.train), ["train"]).find((x) => x.entryId === f.trainEntry);
 		if (b?.prs.includes(f.pr)) out.push({ pr: f.pr, instructionId: b.instructionId });
+	}
+	return out;
+}
+
+/**
+ * The PR numbers Jo waived on this workload for the close check (PLAN wl-mvfjen3q5mqi2o D3), each with the instruction that
+ * waives it: every valid `waive-pr:` binding (`prBindings`), oldest first; a number waived twice keeps its first instruction.
+ * The close check applies a waiver only to a PR gh reports MERGED. Never part of `boundPrs`: a waiver admits no test run.
+ */
+export function waivedPrs(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { pr: number; instructionId: string }[] {
+	const out: { pr: number; instructionId: string }[] = [];
+	for (const b of prBindings(entries, instructions, ["waive-pr"])) {
+		for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, instructionId: b.instructionId });
 	}
 	return out;
 }
