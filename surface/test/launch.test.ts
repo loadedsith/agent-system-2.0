@@ -240,7 +240,7 @@ describe("lane-started: provenance (PLAN wl-mv654hoqwpfhmo § 11.3, PR-P)", () =
 	const SHA = "0123456789abcdef0123456789abcdef01234567";
 	test("as2ProvenanceOf: a clean HEAD answer is the commit, porcelain output is dirty; a failed, missing or malformed answer is null", () => {
 		expect(as2ProvenanceOf({ code: 0, out: `${SHA}\n` }, { code: 0, out: "" })).toEqual({ as2Commit: SHA, as2Dirty: false });
-		expect(as2ProvenanceOf({ code: 0, out: SHA }, { code: 0, out: " M surface/src/launch.ts\n?? new.ts\n" })).toEqual({ as2Commit: SHA, as2Dirty: true });
+		expect(as2ProvenanceOf({ code: 0, out: SHA }, { code: 0, out: " M surface/src/launch.ts\n" })).toEqual({ as2Commit: SHA, as2Dirty: true });
 		expect(as2ProvenanceOf({ code: 128, out: "" }, { code: 128, out: "fatal: not a git repository" })).toEqual({ as2Commit: null, as2Dirty: null });
 		expect(as2ProvenanceOf(null, null)).toEqual({ as2Commit: null, as2Dirty: null });
 		expect(as2ProvenanceOf({ code: 0, out: "HEAD" }, null)).toEqual({ as2Commit: null, as2Dirty: null });

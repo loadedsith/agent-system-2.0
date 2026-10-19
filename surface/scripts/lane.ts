@@ -147,9 +147,10 @@ const PROVENANCE_GIT_TIMEOUT_MS = 10_000;
 
 /**
  * The as2 checkout this script runs from (`repo`, default REPO_ROOT: the machinery the installed profile points at) as
- * `lane-started:` records it (PLAN wl-mv654hoqwpfhmo § 11.3): `git rev-parse HEAD` and `git status --porcelain`, the
- * second without optional locks so it never writes that checkout's index. A git that fails, times out or cannot be run
- * leaves its field null; nothing here throws, so provenance never blocks a launch.
+ * `lane-started:` records it (PLAN wl-mv654hoqwpfhmo § 11.3): `git rev-parse HEAD` and `git status --porcelain
+ * --untracked-files=no` (tracked changes only: the live checkout always holds untracked notes such as `.ai/`), the second
+ * without optional locks so it never writes that checkout's index. A git that fails, times out or cannot be run leaves its
+ * field null; nothing here throws, so provenance never blocks a launch.
  */
 export function readAs2Provenance(repo: string = REPO_ROOT): As2Provenance {
 	const ask = (args: string[]) => {
@@ -160,7 +161,7 @@ export function readAs2Provenance(repo: string = REPO_ROOT): As2Provenance {
 			return null;
 		}
 	};
-	return as2ProvenanceOf(ask(["rev-parse", "--verify", "HEAD"]), ask(["--no-optional-locks", "status", "--porcelain"]));
+	return as2ProvenanceOf(ask(["rev-parse", "--verify", "HEAD"]), ask(["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"]));
 }
 
 /**

@@ -536,9 +536,9 @@ export interface LaneStarted {
 
 /**
  * The as2 checkout a lane runs under (PLAN wl-mv654hoqwpfhmo § 11.3, B14.3 day one): `as2Commit` is its HEAD sha and
- * `as2Dirty` whether it has uncommitted changes, each null when git could not say. The runner reads both from the checkout
- * `lane.ts` runs from (`readAs2Provenance`); `laneStartedBody` adds them. A `lane-started:` written before this had neither
- * field, and none is backfilled.
+ * `as2Dirty` whether its tracked files have uncommitted changes (untracked files do not count), each null when git could
+ * not say. The runner reads both from the checkout `lane.ts` runs from (`readAs2Provenance`); `laneStartedBody` adds them.
+ * A `lane-started:` written before this had neither field, and none is backfilled.
  */
 export interface As2Provenance {
 	as2Commit: string | null;
@@ -553,7 +553,7 @@ export interface GitAnswer {
 
 const COMMIT_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
-/** `git rev-parse HEAD` and `git status --porcelain` answers as provenance (pure): a failed or malformed answer is null, never a guess. */
+/** `git rev-parse HEAD` and `git status --porcelain --untracked-files=no` answers as provenance (pure): a failed or malformed answer is null, never a guess. */
 export function as2ProvenanceOf(head: GitAnswer | null, status: GitAnswer | null): As2Provenance {
 	const sha = head?.code === 0 ? head.out.trim() : "";
 	return {

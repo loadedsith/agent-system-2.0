@@ -345,11 +345,15 @@ describe("provenance (PLAN wl-mv654hoqwpfhmo § 11.3 day one, PR-P): lane-starte
 		return laneSnapshot(r, wl).control.filter((c) => c.prefix === "lane-started" && c.laneId === laneId).map((c) => JSON.parse(c.rest) as Record<string, unknown>);
 	}
 
-	test("as2Commit is the HEAD sha of that checkout on every lane-started: record; as2Dirty is false while it is clean and true once it has an uncommitted change", async () => {
+	test("as2Commit is the HEAD sha of that checkout on every lane-started: record; as2Dirty is false while its tracked files are clean (an untracked file included) and true once one has an uncommitted change", async () => {
 		// One root per launch: a lane's exit spawns the drain (MIGRATION.md item 71), which may start the next open workload of its root.
 		const clean = makeRoot();
 		const as2 = as2Checkout(clean);
 		expect(as2.head).toMatch(/^[0-9a-f]{40}$/);
+		// an untracked file only (the live checkout always has some, e.g. .ai/ notes): not dirty
+		writeFileSync(join(as2.dir, "untracked.txt"), "never added\n");
+		expect(git(as2.dir, ["status", "--porcelain"]).out).toBe("?? untracked.txt");
+		expect(laneScript.readAs2Provenance(as2.dir)).toEqual({ as2Commit: as2.head, as2Dirty: false });
 		const cleanStarts = await startsFrom(clean, as2.script);
 		expect(cleanStarts).toHaveLength(2);
 		expect(cleanStarts.map((s) => ({ as2Commit: s.as2Commit, as2Dirty: s.as2Dirty }))).toEqual([
@@ -359,7 +363,7 @@ describe("provenance (PLAN wl-mv654hoqwpfhmo § 11.3 day one, PR-P): lane-starte
 
 		// an uncommitted change to a tracked file: HEAD is the same commit, the checkout is dirty
 		writeFileSync(join(as2.dir, "provenance.txt"), "changed, not committed\n");
-		expect(git(as2.dir, ["status", "--porcelain"]).out).toBe("M provenance.txt");
+		expect(git(as2.dir, ["status", "--porcelain"]).out).toBe("M provenance.txt\n?? untracked.txt");
 		const dirty = makeRoot();
 		const dirtyStarts = await startsFrom(dirty, as2.script);
 		expect(dirtyStarts).toHaveLength(2);
