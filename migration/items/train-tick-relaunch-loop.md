@@ -2,9 +2,9 @@
 title: The train tick backs off a train whose every PR is held, one live lane per workload, no launch request at the ceiling
 status: building
 workload: wl-mvgn310dpi5gcg
-pr: none
+pr: 287
 ---
-**Built on branch `wl/wl-mvgn310dpi5gcg`, PR pending.** Workload `wl-mvgn310dpi5gcg` (normal stakes, Jo's `open` on q-mvgmb2cbphqubk, plan at `~/agent-scratch/agent-system-2.0/wl-mvgn310dpi5gcg/PLAN.md`). On 2026-10-20 the daily self-heal report train `wl-mvggzumu8zs5xc`, whose only PR #244 was held by owner `wl-mvbcjageg7o2yo`'s conflict task, ran lanes 1 to 15 between about 09:20Z and 12:06Z. From 11:30Z on it ran one about every 5 minutes, sometimes three at once. It spent about $28 with nothing landed, and started one more lane after the ceiling had stopped it.
+**Built on branch `wl/wl-mvgn310dpi5gcg`, PR #287.** Workload `wl-mvgn310dpi5gcg` (normal stakes, Jo's `open` on q-mvgmb2cbphqubk, plan at `~/agent-scratch/agent-system-2.0/wl-mvgn310dpi5gcg/PLAN.md`). On 2026-10-20 the daily self-heal report train `wl-mvggzumu8zs5xc`, whose only PR #244 was held by owner `wl-mvbcjageg7o2yo`'s conflict task, ran lanes 1 to 15 between about 09:20Z and 12:06Z. From 11:30Z on it ran one about every 5 minutes, sometimes three at once. It spent about $28 with nothing landed, and started one more lane after the ceiling had stopped it.
 
 **What was wrong.**
 - The tick recorded a head's wake (`train-head-woken:`) only when its own launcher call exited 0. That night every call was refused `cap`. The drain or the surface served the request a minute later. So the head stayed at zero wakes, the untested-head retry was due on every pass, and `trainRetries`' backoff never applied.
