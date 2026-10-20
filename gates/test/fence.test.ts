@@ -22,7 +22,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -127,8 +127,25 @@ function sh(command: string, cwd: string, env: Record<string, string | undefined
 
 /** Every file under `dir` with its bytes: proof nothing changed. */
 function snapshot(dir: string): string {
-	const r = spawnSync("/bin/bash", ["-c", `find . -print | LC_ALL=C sort | while read -r f; do printf '%s ' "$f"; [ -f "$f" ] && shasum "$f" | cut -c1-40 || echo; done`], { cwd: dir, encoding: "utf8" });
-	return r.stdout;
+	const paths = ["."];
+	const visit = (parent: string) => {
+		for (const entry of readdirSync(join(dir, parent), { withFileTypes: true })) {
+			const path = `${parent}/${entry.name}`;
+			paths.push(path);
+			if (entry.isDirectory()) visit(path);
+		}
+	};
+	visit(".");
+	return paths.sort().map((path) => {
+		const file = join(dir, path);
+		let isFile = false;
+		try {
+			isFile = statSync(file).isFile();
+		} catch {
+			// Like the shell's -f, dangling or unresolvable symlinks have no file digest.
+		}
+		return `${path} ${isFile ? createHash("sha1").update(readFileSync(file)).digest("hex") : ""}\n`;
+	}).join("");
 }
 
 describe("the fence refuses sandboxed writes into the configured ledger directory", () => {
