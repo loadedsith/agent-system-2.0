@@ -9,6 +9,7 @@
 // wrapper and reports every answer closed (the real denial is proved at S8, plan § 8). Boundaries
 // are paused through the runner's AGENT_SYSTEM_TEST_HOOKS files and the wrapper's rendered `hooks`.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -17,7 +18,7 @@ import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/s
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
 import {
-	childLayout, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
+	childLayout, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
@@ -1559,6 +1560,280 @@ describe("the runs lock and current", () => {
 		expect((await resultOf(w, a.wl, A)).verdict).toBe("superseded");
 		expect((await resultOf(w, b.wl, B)).verdict).toBe("stale");
 		expect(marks(w, B, "acquired")[0]).toMatchObject({ displaced: A });
+	});
+});
+
+// ---- the lock queue: oldest request first (plan of wl-mvfutg9edknu2o) ------------------------------------------
+
+type Child = Subprocess<"ignore", number, number>;
+interface Waiter {
+	id: string;
+	wl: string;
+	slice: string;
+}
+
+/** A request on its own workload, `agoMs` in the past, for a sha the PR does not have: once the run holds the lock it ends at once as stale. */
+function waiter(w: World, agoMs: number): Waiter {
+	const { wl, slice } = workload(w);
+	const id = request(w, wl, slice, PR.green, fx.main, agoMs);
+	// The next run id takes a later clock reading: run ids are strictly ordered by creation.
+	Bun.sleepSync(5);
+	return { id, wl, slice };
+}
+
+/** C, then B, then A, requested 10, 20 and 30 s ago: run-id order (C < B < A) is the opposite of request order (A < B < C). */
+function requestsCBA(w: World): { A: Waiter; B: Waiter; C: Waiter } {
+	const C = waiter(w, 10_000);
+	const B = waiter(w, 20_000);
+	const A = waiter(w, 30_000);
+	expect([A.id, B.id, C.id].toSorted()).toEqual([C.id, B.id, A.id]);
+	return { A, B, C };
+}
+
+/** `fn` on the world's runs.db, waiting up to 2 s for a runner's transaction. */
+function runsDb<T>(w: World, fn: (db: Database) => T): T {
+	const db = openLockDb(w.runs, 2_000);
+	try {
+		return fn(db);
+	} finally {
+		db.close();
+	}
+}
+
+/** Another run holds the lock with a heartbeat ten minutes ahead: live for the whole test, until the test changes it. */
+const holdLock = (w: World): void => {
+	runsDb(w, (db) => db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000));
+};
+
+const queueRows = (w: World) =>
+	runsDb(w, (db) => db.query<{ runId: string; workloadId: string; requestedAt: number }, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all());
+
+function heartbeatAt(w: World, runId: string): number | null {
+	try {
+		return parseHeartbeat(readFileSync(join(w.runs, runId, "heartbeat"), "utf8"), runId);
+	} catch {
+		return null;
+	}
+}
+
+function writeHeartbeat(w: World, runId: string, atMs: number): void {
+	mkdirSync(join(w.runs, runId), { recursive: true });
+	writeFileSync(join(w.runs, runId, "heartbeat"), heartbeatText(runId, atMs));
+}
+
+/** The request's own `created_at` in ms: the key its queue row carries. */
+const requestedAtOf = (w: World, r: Waiter): number => Date.parse(testRuns(w.ledger.entries(r.wl)).find((x) => x.request.runId === r.id)!.request.createdAt);
+
+/** A queue row the test writes for a waiter that is no process. */
+function queueRow(w: World, runId: string, workloadId: string, requestedAt: number): void {
+	runsDb(w, (db) => db.query("INSERT INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(runId, workloadId, requestedAt));
+}
+
+/** The request settled as a later starter settles a dead runner's: `test-run: … error runner died`. */
+function settleDead(w: World, r: Waiter): void {
+	w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: r.wl, sliceId: r.slice, kind: "assumption", body: testRunBody(runnerDiedRun({ runId: r.id, pr: PR.green, sha: fx.main, slice: r.slice, by: LANE })) });
+}
+
+/**
+ * The child is stopped once its heartbeat file has not changed for over two heartbeat periods (the world's 500 ms): a running
+ * runner rewrites it every period. (`ps` cannot be spawned in every sandbox this suite runs in.)
+ */
+async function seenStopped(w: World, runId: string): Promise<void> {
+	const quietMs = 2 * Number(w.env.AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS) + 100;
+	let seen = heartbeatAt(w, runId);
+	let since = Date.now();
+	await until(`${runId} stopped (its heartbeat unchanged for ${quietMs} ms)`, () => {
+		const now = heartbeatAt(w, runId);
+		if (now !== seen) {
+			seen = now;
+			since = Date.now();
+		}
+		return Date.now() - since > quietMs;
+	}, 20_000);
+}
+
+/**
+ * Stop `child` outside any runs.db transaction: wait for its heartbeat under 1 s old, SIGSTOP it, and see it stopped; then a
+ * probe connection (busy_timeout 300 ms) runs BEGIN IMMEDIATE; COMMIT. A busy probe means the child froze inside its acquiring
+ * transaction: SIGCONT, sleep one poll, try again (at most 10 times). Every wait is bounded at 20 s, under the 60 s stale threshold.
+ */
+async function stopOutsideTx(w: World, child: Child, runId: string): Promise<void> {
+	for (let attempt = 0; attempt < 10; attempt++) {
+		await until(`a heartbeat of ${runId} under 1 s old`, () => Date.now() - (heartbeatAt(w, runId) ?? 0) < 1_000, 20_000);
+		process.kill(child.pid, "SIGSTOP");
+		await seenStopped(w, runId);
+		const probe = new Database(join(w.runs, "runs.db"));
+		try {
+			probe.exec("PRAGMA busy_timeout = 300");
+			probe.exec("BEGIN IMMEDIATE");
+			probe.exec("COMMIT");
+			return;
+		} catch (e) {
+			if (!(e instanceof Error && "code" in e && String(e.code).startsWith("SQLITE_BUSY"))) throw e;
+		} finally {
+			probe.close();
+		}
+		process.kill(child.pid, "SIGCONT");
+		// One runner poll (the world's 200 ms) before the next stop, so the child can finish the transaction it froze in.
+		await Bun.sleep(200);
+	}
+	throw new Error(`${runId} froze inside a runs.db transaction on every one of 10 stops`);
+}
+
+/** Every child resumed, killed and awaited: a failing assertion leaves no stopped process behind. */
+async function reap(children: Child[]): Promise<void> {
+	for (const c of children) {
+		if (c.exitCode === null && c.signalCode === null) {
+			try {
+				process.kill(c.pid, "SIGCONT");
+			} catch {
+				// already gone
+			}
+			c.kill("SIGKILL");
+		}
+		await c.exited;
+	}
+}
+
+const queuedCount = (w: World, r: Waiter): number => marks(w, r.id, "queued").length;
+const acquiredAt = (w: World, r: Waiter): number => marks(w, r.id, "acquired")[0]!.at as number;
+
+describe("the lock queue: queued runs take the lock oldest request first", () => {
+	test("T1: on a stale-holder takeover, younger waiters B and C wait for the oldest, A, while A is stopped; then A, B, C acquire in request order", async () => {
+		const w = world();
+		const { A, B, C } = requestsCBA(w);
+		holdLock(w);
+		const kids: Child[] = [];
+		try {
+			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
+			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
+			await stopOutsideTx(w, kids[0]!, A.id);
+			runsDb(w, (db) => db.query("UPDATE lock SET heartbeatAt = ?").run(Date.now() - 61_000));
+			const b0 = queuedCount(w, B);
+			const c0 = queuedCount(w, C);
+			await until("B and C three more attempts each, or one acquired",
+				() => (queuedCount(w, B) >= b0 + 3 && queuedCount(w, C) >= c0 + 3) || marks(w, B.id, "acquired").length + marks(w, C.id, "acquired").length > 0, 20_000);
+			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
+			expect(runsDb(w, (db) => lockRow(db)?.runId)).toBe("tr-otherholder");
+			process.kill(kids[0]!.pid, "SIGCONT");
+			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			expect(marks(w, A.id, "acquired")).toEqual([expect.objectContaining({ displaced: "tr-otherholder" })]);
+			expect(marks(w, B.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+			expect(marks(w, C.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+			expect(acquiredAt(w, A)).toBeLessThan(acquiredAt(w, B));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+		} finally {
+			await reap(kids);
+		}
+	});
+
+	test("T2: dead waiters ahead (stale heartbeat, settled request, no request, no heartbeat past the startup lease) never block and are pruned", async () => {
+		const w = world();
+		holdLock(w);
+		const kids: Child[] = [];
+		try {
+			// D and E queue for real, older than A, and are killed while queued.
+			const D = waiter(w, 60_000);
+			const E = waiter(w, 50_000);
+			const cd = spawnRun(w, D.id);
+			const ce = spawnRun(w, E.id);
+			kids.push(cd, ce);
+			await until("D and E queued", () => queuedCount(w, D) >= 1 && queuedCount(w, E) >= 1);
+			expect(queueRows(w).map((q) => q.runId)).toEqual([D.id, E.id]);
+			cd.kill("SIGKILL");
+			ce.kill("SIGKILL");
+			await Promise.all([cd.exited, ce.exited]);
+			writeHeartbeat(w, D.id, Date.now() - 61_000);
+			settleDead(w, E);
+			// F: a row whose run the ledger has no request for. G: a request 200 s old that never beat.
+			const F = newRunId();
+			queueRow(w, F, workload(w).wl, Date.now() - 45_000);
+			const G = waiter(w, 200_000);
+			queueRow(w, G.id, G.wl, requestedAtOf(w, G));
+			expect(queueRows(w).map((q) => q.runId)).toEqual([G.id, D.id, E.id, F]);
+			const { A, B, C } = requestsCBA(w);
+			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
+			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
+			// Pruning happens on every attempt, while another run holds the lock too.
+			await until("D, E, F and G pruned", () => queueRows(w).every((q) => [A.id, B.id, C.id].includes(q.runId)), 20_000);
+			expect(queueRows(w).map((q) => q.runId)).toEqual([A.id, B.id, C.id]);
+			expect(queueRows(w).map((q) => q.requestedAt)).toEqual([A, B, C].map((r) => requestedAtOf(w, r)));
+			runsDb(w, (db) => db.query("DELETE FROM lock").run());
+			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			for (const r of [A, B, C]) expect(marks(w, r.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+			expect(acquiredAt(w, A)).toBeLessThan(acquiredAt(w, B));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+			expect(queueRows(w)).toEqual([]);
+		} finally {
+			await reap(kids);
+		}
+	});
+
+	test("T2b: live waiters that are no process block: a fresh heartbeat on a 10-minute-old request, then no heartbeat inside the startup lease", async () => {
+		const w = world();
+		const kids: Child[] = [];
+		try {
+			const I = waiter(w, 600_000);
+			writeHeartbeat(w, I.id, Date.now());
+			queueRow(w, I.id, I.wl, requestedAtOf(w, I));
+			const H = waiter(w, 5_000);
+			queueRow(w, H.id, H.wl, requestedAtOf(w, H));
+			const B = waiter(w, 2_000);
+			const C = waiter(w, 1_000);
+			for (const r of [B, C]) kids.push(spawnRun(w, r.id));
+			await until("B and C three attempts each", () => queuedCount(w, B) >= 3 && queuedCount(w, C) >= 3, 20_000);
+			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
+			expect(queueRows(w).map((q) => q.runId)).toEqual([I.id, H.id, B.id, C.id]);
+			// I's heartbeat goes stale: I is pruned, and H, inside its startup lease, blocks.
+			writeHeartbeat(w, I.id, Date.now() - 61_000);
+			const b0 = queuedCount(w, B);
+			const c0 = queuedCount(w, C);
+			await until("I pruned and B and C three more attempts each",
+				() => !queueRows(w).some((q) => q.runId === I.id) && queuedCount(w, B) >= b0 + 3 && queuedCount(w, C) >= c0 + 3, 20_000);
+			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
+			expect(queueRows(w).map((q) => q.runId)).toEqual([H.id, B.id, C.id]);
+			settleDead(w, H);
+			for (const r of [B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+			expect(queueRows(w)).toEqual([]);
+		} finally {
+			await reap(kids);
+		}
+	});
+
+	test("T3: a waiter pruned while it was stopped re-joins with its original place when it resumes, and acquires before younger waiters", async () => {
+		const w = world();
+		const { A, B, C } = requestsCBA(w);
+		holdLock(w);
+		const kids: Child[] = [];
+		try {
+			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
+			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
+			const original = queueRows(w).find((q) => q.runId === A.id)!.requestedAt;
+			expect(original).toBe(requestedAtOf(w, A));
+			await stopOutsideTx(w, kids[0]!, A.id);
+			writeHeartbeat(w, A.id, Date.now() - 61_000);
+			await until("A's row pruned", () => !queueRows(w).some((q) => q.runId === A.id), 20_000);
+			expect(runsDb(w, (db) => lockRow(db)?.runId)).toBe("tr-otherholder");
+			process.kill(kids[0]!.pid, "SIGCONT");
+			const back = () => queueRows(w).find((q) => q.runId === A.id)?.requestedAt === original && Date.now() - (heartbeatAt(w, A.id) ?? 0) < 5_000;
+			await until("A back in the queue at its original place with a fresh heartbeat", back, 20_000);
+			// Any attempt of B or C that read A's old heartbeat has ended once each has queued twice more.
+			const b0 = queuedCount(w, B);
+			const c0 = queuedCount(w, C);
+			await until("B and C two more attempts each", () => queuedCount(w, B) >= b0 + 2 && queuedCount(w, C) >= c0 + 2, 20_000);
+			expect(back()).toBe(true);
+			runsDb(w, (db) => db.query("DELETE FROM lock").run());
+			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			expect(acquiredAt(w, A)).toBeLessThan(acquiredAt(w, B));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+		} finally {
+			await reap(kids);
+		}
 	});
 });
 
