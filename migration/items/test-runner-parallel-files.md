@@ -2,7 +2,7 @@
 title: The test runner runs the files of a PR's full part in parallel
 status: building
 workload: wl-mvg2kzuvwngdmo
-pr: none
+pr: 272
 ---
 Workload `wl-mvg2kzuvwngdmo` (normal stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mvg2kzuvwngdmo/PLAN.md`, approved by Jo; measurements in `MEASURE.md` beside it).
 
@@ -23,3 +23,5 @@ Workload `wl-mvg2kzuvwngdmo` (normal stakes, plan revision 4 at `~/agent-scratch
 - Lanes run only the tests their change touches: it changes the done rule and the close check, and it misses spawn-based tests such as lane-script.
 
 **Completion.** Merging is not the end. The workload stays open until a measured day qualifies under PLAN.md § 4: `test-run-waits.ts --day <day> --qualify --workers 6 --merge <merge sha> --repo <checkout>` exits 0. That needs a finished day with at least 10 activated, error-free PR full parts, every run terminal, no wait over 30 minutes and no suspect. A full-part error or a suspect on that day files the reversal first.
+
+**Train return repair.** Publication uses the existing shared post-sweep deadline for retries on either database. The ledger's retry loop no longer nests inside the runs database's retry loop. Persistent contention writes a local error and releases the run lock; transient contention may still publish and settle atomically before the deadline. The full-suite time cap is unchanged.

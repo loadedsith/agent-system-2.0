@@ -2009,16 +2009,26 @@ test("publication contention leaves a local error verdict and releases the run l
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
 	arm(w, runId, "result");
-	const child = spawnRun(w, runId);
+	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
 	await reached(w, runId, "result");
+	const deadline = Date.parse(/post-sweep finalization started; deadline (.+)/.exec(runnerLog(w, runId))![1]!);
 	w.ledger.db.exec("BEGIN IMMEDIATE");
 	try {
+		// The runner is another process, so spend its real clock budget at the hook;
+		// publication must inherit the remainder rather than start a fresh timeout.
+		await until("most of the shared finalization budget is spent", () => Date.now() >= deadline - 500, 2000);
+		const resumedAt = Date.now();
 		go(w, runId, "result");
-		await until("publication fails within its finite retry budget", () => child.exitCode !== null, 30_000);
+		await until("publication fails within the post-sweep deadline", () => child.exitCode !== null, 3000);
+		const exitedAt = Date.now();
+		expect(exitedAt).toBeGreaterThanOrEqual(deadline);
+		expect(exitedAt).toBeLessThan(deadline + 1000);
+		console.info(`publication under held ledger: exited ${exitedAt - resumedAt} ms after resume, ${exitedAt - deadline} ms after the shared deadline`);
 		expect(child.exitCode).toBe(START_EXIT.failed);
 		const result = JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"));
 		expect(result.verdict).toBe("error");
 		expect(result.reason).toContain("result publication failed:");
+		expect(result.reason).toContain("post-sweep deadline exceeded during publication");
 		const db = lockDbOf(w);
 		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
 	} finally {
@@ -2028,4 +2038,37 @@ test("publication contention leaves a local error verdict and releases the run l
 	}
 	expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(0);
 	expect(w.ledger.slice(slice)!.state).toBe("open");
+});
+
+test("publication retries a transient ledger lock within the post-sweep deadline and settles atomically", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	arm(w, runId, "result");
+	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+	try {
+		await reached(w, runId, "result");
+		w.ledger.db.exec("BEGIN IMMEDIATE");
+		try {
+			go(w, runId, "result");
+			await until("publication attempts the held ledger", () => marks(w, runId, "publication-busy").length > 0);
+			expect(child.exitCode).toBeNull();
+			expect(existsSync(join(w.runs, runId, "result.json"))).toBe(false);
+		} finally {
+			w.ledger.db.exec("ROLLBACK");
+			go(w, runId, "result");
+		}
+		await until("publication succeeds after the ledger lock clears", () => child.exitCode !== null, 3000);
+		expect(child.exitCode).toBe(0);
+		const results = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results;
+		expect(results).toHaveLength(1);
+		expect(results[0]!.verdict).toBe("green");
+		expect(w.ledger.slice(slice)!.state).toBe("done");
+		expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "green" });
+		const db = lockDbOf(w);
+		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+	} finally {
+		go(w, runId, "result");
+		await child.exited;
+	}
 });
