@@ -5,8 +5,9 @@
 //   open, `forgery: hit <wl> <row id> <rule>` on the standing workload once it is closed (a closed workload takes no
 //   entry), stamped FORGERY_CHECK_BY. Jo's answers, `forgery-confirmed: <row id> by <in-…>` and `forgery-reversed:
 //   <row id> by <in-…>` (surface/src/input.ts), follow the same placement and are matched by row id wherever they sit.
-//   An answer counts only when trusted (launch.ts `trustedForgeryAnswers`): it never answers itself, and one the check
-//   flagged answers nothing until Jo answers it, so a forged confirmation, alone or in a chain or cycle, lifts no hold.
+//   An answer counts only when it is Jo's (ledger/src/jo-channel.ts `joForgeryAnswer`): surface-stamped, carrying a `surface`
+//   jo-channel mark on its own row id (in the provenance of the workload it sits on, the standing one included), and naming
+//   another row. An unmarked answer, however it got there and whatever answers it in turn, lifts no hold.
 // - A workload is held while it has a recorded hit with neither answer (`unansweredHits`), or, for the read-only
 //   checks that run before a pass has recorded anything (`merge-train.ts stakes --hold-ok`, the launch reserve), a
 //   fresh hit of the check itself (`holdState`). A hit Jo reversed after the workload closed (`forgery-reversed:` on the
@@ -16,10 +17,11 @@
 //   autoboard window, records the new hits, and requests a stop of a held workload's live autonomous lane; the
 //   caller raises one alarm per pass with new hits (`alarmLine`, surface/src/notify.ts).
 import type { EntryRow, Ledger } from "../../ledger/src/index";
+import { joForgeryAnswer, surfaceMarks } from "../../ledger/src/jo-channel";
 import { checkForgery, type ForgeryHit, type ForgeryRule } from "./forgery";
 import {
-	attempts, type ControlEntry, controlEntries, FORGERY_HOLD_REASON, forgeryHitBody, forgeryHitRows, heldLive, holdersOf, laneStopRequestBody,
-	parseForgeryAnswer, parseForgeryHit, parseTrainBoard, trustedForgeryAnswers,
+	attempts, type ControlEntry, controlEntries, FORGERY_HOLD_REASON, forgeryHitBody, heldLive, holdersOf, laneStopRequestBody,
+	parseForgeryAnswer, parseForgeryHit, parseTrainBoard,
 } from "./launch";
 import type { Notify, Speak } from "./notify";
 import { FORGERY_CHECK_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -83,27 +85,30 @@ function controlOf(ledger: Ledger, wl: string, entries: readonly EntryRow[] = le
 type Answer = NonNullable<RecordedHit["answer"]>;
 
 /**
- * Jo's answers to hits on `wl`'s rows, by row id: the first trusted `forgery-confirmed:` or `forgery-reversed:` naming it among
- * `own` (on `wl`), then `standing` (on the standing workload). Trust is `trustedForgeryAnswers` over both lists, every row a
- * recorded hit among them or `fresh` names flagged: an answer the check flagged answers nothing until Jo answers it.
+ * Jo's answers to hits on `wl`'s rows, by row id: the first `forgery-confirmed:` or `forgery-reversed:` naming it among `own`
+ * (on `wl`), then `standing` (on the standing workload), that is Jo's answer (`joForgeryAnswer`; `marked` the surface-marked
+ * entry ids of both workloads).
  */
-function answersOf(own: readonly ControlEntry[], wl: string, standing: readonly ControlEntry[], fresh: readonly string[]): Map<string, Answer> {
-	const both = [...own, ...standing];
-	const flagged = forgeryHitRows(both);
-	for (const id of fresh) flagged.add(id);
-	const ownIds = new Set(own.map((c) => c.id));
+function answersOf(own: readonly ControlEntry[], wl: string, standing: readonly ControlEntry[], marked: ReadonlySet<string>): Map<string, Answer> {
 	const out = new Map<string, Answer>();
-	for (const { entry, rowId } of trustedForgeryAnswers(both, flagged)) {
-		if (!out.has(rowId)) out.set(rowId, { kind: entry.prefix === "forgery-confirmed" ? "confirmed" : "reversed", entryId: entry.id, on: ownIds.has(entry.id) ? wl : STANDING_WORKLOAD_ID });
-	}
+	const read = (list: readonly ControlEntry[], on: string) => {
+		for (const c of list) {
+			if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
+			const a = joForgeryAnswer({ id: c.id, kind: "assumption", body: c.body, created_by: c.createdBy }, marked);
+			if (a && !out.has(a.rowId)) out.set(a.rowId, { kind: a.word, entryId: c.id, on });
+		}
+	};
+	read(own, wl);
+	read(standing, STANDING_WORKLOAD_ID);
 	return out;
 }
 
-/** `recordedHits`, with the check's fresh hits (`fresh`, row ids) flagged too when trusting answers. */
-function recordedWith(ledger: Ledger, wl: string, fresh: readonly string[]): { hits: RecordedHit[]; answers: Map<string, Answer> } {
+/** `recordedHits` with the answers they were read against. */
+function recordedWith(ledger: Ledger, wl: string): { hits: RecordedHit[]; answers: Map<string, Answer> } {
 	const own = wl === STANDING_WORKLOAD_ID ? [] : controlOf(ledger, wl);
 	const standing = controlOf(ledger, STANDING_WORKLOAD_ID);
-	const answers = answersOf(own, wl, standing, fresh);
+	const provenance = wl === STANDING_WORKLOAD_ID ? ledger.provenance(wl) : [...ledger.provenance(wl), ...ledger.provenance(STANDING_WORKLOAD_ID)];
+	const answers = answersOf(own, wl, standing, surfaceMarks(provenance, "entries"));
 	const out: RecordedHit[] = [];
 	const add = (c: ControlEntry, on: string, form: "own" | "closed") => {
 		if (c.prefix !== "forgery" || c.createdBy !== FORGERY_CHECK_BY) return;
@@ -122,7 +127,7 @@ function recordedWith(ledger: Ledger, wl: string, fresh: readonly string[]): { h
  * on the standing workload, each with Jo's trusted answer from either place (`answersOf`).
  */
 export function recordedHits(ledger: Ledger, wl: string): RecordedHit[] {
-	return recordedWith(ledger, wl, []).hits;
+	return recordedWith(ledger, wl).hits;
 }
 
 /** The recorded hits on `wl` Jo has answered neither way: what holds it. */
@@ -140,12 +145,11 @@ export function closedReversals(ledger: Ledger, wl: string): RecordedHit[] {
 
 /**
  * The hold as the read-only checks see it: the recorded hits Jo has not answered, and the check's own hits no pass has
- * recorded yet and Jo has not answered (one per row id, its first rule). Every row the check flags now is flagged when
- * trusting answers, so a confirmation no pass has recorded a hit on yet answers nothing either.
+ * recorded yet and Jo has not answered (one per row id, its first rule).
  */
 export function holdState(ledger: Ledger, wl: string): { unanswered: RecordedHit[]; fresh: ForgeryHit[] } {
 	const scan = scanWorkload(ledger, wl);
-	const { hits: recorded, answers } = recordedWith(ledger, wl, scan.map((h) => h.rowId));
+	const { hits: recorded, answers } = recordedWith(ledger, wl);
 	const known = new Set(recorded.map((h) => h.rowId));
 	const fresh: ForgeryHit[] = [];
 	for (const h of scan) {

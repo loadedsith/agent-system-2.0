@@ -15,7 +15,7 @@ import {
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { joAuthority } from "../../ledger/src/authority";
-import { reversedRowIds } from "../../ledger/src/jo-channel";
+import { joForgeryAnswer, reversedRowIds, surfaceMarks } from "../../ledger/src/jo-channel";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -90,7 +90,7 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
-	"forgery", "forgery-confirmed", "forgery-reversed",
+	"forgery", "forgery-confirmed", "forgery-reversed", "mode-compensation",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -174,7 +174,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * open workload) or `forgery: hit <wl> <row id> <rule>` (on the standing workload, for a closed one) is the forgery check's
  * (FORGERY_CHECK_BY: the train tick's pass, the launcher's reserve), and so is its `lane-stop: <lane> requested forgery-hold by
  * forgery-check` (`validWriter`); Jo's answers `forgery-confirmed: <row id> by <in-…>` and `forgery-reversed: <row id> by <in-…>`
- * are the surface's. `controlEntries` drops every entry a surface `forgery-reversed:` of the same workload names.
+ * are the surface's, and so is a reversal's compensating mode flip's `mode-compensation: <flip id> reverses <row id>`
+ * (surface/src/forgery-words.ts). `controlEntries` drops every entry a surface `forgery-reversed:` of the same workload names.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -233,6 +234,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	forgery: [FORGERY_CHECK_BY],
 	"forgery-confirmed": [SURFACE_BY],
 	"forgery-reversed": [SURFACE_BY],
+	"mode-compensation": [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -488,16 +490,18 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
  * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). A recorded
  * forgery hit Jo has not answered (`forgeryHeld`, PLAN wl-mvfxw3c4zqfzls D4) holds every launch: `forgery-hold`.
+ * `marked` is the workload's surface-marked entry ids (ledger/src/jo-channel.ts `surfaceMarks`): only a marked answer is Jo's.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	marked: ReadonlySet<string>,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
 	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
-	if (forgeryHeld(control).length > 0) return { launch: false, reason: "forgery-hold" };
+	if (forgeryHeld(control, marked).length > 0) return { launch: false, reason: "forgery-hold" };
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
@@ -514,7 +518,10 @@ export function launchable(
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return launchable(
+		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		surfaceMarks(rows.provenance, "entries"),
+	);
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
@@ -1321,48 +1328,25 @@ export function parseForgeryAnswer(rest: string): { rowId: string; by: string } 
 	const m = FORGERY_ANSWER_RE.exec(rest);
 	return m ? { rowId: m[1]!, by: m[2]! } : null;
 }
-/** The row ids the `forgery: hit` entries among `control` flag, either form. */
-export function forgeryHitRows(control: readonly ControlEntry[]): Set<string> {
+/**
+ * The row ids Jo answered among `control`: each `forgery-confirmed:` and `forgery-reversed:` that is Jo's answer by the one trust
+ * rule (ledger/src/jo-channel.ts `joForgeryAnswer`; `marked` the surface-marked entry ids of the workloads `control` comes from).
+ */
+export function forgeryAnswered(control: readonly ControlEntry[], marked: ReadonlySet<string>): Set<string> {
 	const out = new Set<string>();
 	for (const c of control) {
-		const h = c.prefix === "forgery" ? parseForgeryHit(c.rest) : null;
-		if (h) out.add(h.rowId);
+		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
+		const a = joForgeryAnswer({ id: c.id, kind: "assumption", body: c.body, created_by: c.createdBy }, marked);
+		if (a) out.add(a.rowId);
 	}
 	return out;
 }
 /**
- * Jo's answers among `control`, oldest first: each valid `forgery-confirmed:` and `forgery-reversed:` that names a row other
- * than itself and is trusted. One no row id in `flagged` names (the flagged rows: the recorded hits, and the check's fresh ones
- * where the reader has them) is trusted; so is one a trusted `forgery-confirmed:` names. The last is a least fixed point from
- * the unflagged roots, so a flagged confirmation, alone, in a chain or in a cycle, answers nothing until Jo answers it.
- */
-export function trustedForgeryAnswers(control: readonly ControlEntry[], flagged: ReadonlySet<string>): { entry: ControlEntry; rowId: string }[] {
-	const answers: { entry: ControlEntry; rowId: string }[] = [];
-	for (const c of control) {
-		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
-		const a = parseForgeryAnswer(c.rest);
-		if (a && a.rowId !== c.id) answers.push({ entry: c, rowId: a.rowId });
-	}
-	const trusted = new Set(answers.filter((a) => !flagged.has(a.entry.id)).map((a) => a.entry.id));
-	const todo = [...trusted];
-	for (let id = todo.pop(); id !== undefined; id = todo.pop()) {
-		const a = answers.find((x) => x.entry.id === id)!;
-		if (a.entry.prefix !== "forgery-confirmed" || trusted.has(a.rowId) || !answers.some((x) => x.entry.id === a.rowId)) continue;
-		trusted.add(a.rowId);
-		todo.push(a.rowId);
-	}
-	return answers.filter((a) => trusted.has(a.entry.id));
-}
-/** The row ids Jo answered among `control`: each trusted `forgery-confirmed:` and `forgery-reversed:` (`trustedForgeryAnswers`). */
-export function forgeryAnswered(control: readonly ControlEntry[]): Set<string> {
-	return new Set(trustedForgeryAnswers(control, forgeryHitRows(control)).map((a) => a.rowId));
-}
-/**
  * The forgery hold on a workload from its own control entries (D4): every valid own-workload `forgery: hit <row id> <rule>`
- * whose row id no trusted `forgery-confirmed:` or `forgery-reversed:` names (`forgeryAnswered`), one per row id, oldest first.
+ * whose row id no answer of Jo's names (`forgeryAnswered`), one per row id, oldest first.
  */
-export function forgeryHeld(control: readonly ControlEntry[]): { entryId: string; rowId: string; rule: string }[] {
-	const answered = forgeryAnswered(control);
+export function forgeryHeld(control: readonly ControlEntry[], marked: ReadonlySet<string>): { entryId: string; rowId: string; rule: string }[] {
+	const answered = forgeryAnswered(control, marked);
 	const out: { entryId: string; rowId: string; rule: string }[] = [];
 	for (const c of control) {
 		if (c.prefix !== "forgery") continue;

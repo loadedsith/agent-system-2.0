@@ -20,7 +20,7 @@
 //   fires, ledger/schema.sql `questions_resolution_settles_slice`), the launches and boardings the row led to
 //   (`consequences`: the lane's commits, pushes and spend, the merge), and anything on a closed workload.
 // A row id no recorded hit names, or a hit Jo already answered, is refused, never applied and never prose.
-import { forgeryReversedBody, reversedRowIds } from "../../ledger/src/jo-channel";
+import { forgeryReversedBody, joForgeryAnswer, reversedRowIds, surfaceMarks } from "../../ledger/src/jo-channel";
 import type { InstructionRow, Ledger, Mode } from "../../ledger/src/index";
 import { consequences, deferredCancels, forgeryPlacement, hitWorkloads, holdStops, type RecordedHit, recordedHits, unansweredHits } from "./forgery-hold";
 import { modeFlipControl } from "./input";
@@ -117,27 +117,41 @@ function confirm(ledger: Ledger, hit: RecordedHit, on: string, inId: string): st
 
 /**
  * The surface's compensating mode-flip of reversed flip `reversed`: its entry `mode-compensation: <flip id> reverses <row id>`,
- * written beside the flip (the flip's body stays the bare mode every reader of `mode-flip` instructions reads).
+ * a jo-only prefix (ledger/src/authority.ts), so the surface's connection marks it, F1 flags an unmarked one and F5 one from
+ * another writer. It is written beside the flip (the flip's body stays the bare mode every reader of `mode-flip` instructions reads).
  */
 function modeCompensationBody(flipId: string, reversed: string): string {
 	return `mode-compensation: ${flipId} reverses ${reversed}`;
 }
 
-const MODE_COMPENSATION = /^mode-compensation:\s+(in-\S+)\s+reverses\s+\S+$/;
+const MODE_COMPENSATION = /^mode-compensation:\s+(in-\S+)\s+reverses\s+(\S+)$/;
 
 /**
  * The mode `wl` has with every reversed mode-flip and every compensating flip left out: the newest flip Jo made and kept, else
- * the mode it opened with.
+ * the mode it opened with. A flip is a compensation only when all three hold: the `mode-compensation:` entry naming it is
+ * surface-stamped and surface-marked; the flip is a surface-marked mode-flip instruction; and Jo's `forgery-reversed:`
+ * (`joForgeryAnswer`) names the row the entry says it reverses. Anything less is no compensation, so the flip stays Jo's choice.
  */
 function effectiveMode(ledger: Ledger, wl: string): Mode | null {
+	const provenance = ledger.provenance(wl);
+	const markedEntries = surfaceMarks(provenance, "entries");
+	const markedFlips = surfaceMarks(provenance, "instructions");
+	const entries = ledger.entries(wl, "assumption");
+	const reversedByJo = new Set<string>();
+	for (const e of entries) {
+		const a = joForgeryAnswer(e, markedEntries);
+		if (a?.word === "reversed") reversedByJo.add(a.rowId);
+	}
+	const instructions = ledger.instructions(wl, { withReversed: true });
 	const compensations = new Set<string>();
-	for (const e of ledger.entries(wl, "assumption")) {
-		const m = e.created_by === SURFACE_BY ? MODE_COMPENSATION.exec(e.body.trim()) : null;
-		if (m) compensations.add(m[1]!);
+	for (const e of entries) {
+		const m = e.created_by === SURFACE_BY && markedEntries.has(e.id) ? MODE_COMPENSATION.exec(e.body.trim()) : null;
+		if (!m || !markedFlips.has(m[1]!) || !reversedByJo.has(m[2]!)) continue;
+		if (instructions.some((i) => i.id === m[1] && i.kind === "mode-flip" && i.created_by === SURFACE_BY)) compensations.add(m[1]!);
 	}
 	const last = ledger.instructions(wl).findLast((i) => i.kind === "mode-flip" && !compensations.has(i.id));
 	if (last) return last.body as Mode;
-	const opened = ledger.provenance(wl).find((p) => p.tbl === "workloads" && p.action === "insert");
+	const opened = provenance.find((p) => p.tbl === "workloads" && p.action === "insert");
 	const m = opened ? / mode=(autonomous|user-driven)\b/.exec(opened.detail ?? "") : null;
 	return m ? (m[1] as Mode) : null;
 }

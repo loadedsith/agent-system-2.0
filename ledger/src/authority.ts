@@ -64,8 +64,9 @@ export const AUTHORITY: readonly AuthorityRow[] = [
 	jo("control-prefix", "rank-audit", "surface/src/rank-audit.ts; surface/src/render.ts"),
 	jo("control-prefix", "cap", "PR-B's cap reader, through joAuthority"),
 	jo("control-prefix", "switch", "PR-B's switch reader, through joAuthority"),
-	jo("control-prefix", "forgery-confirmed", "surface/src/launch.ts forgeryHeld; surface/src/forgery.ts checkForgery (the row is not flagged again); surface/src/forgery-hold.ts unansweredHits"),
-	jo("control-prefix", "forgery-reversed", "surface/src/launch.ts controlEntries, forgeryHeld; ledger/src/index.ts Ledger.instructions, parkLane; surface/scripts/invariants.ts reservedView; surface/src/decision-log.ts repoOf; surface/src/forgery-hold.ts unansweredHits"),
+	jo("control-prefix", "forgery-confirmed", "ledger/src/jo-channel.ts joForgeryAnswer (surface-marked only), read by surface/src/launch.ts forgeryHeld; surface/src/forgery.ts checkForgery (the row is not flagged again); surface/src/forgery-hold.ts unansweredHits"),
+	jo("control-prefix", "forgery-reversed", "surface/src/launch.ts controlEntries; ledger/src/index.ts Ledger.instructions, parkLane; surface/scripts/invariants.ts reservedView; surface/src/decision-log.ts repoOf; as Jo's answer, ledger/src/jo-channel.ts joForgeryAnswer (surface-marked only), read by surface/src/launch.ts forgeryHeld and surface/src/forgery-hold.ts unansweredHits"),
+	jo("control-prefix", "mode-compensation", "surface/src/forgery-words.ts effectiveMode (surface-marked, naming a surface-marked mode-flip and a row a trusted forgery-reversed: names)"),
 	{
 		kind: "control-prefix",
 		name: "forgery",

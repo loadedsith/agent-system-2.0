@@ -226,6 +226,8 @@ export interface ReserveRows {
 	slices: SliceRow[];
 	/** Every holder the workload ever had, oldest first (`holders`). */
 	holders: string[];
+	/** The workload's provenance (`provenance`): its Jo-channel marks, so the predicate trusts only a marked forgery answer. */
+	provenance: ProvenanceRow[];
 	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
 	liveLanes: number;
 	cap: number;
@@ -589,7 +591,7 @@ export class Ledger {
 
 	/**
 	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
-	 * transaction): the workload row, its entries, questions, instructions and slices, and the
+	 * transaction): the workload row, its entries, questions, instructions, slices and provenance, and the
 	 * live-lane count at `now`. Null when there is no such workload.
 	 */
 	launchRows(workloadId: string, cap: number): ReserveRows | null {
@@ -603,6 +605,7 @@ export class Ledger {
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
 			holders: this.holders(workloadId),
+			provenance: this.provenance(workloadId),
 			liveLanes: this.liveLaneHolders(now).length,
 			cap,
 			now,

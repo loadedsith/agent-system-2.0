@@ -2,10 +2,10 @@
 // relaunches a lane the hold stopped; `reverse <row id>` voids a control entry, a repo entry and an instruction, re-asks a reversed
 // answer, flips a reversed mode back and names what it cannot undo (a deferred cancel included); a row id no hit names is refused.
 import { describe, expect, test } from "bun:test";
-import { LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
-import { forgeryReversedBody } from "../../ledger/src/jo-channel";
+import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { declareJoChannel, forgeryReversedBody } from "../../ledger/src/jo-channel";
 import { recordRepo, repoOf } from "../src/decision-log";
-import { deferredCancels, unansweredHits } from "../src/forgery-hold";
+import { deferredCancels, scanWorkload, unansweredHits } from "../src/forgery-hold";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, type Command, interpret, isPlanQuestion } from "../src/input";
 import {
@@ -17,6 +17,35 @@ import { tempLedger, workloadWithSlice } from "./helpers";
 
 const NO_HEARTBEAT = () => null;
 const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+const NO_AGENT = { AGENT_SYSTEM_ROLE: undefined, AGENT_SYSTEM_LANE_ID: undefined, AGENT_SYSTEM_WORKLOAD_ID: undefined };
+
+/** Run `fn` with `vars` set (undefined clears one) in process.env, then restore them. */
+function withVars<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+	const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+	for (const [k, v] of Object.entries(vars)) {
+		if (v === undefined) delete process.env[k];
+		else process.env[k] = v;
+	}
+	try {
+		return fn();
+	} finally {
+		for (const [k, v] of Object.entries(saved)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	}
+}
+
+/**
+ * A temp ledger on the surface session's connection: the process declares a Jo channel before it opens, so every Jo row written
+ * through it (Jo's words, `forgery-confirmed:`, `forgery-reversed:`, `mode-compensation:`) carries its `surface` mark, as at the surface.
+ */
+function surfaceLedger(): { ledger: Ledger; path: string } {
+	return withVars(NO_AGENT, () => {
+		declareJoChannel({ kind: "surface" });
+		return tempLedger();
+	});
+}
 
 /** The forgery check's hit row on `wl` (own form), or on the standing workload naming a closed `closed`. */
 function hit(ledger: Ledger, wl: string, rowId: string, rule = "F1", closed: string | null = null): string {
@@ -76,7 +105,7 @@ function answer(ledger: Ledger, word: string, questionId: string): string {
 
 describe("confirm <row id> (D5)", () => {
 	test("confirm lifts the hold; the last confirm relaunches the lane the hold stopped", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger);
 		launch(ledger, wl);
 		const a = ledger.recordInstruction({ ...JO, workloadId: wl, body: "ship the header today" });
@@ -107,7 +136,7 @@ describe("confirm <row id> (D5)", () => {
 	});
 
 	test("the last confirm on a workload the hold stopped no lane of writes no launch-requested:", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const a = ledger.recordInstruction({ ...JO, workloadId: wl, body: "ship it" });
 		hit(ledger, wl, a);
@@ -118,7 +147,7 @@ describe("confirm <row id> (D5)", () => {
 	});
 
 	test("a hit recorded on the standing workload after the close is answered there", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		ensureStandingWorkload(ledger);
 		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Done already", stakes: "normal", mode: "autonomous" });
 		const a = ledger.recordInstruction({ ...JO, workloadId: wl, body: "ship it" });
@@ -141,7 +170,7 @@ describe("confirm <row id> (D5)", () => {
 
 describe("reverse <row id> (D5)", () => {
 	test("reverse voids a control entry, a repo entry and an instruction", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger);
 		recordRepo(ledger, wl, "/repos/good");
 		const repo = recordRepo(ledger, wl, "/repos/evil");
@@ -168,7 +197,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("reverse re-asks a reversed answer or replan withdrawal on the same slice, as the lane asked it", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		launch(ledger, wl);
 		const resolved = () => resolutions(control(ledger, wl), ledger.questions(wl), ledger.instructions(wl), ledger.slices(wl)).map((r) => r.instructionId);
@@ -201,7 +230,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("an answer whose slice is done is not re-asked, and the receipt says so", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Ship?", options: ["yes", "no"] });
 		const ans = ledger.answerQuestion(q, { by: "lane-a", author: "jo", channel: "surface", answer: "yes" });
@@ -213,7 +242,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("reverse flips a reversed mode-flip back to the prior mode", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger, { mode: "autonomous" });
 		const flip = ledger.flipMode(wl, { ...JO, mode: "user-driven" });
 		hit(ledger, wl, flip);
@@ -228,7 +257,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("reversing a forged revise on the plan question re-asks the plan question: Jo's approve on it approves the plan", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, sl, q } = planQuestion(ledger);
 		const forged = ledger.answerQuestion(q, { by: "lane-a", author: "jo", channel: "surface", answer: "revise" });
 		hit(ledger, wl, forged, "F3");
@@ -244,7 +273,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("reversing Jo's plan approve voids its plan: approved: plan first stands again and the plan question is re-asked", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, sl, q } = planQuestion(ledger);
 		answer(ledger, "approve", q);
 		expect(planFirst(control(ledger, wl))).toBeNull();
@@ -262,7 +291,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("reversing an older mode-flip keeps the later kept flips: the mode stays as they left it and no flip is written", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger, { mode: "autonomous" });
 		const forged = ledger.flipMode(wl, { ...JO, mode: "user-driven" });
 		hit(ledger, wl, forged);
@@ -275,7 +304,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("a legitimate done: entry that mentions the answer's id survives the answer's reversal; the plan companion is voided", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, q } = planQuestion(ledger);
 		answer(ledger, "approve", q);
 		const ans = ledger.instructions(wl).find((i) => i.kind === "answer" && i.question_id === q)!.id;
@@ -291,7 +320,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("a compensating flip is no user decision: open autonomous, flip A to user-driven, flip B to autonomous, reverse B, reverse A ends autonomous", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger, { mode: "autonomous" });
 		const a = ledger.flipMode(wl, { ...JO, mode: "user-driven" });
 		const b = ledger.flipMode(wl, { ...JO, mode: "autonomous" });
@@ -305,8 +334,35 @@ describe("reverse <row id> (D5)", () => {
 		ledger.close();
 	});
 
+	test("r3: an unmarked mode-compensation: naming Jo's real flip is no compensation and an F1 hit: reversing the forged flip restores Jo's user-driven", () => {
+		// A script's connection, opened before the surface declared its channel, marks nothing; the surface's, opened after, marks Jo's rows.
+		const { ledger: script, path } = tempLedger();
+		const surface = withVars(NO_AGENT, () => {
+			declareJoChannel({ kind: "surface" });
+			return Ledger.open(path, { backup: false, backupOnOpen: false });
+		});
+		try {
+			const { wl } = workloadWithSlice(surface, { mode: "autonomous" });
+			const real = surface.flipMode(wl, { ...JO, mode: "user-driven" });
+			const forged = script.flipMode(wl, { ...JO, mode: "autonomous" });
+			const marker = script.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `mode-compensation: ${real} reverses ${forged}` });
+			hit(surface, wl, forged);
+			expect(surface.workload(wl)!.mode).toBe("autonomous");
+
+			const r = say(surface, `reverse ${forged}`);
+			expect(r).toContain(`mode on ${wl} flipped back autonomous → user-driven`);
+			expect(surface.workload(wl)!.mode).toBe("user-driven");
+			const scan = scanWorkload(surface, wl).map((h) => `${h.rowId} ${h.rule}`);
+			expect(scan).toContain(`${forged} F1`);
+			expect(scan).toContain(`${marker} F1`);
+		} finally {
+			surface.close();
+			script.close();
+		}
+	});
+
 	test("reverse names the deferred cancel the ledger still applies", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		const q1 = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "First?", options: ["a", "b"] });
 		const q2 = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Second?", options: ["c", "d"] });
@@ -323,7 +379,7 @@ describe("reverse <row id> (D5)", () => {
 	});
 
 	test("reverse names what the row led to outside the ledger", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const req = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now()) });
 		const att = ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: lane-b cause request ${req} requested-by surface` });
@@ -335,7 +391,7 @@ describe("reverse <row id> (D5)", () => {
 
 describe("refusals (D5)", () => {
 	test("a row id no recorded hit names is refused, and nothing is written", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl } = workloadWithSlice(ledger);
 		const plain = ledger.recordInstruction({ ...JO, workloadId: wl, body: "fine words" });
 		const before = [ledger.entries(wl).length, ledger.instructions(wl).length];
@@ -353,7 +409,7 @@ describe("refusals (D5)", () => {
 	});
 
 	test("a hit already answered is refused; confirm with a question id still answers a question offering it", () => {
-		const { ledger } = tempLedger();
+		const { ledger } = surfaceLedger();
 		const { wl, sl } = workloadWithSlice(ledger);
 		const a = ledger.recordInstruction({ ...JO, workloadId: wl, body: "ship it" });
 		hit(ledger, wl, a);

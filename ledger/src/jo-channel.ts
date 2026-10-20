@@ -24,6 +24,7 @@
 // surface/scripts/invariants.ts reservedView) unless a later effective reversal voids the reversal itself.
 import { SURFACE_BY } from "../../surface/src/types";
 import { AUTHORITY, agentContext, BOUNDARY } from "./authority";
+import type { ProvenanceRow } from "./index";
 import { defaultLedgerPath, inLiveRoot, TEST_ISOLATED_ENV } from "./locality";
 
 /** A declared Jo channel: the surface, or the by-hand lane launcher of one workload. */
@@ -115,6 +116,35 @@ const REVERSED = /^forgery-reversed:\s+(\S+)\s+by\s+(in-\S+)$/;
 export function parseForgeryReversed(body: string): { rowId: string; by: string } | null {
 	const m = REVERSED.exec(body.trim());
 	return m ? { rowId: m[1]!, by: m[2]! } : null;
+}
+
+/** The `provenance` columns a mark is read from. */
+type MarkRow = Pick<ProvenanceRow, "lane_instance" | "tbl" | "row_id" | "action" | "detail">;
+
+/** The ids of the `table` rows a `surface` jo-channel mark names among `provenance`: the rows the surface session inserted for Jo. */
+export function surfaceMarks(provenance: readonly MarkRow[], table: "entries" | "instructions"): Set<string> {
+	const out = new Set<string>();
+	for (const p of provenance) if (p.lane_instance === JO_CHANNEL_LANE && p.action === "insert" && p.detail === "surface" && p.tbl === table) out.add(p.row_id);
+	return out;
+}
+
+const FORGERY_ANSWER = /^forgery-(confirmed|reversed):\s+(\S+)\s+by\s+(in-\S+)$/;
+
+/**
+ * Jo's answer to a forgery hit (PLAN wl-mvfxw3c4zqfzls D5), or null: the one trust rule every reader of `forgery-confirmed:`
+ * and `forgery-reversed:` as Jo's answer applies (surface/src/forgery.ts checkForgery, surface/src/launch.ts forgeryHeld,
+ * surface/src/forgery-hold.ts and through it the merge train, the close and surface/src/forgery-words.ts). The entry counts
+ * only when it is kind assumption, stamped by the surface, carries a `surface` jo-channel mark on its own row id
+ * (`marked`, from `surfaceMarks(…, "entries")` over the provenance of the workload the entry sits on), and names a row
+ * other than itself. Trust is the entry's own mark and nothing else: a marked confirmation of another confirmation answers
+ * that confirmation's hit only, never its target. No pre-cutover exception: the words ship with the marks, so the surface
+ * that writes one marks it. `reversedRowIds` stays the effective-reversal reader and does not apply this rule.
+ */
+export function joForgeryAnswer(e: { id: string; kind: string; body: string; created_by: string }, marked: ReadonlySet<string>): { word: "confirmed" | "reversed"; rowId: string } | null {
+	if (e.kind !== "assumption" || e.created_by !== SURFACE_BY || !marked.has(e.id)) return null;
+	const m = FORGERY_ANSWER.exec(e.body.trim());
+	if (!m || m[2] === e.id) return null;
+	return { word: m[1] as "confirmed" | "reversed", rowId: m[2]! };
 }
 
 /**

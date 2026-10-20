@@ -306,17 +306,27 @@ describe("confirmed rows and output shape", () => {
 		expect(rules(check({ entries: [a, b] }))).toEqual(["en-cycle-a F1", "en-cycle-b F1"]);
 	});
 
-	test("a marked confirmation exempts its target, and a chain rooted in it; before the surface cutover an unmarked one does", () => {
+	test("a marked confirmation exempts its target only: no chain through it, and no pre-cutover exception", () => {
 		const plan = ent(planApprovedBody("in-1"));
 		const confirmation = ent(`forgery-confirmed: ${plan.id} by in-a`);
 		expect(check({ entries: [plan, confirmation], provenance: [mark("entries", confirmation, "surface")] })).toEqual([]);
 		// a launcher mark is not the surface's: the confirmation is marked (no F1 of its own) but exempts nothing
 		expect(rules(check({ entries: [plan, confirmation], provenance: [mark("entries", confirmation, "launcher")] }))).toEqual([`${plan.id} F1`]);
+		// Jo's marked confirmation of the unmarked confirmation clears that confirmation's hit, never the plan's
 		const root = ent(`forgery-confirmed: ${confirmation.id} by in-b`);
-		expect(check({ entries: [plan, confirmation, root], provenance: [mark("entries", root, "surface")] })).toEqual([]);
-		const early = ent(planApprovedBody("in-2"), SURFACE_BY, BEFORE);
+		expect(rules(check({ entries: [plan, confirmation, root], provenance: [mark("entries", root, "surface")] }))).toEqual([`${plan.id} F1`]);
+		// before the surface cutover an unmarked confirmation is no answer either: a lane's plan stays F5
+		const early = ent(planApprovedBody("in-2"), OWN_LANE, BEFORE);
 		const earlyConfirmation = ent(`forgery-confirmed: ${early.id} by in-c`, SURFACE_BY, BEFORE);
-		expect(check({ entries: [early, earlyConfirmation] })).toEqual([]);
+		expect(rules(check({ entries: [early, earlyConfirmation] }))).toEqual([`${early.id} F5`]);
+	});
+
+	test("mode-compensation: is a jo-only prefix: unmarked after the cutover it is F1, from another writer F5, marked it passes", () => {
+		const marked = ent("mode-compensation: in-c1 reverses in-f1");
+		const unmarked = ent("mode-compensation: in-c2 reverses in-f2");
+		const lane = ent("mode-compensation: in-c3 reverses in-f3", OWN_LANE);
+		const hits = check({ entries: [marked, unmarked, lane], provenance: [mark("entries", marked, "surface")] });
+		expect(rules(hits)).toEqual([`${unmarked.id} F1`, `${lane.id} F5`]);
 	});
 
 	test("a reversed reversal voids nothing: Jo's reversal of a forged reversal brings back a plan gate and a confirmation", () => {
