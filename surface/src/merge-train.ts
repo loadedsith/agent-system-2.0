@@ -21,7 +21,7 @@
 import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import { meter } from "./rank-launch";
 import { type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainBoard, parseTrainFix, planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody } from "./launch";
-import { unansweredHits } from "./forgery-hold";
+import { closedReversals, REVERSED_AFTER_CLOSE, unansweredHits } from "./forgery-hold";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
@@ -373,7 +373,8 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			`\`${RESOLVE_COMMAND} stakes --hold-ok --repo <owner/repo of this workload's origin> --pr <n>\` prints \`normal\` (a same-repo \`wl/<id>\` ` +
 			`branch whose workload is on this repository at normal stakes, and main's protection verified), \`${HOLD_PREFIX} (<gap>)\` ` +
 			"(the PR's own stakes are normal, but main's protection is not verified), `hold: forgery <row id> …` (a ledger row on the PR's " +
-			"workload or this train's that the forgery check flagged and Jo has not answered; whatever the stakes) or `production: <reason>` " +
+			"workload or this train's that the forgery check flagged and Jo has not answered, or reversed after the workload's close; whatever " +
+			"the stakes) or `production: <reason>` " +
 			"(anything else); exit 2 (usage or a gh failure): run it once more. On `hold`, or on a second exit 2: " +
 			`${LANE_RECORD_ENTRY_TOOL} \`train-error: pr <n> protection <gap>\` (\`train-error: pr <n> forgery <row ids>\` on a forgery hold; ` +
 			`\`train-error: pr <n> stakes <the second run's message>\` on exit 2) and pass the PR ` +
@@ -1489,9 +1490,12 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	if (w.status !== "closed" || w.closed_at === null) return no("the workload is open");
 	if (w.mode !== "autonomous") return no(`the workload is ${w.mode}`);
 	if (w.stakes !== "normal") return no(`stakes ${w.stakes}`);
-	// PLAN wl-mvfxw3c4zqfzls D4: a recorded forgery hit Jo has not answered (on W, or on the standing workload since the close) holds the landing.
+	// PLAN wl-mvfxw3c4zqfzls D4: a recorded forgery hit Jo has not answered (on W, or on the standing workload since the close) holds the landing;
+	// D5's last row: one Jo reversed after the close refuses it for good.
 	const forged = unansweredHits(ledger, wl);
 	if (forged.length > 0) return no(`forgery hold: ${forged.map((h) => `${h.rowId} ${h.rule}`).join(", ")} unanswered`);
+	const reversed = closedReversals(ledger, wl);
+	if (reversed.length > 0) return no(`forgery reversal: ${reversed.map((h) => `${h.rowId} ${h.rule}`).join(", ")} ${REVERSED_AFTER_CLOSE}; boarding stays refused`);
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const runs = testRuns(entries);
@@ -1565,6 +1569,8 @@ export function boardLanding(
 		if (!w || w.status !== "closed") return no(`${l.workloadId} is not closed`);
 		const forged = unansweredHits(ledger, l.workloadId);
 		if (forged.length > 0) return no(`forgery hold on ${l.workloadId}: ${forged.map((h) => h.rowId).join(", ")} unanswered`);
+		const reversed = closedReversals(ledger, l.workloadId);
+		if (reversed.length > 0) return no(`forgery reversal on ${l.workloadId}: ${reversed.map((h) => h.rowId).join(", ")} ${REVERSED_AFTER_CLOSE}; boarding stays refused`);
 		const cutover = autoboardCutover(ledger);
 		if (cutover === null) return no("no train-autoboard cutover yet");
 		const trains = everyTrain(ledger).filter((t) => {

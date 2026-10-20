@@ -34,7 +34,8 @@
 //          With --hold-ok the forgery check (PLAN wl-mvfxw3c4zqfzls D4, surface/src/forgery-hold.ts) runs first, read-only,
 //          before the production answer: over the PR's workload (its head branch wl/<id>) and, when AGENT_SYSTEM_WORKLOAD_ID
 //          names one (the train lane's env), the train's own; any hit Jo has not answered, recorded by the train tick or not
-//          yet, prints `hold: forgery <row id> <rule> on <wl>[, …]`.
+//          yet, prints `hold: forgery <row id> <rule> on <wl>[, …]`, and a hit Jo reversed after its workload closed prints
+//          `hold: forgery <row id> <rule> on <wl> reversed after the close` (D5: boarding stays refused).
 // list     the train's members (`trainMembers`: Jo's `train:` and the train tick's `train-board:`, PLAN wl-mvbjiettjrfpxc
 //          D5) from the ledger opened read-only, in membership order, one line each: `<n> jo` or `<n> board`. No gh.
 //
@@ -161,8 +162,8 @@ function openReadOnly(): Ledger {
  * `stakes` (D1, D2): the PR's head, read once from gh, against the ledger opened read-only, then, for a normal PR, main's
  * protection; `normal`, or `production: <reason>` (`production: main protection unverified (<why>)` when it does not hold).
  * With `holdOk` (PLAN wl-mvbjiettjrfpxc D5) the unverified protection of a normal PR is `hold: main protection unverified (<why>)`,
- * and first of all a forgery hit Jo has not answered on the PR's workload or the train's own is `hold: forgery …`
- * (PLAN wl-mvfxw3c4zqfzls D4, `forgeryStakesHold`), whatever the PR's stakes.
+ * and first of all a forgery hit Jo has not answered, or reversed after its workload's close, on the PR's workload or the train's
+ * own is `hold: forgery …` (PLAN wl-mvfxw3c4zqfzls D4, D5, `forgeryStakesHold`), whatever the PR's stakes.
  */
 function stakes(repo: string, n: number, holdOk: boolean): Outcome {
 	const args = ["pr", "view", String(n), "-R", repo, "--json", "number,headRefName,isCrossRepository,headRepository,headRepositoryOwner"];

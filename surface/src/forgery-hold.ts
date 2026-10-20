@@ -7,7 +7,9 @@
 //   <row id> by <in-…>` (surface/src/input.ts), follow the same placement and are matched by row id wherever they sit.
 // - A workload is held while it has a recorded hit with neither answer (`unansweredHits`), or, for the read-only
 //   checks that run before a pass has recorded anything (`merge-train.ts stakes --hold-ok`, the launch reserve), a
-//   fresh hit of the check itself (`holdState`).
+//   fresh hit of the check itself (`holdState`). A hit Jo reversed after the workload closed (`forgery-reversed:` on the
+//   standing workload, `closedReversals`) keeps the boarding, landing and `stakes --hold-ok` refusal for good (D5's last
+//   row): nothing in the ledger undoes a closed workload's row, so its PR never boards. Only the unanswered hit is LOUD.
 // - The train tick's pass (`forgeryPass`) runs over every open workload and every workload closed within the
 //   autoboard window, records the new hits, and requests a stop of a held workload's live autonomous lane; the
 //   caller raises one alarm per pass with new hits (`alarmLine`, surface/src/notify.ts).
@@ -30,8 +32,8 @@ export interface RecordedHit {
 	rowId: string;
 	rule: string;
 	createdAt: string;
-	/** Jo's answer to it, or null while it holds. */
-	answer: { kind: "confirmed" | "reversed"; entryId: string } | null;
+	/** Jo's answer to it, or null while it holds; `on` is where the answer sits (the standing workload for one written after the close). */
+	answer: { kind: "confirmed" | "reversed"; entryId: string; on: string } | null;
 }
 
 /** A hit written by this call: which workload, which row and rule, and the `forgery:` entry. */
@@ -75,12 +77,15 @@ function controlOf(ledger: Ledger, wl: string, entries: readonly EntryRow[] = le
 	return controlEntries(entries, holdersOf(entries, w?.holder ?? null, ledger.holders(wl)));
 }
 
-/** Jo's answers among `control`, by row id: the first valid `forgery-confirmed:` or `forgery-reversed:` naming it. */
-function answersIn(control: readonly ControlEntry[], into: Map<string, { kind: "confirmed" | "reversed"; entryId: string }>): void {
+/** A hit's answer: which word, its entry, and the workload the entry sits on. */
+type Answer = NonNullable<RecordedHit["answer"]>;
+
+/** Jo's answers among `control` (on workload `on`), by row id: the first valid `forgery-confirmed:` or `forgery-reversed:` naming it. */
+function answersIn(control: readonly ControlEntry[], on: string, into: Map<string, Answer>): void {
 	for (const c of control) {
 		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
 		const a = parseForgeryAnswer(c.rest);
-		if (a && !into.has(a.rowId)) into.set(a.rowId, { kind: c.prefix === "forgery-confirmed" ? "confirmed" : "reversed", entryId: c.id });
+		if (a && !into.has(a.rowId)) into.set(a.rowId, { kind: c.prefix === "forgery-confirmed" ? "confirmed" : "reversed", entryId: c.id, on });
 	}
 }
 
@@ -91,9 +96,9 @@ function answersIn(control: readonly ControlEntry[], into: Map<string, { kind: "
 export function recordedHits(ledger: Ledger, wl: string): RecordedHit[] {
 	const own = wl === STANDING_WORKLOAD_ID ? [] : controlOf(ledger, wl);
 	const standing = controlOf(ledger, STANDING_WORKLOAD_ID);
-	const answers = new Map<string, { kind: "confirmed" | "reversed"; entryId: string }>();
-	answersIn(own, answers);
-	answersIn(standing, answers);
+	const answers = new Map<string, Answer>();
+	answersIn(own, wl, answers);
+	answersIn(standing, STANDING_WORKLOAD_ID, answers);
 	const out: RecordedHit[] = [];
 	const add = (c: ControlEntry, on: string, form: "own" | "closed") => {
 		if (c.prefix !== "forgery" || c.createdBy !== FORGERY_CHECK_BY) return;
@@ -113,15 +118,23 @@ export function unansweredHits(ledger: Ledger, wl: string): RecordedHit[] {
 }
 
 /**
+ * The recorded hits on `wl` Jo reversed after its close (the `forgery-reversed:` on the standing workload, D5's last row): no longer
+ * unanswered, so no LOUD line, but the merge train's refusal stays (`landingReady`, `boardLanding`, `stakes --hold-ok`).
+ */
+export function closedReversals(ledger: Ledger, wl: string): RecordedHit[] {
+	return recordedHits(ledger, wl).filter((h) => h.answer?.kind === "reversed" && h.answer.on !== wl);
+}
+
+/**
  * The hold as the read-only checks see it: the recorded hits Jo has not answered, and the check's own hits no pass has
  * recorded yet and Jo has not answered (one per row id, its first rule).
  */
 export function holdState(ledger: Ledger, wl: string): { unanswered: RecordedHit[]; fresh: ForgeryHit[] } {
 	const recorded = recordedHits(ledger, wl);
 	const known = new Set(recorded.map((h) => h.rowId));
-	const answers = new Map<string, { kind: "confirmed" | "reversed"; entryId: string }>();
-	answersIn(wl === STANDING_WORKLOAD_ID ? [] : controlOf(ledger, wl), answers);
-	answersIn(controlOf(ledger, STANDING_WORKLOAD_ID), answers);
+	const answers = new Map<string, Answer>();
+	answersIn(wl === STANDING_WORKLOAD_ID ? [] : controlOf(ledger, wl), wl, answers);
+	answersIn(controlOf(ledger, STANDING_WORKLOAD_ID), STANDING_WORKLOAD_ID, answers);
 	const fresh: ForgeryHit[] = [];
 	for (const h of scanWorkload(ledger, wl)) {
 		if (known.has(h.rowId) || answers.has(h.rowId) || fresh.some((x) => x.rowId === h.rowId)) continue;
@@ -265,8 +278,9 @@ export function forgeryHoldLine(ledger: Ledger, wl: string, opts: { fresh?: bool
 }
 
 /**
- * `stakes --hold-ok`'s forgery answer (D4, surface/scripts/merge-train.ts): `hold: forgery <row id> <rule> on <wl>[, …]` over
- * every hit on `workloads` Jo has not answered, recorded by a pass or not yet; null when there is none. Reads only.
+ * `stakes --hold-ok`'s forgery answer (D4, D5, surface/scripts/merge-train.ts): `hold: forgery <row id> <rule> on <wl>[, …]` over
+ * every hit on `workloads` Jo has not answered, recorded by a pass or not yet, and `<row id> <rule> on <wl> reversed after the
+ * close` for each hit Jo reversed once its workload had closed (`closedReversals`); null when there is none. Reads only.
  */
 export function forgeryStakesHold(ledger: Ledger, workloads: readonly string[]): string | null {
 	const rows: string[] = [];
@@ -274,9 +288,13 @@ export function forgeryStakesHold(ledger: Ledger, workloads: readonly string[]):
 		if (!ledger.workload(wl)) continue;
 		const { unanswered, fresh } = holdState(ledger, wl);
 		for (const h of [...unanswered, ...fresh]) rows.push(`${h.rowId} ${h.rule} on ${wl}`);
+		for (const h of closedReversals(ledger, wl)) rows.push(`${h.rowId} ${h.rule} on ${wl} ${REVERSED_AFTER_CLOSE}`);
 	}
 	return rows.length === 0 ? null : `hold: forgery ${rows.join(", ")}`;
 }
+
+/** What the merge train's refusal of a closed reversal says after the row id (`forgeryStakesHold`, `landingReady`, `boardLanding`). */
+export const REVERSED_AFTER_CLOSE = "reversed after the close";
 
 /** Each rule's short name, as surface/src/forgery.ts words its details. */
 export const FORGERY_RULE_NAMES: Record<string, string> = {

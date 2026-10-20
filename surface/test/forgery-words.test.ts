@@ -7,9 +7,10 @@ import { forgeryReversedBody } from "../../ledger/src/jo-channel";
 import { recordRepo, repoOf } from "../src/decision-log";
 import { deferredCancels, unansweredHits } from "../src/forgery-hold";
 import { ensureStandingWorkload } from "../src/identity";
-import { apply, type Command, interpret } from "../src/input";
+import { apply, type Command, interpret, isPlanQuestion } from "../src/input";
 import {
-	controlEntries, FORGERY_HOLD_REASON, forgeryConfirmedBody, forgeryHitBody, holdersOf, laneStopRequestBody, launchRequestedBody, resolutions, verdictOf,
+	controlEntries, FORGERY_HOLD_REASON, forgeryConfirmedBody, forgeryHitBody, holdersOf, laneStopRequestBody, launchRequestedBody, planFirst, planFirstBody, resolutions,
+	verdictOf,
 } from "../src/launch";
 import { FORGERY_CHECK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { tempLedger, workloadWithSlice } from "./helpers";
@@ -48,6 +49,30 @@ const control = (ledger: Ledger, wl: string) => {
 
 const launch = (ledger: Ledger, wl: string, lane = "lane-a") =>
 	ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: ${lane} cause first requested-by test` });
+
+/**
+ * A plan-first workload held by lane-a whose plan slice raised the plan question, with lane-a's `plan-question:` entry in the
+ * same transaction, as lane_raise_question writes it (surface/extensions/lane-tools.ts).
+ */
+function planQuestion(ledger: Ledger): { wl: string; sl: string; q: string } {
+	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "Plan the cut", stakes: "normal", mode: "autonomous" });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: planFirstBody("your word") });
+	expect(ledger.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: null }).won).toBe(true);
+	const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "plan", doneCondition: "plan approved", inputs: "brief" });
+	const q = ledger.write(() => {
+		const id = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "/tmp/plan.md", options: ["approve", "revise", "cancel"] });
+		ledger.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: `plan-question: ${id}` });
+		return id;
+	});
+	return { wl, sl, q };
+}
+
+/** Jo's typed `<answer> <question id>` at the surface; returns the receipt. */
+function answer(ledger: Ledger, word: string, questionId: string): string {
+	const cmd = interpret(ledger, `${word} ${questionId}`, NO_HEARTBEAT);
+	expect(cmd).toMatchObject({ kind: "answer", questionId, answer: word });
+	return apply(ledger, cmd!, NO_HEARTBEAT);
+}
 
 describe("confirm <row id> (D5)", () => {
 	test("confirm lifts the hold; the last confirm relaunches the lane the hold stopped", () => {
@@ -199,6 +224,53 @@ describe("reverse <row id> (D5)", () => {
 		const flips = ledger.instructions(wl).filter((i) => i.kind === "mode-flip");
 		expect(flips.map((i) => [i.body, i.author, i.created_by])).toEqual([["autonomous", "jo", SURFACE_BY]]);
 		expect(bodies(ledger, wl, "launch-requested:").some((b) => b.endsWith("(mode-flip)"))).toBe(true);
+		ledger.close();
+	});
+
+	test("reversing a forged revise on the plan question re-asks the plan question: Jo's approve on it approves the plan", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl, q } = planQuestion(ledger);
+		const forged = ledger.answerQuestion(q, { by: "lane-a", author: "jo", channel: "surface", answer: "revise" });
+		hit(ledger, wl, forged, "F3");
+		say(ledger, `reverse ${forged}`);
+		const asked = ledger.questions(wl).filter((x) => x.state === "open");
+		expect(asked.map((x) => [x.slice_id, x.created_by])).toEqual([[sl, "lane-a"]]);
+		expect(isPlanQuestion(ledger, asked[0]!)).toBe(true);
+		expect(planFirst(control(ledger, wl))).not.toBeNull();
+
+		answer(ledger, "approve", asked[0]!.id);
+		expect(planFirst(control(ledger, wl))).toBeNull();
+		ledger.close();
+	});
+
+	test("reversing Jo's plan approve voids its plan: approved: plan first stands again and the plan question is re-asked", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl, q } = planQuestion(ledger);
+		answer(ledger, "approve", q);
+		expect(planFirst(control(ledger, wl))).toBeNull();
+		const ans = ledger.instructions(wl).find((i) => i.kind === "answer" && i.question_id === q)!.id;
+		hit(ledger, wl, ans);
+
+		say(ledger, `reverse ${ans}`);
+		expect(planFirst(control(ledger, wl))).not.toBeNull();
+		const asked = ledger.questions(wl).filter((x) => x.state === "open");
+		expect(asked.map((x) => x.slice_id)).toEqual([sl]);
+		expect(asked[0]!.id).not.toBe(q);
+		expect(isPlanQuestion(ledger, asked[0]!)).toBe(true);
+		expect(unansweredHits(ledger, wl)).toEqual([]);
+		ledger.close();
+	});
+
+	test("reversing an older mode-flip keeps the later kept flips: the mode stays as they left it and no flip is written", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger, { mode: "autonomous" });
+		const forged = ledger.flipMode(wl, { ...JO, mode: "user-driven" });
+		hit(ledger, wl, forged);
+		ledger.flipMode(wl, { ...JO, mode: "autonomous" });
+		ledger.flipMode(wl, { ...JO, mode: "user-driven" });
+		say(ledger, `reverse ${forged}`);
+		expect(ledger.workload(wl)!.mode).toBe("user-driven");
+		expect(ledger.instructions(wl, { withReversed: true }).filter((i) => i.kind === "mode-flip").map((i) => i.body)).toEqual(["user-driven", "autonomous", "user-driven"]);
 		ledger.close();
 	});
 

@@ -3,6 +3,7 @@
 // and a confirmed row.
 import { describe, expect, test } from "bun:test";
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type ProvenanceRow, type QuestionRow } from "../../ledger/src/index";
+import { forgeryReversedBody } from "../../ledger/src/jo-channel";
 import { checkForgery, type ForgeryHit, type ForgeryInput, isLaneId, JO_CHANNEL } from "../src/forgery";
 import { laneStopRequestBody, planApprovedBody } from "../src/launch";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
@@ -276,6 +277,16 @@ describe("confirmed rows and output shape", () => {
 		const laneAnswer = ins({ kind: "answer", channel: "direct", question_id: "q-1", created_by: OWN_LANE });
 		const entries = [lanePlan, ent(`forgery-confirmed: ${lanePlan.id} by in-a`), ent(`forgery-confirmed: ${laneAnswer.id} by in-b`)];
 		expect(check({ instructions: [laneAnswer], entries, provenance: entries.slice(1).map((e) => mark("entries", e, "surface")) })).toEqual([]);
+	});
+
+	test("a confirmation a surface reversal names exempts nothing: its unmarked target is flagged, with no earlier hit of its own", () => {
+		// A forged `plan: approved` and a forged confirmation of it, both unmarked and surface-stamped, before any hit names the plan;
+		// then Jo's marked reversal of the confirmation.
+		const plan = ent(planApprovedBody("in-1"));
+		const confirmation = ent(`forgery-confirmed: ${plan.id} by in-a`);
+		const reversal = ent(forgeryReversedBody(confirmation.id, "in-b"));
+		const hits = check({ entries: [plan, confirmation, reversal], provenance: [mark("entries", reversal, "surface")] });
+		expect(rules(hits)).toEqual([`${plan.id} F1`, `${confirmation.id} F1`]);
 	});
 
 	test("one hit per (row, rule), sorted by table, row id and rule, whatever the input order", () => {

@@ -8,6 +8,7 @@
 // is flagged for lacking that kind of mark, so a deploy floods nothing.
 import { AUTHORITY } from "../../ledger/src/authority";
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type ProvenanceRow, type QuestionRow } from "../../ledger/src/index";
+import { reversedRowIds } from "../../ledger/src/jo-channel";
 import { controlWriterRejected } from "./launch";
 import { SURFACE_BY } from "./types";
 
@@ -81,11 +82,15 @@ function after(at: string, cutover: string | null): boolean {
 
 const CONFIRMED = /^forgery-confirmed:\s+(\S+)\s+by\s+in-\S+/;
 
-/** Row ids Jo confirmed as his (`forgery-confirmed: <row id> by <in-…>`, stamped by the surface). */
+/**
+ * Row ids Jo confirmed as his (`forgery-confirmed: <row id> by <in-…>`, stamped by the surface), less every confirmation a surface
+ * `forgery-reversed:` among `entries` names (`reversedRowIds`, as `controlEntries` drops it): a reversed confirmation exempts nothing.
+ */
 function confirmedIds(entries: readonly EntryRow[]): Set<string> {
 	const out = new Set<string>();
+	const reversed = reversedRowIds(entries);
 	for (const e of entries) {
-		if (e.kind !== "assumption" || e.created_by !== SURFACE_BY) continue;
+		if (e.kind !== "assumption" || e.created_by !== SURFACE_BY || reversed.has(e.id)) continue;
 		const m = CONFIRMED.exec(e.body.trim());
 		if (m) out.add(m[1]!);
 	}

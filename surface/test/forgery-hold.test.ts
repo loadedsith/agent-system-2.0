@@ -1,7 +1,7 @@
 // The forgery hold (PLAN wl-mvfxw3c4zqfzls D3, D4; R11-R14): a workload with a recorded `forgery:` hit Jo has answered
 // neither way is not launched autonomously (`launchable` → forgery-hold), its live autonomous lane gets the check's stop
 // request (a by-hand lane gets none), the merge train refuses to board it (`landingReady`, `boardLanding`), and the close is
-// refused; Jo's `forgery-confirmed:` lifts each. The launch reserve (surface/scripts/lane.ts `reserve`) runs the check itself
+// refused; Jo's `forgery-confirmed:` lifts each, and a `forgery-reversed:` after the close keeps the train's refusal (D5). The launch reserve (surface/scripts/lane.ts `reserve`) runs the check itself
 // and refuses on a hit no pass recorded yet, writing the hit rows and raising one alarm; the needs-you line is LOUD until Jo
 // answers; `merge-train.ts stakes --hold-ok` (the real script, a fake gh on PATH) answers `hold: forgery <row id>` for a hit
 // recorded or not. Every forged row is a real ledger row: a lane-written jo-only prefix (F5), a lane-stamped answer (F3).
@@ -269,5 +269,58 @@ exit 1
 		s.pr(8, `wl/${prWl}`);
 		expect(s.run(8, { own: train }).out).toBe(`hold: forgery ${row} F5 on ${train}`);
 		expect(s.run(8).out).not.toContain("hold: forgery");
+	});
+
+	test("a closed workload's hit Jo reversed keeps landingReady, boardLanding and stakes --hold-ok refused, with no LOUD line; confirm lifts all three", () => {
+		const w = boardWorld();
+		// Each landing's lane forges a jo-only row just before the close.
+		const forged = new Map<string, string>();
+		const close = w.ledger.closeWorkload.bind(w.ledger);
+		w.ledger.closeWorkload = ((id: string, s: { by: string }) => {
+			forged.set(id, forgedPlan(w.ledger, id));
+			return close(id, s);
+		}) as typeof w.ledger.closeWorkload;
+		const reversedWl = w.landing(121);
+		const confirmedWl = w.landing(122);
+		w.ledger.closeWorkload = close;
+		const reversedRow = forged.get(reversedWl)!;
+		const confirmedRow = forged.get(confirmedWl)!;
+		const CTX = { config: SERVED };
+		const reversedLanding = landingReady(w.ledger, reversedWl, CTX);
+		expect(reversedLanding.ready).toBe(true);
+		if (!reversedLanding.ready) return;
+		forgeryPass(w.ledger, AUTOBOARD_WINDOW_MS);
+		const s = script(w.ledger.path);
+		s.pr(121, `wl/${reversedWl}`);
+		s.pr(122, `wl/${confirmedWl}`);
+
+		// Jo's answers to a closed workload's rows sit on the standing workload
+		reverse(w.ledger, STANDING_WORKLOAD_ID, reversedRow);
+		confirm(w.ledger, STANDING_WORKLOAD_ID, confirmedRow);
+		// answered both ways: the LOUD line goes
+		expect(errorLines(w.ledger).filter((l) => l.kind === "forgery")).toEqual([]);
+
+		// reversed: the train still refuses, in words of its own (the hit is answered, not unanswered)
+		const refusedLanding = landingReady(w.ledger, reversedWl, CTX);
+		expect(refusedLanding.ready).toBe(false);
+		if (refusedLanding.ready) return;
+		expect(refusedLanding.reason).toContain(reversedRow);
+		expect(refusedLanding.reason).not.toContain("unanswered");
+		const refusedBoard = boardLanding(w.ledger, reversedLanding);
+		expect(refusedBoard.boarded).toBe(false);
+		if (refusedBoard.boarded) return;
+		expect(refusedBoard.reason).toContain(reversedRow);
+		expect(refusedBoard.reason).not.toContain("unanswered");
+		const held = s.run(121);
+		expect(held.code).toBe(0);
+		expect(held.out.startsWith(`hold: forgery ${reversedRow} F5 on ${reversedWl}`)).toBe(true);
+		expect(held.out).not.toBe(`hold: forgery ${reversedRow} F5 on ${reversedWl}`);
+
+		// confirmed: all three lift
+		const after = landingReady(w.ledger, confirmedWl, CTX);
+		expect(after.ready).toBe(true);
+		if (!after.ready) return;
+		expect(s.run(122).out).not.toContain("hold: forgery");
+		expect(boardLanding(w.ledger, after)).toMatchObject({ boarded: true });
 	});
 });

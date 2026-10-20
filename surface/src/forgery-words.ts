@@ -8,14 +8,19 @@
 // - `reverse <row id>`: the row was not Jo's. Jo's instruction `reverse <row id>`, then `forgery-reversed: <row id> by <in-…>`
 //   (ledger/src/jo-channel.ts) in the same placement, then what D5's table undoes. A control entry and a `repo:` entry need no
 //   write: `controlEntries` and `repoOf` skip a reversed id. An instruction of any kind leaves every decision read
-//   (`Ledger.instructions`); a reversed answer or `replan` withdrawal is no resolution (`resolutions` reads the filtered rows), so
-//   its question is re-asked on the same slice, same body and options, stamped as the original asker, while the slice is open
-//   or paused. A reversed mode-flip gets Jo's compensating flip back to the mode before it. What cannot be undone is named in
-//   the receipt: a `cancel` withdrawal (a cancelled slice is terminal; a deferred one still fires, ledger/schema.sql
-//   `questions_resolution_settles_slice`), the launches and boardings the row led to (`consequences`: the lane's commits,
-//   pushes and spend, the merge), and anything on a closed workload.
+//   (`Ledger.instructions`); a reversed answer or withdrawal also voids its companions, the surface's entries that name it
+//   (`plan: approved <answer>`, `pair-taken: … by <answer>`, `ceiling: … by <answer>`, `review-rounds-extend: … by <answer>`),
+//   each by its own `forgery-reversed:`, so every reader skips it as `controlEntries` does. A reversed answer or `replan`
+//   withdrawal is no resolution (`resolutions` reads the filtered rows), so its question is re-asked on the same slice, same
+//   body and options, stamped as the original asker, while the slice is open or paused; every role entry naming the old
+//   question (`QUESTION_ROLES`) is written again naming the new one, by the same writer, so the re-asked question keeps its
+//   role (the plan question stays the plan question). A reversed mode-flip gets Jo's compensating flip to the mode the
+//   workload has without it (the newest kept flip, later ones included), only when that differs from the mode now. What
+//   cannot be undone is named in the receipt: a `cancel` withdrawal (a cancelled slice is terminal; a deferred one still
+//   fires, ledger/schema.sql `questions_resolution_settles_slice`), the launches and boardings the row led to
+//   (`consequences`: the lane's commits, pushes and spend, the merge), and anything on a closed workload.
 // A row id no recorded hit names, or a hit Jo already answered, is refused, never applied and never prose.
-import { forgeryReversedBody } from "../../ledger/src/jo-channel";
+import { forgeryReversedBody, reversedRowIds } from "../../ledger/src/jo-channel";
 import type { InstructionRow, Ledger, Mode } from "../../ledger/src/index";
 import { consequences, deferredCancels, forgeryPlacement, hitWorkloads, holdStops, type RecordedHit, recordedHits, unansweredHits } from "./forgery-hold";
 import { modeFlipControl } from "./input";
@@ -110,35 +115,76 @@ function confirm(ledger: Ledger, hit: RecordedHit, on: string, inId: string): st
 	return `${head}; the hold on ${wl} is lifted, and it had stopped ${lanes}, so a relaunch is requested`;
 }
 
-/** The mode `wl` had just before the raw instruction `flipId`: the effective mode-flip before it, else the mode it opened with. */
-function modeBefore(ledger: Ledger, wl: string, flipId: string): Mode | null {
-	const raw = ledger.instructions(wl, { withReversed: true });
-	const kept = new Set(ledger.instructions(wl).map((i) => i.id));
-	let prior: Mode | null = null;
-	for (const i of raw) {
-		if (i.id === flipId) break;
-		if (i.kind === "mode-flip" && kept.has(i.id)) prior = i.body as Mode;
-	}
-	if (prior !== null) return prior;
+/** The mode `wl` has with every reversed mode-flip left out: its newest kept mode-flip, else the mode it opened with. */
+function effectiveMode(ledger: Ledger, wl: string): Mode | null {
+	const last = ledger.instructions(wl).findLast((i) => i.kind === "mode-flip");
+	if (last) return last.body as Mode;
 	const opened = ledger.provenance(wl).find((p) => p.tbl === "workloads" && p.action === "insert");
 	const m = opened ? / mode=(autonomous|user-driven)\b/.exec(opened.detail ?? "") : null;
 	return m ? (m[1] as Mode) : null;
 }
 
-/** What reversing the instruction `ins` of open workload `wl` does beyond voiding it, as receipt parts; `undone` gathers what cannot be. */
-function reverseInstruction(ledger: Ledger, wl: string, ins: InstructionRow, undone: string[]): string[] {
+/**
+ * The role entries keyed by a question id, the first token after the prefix: the plan question (`plan-question:`, a holder's,
+ * surface/src/launch.ts isPlanQuestionIn), the round-limit and park questions (`review-limit:`, `review-park:`, the
+ * classifier's), the pair offer (`pair-offer:`, its site's raiser) and the orchestrator question's subject (`question-about:`,
+ * the surface's). Each reader matches the question by that id and checks the entry's writer, so a copy by the same writer
+ * holds the role for the new id exactly when the original held it for the old one.
+ */
+const QUESTION_ROLES = /^(plan-question|review-limit|review-park|pair-offer|question-about):\s+(q-\S+)(.*)$/;
+
+/** Write every unreversed role entry of `wl` naming question `from` again naming `to`, by its own writer; returns their prefixes. */
+function copyRoles(ledger: Ledger, wl: string, from: string, to: string): string[] {
+	const entries = ledger.entries(wl, "assumption");
+	const reversed = reversedRowIds(entries);
+	const out: string[] = [];
+	for (const e of entries) {
+		const m = reversed.has(e.id) ? null : QUESTION_ROLES.exec(e.body.trim());
+		if (!m || m[2] !== from) continue;
+		ledger.recordEntry({ by: e.created_by, workloadId: wl, sliceId: e.slice_id, kind: "assumption", body: `${m[1]}: ${to}${m[3]}` });
+		out.push(`${m[1]}:`);
+	}
+	return out;
+}
+
+/**
+ * Void the companions of the reversed answer or withdrawal `insId`: each unreversed surface entry of `wl` with `insId` among
+ * its words (the answer's transaction writes them, input.ts apply), Jo's forgery answers aside, gets its own
+ * `forgery-reversed: <entry> by <inId>`, which `controlEntries` and every reader of reversed ids skip. Returns `<prefix>: <id>`.
+ */
+function voidCompanions(ledger: Ledger, wl: string, insId: string, inId: string): string[] {
+	const entries = ledger.entries(wl, "assumption");
+	const reversed = reversedRowIds(entries);
+	const out: string[] = [];
+	for (const e of entries) {
+		const body = e.body.trim();
+		if (e.created_by !== SURFACE_BY || reversed.has(e.id) || /^forgery(?:-confirmed|-reversed)?:/.test(body)) continue;
+		if (!body.split(/\s+/).includes(insId)) continue;
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: forgeryReversedBody(e.id, inId) });
+		out.push(`${/^([a-z-]+):/.exec(body)?.[1] ?? "entry"}: ${e.id}`);
+	}
+	return out;
+}
+
+/**
+ * What reversing the instruction `ins` of open workload `wl` by Jo's instruction `inId` does beyond voiding it, as receipt
+ * parts; `undone` gathers what cannot be.
+ */
+function reverseInstruction(ledger: Ledger, wl: string, ins: InstructionRow, inId: string, undone: string[]): string[] {
 	if (ins.kind === "mode-flip") {
-		// The reversal entry is already written, so `modeBefore`'s effective read leaves `ins` out; it reads only the rows before it.
-		const prior = modeBefore(ledger, wl, ins.id);
+		// The reversal entry is already written, so `effectiveMode` leaves `ins` out and keeps every later flip.
+		const mode = effectiveMode(ledger, wl);
 		const now = ledger.workload(wl)!.mode;
-		if (prior === null || prior === now) return [`mode-flip ${ins.id} voided; ${wl} is ${now} already, so no flip back`];
-		const flip = ledger.flipMode(wl, { by: SURFACE_BY, author: "jo", channel: "surface", mode: prior });
-		return [`mode on ${wl} flipped back ${now} → ${prior} (mode-flip ${flip})${modeFlipControl(ledger, wl, prior)}`];
+		if (mode === null || mode === now) return [`mode-flip ${ins.id} voided; ${wl} is ${now} without it, so no flip back`];
+		const flip = ledger.flipMode(wl, { by: SURFACE_BY, author: "jo", channel: "surface", mode });
+		return [`mode on ${wl} flipped back ${now} → ${mode} (mode-flip ${flip})${modeFlipControl(ledger, wl, mode)}`];
 	}
 	if (ins.kind === "instruction") return [`instruction ${ins.id} voided for every decision reader`];
+	const companions = voidCompanions(ledger, wl, ins.id, inId);
+	const voided = companions.length > 0 ? `; its companion ${companions.join(", ")} voided for every reader` : "";
 	const q = ins.question_id ? ledger.question(ins.question_id) : null;
 	const slice = q ? ledger.slice(q.slice_id) : null;
-	if (!q || !slice) return [`${ins.kind} ${ins.id} voided for every decision reader`];
+	if (!q || !slice) return [`${ins.kind} ${ins.id} voided for every decision reader${voided}`];
 	if (ins.kind === "withdrawal" && ins.disposition === "cancel") {
 		const deferred = deferredCancels(ledger, wl).find((d) => d.rowId === ins.id);
 		if (deferred) {
@@ -146,14 +192,16 @@ function reverseInstruction(ledger: Ledger, wl: string, ins: InstructionRow, und
 		} else {
 			undone.push(`withdrawal ${ins.id} cancelled ${slice.id}, and a cancelled slice stays cancelled; re-cut the slice to keep its work`);
 		}
-		return [`withdrawal ${ins.id} voided for every decision reader`];
+		return [`withdrawal ${ins.id} voided for every decision reader${voided}`];
 	}
 	if (slice.state !== "open" && slice.state !== "paused") {
 		undone.push(`${q.id} cannot be re-asked: ${slice.id} is ${slice.state}`);
-		return [`${ins.kind} ${ins.id} voided for every decision reader`];
+		return [`${ins.kind} ${ins.id} voided for every decision reader${voided}`];
 	}
 	const asked = ledger.raiseQuestion({ by: q.created_by, workloadId: wl, sliceId: slice.id, body: q.body, options: JSON.parse(q.options) as string[] });
-	return [`${ins.kind} ${ins.id} to ${q.id} voided; re-asked as ${asked} on ${slice.id}, as ${q.created_by} asked it`];
+	const roles = copyRoles(ledger, wl, q.id, asked);
+	const role = roles.length > 0 ? `, its role (${roles.join(", ")}) carried to it` : "";
+	return [`${ins.kind} ${ins.id} to ${q.id} voided${voided}; re-asked as ${asked} on ${slice.id}, as ${q.created_by} asked it${role}`];
 }
 
 /** The reversal's writes after Jo's instruction `inId`; returns the receipt. */
@@ -167,7 +215,7 @@ function reverse(ledger: Ledger, hit: RecordedHit, on: string, inId: string): st
 		parts.push(`${wl} is closed: the reversal is recorded on ${STANDING_WORKLOAD_ID} and nothing in the ledger is undone; boarding stays refused`);
 		undone.push(`the close of ${wl}`);
 	} else if (ins !== null) {
-		parts.push(...reverseInstruction(ledger, wl, ins, undone));
+		parts.push(...reverseInstruction(ledger, wl, ins, inId, undone));
 	} else {
 		const e = ledger.entry(hit.rowId);
 		const prefix = e ? /^([a-z-]+):/.exec(e.body.trim())?.[1] : undefined;
