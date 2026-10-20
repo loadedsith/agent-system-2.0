@@ -305,6 +305,27 @@ export function controlEntries(entries: readonly EntryRow[], holders: readonly s
 	return out;
 }
 
+/**
+ * The prefix of a control line `controlEntries` parses but drops because `validWriter` rejects its writer, else
+ * null (not a control line, unparsable, or a valid writer). The forgery check's F5 (surface/src/forgery.ts) makes
+ * that silent drop loud; the parse is `controlEntries`' own, line for line.
+ */
+export function controlWriterRejected(e: EntryRow, holders: readonly string[] = []): ControlPrefix | null {
+	if (e.kind !== "assumption") return null;
+	const m = PREFIXED.exec(e.body.trim());
+	if (!m || !(CONTROL_PREFIXES as readonly string[]).includes(m[1]!)) return null;
+	const prefix = m[1] as ControlPrefix;
+	let rest = (m[2] ?? "").trim();
+	let laneId: string | null = null;
+	if (LANE_SCOPED[prefix]) {
+		const lane = /^(lane-\S+)(?:\s+([\s\S]*))?$/.exec(rest);
+		if (!lane) return null;
+		laneId = lane[1]!;
+		rest = (lane[2] ?? "").trim();
+	}
+	return validWriter(prefix, rest, e.created_by, holders, laneId) ? null : prefix;
+}
+
 // ---- attempts and causes -----------------------------------------------------------------------
 
 export type Cause =
