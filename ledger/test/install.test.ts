@@ -270,6 +270,45 @@ describe("install: every machinery file has exactly one manifest row (P-11 manif
 		expect(existsSync(r.db)).toBe(false);
 	});
 
+	test("membership is literal for spaces, backslashes and glob characters, not a pattern match", () => {
+		const listed = "ledger/src/manifest literal-\\[ab]*?.md";
+		const unlisted = "ledger/src/manifest literal-\\a-expanded.md";
+		writeFileSync(join(copy, listed), "listed\n");
+		writeFileSync(join(copy, unlisted), "unlisted\n");
+		writeFileSync(manifest, `${original}${listed}${T}doc${T}-\n`);
+		try {
+			const r = install("literal-membership");
+			expect(r.out).toContain(`have no manifest row:\n  ${unlisted}\n`);
+			expect(r.out).not.toContain(`\n  ${listed}\n`);
+			expect(r.exitCode).toBe(2);
+			expect(existsSync(r.db)).toBe(false);
+		} finally {
+			writeFileSync(manifest, original);
+			rmSync(join(copy, listed));
+			rmSync(join(copy, unlisted));
+		}
+	});
+
+	test("membership is case-sensitive even when BASH_ENV enables nocasematch", () => {
+		const lower = join(copy, "ledger", "schema.md");
+		// On a case-sensitive filesystem both files exist; on a case-insensitive one this is
+		// already SCHEMA.md. Either way, the lowercase row must not own the uppercase path.
+		const created = !existsSync(lower);
+		if (created) cpSync(join(copy, "ledger", "SCHEMA.md"), lower);
+		const bashEnv = join(root, "nocasematch.sh");
+		writeFileSync(bashEnv, "shopt -s nocasematch\n");
+		manifestWith([DOC_ROW, `ledger/schema.md${T}doc${T}-`]);
+		try {
+			const r = install("case-membership", { BASH_ENV: bashEnv });
+			expect(r.out).toContain("have no manifest row:\n  ledger/SCHEMA.md\n");
+			expect(r.exitCode).toBe(2);
+			expect(existsSync(r.db)).toBe(false);
+		} finally {
+			writeFileSync(manifest, original);
+			if (created) rmSync(lower);
+		}
+	});
+
 	test("a duplicated manifest row is refused, nothing written", () => {
 		writeFileSync(manifest, `${original}${DOC_ROW}\n`);
 		const r = install("duplicate-row");
@@ -277,6 +316,49 @@ describe("install: every machinery file has exactly one manifest row (P-11 manif
 		expect(r.out).toContain(`duplicate row for ledger/SCHEMA.md`);
 		expect(r.exitCode).toBe(2);
 		expect(existsSync(r.db)).toBe(false);
+	});
+
+	test("a malformed leading-TAB duplicate is refused before ledger or profile writes", () => {
+		writeFileSync(manifest, `${original}${T}${DOC_ROW}\n`);
+		try {
+			const r = install("leading-tab-duplicate");
+			expect(r.exitCode).toBe(2);
+			expect(r.out).toContain("need exactly three TAB-separated fields");
+			expect(existsSync(dirname(r.db))).toBe(false);
+			expect(existsSync(join(r.home, ".omp"))).toBe(false);
+		} finally {
+			writeFileSync(manifest, original);
+		}
+	});
+
+	test("a coverage awk failure refuses installation before ledger or profile writes", () => {
+		const bin = join(root, "coverage-awk-bin");
+		mkdirSync(bin);
+		const awk = Bun.which("awk", { PATH: installPath });
+		expect(awk).not.toBeNull();
+		writeFileSync(join(bin, "awk"), [
+			"#!/bin/bash",
+			'if [ "${@: -1}" = "-" ]; then',
+			"\tprintf '%s\\n' 'injected coverage awk failure' >&2",
+			"\texit 42",
+			"fi",
+			`exec ${JSON.stringify(awk)} "$@"`,
+			"",
+		].join("\n"));
+		chmodSync(join(bin, "awk"), 0o755);
+		const file = join(copy, "ledger", "src", "coverage-awk-unmanifested.ts");
+		writeFileSync(file, "export {};\n");
+		try {
+			const r = install("coverage-awk-failure", { PATH: `${bin}:${installPath}` });
+			expect(r.exitCode).toBe(2);
+			expect(r.out).toContain("manifest ok:");
+			expect(r.out).toContain("injected coverage awk failure");
+			expect(r.out).toContain("could not check manifest coverage under ledger");
+			expect(existsSync(dirname(r.db))).toBe(false);
+			expect(existsSync(join(r.home, ".omp"))).toBe(false);
+		} finally {
+			rmSync(file);
+		}
 	});
 });
 

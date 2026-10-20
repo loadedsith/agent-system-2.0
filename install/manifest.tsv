@@ -3,6 +3,9 @@
 # install/install.sh fails when a file under a machinery directory has no row here, or when any
 # symbolic link sits under one. Exactly one ledger-schema row (ledger/schema.sql, the file the
 # module applies), one ledger-init row, one ledger-backup row and one ledger-backup-agent row.
+# Paths are case-sensitive literals, not globs, including spaces and backslashes. Duplicate and
+# coverage checks use keyed lookups rather than rescanning a growing path list for every artifact;
+# filesystem and symbolic-link checks still run before any installed state is written.
 # destination: "-" = used in place from the checkout, nothing is copied or linked;
 #              "{ledger_db}" = the ledger file ($AGENT_SYSTEM_LEDGER_DB, default $HOME/.agent-system-2/ledger.db);
 #              "{launch_agents}/<name>" = $HOME/Library/LaunchAgents/<name>, written filled in on macOS
