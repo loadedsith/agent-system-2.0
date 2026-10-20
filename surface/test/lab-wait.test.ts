@@ -12,15 +12,15 @@ import { rankGate } from "../src/rank-launch";
 import { renderWake } from "../src/render";
 import { type SurfaceSession, surfaceSession } from "../src/session";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, LANE_SCRIPT, laneRoot, type LaneRoot, setScript, settleDrains, tempLedger, timers, tmp, until } from "./helpers";
+import { ctxOf, drainsSpawned, fakePi, fakeRecords, LANE_SCRIPT, laneRoot, type LaneRoot, setScript, settleDrains, tempLedger, timers, tmp, until } from "./helpers";
 import { ensureStandingWorkload } from "../src/identity";
 import { formatOverride } from "../src/rank";
 import { STANDING_WORKLOAD_ID } from "../src/types";
 import { recordRepo } from "../src/decision-log";
 
-const roots: LaneRoot[] = [];
+const roots: { root: LaneRoot; syntheticExits: string[] }[] = [];
 afterAll(async () => {
-	const settled = await Promise.allSettled(roots.map(r => settleDrains(r)));
+	const settled = await Promise.allSettled(roots.map(({ root, syntheticExits }) => settleDrains(root, 60_000, syntheticExits)));
 	for (const s of settled) if (s.status === "rejected") throw s.reason;
 }, 120_000);
 
@@ -167,13 +167,16 @@ describe("normal lanes' lab gate", () => {
 
 	test("T10: two real lane.ts launch starters consume a waited cause exactly once", async () => {
 		const root = laneRoot();
-		roots.push(root);
+		const syntheticExits: string[] = [];
+		roots.push({ root, syntheticExits });
 		const l = Ledger.open(root.ledgerPath, { backup: false, backupOnOpen: false });
 		try {
 			const wl = opened(l);
 			recordRepo(l, wl, root.repo);
 			note(l, wl, doneBody("the probe is done"));
 			const lane = waitingAttempt(l, wl);
+			// This prior attempt is ledger-only: no runner existed to spawn its drain.
+			syntheticExits.push(lane);
 			setScript(root, {
 				stateModel: { provider: "anthropic", id: "claude-opus-5-5" },
 				steps: [{ tool: "lane_record_entry", args: { body: "done-because: the probe is done" } }],
@@ -188,6 +191,10 @@ describe("normal lanes' lab gate", () => {
 			expect(control(l, wl).filter(c => c.prefix === "launch" && c.rest.includes(`cause waited ${lane} `))).toHaveLength(1);
 			expect(control(l, wl).filter(c => c.prefix === "launch")).toHaveLength(2);
 			await until("the waited relaunch completed", () => control(l, wl).some(c => c.prefix === "lane-exit" && c.laneId !== lane && c.rest.includes("outcome completed")));
+			const relaunched = control(l, wl).find(c => c.prefix === "launch" && c.laneId !== lane)!.laneId!;
+			expect(fakeRecords(root).filter(r => r.argv !== undefined)).toHaveLength(1);
+			await settleDrains(root, 60_000, syntheticExits);
+			expect(drainsSpawned(root).map(d => d.by)).toEqual([relaunched]);
 			expect(verdictOf(l.launchRows(wl, 3)!, snapshot(false))).toEqual({ launch: false, reason: "awaiting-close" });
 		} finally {
 			l.close();

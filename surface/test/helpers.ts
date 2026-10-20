@@ -433,11 +433,13 @@ function rootControl(r: LaneRoot): ControlEntry[] {
  * launch-failed: for a starter that failed after its reservation), every runner process is gone, every runner
  * that wrote its own lane-exit: has its `spawned` line, and every spawned drain has logged its end and is
  * gone. Repeated until a pass finds no new launch and no new drain, since a drain's lane spawns its own drain.
+ * `syntheticExits` names only ledger-only fixture exits with no runner to spawn a drain; all real processes
+ * and all drains (including any unexpectedly spawned by a synthetic lane) still have to settle.
  * When a wait fails (its timeout, or an unreadable ledger), every runner and drain of the root still alive is
  * SIGKILLed and waited for until it is gone, then the failure is rethrown: the caller removes the root only
  * after this returns or rejects, so no process it waited on outlives its root.
  */
-export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<void> {
+export async function settleDrains(r: LaneRoot, timeoutMs = 60_000, syntheticExits: readonly string[] = []): Promise<void> {
 	if (!existsSync(r.ledgerPath)) return;
 	const deadline = Date.now() + timeoutMs;
 	const left = () => Math.max(1_000, deadline - Date.now());
@@ -453,7 +455,7 @@ export async function settleDrains(r: LaneRoot, timeoutMs = 60_000): Promise<voi
 				const pid = laneStarted(control, laneId)?.runnerPid;
 				if (pid) await until(`runner ${pid} gone`, () => !alive(pid), left());
 			}
-			for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner") await drainOf(r, c.laneId!, left());
+			for (const c of control) if (c.prefix === "lane-exit" && c.createdBy === "lane-runner" && !syntheticExits.includes(c.laneId!)) await drainOf(r, c.laneId!, left());
 			const spawned = drainsSpawned(r);
 			for (const d of spawned) await drainEnded(r, d.pid, left());
 			const now = `${control.filter((c) => c.prefix === "launch").length} ${spawned.length}`;

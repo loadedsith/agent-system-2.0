@@ -6,12 +6,13 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadTierTable } from "../../classifier/src/tier-table";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { laneClaimed } from "../scripts/lane";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, laneDir, laneExit, laneModelBody, laneStarted, trainBoardBody, verdictOf, worktreeBody, worktreePath } from "../src/launch";
 import { homeModel, readLabWaitContext, recordLabWait, reconcileLabWait, standingWait } from "../src/lab-wait";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import type { FakeScript, FakeStep, LaneRoot } from "./helpers";
-import { fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, laneSnapshot, setScript, settleDrains, sh, until } from "./helpers";
+import { fakeRecords, LANE_SCRIPT, laneIdOf, laneRoot, laneSnapshot, setScript, settleDrains, sh, tempLedger, until } from "./helpers";
 
 const A = "anthropic/claude-opus-5-5";
 const SOL = "openai-codex/gpt-6.1-sol";
@@ -136,6 +137,41 @@ const deathSenders = (r: LaneRoot, wl: string) => {
 		l.close();
 	}
 };
+
+describe("readiness claim provenance", () => {
+	test("a stakes update preserves a real claim, never a starter's reservation or a lane entry", () => {
+		const { ledger: l } = tempLedger();
+		try {
+			const wl = l.openWorkload({ by: SURFACE_BY, brief: "claim probe", stakes: "normal", mode: "autonomous" });
+			const lane = "lane-claim-probe";
+			const claimed = () => laneClaimed(l.workload(wl), lane, l.provenance(wl));
+			l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: lane, leaseMs: 60_000 });
+			l.recordEntry({ by: lane, workloadId: wl, kind: "assumption", body: "not a workload claim" });
+			l.setStakes(wl, { by: SURFACE_BY, stakes: "production" });
+			expect(claimed()).toBe(false);
+			l.setStakes(wl, { by: lane, stakes: "normal" });
+			expect(claimed()).toBe(false);
+			l.claimWorkload(wl, { by: lane, holder: lane, leaseMs: 60_000 });
+			expect(claimed()).toBe(true);
+			l.setStakes(wl, { by: SURFACE_BY, stakes: "normal" });
+			expect(l.workload(wl)?.changed_by).toBe(SURFACE_BY);
+			expect(claimed()).toBe(true);
+			l.releaseWorkload(wl, { by: lane, holder: lane });
+			expect(claimed()).toBe(false);
+			l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: lane, leaseMs: 60_000 });
+			l.setStakes(wl, { by: SURFACE_BY, stakes: "production" });
+			expect(claimed()).toBe(false);
+			l.claimWorkload(wl, { by: lane, holder: lane, leaseMs: 60_000 });
+			l.setStakes(wl, { by: SURFACE_BY, stakes: "normal" });
+			expect(claimed()).toBe(true);
+			l.releaseWorkload(wl, { by: lane, holder: lane });
+			l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-other", leaseMs: 60_000 });
+			expect(claimed()).toBe(false);
+		} finally {
+			l.close();
+		}
+	});
+});
 
 describe("PLAN wl-mv71x5rwdu7eo0 § 4: the quota guard at the runner's spawn", () => {
 	test("a named anthropic model with anthropic 5h at 0.85: no omp spawned; one launch-failed: at headroom and one lane-died:, both by lane-runner; released", async () => {
@@ -595,14 +631,18 @@ describe("normal autonomous lanes wait and return to their own lab (PLAN wl-mvh2
 			const lane1 = laneIdOf(wl, 1);
 			await endOf(r, wl, lane1);
 			const snap = laneSnapshot(r, wl);
+			const diagnostics = `${JSON.stringify(snap.control)}\n${runnerLog(r, wl)}`;
 			if (to === "production") {
-				expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${SOL}`, "get_state", "prompt"]);
-				expect(laneExit(snap.control, lane1)?.outcome).toBe("completed");
+				expect(commandsOf(r, 1).slice(0, 4), diagnostics).toEqual(["get_state", `set_model ${SOL}`, "get_state", "prompt"]);
+				expect(laneStarted(snap.control, lane1), diagnostics).toMatchObject({ startModel: A, homeModel: SOL, ranModel: SOL });
+				expect(snap.control.filter(c => c.prefix === "lane-headroom").map(c => c.rest), diagnostics).toEqual([`${A} -> ${SOL} (${REASON})`]);
+				expect(snap.control.some(c => c.prefix === "lane-ready" && c.laneId === lane1), diagnostics).toBe(true);
+				expect(laneExit(snap.control, lane1)?.outcome, diagnostics).toBe("completed");
 			} else {
 				expect(commandsOf(r, 1)).toEqual(["get_state"]);
 				expect(laneExit(snap.control, lane1)?.outcome).toBe("waiting");
 			}
-			expect(snap.deaths).toEqual([]);
+			expect(snap.deaths, diagnostics).toEqual([]);
 		}, 60_000);
 	}
 

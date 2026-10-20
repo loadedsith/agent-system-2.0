@@ -56,7 +56,7 @@ import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type ReserveRows, type ReserveVerdict, type SliceRow, type Stakes,
-	type WorkloadRow,
+	type ProvenanceRow, type WorkloadRow,
 } from "../../ledger/src/index";
 import {
 	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
@@ -842,6 +842,26 @@ export function stillReserved(workload: Pick<WorkloadRow, "holder"> | null, lane
 }
 
 /**
+ * The lane itself claimed the current holding interval. A stakes/mode write may replace changed_by
+ * after session_start, so the last-writer stamp alone is not a durable readiness receipt.
+ * Workload provenance is oldest first. Stop at the newest holder change: a prior claim before a
+ * release/re-reservation never proves this reservation's readiness. Only the lane's own holder/lease
+ * write (or an unchanged lease renewal, whose detail is empty) counts, never the starter or an entry.
+ */
+export function laneClaimed(workload: Pick<WorkloadRow, "holder"> | null, laneId: string, provenance: readonly Pick<ProvenanceRow, "tbl" | "action" | "lane_instance" | "detail">[]): boolean {
+	if (workload === null || workload.holder !== laneId) return false;
+	for (let i = provenance.length - 1; i >= 0; i--) {
+		const row = provenance[i]!;
+		if (row.tbl !== "workloads" || row.action !== "update") continue;
+		const detail = row.detail ?? "";
+		const holder = /(?:^|\s)holder (\S+?)->(\S+)/.exec(detail);
+		if (holder !== null) return holder[2] === laneId && row.lane_instance === laneId;
+		if (row.lane_instance === laneId && (row.detail === "" || /(?:^|\s)lease \S+/.test(detail))) return true;
+	}
+	return false;
+}
+
+/**
  * D2b: the spawn, inside the one ledger write that spawns omp and records its `lane-started:` (the runner's `startAsOwner`
  * body, `cmdInteractive`'s spawn write). With nothing spawned yet (`current` null), the workload must still be held by
  * `laneId` (`stillReserved`), else nothing is spawned and a `held` Fail (stage `reserve`) rolls the write back: another
@@ -1111,7 +1131,7 @@ async function cmdRun(wl: string, laneId: string): Promise<number> {
  * The runner (§ 5 pseudocode), run by the lane id's lock owner. Lifecycle ownership starts at the first line: whatever fails after
  * the reservation — preparation, the spawn, a read, a ledger write — ends in one finalization that
  * records the end and releases the pre-claim (Codex review B3). Readiness is the lane's own claim
- * (`changed_by` = the lane id) within the pre-claim lease, never an rpc frame (B1); a turn ends at
+ * (durable workload claim provenance by the lane id) within the pre-claim lease, never an rpc frame (B1); a turn ends at
  * the `prompt_result` for the prompt this runner sent, with its status kept (B2), and is decided
  * only once omp is settled (MIGRATION.md item 40, src/turn-end.ts): a continue prompt, a hold for
  * the lane's own hands, or the outcome, a death enqueued before EOF; a stop, from the ledger or a
@@ -1546,7 +1566,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		send({ id: STATE_ID, type: "get_state" });
 
-		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
+		// Readiness (B1): the lane's own claim within the pre-claim lease; later stakes writes cannot erase it. No renewal before it. Every lane also
 		// waits for OMP's first get_state: an eligible lane waits without a prompt or confirms its home; an excluded lane
 		// keeps the named check (item 85) or moveOff path. Ready means the claim, model, lane-ready: receipt and prompt all
 		// landed; a failure in any of them is fatal (review 2, R2).
@@ -1554,7 +1574,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
-				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
+				const claimed = cur?.holder === laneId && laneClaimed(cur, laneId, ledger.provenance(wl));
 				if (claimed && modelChecked) {
 					clearInterval(readyPoll);
 					const { workload: latest, control } = controlNow();
