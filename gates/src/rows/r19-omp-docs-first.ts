@@ -4,13 +4,14 @@
 //
 // - A question starts at an input: Ilex's or a lane's `input` (interactive or rpc), a hand's task prompt.
 //   Nothing else starts one, so a hidden continuation or an aside keeps the question it follows.
-// - It triggers at once on a keyword (KEYWORDS, whole words, case-insensitive), else on one judge call
-//   started at the input and awaited at the first answer boundary. The judge is OMP's `judge` role through
-//   classifier/src/judge-ask.ts askJudgment; an error, a timeout or no judge at all counts as triggered.
+// - It triggers at once on a keyword (KEYWORDS, whole words, case-insensitive, over the whole input), else on
+//   one judge call started at the input and awaited at the first answer boundary. The judge is OMP's `judge`
+//   role through classifier/src/judge-ask.ts askJudgment, shown judgeText(input); an error, a timeout or no
+//   judge at all counts as triggered.
 // - It is consulted once a successful `read`, `grep`, `find` or `search` (grep's legacy name) since the input
 //   named an `omp://` doc, a file under an `@oh-my-pi/` package, or OMP-HARNESS.md / OMP-RUNTIME.md.
-// - While triggered and unconsulted, every answer attempt is held; after HOLD_LIMIT holds the next attempt
-//   goes through carrying RELEASE_LINE, so a model that cannot read the docs does not loop forever.
+// - While triggered and unconsulted, every answer attempt is held, with no limit and no release. The hold
+//   reason names WAY_OUT, a read that always exists, so a model is never held with nothing it can do.
 import { askJudgment, type BoolQuestion, type JudgmentJudge } from "../../../classifier/src/judge-ask";
 import { CHANNEL_REPLY_TOOL, LANE_MESSAGE_TOOL, LANE_RAISE_QUESTION_TOOL, RAISE_QUESTION_TOOL } from "../../../surface/src/types";
 
@@ -33,12 +34,21 @@ export function keywordHit(text: string): string | null {
 	return KEYWORD_PATTERNS.find(([, re]) => re.test(text))?.[0] ?? null;
 }
 
-/** The longest part of an input the judge is shown: the question is at its start, and a long paste costs tokens for nothing. */
-export const QUESTION_CAP = 4000;
+/** Inputs up to this many characters reach the judge whole. */
+export const JUDGE_WHOLE = 24_000;
+/** Above JUDGE_WHOLE the judge sees this many characters from the start (what the input opens with)… */
+export const JUDGE_HEAD = 8_000;
+/** …and this many from the end, where a question after a long paste sits. */
+export const JUDGE_TAIL = 16_000;
 /** How long the judge has, from the input to an answer: classifier/extension.ts gives its pair-signal ask the same 10 s. */
 export const JUDGE_TIMEOUT_MS = 10_000;
-/** Holds before an attempt is let through with RELEASE_LINE. */
-export const HOLD_LIMIT = 5;
+
+/** What the judge is shown of `text`: all of it up to JUDGE_WHOLE, else its head and tail with the cut named. */
+export function judgeText(text: string): string {
+	if (text.length <= JUDGE_WHOLE) return text;
+	const omitted = text.length - JUDGE_HEAD - JUDGE_TAIL;
+	return `${text.slice(0, JUDGE_HEAD)}\n[… ${omitted} characters omitted …]\n${text.slice(-JUDGE_TAIL)}`;
+}
 
 /** The one judge question, keyed as askJudgment sends it. */
 export const OMP_QUESTION: Record<"omp_question", BoolQuestion> = {
@@ -77,7 +87,7 @@ export async function judgeQuestion(text: string, judge: JudgeSource | undefined
 	}, timeoutMs);
 	const asked = (async (): Promise<Trigger> => {
 		try {
-			const r = await askJudgment(await judge(), text.slice(0, QUESTION_CAP), OMP_QUESTION, { timeoutMs, signal: abort.signal });
+			const r = await askJudgment(await judge(), judgeText(text), OMP_QUESTION, { timeoutMs, signal: abort.signal });
 			if (!r.ok) return { triggered: true, why: `the judge failed (${r.reason}), so the input counts` };
 			const a = r.answers.omp_question;
 			const yes = a?.type === "bool" ? a.bool : 1;
@@ -126,22 +136,26 @@ export function outwardTool(toolName: string, input: Record<string, unknown>): s
 export const HELD_MARKER = "(Answer held by P-11 row 19 until an OMP doc is read. The answer follows.)";
 /** Every text block of a later hold for the same question. Non-empty: an empty reply is an empty stop, which skips session_stop. */
 export const LATER_HOLD = "…";
-/** The line a released answer carries. */
-export const RELEASE_LINE = `row 19: released after ${HOLD_LIMIT} holds without an OMP read`;
+/**
+ * The read that always gets a held answer out: the profile's OMP-HARNESS.md, where install/manifest.tsv links it
+ * into the agent-system-2 profile, or in the agent-system checkout.
+ */
+export const WAY_OUT = ["~/.omp/profiles/agent-system-2/agent/OMP-HARNESS.md", "profile/OMP-HARNESS.md"] as const;
 
 /** The refusal or stop-block reason for hold number `hold`, naming what to read. */
 export function holdReason(why: string, hold: number): string {
 	return (
 		`P-11 row 19 held this answer: the input it answers is a question about OMP, the harness this session runs in (${why}), ` +
-		"and nothing of OMP's own has been read since. Read it first with `read`, `grep` or `find`: the profile's OMP-HARNESS.md or " +
-		"OMP-RUNTIME.md (in the profile's agent dir, or profile/ in the agent-system checkout), an omp:// doc (`read omp://` lists them), " +
-		"or the OMP source, a file under the `@oh-my-pi/` packages (pi-coding-agent/src). A read that errors does not count. Then answer " +
-		`from what it says. (hold ${hold} of ${HOLD_LIMIT}; after ${HOLD_LIMIT} the answer goes through carrying "${RELEASE_LINE}")`
+		"and nothing of OMP's own has been read since. Every answer is held until one read succeeds; this one always works: " +
+		`\`read ${WAY_OUT[0]}\` (the installed profile's guide), or \`read ${WAY_OUT[1]}\` in the agent-system checkout. ` +
+		"OMP-RUNTIME.md beside either, an omp:// doc (`read omp://` lists them) or a file under the `@oh-my-pi/` packages " +
+		"(pi-coding-agent/src) counts too, by `read`, `grep` or `find`. A read that errors does not count. Then answer " +
+		`from what it says. (hold ${hold})`
 	);
 }
 
 /** One answer attempt's outcome. */
-export type Attempt = { kind: "pass" } | { kind: "hold"; reason: string } | { kind: "release"; why: string };
+export type Attempt = { kind: "pass" } | { kind: "hold"; reason: string };
 
 /** One question: from its input to the next, what it takes to answer it. */
 export class OmpQuestion {
@@ -149,9 +163,6 @@ export class OmpQuestion {
 	consulted = false;
 	/** Holds so far; a consult ends the question's holds. */
 	holds = 0;
-	released = false;
-	/** RELEASE_LINE reached an answer (a release at an outward tool shows it on the next reply). */
-	releaseShown = false;
 	/** HELD_MARKER showed for this question; later holds show LATER_HOLD. */
 	markerShown = false;
 	/** The reply held at `assistant_message`, until its `session_stop` hands it back to the model. */
@@ -164,21 +175,17 @@ export class OmpQuestion {
 		this.trigger = hit ? Promise.resolve({ triggered: true, why: `it names \`${hit}\`` }) : judgeQuestion(text, judge, timeoutMs);
 	}
 
-	/** The trigger while an answer would be held now (triggered, unconsulted, not released), else null. Counts nothing. */
+	/** The trigger while an answer would be held now (triggered and unconsulted), else null. Counts nothing. */
 	async holding(): Promise<Trigger | null> {
-		if (this.consulted || this.released) return null;
+		if (this.consulted) return null;
 		const t = await this.trigger;
-		return t.triggered && !this.consulted && !this.released ? t : null;
+		return t.triggered && !this.consulted ? t : null;
 	}
 
-	/** One answer attempt: passed, held (counted), or released once HOLD_LIMIT holds have gone by. */
+	/** One answer attempt: passed, or held (counted). Held every time until a consult. */
 	async attempt(): Promise<Attempt> {
 		const t = await this.holding();
 		if (!t) return { kind: "pass" };
-		if (this.holds >= HOLD_LIMIT) {
-			this.released = true;
-			return { kind: "release", why: t.why };
-		}
 		this.holds++;
 		this.reason = holdReason(t.why, this.holds);
 		return { kind: "hold", reason: this.reason };

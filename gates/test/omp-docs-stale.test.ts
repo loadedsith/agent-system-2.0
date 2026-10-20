@@ -6,17 +6,26 @@
 // transformContext). A compaction or an in-place reset emits no extension event and only changes the
 // messages the next request hands to emitContext, so those cases replace the messages and call it again.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import ompDocsStaleRow, { findStaleDocs, PROFILE_OMP_DOCS, STALE_NOTICE_TYPE, type StaleDocsHost } from "../extensions/omp-docs-stale";
 import { isOmpDoc, ompDocs, parseSnapshotLine, staleDocs, staleNotice, VENDORED_OMP_DOCS } from "../src/omp-docs";
 import type { GatesAPI } from "../src/session";
 import { tmp } from "./helpers";
 
-// Imported by absolute path, as gates/test/host.test.ts does: a fresh clone has no global OMP install,
-// and there the runner tests skip.
-const OMP = "/Users/jowolff/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src";
-const HAS_OMP = existsSync(`${OMP}/extensibility/extensions/runner.ts`);
+// The installed OMP's source, found from the `omp` on PATH (as gates/test/fence.test.ts and open-links.test.ts
+// find it): its realpath lies inside @oh-my-pi/pi-coding-agent. A machine with no OMP installed skips the runner tests.
+const OMP = ((): string | null => {
+	const bin = Bun.which("omp");
+	if (!bin) return null;
+	let dir = dirname(realpathSync(bin));
+	while (!(basename(dir) === "pi-coding-agent" && basename(dirname(dir)) === "@oh-my-pi")) {
+		if (dirname(dir) === dir) return null;
+		dir = dirname(dir);
+	}
+	return join(dir, "src");
+})();
+const HAS_OMP = OMP !== null && existsSync(`${OMP}/extensibility/extensions/runner.ts`);
 
 const line = (version: string, date = "2026-10-20") => `snapshot of OMP ${version}, ${date}; drift will occur`;
 const NOTICE_TAIL = "Verify any OMP claim against OMP source or omp:// docs before relying on it.";

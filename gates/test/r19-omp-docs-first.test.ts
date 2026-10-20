@@ -9,11 +9,11 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import type { JudgmentJudge } from "../../classifier/src/judge-ask";
 import { Ledger } from "../../ledger/src/index";
-import ompDocsFirstRow, { RELEASE_LOG } from "../extensions/r19-omp-docs-first";
+import ompDocsFirstRow from "../extensions/r19-omp-docs-first";
 import p11Gates from "../index";
 import type { FenceSettings } from "../src/fence";
 import { checkTurnShape } from "../src/rows/r01-turn-shape";
-import { consultsOmp, HELD_MARKER, HOLD_LIMIT, KEYWORDS, keywordHit, QUESTION_CAP, RELEASE_LINE } from "../src/rows/r19-omp-docs-first";
+import { consultsOmp, HELD_MARKER, KEYWORDS, keywordHit } from "../src/rows/r19-omp-docs-first";
 import type { GatesAPI } from "../src/session";
 import { CERTIFIED, tmp } from "./helpers";
 
@@ -176,7 +176,7 @@ describe("the trigger", () => {
 		expect(judge.calls).toHaveLength(0);
 	});
 
-	test("judge yes holds, judge no passes, and the question sent is capped", async () => {
+	test("judge yes holds, judge no passes, and an input up to 24000 characters reaches the judge whole", async () => {
 		const yes = judgeSaying(0.9);
 		const a = session("lane", yes);
 		await a.f.emit("input", SAID("how do I make a session resumable?"), a.ctx);
@@ -185,10 +185,38 @@ describe("the trigger", () => {
 
 		const no = judgeSaying(0.1);
 		const b = session("lane", no);
-		const long = `fix the flaky test ${"x".repeat(QUESTION_CAP * 2)}`;
+		const long = `fix the flaky test ${"x".repeat(24000 - 19)}`;
+		expect(long).toHaveLength(24000);
 		await b.f.emit("input", SAID(long), b.ctx);
 		expect(await answer(b)).toEqual({ shown: ANSWER, stop: null });
-		expect(String(no.calls[0]!.state).length).toBeLessThanOrEqual(QUESTION_CAP);
+		expect(no.calls[0]!.state).toBe(long);
+	});
+
+	test("a question after a 30000-character paste reaches the judge: its first 8000 and last 16000 characters, and the cut named", async () => {
+		const question = "How do I attach another working directory to this session?";
+		const said = `${"x".repeat(30000)}\n\n${question}`;
+		expect(keywordHit(said)).toBeNull();
+		// Yes only when the trailing question is in what it is shown.
+		const calls: string[] = [];
+		const judge = async (): Promise<JudgmentJudge> => ({
+			judge: async (request) => {
+				calls.push(String(request.state));
+				const key = Object.keys(request.questions)[0]!;
+				return { answers: { [key]: { noul: String(request.state).includes(question) ? 1 : 0 } }, model: "jev-1.13.0", provider: "typesafe" };
+			},
+		});
+		const s = session("lane", judge);
+		await s.f.emit("input", SAID(said), s.ctx);
+		expect((await answer(s)).stop).toContain(ROW19);
+		expect(calls).toEqual([`${said.slice(0, 8000)}\n[… ${said.length - 24000} characters omitted …]\n${said.slice(-16000)}`]);
+	});
+
+	test("the keyword match runs over the whole input, past any cut", async () => {
+		const judge = judgeSaying(0);
+		const s = session("lane", judge);
+		await s.f.emit("input", SAID(`${"x".repeat(30000)} what does omp do here?`), s.ctx);
+		expect((await answer(s)).stop).toContain(ROW19);
+		expect(judge.calls).toHaveLength(0);
 	});
 
 	test("a judge that errors, cannot be resolved, or does not answer in time holds (fail closed)", async () => {
@@ -344,7 +372,7 @@ describe("row 1 and row 19 together", () => {
 		const r19 = await answer(s, malformed);
 		expect(r19.shown).toBe(HELD_MARKER);
 		expect(r19.stop).toContain(ROW19);
-		expect(r19.stop).toContain("hold 1 of");
+		expect(r19.stop).toContain("hold 1");
 		expect(r19.stop).not.toContain(ROW1);
 		expect(r19.stop).toEndWith(`Your held reply was:\n\n${malformed}`);
 		await s.f.emit("before_agent_start", { prompt: "", systemPrompt: [] }, s.ctx);
@@ -372,43 +400,86 @@ describe("row 1 and row 19 together", () => {
 		expect(r1.stop).not.toContain(ROW19);
 	});
 
-	test("row 19's marker, its later holds and its release line pass row 1, for the orchestrator and a lane", () => {
-		const released = `#### ${RELEASE_LINE}\n\n## Needs you\n- nothing\n\n**QUESTION**\nShip it today? Options: yes / no\n\nNothing else waiting.`;
+	test("row 19's marker and its later holds pass row 1, for the orchestrator and a lane", () => {
 		for (const role of ["orchestrator", "lane"] as const) {
 			expect(checkTurnShape(HELD_MARKER, role)).toBeNull();
 			expect(checkTurnShape("…", role)).toBeNull();
-			expect(checkTurnShape(released, role)).toBeNull();
 		}
 	});
 });
 
-describe("the loop guard", () => {
-	test(`final text: ${HOLD_LIMIT} holds, then the reply goes through with the release line, logged`, async () => {
+describe("no release without a read", () => {
+	const ATTEMPTS = 8;
+	/** The read the hold reason promises always exists: the profile's OMP-HARNESS.md, installed or in the checkout. */
+	const WAY_OUT = ["~/.omp/profiles/agent-system-2/agent/OMP-HARNESS.md", "profile/OMP-HARNESS.md"];
+	const nextTurn = (s: Session) => s.f.emit("before_agent_start", { prompt: "", systemPrompt: [] }, s.ctx);
+
+	test(`final text: held at every one of ${ATTEMPTS} attempts, the reason naming the way out; one read then lets it through`, async () => {
 		const s = session("lane", judgeSaying(0));
 		await s.f.emit("input", SAID("explain the omp extension runner"), s.ctx);
-		for (let i = 1; i <= HOLD_LIMIT; i++) {
+		for (let i = 1; i <= ATTEMPTS; i++) {
 			const r = await answer(s);
 			expect(r.shown).toBe(i === 1 ? HELD_MARKER : "…");
-			expect(r.stop).toContain(`hold ${i} of ${HOLD_LIMIT}`);
-			await s.f.emit("before_agent_start", { prompt: "", systemPrompt: [] }, s.ctx);
+			expect(r.stop).toContain(ROW19);
+			for (const path of WAY_OUT) expect(r.stop).toContain(path);
+			expect(r.stop).toEndWith(`Your held reply was:\n\n${ANSWER}`);
+			await nextTurn(s);
 		}
-		const last = await answer(s);
-		expect(last.stop).toBeNull();
-		expect(last.shown).toBe(`#### ${RELEASE_LINE}\n\n${ANSWER}`);
-		expect(RELEASE_LINE).toBe(`row 19: released after ${HOLD_LIMIT} holds without an OMP read`);
-		expect(s.f.entries.filter((e) => e.type === RELEASE_LOG)).toHaveLength(1);
-		// Released for this question: later replies pass untouched.
+		await s.f.emit("tool_result", { toolName: "read", toolCallId: "r", input: { path: WAY_OUT[0] }, isError: false }, s.ctx);
+		expect(await answer(s)).toEqual({ shown: ANSWER, stop: null });
 		expect(await answer(s)).toEqual({ shown: ANSWER, stop: null });
 	});
 
-	test(`a hand's yield: ${HOLD_LIMIT} refusals, then it goes through carrying the release line, logged`, async () => {
+	test(`a hand's yield: refused at every one of ${ATTEMPTS} attempts, unchanged; one read then lets it through as sent`, async () => {
 		const s = session("hand", judgeSaying(0));
 		await s.f.emit("before_agent_start", { prompt: "What does /add-dir change?", systemPrompt: [] }, s.ctx);
 		const yieldCall = { toolName: "yield", toolCallId: "y", input: { data: { report: "**PMDW**\nDone.", n: 3 } } };
-		for (let i = 1; i <= HOLD_LIMIT; i++) expect((await s.f.emit("tool_call", yieldCall, s.ctx))?.reason).toContain(`hold ${i} of ${HOLD_LIMIT}`);
+		for (let i = 1; i <= ATTEMPTS; i++) {
+			const r = await s.f.emit("tool_call", yieldCall, s.ctx);
+			expect(r?.block).toBe(true);
+			expect(r?.input).toBeUndefined();
+			for (const path of WAY_OUT) expect(r?.reason).toContain(path);
+		}
+		await s.f.emit("tool_result", { toolName: "read", toolCallId: "r", input: { path: "profile/OMP-HARNESS.md" }, isError: false }, s.ctx);
 		const passed = await s.f.emit("tool_call", yieldCall, s.ctx);
 		expect(passed?.block).toBeUndefined();
-		expect(passed?.input).toEqual({ data: { report: `${RELEASE_LINE}\n\n**PMDW**\nDone.`, n: 3 } });
-		expect(s.f.entries.filter((e) => e.type === RELEASE_LOG)).toHaveLength(1);
+		expect(passed?.input).toBeUndefined();
+	});
+
+	test(`outward tools: refused at every one of ${ATTEMPTS} attempts, by name and as a device; one read then lets them through`, async () => {
+		const s = session("orchestrator", judgeSaying(0));
+		await s.f.emit("input", SAID("what is omp's /collab?"), s.ctx);
+		const calls = [
+			{ toolName: "orchestrator_reply", toolCallId: "o", input: { to: "plumb", body: "x", i: "x" } },
+			{ toolName: "orchestrator_raise_question", toolCallId: "q", input: { body: "x?", options: ["a", "b"], i: "x" } },
+			{ toolName: "write", toolCallId: "w", input: { path: "xd://orchestrator_reply", content: "{}" } },
+		];
+		for (let i = 1; i <= ATTEMPTS; i++) {
+			for (const call of calls) {
+				const r = await s.f.emit("tool_call", call, s.ctx);
+				expect(r?.block).toBe(true);
+				expect(r?.reason).toContain(ROW19);
+			}
+		}
+		await s.f.emit("tool_result", { toolName: "read", toolCallId: "r", input: { path: "omp://extensions.md" }, isError: false }, s.ctx);
+		for (const call of calls) expect(await s.f.emit("tool_call", call, s.ctx)).toBeUndefined();
+	});
+
+	test(`a mixed run of outward tools and final replies stays held past ${ATTEMPTS} attempts; one read then lets both through`, async () => {
+		const s = session("lane", judgeSaying(0));
+		await s.f.emit("input", { text: "how does the harness end an rpc turn?", source: "rpc" }, s.ctx);
+		const message = { toolName: "lane_message", toolCallId: "m", input: { body: "answer" } };
+		for (let i = 1; i <= ATTEMPTS; i++) {
+			const tool = await s.f.emit("tool_call", message, s.ctx);
+			expect(tool?.block).toBe(true);
+			expect(tool?.reason).toContain(ROW19);
+			const reply = await answer(s);
+			expect(reply.shown).toBe(i === 1 ? HELD_MARKER : "…");
+			expect(reply.stop).toContain(ROW19);
+			await nextTurn(s);
+		}
+		await s.f.emit("tool_result", { toolName: "grep", toolCallId: "g", input: { pattern: "turn_end", path: "/g/node_modules/@oh-my-pi/pi-coding-agent/src" }, isError: false }, s.ctx);
+		expect(await s.f.emit("tool_call", message, s.ctx)).toBeUndefined();
+		expect(await answer(s)).toEqual({ shown: ANSWER, stop: null });
 	});
 });
