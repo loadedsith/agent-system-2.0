@@ -190,6 +190,23 @@ describe("T1 openable text", () => {
   const a=join(root,"README.md"), b=join(root,"missing.md");
   expect(linkMarkdown(`|${a}|${b}|`,opts)).toBe(`|${md(a,a)}|${md(b,b)}|`);
  });
+ test("space-bearing paths survive compact tables and separators before later slashes", () => {
+  const a=join(root,"My File.md"), b=join(root,"Other File.md");
+  for(const p of [a,b]) writeFileSync(p,"plan");
+  for(const render of [linkMarkdown,linkTerminal]) {
+   const expected=(p:string)=>{
+    if(render === linkMarkdown) return md(p,p);
+    const url=fileUrl(p), osc=(s:string)=>`\x1b]8;;${url}\x07${s}\x1b]8;;\x07`;
+    return `${osc(p)} (${osc(url)})`;
+   };
+   expect(render(`|${a}|${b}|`,opts)).toBe(`|${expected(a)}|${expected(b)}|`);
+   for(const source of [a,"./My File.md"]) {
+    for(const separator of ["|","–","—"]) {
+     expect(render(`${source}${separator}a/b`,opts)).toBe(`${expected(a)}${separator}a/b`);
+    }
+   }
+  }
+ });
  test("existing punctuation filenames win over formatting boundaries", () => {
   for (const name of ["punct**", "punct_", "punct|", "punct—see", "punct–see", "punct.", "punct!"]) {
    const p=join(root,name);

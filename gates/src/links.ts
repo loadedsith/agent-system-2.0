@@ -122,6 +122,9 @@ function pathCandidates(text: string, o: LinkOptions): PathCandidates {
    // Keep only indexed whitespace ends strictly before the impossible slash.
    // Inventing an end here would turn /file/nope into a partial /file link.
    limit = after(ends, boundary);
+   // A prose separator can hide a spaced path: retain its containing token end
+   // for trimPathToken, but never invent a slash endpoint or extend plain descendants.
+   if (/[|–—]/.test(text.slice(i === slashStart ? start : slashes[i - 1]! + 1, boundary))) limit++;
    // Before the first slash, only the first bare name.ext token can be a path.
    if (i === slashStart) limit = Math.min(limit, first + 1);
    break;
