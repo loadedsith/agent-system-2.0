@@ -78,6 +78,40 @@ describe("T1 openable text", () => {
   expect(linkMarkdown(`\`${spaced}\``, opts)).toBe(md(spaced, spaced));
   expect(linkMarkdown("/v1/feeds/legacy /login", opts)).toBe("/v1/feeds/legacy /login");
  });
+ test("longest existing space paths survive long prose and formatting", () => {
+  const dir=join(root,"space-prefix");
+  mkdirSync(dir);
+  for(const name of ["plan.md","plan.md extended notes.md","draft [v2] `notes`.md"]) writeFileSync(join(dir,name),"plan");
+  const tail=" ordinary ledger words".repeat(800);
+  for(const spelling of [dir,"~/space-prefix","./space-prefix","space-prefix"]) {
+   for(const name of ["plan.md extended notes.md","draft [v2] `notes`.md"]) {
+    const p=join(dir,name), source=`${spelling}/${name}:3`;
+    const expected=`**${md(`${p}:3`,p)}**${tail}`;
+    expect(linkMarkdown(`**${source}**${tail}`,opts)).toBe(expected);
+    expect(linkMarkdown(expected,opts)).toBe(expected);
+    expect(linkTerminal(`**${source}**${tail}`,opts)).toBe(`**${linkTerminal(`${p}:3`,opts)}**${tail}`);
+    expect(linkedPaths(expected)).toEqual([{path:p,line:"3"}]);
+   }
+  }
+ });
+ for(const render of [linkMarkdown,linkTerminal]) {
+  for(const shape of ["slash-free","path-leading","mixed"] as const) {
+   test(`${render.name} avoids long-line freeze: ${shape}`, () => {
+    const p=join(root,"README.md");
+    const prose="ordinary ledger status words ".repeat(600);
+    const text=shape === "slash-free" ? prose : shape === "path-leading" ? `${p} ${prose}` : `${prose.slice(0,prose.length/2)}${p} ${prose.slice(prose.length/2)}`;
+    const expected=shape === "slash-free" ? text : shape === "path-leading" ? `${render(p,opts)} ${prose}` : `${prose.slice(0,prose.length/2)}${render(p,opts)} ${prose.slice(prose.length/2)}`;
+    // Warm setup outside the measurement. Two seconds is a freeze guard, not a microbenchmark;
+    // the ~17k single line amplifies the old repeated suffix scans well beyond timer noise.
+    render("warm ordinary text",opts);
+    const started=performance.now();
+    const actual=render(text,opts);
+    const elapsed=performance.now()-started;
+    expect(actual).toBe(expected);
+    expect(elapsed).toBeLessThan(2000);
+   },120_000);
+  }
+ }
  test("formatting and prose separators stay outside path targets", () => {
   for (const name of ["README.md", "missing.md"]) {
    const p=join(root,name);

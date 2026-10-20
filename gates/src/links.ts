@@ -79,17 +79,75 @@ function issueTarget(s: string, repo: LinkOptions["repo"]): string | null {
  return `https://${host}/${slug}/${m[1] === "pr" ? "pulls" : "issues"}${m[3] ? `?${new URLSearchParams({q:search.join(" ")})}` : ""}`;
 }
 interface Hit { visible: string; target: string }
+interface ExistingPath { raw: string; hit: Hit }
+type PathCandidates = (start: number) => ExistingPath | null;
+function pathHit(raw: string, path: string): Hit {
+ const line = suffix(raw).line;
+ return { visible: path + (line ? `:${line}` : ""), target: fileUrl(path) };
+}
+
+/** Index a span once, not every suffix at every prose token. */
+function pathCandidates(text: string, o: LinkOptions): PathCandidates {
+ if (!text.includes("/") && !text.includes(".")) return () => null;
+ const ends: number[] = [], slashes: number[] = [];
+ for (const m of text.matchAll(/\/|\s+/g)) {
+  if (m[0] === "/") slashes.push(m.index!);
+  else if (m.index! > 0 && !/\s/.test(text[m.index! - 1]!)) ends.push(m.index!);
+ }
+ if (text && !/\s/.test(text[text.length - 1]!)) ends.push(text.length);
+ const after = (positions: number[], start: number): number => {
+  let lo = 0, hi = positions.length;
+  while (lo < hi) {
+   const mid = (lo + hi) >>> 1;
+   if (positions[mid]! < start) lo = mid + 1;
+   else hi = mid;
+  }
+  return lo;
+ };
+ return start => {
+  const first = after(ends, start + 1);
+  if (first === ends.length || /\s/.test(text[start]!)) return null;
+  const token = text.slice(start, ends[first]);
+  if (SCHEME.test(token)) return null;
+  const slash = slashes[after(slashes, start)];
+  // A slash-free run containing spaces cannot satisfy pathTarget's bare name.ext rule.
+  // Without a slash or dot even the first token is ordinary prose: no suffix probes.
+  if (slash === undefined && !token.includes(".")) return null;
+  if (slash !== undefined && slash > start && !token.startsWith("~/") &&
+      (o.exists ?? diskKind)(absolute(text.slice(start, slash), o)) !== "dir") {
+   // The first token may still be a bare filename before some unrelated later slash.
+   return existing(ends[first]!);
+  }
+  // Across spaces only exact existence can win, longest first. Parent fallback is
+  // deliberately left to the ordinary single-token parser.
+  for (let i = slash === undefined ? first : ends.length - 1; i >= first; i--) {
+   const found = existing(ends[i]!);
+   if (found) return found;
+  }
+  return null;
+
+  function existing(end: number): ExistingPath | null {
+   let raw = text.slice(start, end);
+   let path = pathTarget(raw, o, false);
+   if (!path) {
+    raw = trimPathToken(raw, o);
+    path = pathTarget(raw, o, false);
+   }
+   return path ? { raw, hit: pathHit(raw, path) } : null;
+  }
+ };
+}
 function target(s: string, o: LinkOptions, parent = true): Hit | null {
  if (/^https?:\/\//.test(s)) return {visible:s,target:s};
  const issue = issueTarget(s,o.repo);
  if (issue) return {visible:s,target:issue};
  if (SCHEME.test(s)) { const p = HANDLE.test(s) ? o.handles?.get(s) : null; return p ? {visible:s,target:fileUrl(p)} : null; }
  const p = pathTarget(s,o,parent);
- return p ? {visible: p + (suffix(s).line ? `:${suffix(s).line}` : ""),target:fileUrl(p)} : null;
+ return p ? pathHit(s, p) : null;
 }
 
 // One walker owns exemptions for rendering, discovery, and raw handle expansion.
-function walk(text: string, plain: (s: string) => string, code: (s: string) => string, linked: (s:string)=>string = s=>s, literal?: (s:string)=>{text:string;length:number}|null): string {
+function walk(text: string, plain: (s: string) => string, code: (s: string) => string, linked: (s:string)=>string = s=>s, literal?: (line:string,start:number)=>{text:string;length:number}|null): string {
  let fence: { char: string; length: number } | null = null;
  let comment = false;
  return text.split(/(?<=\n)/).map(line => {
@@ -109,7 +167,7 @@ function walk(text: string, plain: (s: string) => string, code: (s: string) => s
    if (protectedSpan) { out += linked(protectedSpan[0]); pos += protectedSpan[0].length; continue; }
    const inline = /^(`+)([\s\S]*?)\1/.exec(rest);
    if (inline) { const rewritten = code(inline[2]!); out += rewritten === inline[2] ? inline[0] : rewritten; pos += inline[0].length; continue; }
-   const whole=literal?.(rest);
+   const whole=literal?.(line,pos);
    if(whole) { out+=whole.text; pos+=whole.length; continue; }
    let end = pos + 1;
    // Prose delimiters expose token starts, but are valid inside URL paths and queries.
@@ -122,22 +180,17 @@ function walk(text: string, plain: (s: string) => string, code: (s: string) => s
 }
 const TOKEN = /(?:[a-z][a-z0-9+.-]*:\/\/[^\s`<>\[\]]*|~\/[^\s`<>\[\]]+|\/(?!\/)[^\s`<>\[\]]+|(?:\.{1,2}\/)?[\w@][^\s`<>\[\]]*)/gi;
 function transformPlain(s: string, o: LinkOptions, render: (h: Hit) => string): string {
+ if (!s.includes("/") && !s.includes(".")) return s;
  let out="", pos=0;
  const tokens=new RegExp(TOKEN.source,TOKEN.flags);
+ const existing = pathCandidates(s, o);
  let m:RegExpExecArray|null;
  while ((m=tokens.exec(s))) {
   if (m.index < pos || (m.index > 0 && /[\w/]/.test(s[m.index-1]!))) continue;
   let at=m.index,raw=m[0], hit: Hit | null = null;
-  // Only an existing whole path may consume prose spaces. Longest existing candidate wins.
-  if (!SCHEME.test(raw)) {
-   const rest=s.slice(m.index!);
-   for (let n=rest.length; n>raw.length; n--) {
-    if (n<rest.length && !/\s/.test(rest[n]!)) continue;
-    const candidate=rest.slice(0,n).trimEnd();
-    const p=pathTarget(candidate,o,false) ?? pathTarget(trimPunctuation(candidate),o,false);
-    if (p) { raw = pathTarget(candidate,o,false) ? candidate : trimPunctuation(candidate); hit=target(raw,o,false); break; }
-   }
-  }
+  // Share the literal parser's eligibility guard and longest-existing selection.
+  const whole = existing(m.index);
+  if (whole && whole.raw.length > raw.length) { raw = whole.raw; hit = whole.hit; }
   if (!hit) {
    if (!SCHEME.test(raw) && pathTarget(raw,o,false)) hit=target(raw,o);
    else {
@@ -155,30 +208,23 @@ function transformPlain(s: string, o: LinkOptions, render: (h: Hit) => string): 
  return out+s.slice(pos);
 }
 function transform(text: string, o: LinkOptions, render: (h: Hit) => string, linked?: (s:string)=>string): string {
+ let line = "", existing: PathCandidates | undefined;
  return walk(text,s=>transformPlain(s,o,render),s=>{
   const hit=target(s,o);
   // Inline commands and multiple references are not single path tokens.
   if (!hit || COMMAND_LINE.test(s) || (!SCHEME.test(s) && /\s/.test(s) && !pathTarget(s,o,false) && !/^(?:~\/|\/)/.test(s))) return s;
   return render(hit);
- },linked,rest=>{
-  if(SCHEME.test(rest) || /^\s/.test(rest)) return null;
-  const formatting=/^(?:[*_~]{1,3}|[|–—])/.exec(rest);
-  const slash=rest.indexOf("/");
-  if(slash > 0 && !formatting && !rest.startsWith("~/") && (o.exists ?? diskKind)(absolute(rest.slice(0,slash),o)) !== "dir") return null;
+ },linked,(source,start)=>{
+  if (source !== line || !existing) { line = source; existing = pathCandidates(source, o); }
+  if (/\s/.test(source[start]!)) return null;
   // Check a whole existing path before treating filename backticks/brackets as Markdown.
-  // Space joining still requires existence; the parent rule only applies to one token.
-  const ends=[...rest.matchAll(/\s|$/g)].map(m=>m.index!);
-  for(let i=ends.length-1;i>=0;i--) {
-   let raw=rest.slice(0,ends[i]);
-   if(!raw) continue;
-   const exact=pathTarget(raw,o,false);
-   if(!exact) raw=trimPathToken(raw,o);
-   const path=exact ?? pathTarget(raw,o,false);
-   if(path) return {text:render(target(raw,o,false)!),length:raw.length};
-  }
+  const whole = existing(start);
+  if (whole) return {text:render(whole.hit),length:whole.raw.length};
   // Expose an adjacent path without consuming its Markdown wrapper or table/dash separator.
+  const formatting=/^(?:\*{1,3}|_{1,3}|~{1,3}(?!\/)|[|–—])/.exec(source.slice(start,start+3));
   if(formatting) return {text:formatting[0],length:formatting[0].length};
-  const token=/^\S+/.exec(rest)?.[0];
+  if (source[start] !== "/" && !(source[start] === "~" && source[start+1] === "/")) return null;
+  const token=/^\S+/.exec(source.slice(start))?.[0];
   if(token && /^(?:\/|~\/)/.test(token) && /[`\[\]]/.test(token)) {
    const raw=trimPathToken(token,o),hit=target(raw,o);
    if(hit) return {text:render(hit),length:raw.length};
