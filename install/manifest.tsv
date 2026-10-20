@@ -49,6 +49,7 @@ classifier/test/crosslab.test.ts	test	-
 classifier/test/extension.test.ts	test	-
 classifier/test/fingerprint.test.ts	test	-
 classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
+classifier/test/fixtures/classifier-sample-2026-10-20.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
@@ -64,6 +65,7 @@ classifier/test/fixtures/kimi-findings/kimi-transcript-empty.md	test	-
 classifier/test/fixtures/kimi-findings/kimi-transcript-runner.md	test	-
 classifier/test/fixtures/kimi-findings/openai-delivered-byhand.json	test	-
 classifier/test/fixtures/kimi-findings/openai-delivered-snapshot-settle.json	test	-
+classifier/test/fixtures/kind-question-2026-10-20.json	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-
@@ -1141,8 +1143,11 @@ surface/test/merge-train-resolve.test.ts	test	-
 surface/test/train-word.test.ts	test	-
 surface/test/merge-train-stack.test.ts	test	-
 surface/test/train-return.test.ts	test	-
+surface/test/train-board.test.ts	test	-
 surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
+surface/test/train-world.ts	test	-
+surface/test/train-escalation.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
@@ -1247,6 +1252,16 @@ surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Openable links (migration/items/openable-links.md): render-only linking and the local herdr action.
+gates/src/links.ts	module	-
+gates/extensions/open-links.ts	extension	-
+gates/test/links.test.ts	test	-
+gates/test/open-links.test.ts	test	-
+surface/src/linked-api.ts	module	-
+surface/test/linked-api.test.ts	test	-
+install/herdr-file-links/herdr-plugin.toml	install	-
+install/herdr-file-links/open-file.sh	install	-
+ledger/test/file-links-install.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-
@@ -1269,6 +1284,12 @@ surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
 surface/test/phoenix-run.test.ts	test	-
+# Agent channel, phase 1 (migration/items/agent-channel.md): Plumb sends Ilex notes and proposals through
+# the OMP seat mailbox; never authored as Jo. Loaded by surface/index.ts for the orchestrator only.
+surface/src/channel.ts	module	-
+surface/extensions/agent-channel.ts	module	-
+surface/test/channel.test.ts	test	-
+surface/test/channel-reply.test.ts	test	-
 # Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
 # jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
 # profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
