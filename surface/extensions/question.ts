@@ -10,7 +10,10 @@
 // Jo's standing rulings are checked first (gates/src/rulings.ts `askJo`): a question one of them decides is not raised, and the tool returns the ruling and what to do instead, with no id for a QUESTION block.
 // `now` (one of NOW_CATEGORIES, PLAN wl-mvg1vs0rhnu3gg § 1.0) skips the rulings and reaches Jo at once; any other word is refused with nothing written.
 // An ask repeating an open question about the same workload returns that id, reused, with no second subject entry; a body naming
-// another workload's open question is a relay and is refused with nothing written (§ 3.5).
+// another workload's open question is a relay and is refused with nothing written (§ 3.5). A reused id an earlier reply already
+// published (row 15's `question-published:` record) is in front of Jo: row 15 refuses a second QUESTION block naming it, so the
+// reply says not to publish one (fix round 1, F2); a reused id never published is named in the QUESTION block as a new one is.
+import { publishedQuestionIds } from "../../gates/src/rows/r15-orchestrator-role";
 import { decidedText, installedReviewModel, isNowCategory, MODEL_SUBJECTS, type ModelSubject, NOW_CATEGORIES, type NowCategory, nowMarks, subjectProblem } from "../../gates/src/rulings";
 import { raiseOrchestratorQuestion, relayedQuestion, relayRefusal, reservedQuestionBody } from "../src/orchestrator-question";
 import { surfaceSession } from "../src/session";
@@ -77,7 +80,14 @@ export default function questionRow(pi: SurfaceAPI, env: Record<string, string |
 			const nowNote = mark === null ? "" : ` It reaches Jo at once, marked NOW (${mark}).`;
 			const answers = `Jo answers with \`<option> ${id}\` or \`withdraw ${id}\`, or in prose you record with orchestrator_record_instruction naming questionId ${id} and the inputId the surface gives Jo's words.`;
 			if ("reused" in asked) {
-				return text(`Question ${id}${about ? ` about ${about}` : ""} is already open with this body and options; nothing new was raised.${nowNote} Name ${id} in your QUESTION block. ${answers}`, { id, about, options, reused: true, now: mark });
+				const reused = `Question ${id}${about ? ` about ${about}` : ""} is already open with this body and options; nothing new was raised.${nowNote}`;
+				if (publishedQuestionIds(ledger).has(id)) {
+					return text(
+						`${reused} An earlier reply already put ${id} in front of Jo: send no new QUESTION block for it (P-11 row 15 holds a reply that asks a row twice); if you mention it, name ${id} in plain words. ${answers}`,
+						{ id, about, options, reused: true, published: true, now: mark },
+					);
+				}
+				return text(`${reused} Name ${id} in your QUESTION block. ${answers}`, { id, about, options, reused: true, published: false, now: mark });
 			}
 			pi.appendEntry("surface-question", { id, about });
 			return text(`Raised question ${id}${about ? ` about ${about}` : ""} (${options.join(" / ")}); name ${id} in your QUESTION block.${nowNote} ${answers}`, { id, about, options, now: mark });

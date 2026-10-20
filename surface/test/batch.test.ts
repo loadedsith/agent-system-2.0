@@ -325,6 +325,61 @@ describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is o
 		}]);
 		expect(onFire(l, shown[0]!)).toBe(true);
 	});
+
+	test("fix round 1 (F3): a security red whose workload closes before delivery still shows, on fire, and delivery consumes it exactly once", () => {
+		const c = clock();
+		const { ledger: l } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a-1", leaseMs: 3_600_000 }).won).toBe(true);
+		const sec = finish(l, wl, sl, 17, [SEC]);
+		expect(sec.security).not.toBeNull();
+		// The lane fixes it, completes its slice and lets go; the workload closes with the alert still held.
+		c.plusHours(0.1);
+		l.completeSlice(sl, { by: "lane-a-1", artifact: "fixed" });
+		l.releaseWorkload(wl, { by: "lane-a-1", holder: "lane-a-1" });
+		l.closeWorkload(wl, { by: SURFACE_BY });
+		expect(l.workload(wl)!.status).toBe("closed");
+		expect(l.inFlight().some((w) => w.workload.id === wl)).toBe(false);
+		expect(l.message(sec.security!)!.state).toBe("held");
+		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === wl);
+		const shown = lines();
+		expect(shown).toEqual([{
+			kind: "security-red", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
+			line: `security tests red on ${wl}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
+		}]);
+		expect(onFire(l, shown[0]!)).toBe(true);
+		expect(consumeLines(l, shown)).toBe(1);
+		expect(l.message(sec.security!)!.state).toBe("delivered");
+		expect(lines()).toEqual([]);
+		expect(consumeLines(l, shown)).toBe(0);
+	});
+
+	test("fix round 1 (F3): a security red on a workload closed before delivery is rendered and consumed at a wake exactly once, and nothing shows it at the next render; other held messages on the closed workload are left alone", async () => {
+		const t = await surface();
+		const l = t.lane;
+		const { wl, sl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a-1", leaseMs: 3_600_000 }).won).toBe(true);
+		const sec = finish(l, wl, sl, 17, [SEC]);
+		expect(sec.security).not.toBeNull();
+		// Two held messages on the same workload that are not the runner's security red: a death, and a lane's look-alike.
+		const died = death(l, wl, 0);
+		const forged = l.enqueue({ by: "lane-a-1", workloadId: wl, sender: "lane-a-1", recipient: ORCHESTRATOR_RECIPIENT, body: l.message(sec.security!)!.body });
+		l.completeSlice(sl, { by: "lane-a-1", artifact: "fixed" });
+		l.releaseWorkload(wl, { by: "lane-a-1", holder: "lane-a-1" });
+		l.closeWorkload(wl, { by: SURFACE_BY });
+		const needle = `security tests red on ${wl}: run ${sec.runId}`;
+		await t.f.emit("session_compact", { type: "session_compact" }, t.ctx);
+		const wake = await t.jo("go on");
+		expect(wake.split(needle)).toHaveLength(2);
+		expect(l.message(sec.security!)!.state).toBe("delivered");
+		expect([l.message(died)!.state, l.message(forged)!.state]).toEqual(["held", "held"]);
+		await t.f.tool("orchestrator_wake_read").execute("2", { body: "resuming" }, undefined, undefined, t.ctx);
+		const read = (await t.f.tool("orchestrator_ledger").execute("1", {}, undefined, undefined, t.ctx)).content[0]!.text;
+		expect(read).not.toContain(needle);
+		t.minutes(10);
+		t.poll();
+		expect(t.needsYou().some((x) => x.message.content.includes(needle))).toBe(false);
+	});
 });
 
 describe("the window: routine lines wait and go out together (D3)", () => {

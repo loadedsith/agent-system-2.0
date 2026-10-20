@@ -10,6 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { checkQuestionPublication, recordPublication, reusedQuestionRefusal } from "../../gates/src/rows/r15-orchestrator-role";
 import { Ledger } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
 import { check, type Probe } from "../scripts/invariants";
@@ -398,6 +399,33 @@ describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs
 		await s.say(`stop ${qb}`);
 		expect(ledger.instructions(a).map((i) => i.body)).toEqual([`Jo: "keep" — answers ${qa}: Keep the lane running?`]);
 		expect(ledger.instructions(b).map((i) => i.body)).toEqual([`Jo: "stop" — answers ${qb}: Keep the lane running?`]);
+	});
+
+	test("fix round 1 (F2): a repeat of a question an earlier reply published says it is in front of Jo and asks for no new QUESTION block, with and without now; the reply that follows passes row 15", async () => {
+		const { ledger, path } = tempLedger();
+		const s = surface(path);
+		const ask = { body: "Keep the lane running?", options: ["keep", "stop"] };
+		const q = s.idOf(await s.raise(ask));
+		const reused = `Question ${q} is already open with this body and options; nothing new was raised.`;
+		// Not yet published: the repeat is named in the QUESTION block, as a new question is.
+		expect(await s.raise(ask)).toStartWith(`${reused} Name ${q} in your QUESTION block.`);
+		// The reply that publishes it, bound and cited as gates/extensions/r01-turn-shape.ts binds and cites a final reply.
+		const block = `**QUESTION**\n(${q}) Keep the lane running? Options: keep / stop`;
+		const bound = checkQuestionPublication(block, () => ledger);
+		expect(bound).toEqual({ ok: true, questionIds: [q] });
+		recordPublication(() => ledger, [q], "orchestrator");
+		for (const now of [null, "guard", "guard"]) {
+			const reply = await s.raise({ ...ask, ...(now === null ? {} : { now }) });
+			const nowNote = now === null ? "" : " It reaches Jo at once, marked NOW (guard).";
+			expect(reply).toStartWith(`${reused}${nowNote} An earlier reply already put ${q} in front of Jo: send no new QUESTION block for it`);
+			expect(reply).not.toContain("in your QUESTION block");
+			// The final reply that follows the tool's words carries no QUESTION block naming q: row 15 lets it out.
+			expect(checkQuestionPublication(`**PMDW**\n${q} is already in front of Jo; waiting on the answer.`, () => ledger)).toEqual({ ok: true, questionIds: [] });
+			// Row 15 is unchanged: the block the old reply asked for is still refused.
+			expect(checkQuestionPublication(block, () => ledger)).toEqual({ ok: false, reason: reusedQuestionRefusal(q, "published") });
+		}
+		expect(ledger.questions(STANDING_WORKLOAD_ID).map((x) => x.id)).toEqual([q]);
+		expect(ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by])).toEqual([[`now: ${q} guard`, ESCALATION_BY]]);
 	});
 });
 

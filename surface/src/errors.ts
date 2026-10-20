@@ -48,7 +48,8 @@
 // taking the workload hides it, a `test-run:` green written after it clears it.
 // Security red (PLAN wl-mvg1vs0rhnu3gg § 3.3): every held `security-red:` the test runner sent about a workload, one line
 // each in the order written, before the test-run lines. A live lane holder, a train task's routing and a later green hide
-// none of them: a failing security test reaches Jo whatever is fixing it. Delivery consumes each.
+// none of them: a failing security test reaches Jo whatever is fixing it. They are read from the messages table, not from
+// the open workloads, so closing the workload before delivery drops none (fix round 1, F3). Delivery consumes each.
 // Due: an open workload whose brief starts `due:<date> ` with date <= now by instant (Codex S4).
 // Scratch (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): an open workload whose newest valid `scratch-over-cap:` /
 // `scratch-under-cap:` control entry (a holder's: the lane extension's turn-end measure, surface/extensions/lane.ts)
@@ -416,15 +417,20 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** The § 3.3 lines for a workload: each held `security-red:` from the test runner, whatever holds the workload or routes its runs. */
-function securityRedLines(workloadId: string, pending: readonly MessageRow[]): ErrorLine[] {
-	return pending.flatMap((m) => {
-		if (m.state !== "held" || m.recipient !== ORCHESTRATOR_RECIPIENT || m.created_by !== TEST_RUNNER_BY || !m.body.startsWith(SECURITY_RED_PREFIX)) return [];
+/**
+ * The § 3.3 lines: each held `security-red:` the test runner sent, in the order written, whatever holds its workload, routes its
+ * runs, or whether the workload is open or closed (fix round 1, F3). A body naming another workload than its message row is ignored.
+ */
+function securityRedLines(ledger: Ledger): ErrorLine[] {
+	const held = ledger.db.query<MessageRow, [string, string, string]>(
+		"SELECT * FROM messages WHERE state = 'held' AND recipient = ?1 AND created_by = ?2 AND instr(body, ?3) = 1 ORDER BY created_at, id",
+	).all(ORCHESTRATOR_RECIPIENT, TEST_RUNNER_BY, SECURITY_RED_PREFIX);
+	return held.flatMap((m) => {
 		const s = parseSecurityRed(m.body);
-		if (!s || s.workloadId !== workloadId) return [];
+		if (!s || s.workloadId !== m.workload_id) return [];
 		return [{
-			kind: "security-red" as const, workloadId, rowId: m.id, messageIds: [m.id],
-			line: `security tests red on ${workloadId}: run ${s.runId} at ${s.sha.slice(0, 7)} (slice ${s.slice}) has ${s.failing} failing under ${SECURITY_TEST_PATHS.join(", ")}, first ${s.first} — a lane asks you before it changes such a test`,
+			kind: "security-red" as const, workloadId: s.workloadId, rowId: m.id, messageIds: [m.id],
+			line: `security tests red on ${s.workloadId}: run ${s.runId} at ${s.sha.slice(0, 7)} (slice ${s.slice}) has ${s.failing} failing under ${SECURITY_TEST_PATHS.join(", ")}, first ${s.first} — a lane asks you before it changes such a test`,
 		}];
 	});
 }
@@ -436,7 +442,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 	const reserved: ErrorLine[] = [];
 	const held: ErrorLine[] = [];
 	const artifact: ErrorLine[] = [];
-	const securityRed: ErrorLine[] = [];
+	const securityRed = securityRedLines(ledger);
 	const testRun: ErrorLine[] = [];
 	const died: ErrorLine[] = [];
 	const idle: ErrorLine[] = [];
@@ -478,7 +484,6 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (!slice || slice.state === "done" || slice.state === "cancelled") continue;
 			artifact.push({ kind: "artifact", workloadId: wl, rowId: sliceId, state: String(n), messageIds: heldIds, line: `slice ${sliceId} (${label}) failed its runtime artifact ${n} times: ${short(slice.task, 70)}` });
 		}
-		securityRed.push(...securityRedLines(wl, pendingMessages));
 		const run = testRunLine(ledger, workload, pendingMessages, now, windows);
 		if (run) testRun.push(run);
 		const deaths = laneDeaths(ledger, wl);
