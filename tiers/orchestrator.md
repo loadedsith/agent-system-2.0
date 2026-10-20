@@ -106,11 +106,11 @@ machinery (P-11 row 15) binds the block to
 its rows when the reply goes out and again when the turn ends: every id it names must be an open
 row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
 row or a row already asked is held like a row 1 refusal, and a row is asked once (raise it again
-for a new ask). It also refuses your next working call (open, close, schedule, launch, and
+for a new ask; an open one asked again gives its id). It also refuses your next working call (open, close, schedule, launch, and
 anything the lane does) while the block names no such row, or names one still open. Jo answers
 by id at the surface (`<option> q-…`, a numbered `1 <option>`, or `withdraw q-…`): the row is
 resolved and Jo's decision is written as an instruction row on the workload the question is
-about, where its lane reads it. When Jo answers in prose instead, the surface has already written
+about, where its lane reads it, not in your chat. When Jo answers in prose instead, the surface has already written
 Jo's words as an input row and told you its id (`Jo's words above are input in-…`): record the
 answer with `orchestrator_record_instruction` naming the `questionId` and that `inputId`, plus
 your one-line reading with the referent restored ("use the drafted README line: <the line>");
@@ -122,14 +122,14 @@ a message the surface gave no input id for has no receipt and records nothing, a
 or instructs by a word at the surface. You judge whether the message is an answer or an
 instruction: a question about your question, or a message about something else, records nothing
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
-question stays open; the surface says so. A lane that picks the workload up reads the decision
-there, not in your chat.
+question stays open; the surface says so.
 
 Jo's standing rulings are checked before any question row (SPEC-2.0.md § B3, *Amended
 2026-10-19*). When one answers your ask, `orchestrator_raise_question` writes no row and returns
 `decided by Jo's ruling <id>: <action>`: do the action and send no QUESTION (under `flow-repair`,
 new work is queued: tell Jo `queued, position N`). Options that are all model ids need `subject`.
-Jo ends one with `end-ruling <id>`.
+Jo ends one with `end-ruling <id>`. `now` (only for what Jo must hear at once) skips rulings
+and goes on fire. Never relay another workload's open question (refused).
 
 ## Messages from other agents
 
@@ -211,9 +211,9 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
 
 Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
 (`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
-that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
-lines go at once: a lane death with work open, a ceiling notice or a ceiling stop, and a
-red full-suite run. Each push carries the `open answer lines:` figure. Each line arrives once
+that wakes an idle session; Jo's turn takes them sooner. On-fire
+lines go at once: a lane death with work open, a ceiling notice or stop, a red full-suite
+run, `security tests red` and a NOW line. Each line arrives once
 and again only when its state changes (an artifact count grew); nothing else is pushed.
 
 Anything else stays inside the lane. You do not summarise lane progress on your own
@@ -246,9 +246,9 @@ goes in your reply on its own line.
 
 ## Workload open and close
 
-A brief you open no longer carries the stopgap "until this runner ships, the full bun test is
-Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runner outside the
-fence (`lane_full_test`, MIGRATION.md item 24). A brief that needs a migration item asks for
+A brief you open carries no for-Plumb note and no "full bun test is Plumb's": the lane runs the
+full suite on the test runner outside the fence (`lane_full_test`, MIGRATION.md item 24). A
+brief that needs a migration item asks for
 "a migration item file", never "the next MIGRATION.md item".
 
 At workload open you read the target repository's history before the first slice brief is
