@@ -24,6 +24,10 @@
 // already raised are never re-checked. Every question goes through Jo's standing rulings (gates/src/rulings.ts `askJo`,
 // PLAN wl-mvfkv7llkp7nk0 § 1): one a ruling decides writes no question row, records the lane's `ruling-applied:` and
 // returns what to do instead; a question whose every option is a `provider/model` id declares its `subject`.
+// PLAN wl-mvg1vs0rhnu3gg § 1.0, § 3.5: `now` (one of NOW_CATEGORIES; any other word is refused, nothing written) skips the
+// rulings and plan auto-start; a plan question carrying it still passes the review and shape checks. An ask repeating an
+// open question on its slice (same body and options) skips the plan checks and goes to `askJo`, which returns the open id
+// as reused (with a `now:` mark when the repeat carries `now`); `plan-question:` is written only on a new raise.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
@@ -46,7 +50,10 @@ import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
 } from "../../classifier/src/lab";
 import { countRounds, parseReviewGroup, parseReviewLimit, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
-import { type AskResult, askJo, decidedText, installedReviewModel, MODEL_SUBJECTS, type ModelSubject, RULING_APPLIED_PREFIX, rulingActive, subjectProblem } from "../../gates/src/rulings";
+import {
+	type AskResult, askJo, decidedText, installedReviewModel, isNowCategory, MODEL_SUBJECTS, type ModelSubject, NOW_CATEGORIES, type NowCategory, nowMarks, RULING_APPLIED_PREFIX,
+	rulingActive, subjectProblem,
+} from "../../gates/src/rulings";
 import { gateSession } from "../../gates/src/session";
 import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
@@ -59,7 +66,7 @@ import {
 import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs } from "../src/merge-train";
 import { NOTICE_PREFIX, sendNotice } from "../src/notice";
 import { PAIR_OPTION } from "../src/pair-suggest";
-import { testRuns } from "../src/test-run";
+import { SECURITY_RED_PREFIX, testRuns } from "../src/test-run";
 import { releasedOpenBody, sliceCounts, unsettledHands } from "../src/turn-end";
 import {
 	ARTIFACT_COMMAND_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, type Ctx, ESCALATION_BY, HOLD_HOURS, LANE_ADD_SLICE_TOOL, LANE_COMPLETE_SLICE_TOOL,
@@ -81,7 +88,7 @@ const SLICE_ID_RE = /^sl-\S+$/;
 const text = (t: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text: t }], details });
 
 /** Message bodies the machinery writes and the surface reads as signals; a lane's own message must not open with one. */
-const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, NOTICE_PREFIX];
+const PUSHED_SIGNAL_PREFIXES = [LANE_DIED_PREFIX, PROMPT_WAIT_PREFIX, PROMPT_RESOLVED_PREFIX, ARTIFACT_FAILED_PREFIX, ARTIFACT_PASSED_PREFIX, TEST_RUN_FAILED_PREFIX, NOTICE_PREFIX, SECURITY_RED_PREFIX];
 
 /** The slice kinds `lane_add_slice` takes; the routing kinds, so the plan slice is `judge` (SPEC § B6). */
 const SLICE_KINDS = ["locate", "understand", "change-small", "change-large", "judge"] as const;
@@ -390,7 +397,10 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			"A plan question offering approve is refused until a review hand named after the plan slice has reviewed the plan on another lab since the last question, and refused in any other shape. " +
 			"Until the plan is approved, a question offering approve on any other slice is refused. " +
 			"Jo's standing rulings are checked first: a question one of them already answers is not raised, and the tool returns the ruling and what to do instead. " +
-			"When every option is a provider/model id, `subject` says what the model is for (lane-model or review-model); otherwise it is left out.",
+			"When every option is a provider/model id, `subject` says what the model is for (lane-model or review-model); otherwise it is left out. " +
+			`\`now\` (one of ${NOW_CATEGORIES.join(", ")}) puts the question before Jo at once, past every ruling and past plan auto-start: a credible data-integrity or security risk or an urgent incident, ` +
+			"weakening a guard or crossing a boundary Jo stated, or an irreversible effect or money commitment the plan does not authorize. " +
+			"Asking an open question again (same slice, body and options) returns its id and raises nothing new; with `now` it marks that question NOW.",
 		parameters: z.object({
 			slice: z.string().describe("The slice id (sl-…) the question is about."),
 			body: z.string().describe("The question, in plain words (the plan slice's approve question: the plan in the shape above)."),
@@ -399,6 +409,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				.enum(MODEL_SUBJECTS)
 				.optional()
 				.describe("Required when every option is a provider/model id: lane-model (the model a lane runs on) or review-model (the model a review runs on)."),
+			now: z.enum(NOW_CATEGORIES).optional().describe("Only when Jo must hear it at once: the category of the now trigger."),
 		}),
 		approval: "write",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -412,11 +423,20 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			// PLAN wl-mv67564rdkfvnk D9 (2): `pair` is offered only by the round-limit raise site, never by a lane.
 			if (options.some((x) => x.toLowerCase() === PAIR_OPTION)) return text(`The option \`${PAIR_OPTION}\` is offered only by the round-limit question the machinery raises; nothing was asked.`);
 			if (options.some((x) => /\s/.test(x))) return text("Each option is one word (Jo answers with it alone or as `<option> q-…`); nothing was asked.");
+			const nowWord = typeof params.now === "string" && params.now.trim() !== "" ? params.now.trim() : null;
+			if (nowWord !== null && !isNowCategory(nowWord)) return text(`\`now\` is one of ${NOW_CATEGORIES.join(", ")}, not ${nowWord}; nothing was asked.`);
+			const now: NowCategory | null = nowWord;
 			const refused = reserved(body, "asked") ?? runnerSignal(body, "asked");
 			if (refused) return refused;
 			const on = sliceOn(o.own, slice, "asked");
 			if (!on.ok) return on.result;
 			const { ledger, workloadId } = o.own;
+			const subject = typeof params.subject === "string" && params.subject !== "" ? (params.subject as ModelSubject) : null;
+			// PLAN wl-mvg1vs0rhnu3gg § 1.0 (review r3 F1): an ask repeating an open question on this slice, with the same body and
+			// options, passed the plan checks when it was raised; it skips them and auto-start and goes to askJo, which returns
+			// the open id as reused (askJo's own rule; a model-subject ask never repeats one).
+			const optionsJson = JSON.stringify(options);
+			const repeat = subject === null && ledger.questions(workloadId).some((q) => q.state === "open" && q.slice_id === slice && q.body === body && q.options === optionsJson);
 			// A question offering approve on the plan slice while `plan: first` stands is the plan question: reviewed (D8), then in shape (D7).
 			// Offering approve on any other slice then is refused (PLAN wl-mv5i3lulwwbbi8 D4): Jo's approve there would approve nothing.
 			let plan = false;
@@ -432,7 +452,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				}
 				plan = planSl !== null;
 			}
-			if (plan) {
+			if (plan && !repeat) {
 				if (!planReviewed(ledger, workloadId, slice)) return text(`${planReviewRefusal(slice)}. Nothing was asked.`);
 				// PLAN wl-mv8vwb04cy18n4 D3: the plan file is read here, once; a file that cannot be read is null and refused.
 				// The read is bounded: at most PLAN_FILE_MAX_BYTES + 1 bytes, whatever the file's size or growth, so a plan
@@ -468,7 +488,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				}
 				// PLAN wl-mvfkv7llkp7nk0 § 3: a normal-stakes plan whose latest review round passed wholly cross-lab starts here,
 				// with no question row: ESCALATION_BY's `plan: approved auto <group>` and Jo's notice, in one write that re-reads (a)–(e).
-				const started = ledger.write(() => {
+				// A plan question carrying `now` skips this and goes to Jo (PLAN wl-mvg1vs0rhnu3gg § 1.0, review r2 N1).
+				const started = now !== null ? null : ledger.write(() => {
 					const group = planAutoStartRound(ledger, workloadId, slice, Date.parse(ledger.now()));
 					if (group === null) return null;
 					ledger.recordEntry({ by: ESCALATION_BY, workloadId, sliceId: slice, kind: "assumption", body: planAutoApprovedBody(group) });
@@ -484,29 +505,44 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 					);
 				}
 			}
-			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write.
+			// D9 part two: the plan question's role is recorded as it is raised, by the holding lane, in the same write; a reused
+			// open question already has its entry (PLAN wl-mvg1vs0rhnu3gg § 3.5). A plan repeat that skipped the plan checks and
+			// finds its open question resolved inside the write is rolled back: a new plan question passes every check.
 			// PLAN wl-mvfkv7llkp7nk0 § 1: the standing rulings are checked first; a decided question writes no question row.
-			const subject = typeof params.subject === "string" && params.subject !== "" ? (params.subject as ModelSubject) : null;
 			const subjectWrong = subjectProblem(options, subject);
 			if (subjectWrong !== null) return text(`${subjectWrong}; nothing was asked.`);
-			const asked: AskResult = ledger.write(() => {
-				const r = askJo(
-					ledger,
-					{ by: o.own.laneId, workloadId, sliceId: slice, body, options, subject },
-					{
-						asker: "lane",
-						builders: builderLabs(ledger, workloadId),
-						stakes: o.own.workload.stakes,
-						train: trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0,
-						reviewModel: () => installedReviewModel(env),
-					},
-				);
-				if (plan && "raised" in r) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(r.raised) });
-				return r;
-			});
+			const skippedChecks = plan && repeat;
+			const resolvedMeanwhile = new Error("the repeated open question was resolved");
+			let asked: AskResult;
+			try {
+				asked = ledger.write(() => {
+					const r = askJo(
+						ledger,
+						{ by: o.own.laneId, workloadId, sliceId: slice, body, options, subject, now },
+						{
+							asker: "lane",
+							builders: builderLabs(ledger, workloadId),
+							stakes: o.own.workload.stakes,
+							train: trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0,
+							reviewModel: () => installedReviewModel(env),
+						},
+					);
+					if (skippedChecks && !("reused" in r)) throw resolvedMeanwhile;
+					if (plan && "raised" in r && !("reused" in r)) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(r.raised) });
+					return r;
+				});
+			} catch (e) {
+				if (e !== resolvedMeanwhile) throw e;
+				return text(`The open question this repeats on ${slice} was resolved while you asked; nothing was asked. Raise the plan question again: a new one passes every plan check.`);
+			}
 			if ("decided" in asked) return text(`${decidedText(asked.decided)}.`, { ruling: asked.decided.ruling, answer: asked.decided.answer });
 			const id = asked.raised;
-			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });
+			const mark = nowMarks(ledger.entries(workloadId, "assumption")).get(id) ?? null;
+			const nowNote = mark === null ? "" : ` It reaches Jo at once, marked NOW (${mark}).`;
+			if ("reused" in asked) {
+				return text(`Question ${id} on ${slice} is already open with this body and options; nothing new was raised.${nowNote} The slice stays paused until Jo answers ${id}.`, { id, reused: true, now: mark });
+			}
+			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.${nowNote}`, { id, now: mark });
 		},
 	});
 

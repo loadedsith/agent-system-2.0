@@ -17,7 +17,7 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { apply, interpret } from "../src/input";
 import { answerOrchestratorQuestion, questionSubject, questionSubjectBody } from "../src/orchestrator-question";
-import { STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, STANDING_BRIEF, STANDING_SLICE_ID, STANDING_SLICE_TASK, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
 
 type Started = { systemPrompt: string[]; messages: { customType: string; content: string }[] };
@@ -337,6 +337,67 @@ describe("Jo's input as the answer's receipt (fix round 1, B1)", () => {
 		expect(await record(s, { questionId: q2, inputId: late })).toMatch(new RegExp(`^${q2} is about ${wl}, which is closed \\(.+\\): the answer was not recorded and ${q2} stays open; \`withdraw ${q2}\` withdraws it; nothing was recorded.$`));
 		expect(ledger.question(q2)!.state).toBe("open");
 		expect(ledger.instructions(wl)).toHaveLength(2);
+	});
+});
+
+describe("escalation phase 2 through orchestrator_raise_question (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 3.5; R1, R7, R8)", () => {
+	test("a relay, a body naming another workload's open question, is refused with no row and no entry; a resolved one, or the orchestrator's own, is no relay", async () => {
+		const { ledger, path } = tempLedger();
+		const wl = ledger.openWorkload({ by: "lane-a", brief: "Fix", stakes: "normal", mode: "autonomous" });
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "plan", doneCondition: "d", inputs: "i" });
+		const lane = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Approve the plan?", options: ["approve", "revise"] });
+		const s = surface(path);
+		const relay = `Relay of the lane's question ${lane}: approve its plan?`;
+		expect(await s.raise({ body: relay, options: ["approve", "revise"], about: wl })).toBe(`${lane} is already on Jo's needs-you list; do not relay it. Nothing was asked.`);
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.entries(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(s.f.entries.filter((e) => e.type === "surface-question")).toEqual([]);
+		// The orchestrator's own open question is not another workload's: naming it raises.
+		const own = s.idOf(await s.raise({ body: "Rename the plan file?", options: ["yes", "no"] }));
+		expect(s.idOf(await s.raise({ body: `Does ${own} still stand after the rename?`, options: ["yes", "no"] }))).toMatch(/^q-/);
+		// Once Jo answered the lane's question it is off the needs-you list: naming it is no relay.
+		ledger.answerQuestion(lane, { by: SURFACE_BY, answer: "revise", author: "jo", channel: "surface" });
+		expect(s.idOf(await s.raise({ body: relay, options: ["approve", "revise"], about: wl }))).toMatch(/^q-/);
+	});
+
+	test("now: an unknown word is refused with nothing written; now: incident raises past the gates-stakes ruling with ESCALATION_BY's now: mark", async () => {
+		const { ledger, path } = tempLedger();
+		const s = surface(path);
+		const body = "The fix touches gates/src/rows/r08.ts. Open it at normal or production stakes?";
+		expect(await s.raise({ body, options: ["normal", "production"], now: "asap" })).toBe(
+			"`now` is one of integrity, security, incident, guard, boundary, irreversible, money, not asap; nothing was asked.",
+		);
+		expect(ledger.questions(STANDING_WORKLOAD_ID)).toEqual([]);
+		expect(ledger.entries(STANDING_WORKLOAD_ID)).toEqual([]);
+		const reply = await s.raise({ body, options: ["normal", "production"], now: "incident" });
+		const q = s.idOf(reply);
+		expect(reply).toContain(`(normal / production); name ${q} in your QUESTION block. It reaches Jo at once, marked NOW (incident).`);
+		const entries = ledger.entries(STANDING_WORKLOAD_ID).map((e) => [e.body, e.created_by]);
+		expect(entries).toEqual([[`now: ${q} incident`, ESCALATION_BY]]);
+		expect(ledger.slice(STANDING_SLICE_ID)!.state).toBe("paused");
+	});
+
+	test("a repeated ask is the open question, reused: no second row, question-about: or surface-question; with now it gains one mark; about another workload it is its own question, and Jo's answers mirror to the right workload", async () => {
+		const { ledger, path } = tempLedger();
+		const a = ledger.openWorkload({ by: "lane-a", brief: "A", stakes: "normal", mode: "autonomous" });
+		const b = ledger.openWorkload({ by: "lane-b", brief: "B", stakes: "normal", mode: "autonomous" });
+		const s = surface(path);
+		const ask = { body: "Keep the lane running?", options: ["keep", "stop"] };
+		const qa = s.idOf(await s.raise({ ...ask, about: a }));
+		const reused = `Question ${qa} about ${a} is already open with this body and options; nothing new was raised.`;
+		expect(await s.raise({ ...ask, about: a })).toStartWith(`${reused} Name ${qa} in your QUESTION block.`);
+		for (let i = 0; i < 2; i++) expect(await s.raise({ ...ask, about: a, now: "guard" })).toStartWith(`${reused} It reaches Jo at once, marked NOW (guard). Name ${qa} in your QUESTION block.`);
+		const qb = s.idOf(await s.raise({ ...ask, about: b }));
+		expect(qb).not.toBe(qa);
+		expect(ledger.questions(STANDING_WORKLOAD_ID).map((q) => q.id).sort()).toEqual([qa, qb].sort());
+		const standing = ledger.entries(STANDING_WORKLOAD_ID);
+		expect(standing.filter((e) => e.body.startsWith("question-about: ")).map((e) => e.body).sort()).toEqual([questionSubjectBody(qa, a), questionSubjectBody(qb, b)].sort());
+		expect(standing.filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by])).toEqual([[`now: ${qa} guard`, ESCALATION_BY]]);
+		expect(s.f.entries.filter((e) => e.type === "surface-question").map((e) => e.data)).toEqual([{ id: qa, about: a }, { id: qb, about: b }]);
+		await s.say(`keep ${qa}`);
+		await s.say(`stop ${qb}`);
+		expect(ledger.instructions(a).map((i) => i.body)).toEqual([`Jo: "keep" — answers ${qa}: Keep the lane running?`]);
+		expect(ledger.instructions(b).map((i) => i.body)).toEqual([`Jo: "stop" — answers ${qb}: Keep the lane running?`]);
 	});
 });
 
