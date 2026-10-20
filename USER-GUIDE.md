@@ -191,6 +191,7 @@ channel:
 - **Workload block:** `brief:`, `done:`, then the one-liner
   `stakes: normal · mode: autonomous · plan first: <why> — flip either with one word: … · ceiling $50 / 6h`,
   then `spent $12.4 of $50 · 95.2 of 360 min`, the lane and its lease, `slices:`, `open questions:`, and the last 8 ledger entries.
+- **Openable links:** render machinery makes settled agent paths and URLs clickable in OMP → herdr → kitty (including Plumb); stored docs/ledger stay raw. Unresolved session-local handles such as `local://PLAN.md` in ledger-derived wakes, reads, relays/questions and Applied lines stay plain text: Ilex never substitutes its own same-named file or reconstructs the old session. New lane bodies still expand locatable handles to raw absolute paths using the original caller before storage; current-session model replies and non-ledger custom messages keep their own local resolution. File clicks explicitly text-open safe documents, reveal directories/unknown formats/scripts/executables/symlink paths, and refuse app/bundle paths rather than launch them. The streaming/handle exceptions and upstream requests are in `migration/items/openable-links.md`, "Approved limitations and upstream requests".
 
 ## 5. Who does what
 

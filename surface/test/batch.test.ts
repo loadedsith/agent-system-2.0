@@ -26,7 +26,7 @@ import { ensureStandingWorkload, standingSlice } from "../src/identity";
 import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { askJo, nowBody } from "../../gates/src/rulings";
-import { clock, ctxOf, fakePi, notices, type Sent, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
+import { clock, ctxOf, fakePi, loadTestText, notices, type Sent, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
 
 const NEEDS = "## needs you (new since your last turn)";
 const BACK = "## back: everything waiting on you (complete list; write each up with its content)";
@@ -44,7 +44,7 @@ async function surface() {
 	const c = clock("2026-10-12T19:00:00.000Z");
 	const lane = Ledger.open(e.AGENT_SYSTEM_LEDGER_DB, { create: true, backup: false, backupOnOpen: false, clock: c.now });
 	const f = fakePi();
-	orchestratorSurface(f.pi, e, {});
+	await orchestratorSurface(f.pi, e, { loadText: loadTestText });
 	const ctx = ctxOf();
 	const s = surfaceSession(ctx, e);
 	s.now = c.now;
