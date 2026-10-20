@@ -24,6 +24,8 @@
 //   PLAN-2 wl-mvb9mw00ycfjeo D5) registers after the fence: the rows judge those calls as their write,
 //   edit and bash equivalents, and only a call every row allowed is authorized for plugins/paired-as2.ts
 //   to execute, bound to the arguments it was judged with.
+import openLinks from "./extensions/open-links";
+import { linkedApi } from "./src/links";
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
 import contractRow from "./extensions/r02-contract";
@@ -135,12 +137,15 @@ export default function p11Gates(
 	startCheck: ShellStartCheck = hostShellStart,
 	cleanShell: CleanShellCheck | undefined = fenceSettings === hostFenceSettings ? hostCleanShell : undefined,
 ): void {
+	openLinks(pi);
+	const ledgerPi = linkedApi(pi, undefined, undefined, "ledger");
+	pi = linkedApi(pi);
 	contractRow(pi, env);
 	receiptsRow(pi, env);
 	askPolicyRow(pi, env);
 	orchestratorRoleRow(pi, env);
 	typedWrapperRow(pi);
-	wakeReadRow(pi, env);
+	wakeReadRow(ledgerPi, env);
 	tierNameRow(pi);
 	briefFieldsRow(pi, env);
 	questionRow(pi, env);
