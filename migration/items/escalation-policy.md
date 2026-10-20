@@ -2,7 +2,7 @@
 title: Escalation policy phase 1 — standing rulings decide questions, normal plans that pass cross-lab review start on their own, and the ceiling stops and sends a notice instead of asking
 status: open
 workload: wl-mvfkv7llkp7nk0
-pr: TBD
+pr: 267
 ---
 Jo's words, 2026-10-19: *"yes to auto-start, stop at 100%"*, deciding decisions 1 and 2 of the escalation-policy draft (`~/agent-scratch/agent-system-2.0/escalation-policy/DRAFT.md`), plus the paired-workload amendment in-mvfo7nphl9xn28. Decision log: `.ai/decision-log/2026-10-19--1125--plumb--escalation-policy-auto-start-normal-plans-and-stop-at-ceiling.md`. Plan: `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvfkv7llkp7nk0/PLAN.md` (rev 5, approved). Before this change Jo was asked questions that a ruling of Jo's had already answered, every normal-stakes plan waited for Jo's `approve` even after a clean cross-lab pass, and the ceiling raised a stop / extend / split question at 80 % and again at 100 %.
 
