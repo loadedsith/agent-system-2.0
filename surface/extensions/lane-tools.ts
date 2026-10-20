@@ -24,7 +24,7 @@
 // already raised are never re-checked. Every question goes through Jo's standing rulings (gates/src/rulings.ts `askJo`,
 // PLAN wl-mvfkv7llkp7nk0 § 1): one a ruling decides writes no question row, records the lane's `ruling-applied:` and
 // returns what to do instead; a question whose every option is a `provider/model` id declares its `subject`. A merge
-// train's merge question on one of its own PR slices carries the `trainSignoff` fact, its gh half read live here (PLAN
+// train's merge question on one of its PRs' disposition slices carries the `trainSignoff` fact, its gh half read live here (PLAN
 // wl-mvg8itbt0rz3ls D2, surface/src/merge-train.ts `trainSignoff`), so Jo's ruling train-signoff can decide it.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
@@ -62,7 +62,7 @@ import {
 } from "../src/launch";
 import {
 	checkoutOwnerRepo, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs,
-	trainSignoff, trainSlicePr,
+	trainSignoff, trainSliceId, trainSlicePr,
 } from "../src/merge-train";
 import { DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { NOTICE_PREFIX, sendNotice } from "../src/notice";
@@ -537,10 +537,12 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const subject = typeof params.subject === "string" && params.subject !== "" ? (params.subject as ModelSubject) : null;
 			const subjectWrong = subjectProblem(options, subject);
 			if (subjectWrong !== null) return text(`${subjectWrong}; nothing was asked.`);
-			// PLAN wl-mvg8itbt0rz3ls D2: a train's merge question on one of its own PR slices carries the `trainSignoff` fact Jo's
-			// ruling train-signoff reads; gh is read here, before the write, and the ledger half is computed inside it.
+			// PLAN wl-mvg8itbt0rz3ls D2: a train's merge question on a PR's disposition slice (`trainSliceId`, the slice the ruling's
+			// action completes and its notice reads) carries the `trainSignoff` fact Jo's ruling train-signoff reads; a `-full-<r>`
+			// slice's carries none and is raised. gh is read here, before the write, and the ledger half is computed inside it.
 			const train = trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0;
-			const signoffPr = train && questionKind(options, subject) === "merge" ? trainSlicePr(slice, workloadId) : null;
+			const mergePr = train && questionKind(options, subject) === "merge" ? trainSlicePr(slice, workloadId) : null;
+			const signoffPr = mergePr !== null && slice === trainSliceId(workloadId, mergePr) ? mergePr : null;
 			const reads = signoffPr === null ? null : await signoffReads(ledger, workloadId, signoffPr);
 			const asked: AskResult | { refused: ToolResult } = ledger.write(() => {
 				// The gh reads awaited outside any transaction: the holder, its live lease and the slice are read again here, in

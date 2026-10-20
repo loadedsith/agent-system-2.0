@@ -25,7 +25,7 @@ import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../cl
 import { meter } from "./rank-launch";
 import {
 	type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard, parseTrainFix,
-	planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
+	planFirst, planSlice, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { askJo, raisedId, type TrainSignoffFact } from "../../gates/src/rulings";
@@ -1652,8 +1652,9 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 
 /**
  * PLAN wl-mvg8itbt0rz3ls D2 rule 3, stricter than the auto-board `reviewPassed`: W's review is settled and passed. The reviewed
- * slices are every slice of W that is not a plan slice (a plan question's slice, or the slice of the auto-start's
- * `plan: approved auto …`, which raises no question row) and has any `review-group:`, review `hand-spawn: … review yes`
+ * slices are every slice of W that is not a plan slice (a plan question's slice, the slice of the auto-start's
+ * `plan: approved auto …`, which raises no question row, or, while `plan: first` stands unapproved (`planFirst`), the slice that
+ * holds the plan role now (`planSlice`), whose plan may be reviewed before its question exists) and has any `review-group:`, review `hand-spawn: … review yes`
  * or `review-round:` entry; at least one exists; each one's newest `review-loop-end:` (from a holder lane or the surface, as
  * `reviewPassed` reads it) is `pass` or `accept`, and after it that slice has no `review-group:`, review `hand-spawn:` or
  * `review-round:` (the later-entry rule of `planAutoStartRound`, surface/extensions/lane-tools.ts): a review dispatched after a
@@ -1666,9 +1667,11 @@ export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | 
 	const control = controlEntries(entries, holders);
 	const planQuestions = new Set(control.filter((c) => c.prefix === "plan-question").map((c) => c.rest.split(/\s/)[0]));
 	const sliceOf = new Map(entries.map((e) => [e.id, e.slice_id]));
+	const pending = planFirst(control) !== null ? planSlice(ledger.slices(wl)) : null;
 	const planSlices = new Set([
 		...ledger.questions(wl).filter((q) => planQuestions.has(q.id)).map((q) => q.slice_id),
 		...control.filter((c) => c.prefix === "plan" && /^approved auto\b/.test(c.rest)).map((c) => sliceOf.get(c.id) ?? null),
+		...(pending === null ? [] : [pending.id]),
 	]);
 	/** The slice a review dispatch or round entry is about, or null for any other entry. */
 	const reviewOf = (e: EntryRow): string | null => {
@@ -1695,26 +1698,39 @@ export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | 
  * PLAN wl-mvg8itbt0rz3ls D2: the `trainSignoff` fact Jo's ruling `train-signoff` (gates/src/rulings.ts) reads for PR `pr` on train
  * `train` (repository `trainRepo`), from the ledger, gh's `view` of the PR (TASK_VIEW_FIELDS) and main's `protection` as read
  * live (`mainProtectionGap`). Ok only when all hold, else the first failing rule as the reason:
- * (0) the PR's disposition slice has no open question (D6: a merge question already open stays Jo's);
+ * (0) no train slice of `pr` (its disposition slice or a `-full-<r>` one, `trainSlicePr`) has an open question (D6: a merge
+ *     question already open stays Jo's), and the train is not held by Jo's stop (`trainHold`: only his train word resumes it);
  * (1) an authenticated Jo `train:` binding on the train names `pr` (`trainBindings` with source jo, every binding: a later
  *     `train <N>` or resume counts, a PR only the tick boarded does not);
- * (2) `branchWorkload` (prStakes' D1 lookup) finds the PR's workload W, and W's stakes are production;
+ * (2) `branchWorkload` (prStakes' D1 lookup) finds the PR's workload W, W's stakes are production, W has no plan hold
+ *     (`planHold`: Jo's `halt`, or the auto-start's) and no plan pending (`planFirst`: `plan: first` with no `plan: approved`);
  * (3) W's review is settled and passed (`reviewSettledPassed`);
  * (4) the newest full-suite run on `pr` with a result, on the train or on W (`testRuns`; their requests in the ledger's own
  *     order across both workloads, created_at then rowid), is green or red-main at the PR's current head `view.headRefOid`;
  * (5) `protection` is ok.
+ * The lane tool calls it inside the `ledger.write` that decides or raises, so a stop, a halt or a question recorded while gh
+ * was read is seen here. It is asked only on the PR's disposition slice (`trainSliceId`), the slice the action completes.
  */
 export function trainSignoff(ledger: Ledger, train: string, pr: number, view: TaskView, trainRepo: string, protection: Protection): TrainSignoffFact {
 	const no = (reason: string): TrainSignoffFact => ({ ok: false, reason });
 	const trainEntries = ledger.entries(train);
+	const trainInstructions = ledger.instructions(train);
+	const trainQuestions = ledger.questions(train);
 	if (view.number !== pr) return no(`gh's view is of #${view.number}, not #${pr}`);
 	const slice = trainSliceId(train, pr);
-	const asked = ledger.questions(train).find((q) => q.slice_id === slice && q.state === "open");
-	if (asked !== undefined) return no(`${slice} has open question ${asked.id}: Jo's answer stands`);
-	if (!trainBindings(trainEntries, ledger.instructions(train)).some((b) => b.source === "jo" && b.prs.includes(pr))) return no(`no train word of Jo's on ${train} names #${pr}`);
+	const asked = trainQuestions.find((q) => q.state === "open" && trainSlicePr(q.slice_id, train) === pr);
+	if (asked !== undefined) return no(`${asked.slice_id} has open question ${asked.id}: Jo's answer stands`);
+	const stopped = trainHold({ entries: trainEntries, instructions: trainInstructions, questions: trainQuestions });
+	if (stopped !== null) return no(stopped);
+	if (!trainBindings(trainEntries, trainInstructions).some((b) => b.source === "jo" && b.prs.includes(pr))) return no(`no train word of Jo's on ${train} names #${pr}`);
 	const b = branchWorkload(view, trainRepo, ledger);
 	if (!b.ok) return no(b.reason);
 	if (b.w.stakes !== "production") return no(`${b.id}'s stakes are ${b.w.stakes}, not production`);
+	const hold = planHold(ledger, b.id);
+	if (hold !== null) return no(`${hold.reason}: the train holds its PRs`);
+	const wEntries = ledger.entries(b.id);
+	const plan = planFirst(controlEntries(wEntries, holdersOf(wEntries, b.w.holder, ledger.holders(b.id))));
+	if (plan !== null) return no(`${b.id}'s plan is not approved (plan: first ${plan.trigger})`);
 	const review = reviewSettledPassed(ledger, b.id);
 	if (!review.ok) return no(review.reason);
 	const runs = [...testRuns(trainEntries), ...testRuns(ledger.entries(b.id))].filter((r) => r.request.pr === pr && r.result !== null);

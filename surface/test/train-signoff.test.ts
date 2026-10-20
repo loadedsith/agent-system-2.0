@@ -10,11 +10,12 @@ import { CLASSIFIER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../
 import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { applyTrain, interpret } from "../src/input";
-import { JO_HOLDER, planAutoApprovedBody, trainBoardBody } from "../src/launch";
-import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
+import { apply, applyTrain, interpret } from "../src/input";
+import { JO_HOLDER, planAutoApprovedBody, planAutoStartNoticeBody, planFirstBody, trainBoardBody } from "../src/launch";
+import { reviewSettledPassed, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
+import { sendNotice } from "../src/notice";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
-import { ESCALATION_BY, LANE_RAISE_QUESTION_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, HOLD_HOURS, LANE_RAISE_QUESTION_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tempLedger, tmp } from "./helpers";
 
 const REPO = "thewolff/product";
@@ -59,8 +60,8 @@ interface World {
 	reviewed: (token: string) => void;
 	loopEnd: (reason: LoopEndReason) => void;
 	answers: Record<keyof Gh, Answer>;
-	/** `duringGh` runs inside the fake gh's `pr view`, before its answer reaches the tool: after the tool's guards, before its write. */
-	ask: (options?: string[], duringGh?: () => void) => Promise<{ text: string; calls: { command: string; args: string[] }[] }>;
+	/** `duringGh` runs inside the fake gh's `pr view`, before its answer reaches the tool: after the tool's guards, before its write. `on` is the slice asked on (the PR's disposition slice by default). */
+	ask: (options?: string[], duringGh?: () => void, on?: string) => Promise<{ text: string; calls: { command: string; args: string[] }[] }>;
 	applied: () => (string | null)[][];
 }
 
@@ -121,7 +122,7 @@ function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production"; n
 	const answers: Record<keyof Gh, Answer> = { ...gh };
 
 	/** Ask the merge question through the real tool, as TRAIN_LANE; the reply text and the gh calls it made. */
-	const ask = async (options = OPTIONS, duringGh?: () => void) => {
+	const ask = async (options = OPTIONS, duringGh?: () => void, on = sl) => {
 		const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: train, AGENT_SYSTEM_LANE_ID: TRAIN_LANE, HOME: "/nonexistent-home" };
 		const f = fakePi(undefined, { exec: true });
 		const reply = (a: Answer) => (a === FAIL ? { stdout: "", stderr: "HTTP 502", code: 1, killed: false } : { stdout: JSON.stringify(a), stderr: "", code: 0, killed: false });
@@ -138,7 +139,7 @@ function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production"; n
 		orchestratorSurface(f.pi, env);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
-		const r = await f.tool(LANE_RAISE_QUESTION_TOOL).execute("q1", { slice: sl, body: `#${PR} green and mergeable at ${H1}; merged / skip / stop?`, options }, undefined, undefined, ctx);
+		const r = await f.tool(LANE_RAISE_QUESTION_TOOL).execute("q1", { slice: on, body: `#${PR} green and mergeable at ${H1}; merged / skip / stop?`, options }, undefined, undefined, ctx);
 		return { text: r.content[0]!.text, calls: f.execs.calls };
 	};
 	const applied = () => ledger.entries(train).filter((e) => e.body.startsWith("ruling-applied:")).map((e) => [e.created_by, e.slice_id, e.body]);
@@ -410,9 +411,14 @@ describe("code review r1: the decision re-reads authority, leaves an open questi
 	});
 
 	test("finding 3: an auto-started plan's passed review is no implementation review once W is production; a settled one then decides", async () => {
-		/** W at normal stakes, its plan reviewed (ended pass) and started by the auto-start (no question row), then raised to production. */
+		/**
+		 * W at normal stakes, its plan reviewed (ended pass) and started by the auto-start (no question row), then raised to
+		 * production; the auto-start's hold (`planHold`) has run out: its notice delivered, Jo typed, HOLD_HOURS passed. The
+		 * world's clock runs from HOLD_HOURS + 1 h ago, a second a step, then jumps to a minute ago, where the train lane's lease is renewed.
+		 */
 		const autoStarted = (): World => {
-			const w = world({ stakes: "normal" });
+			let t = Date.now() - (HOLD_HOURS + 1) * 3_600_000;
+			const w = world({ stakes: "normal", now: () => new Date((t += 1_000)).toISOString() });
 			const plan = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "plan the header move", doneCondition: "plan approved", inputs: "the brief" });
 			w.ledger.recordEntry({ by: OWNER_LANE, workloadId: w.owner, sliceId: plan, kind: "assumption", body: "hand-spawn: dp-1 session /sessions/dp-1 spawn - review yes group dg-dp-1 row openai-codex/gpt-6.1-sol" });
 			w.ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: w.owner, sliceId: plan, kind: "assumption", body: reviewRoundBody({ slice: plan, round: 1, token: "dp-1", group: "dg-dp-1", verdict: "accepted", findings: UNKNOWN }) });
@@ -420,6 +426,12 @@ describe("code review r1: the decision re-reads authority, leaves an open questi
 			w.ledger.recordEntry({ by: ESCALATION_BY, workloadId: w.owner, sliceId: plan, kind: "assumption", body: planAutoApprovedBody("dg-dp-1") });
 			w.ledger.completeSlice(plan, { by: OWNER_LANE, artifact: "/plans/PLAN.md" });
 			w.ledger.setStakes(w.owner, { by: SURFACE_BY, stakes: "production" });
+			const notice = sendNotice(w.ledger, { by: ESCALATION_BY, workloadId: w.owner, body: planAutoStartNoticeBody(w.owner, "/plans/PLAN.md") });
+			w.ledger.advanceMessage(notice, "delivered", { by: SURFACE_BY });
+			ensureStandingWorkload(w.ledger);
+			w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, body: "what's up", author: "jo", channel: "surface" });
+			t = Date.now() - 60_000;
+			expect(w.ledger.claimWorkload(w.train, { by: LANE_STARTER_BY, holder: TRAIN_LANE, leaseMs: 600_000 }).won).toBe(true);
 			w.run(w.train, w.full, H1, "green");
 			return w;
 		};
@@ -453,6 +465,101 @@ describe("code review r1: the decision re-reads authority, leaves an open questi
 		wRedThenTrainGreen.run(wRedThenTrainGreen.owner, wRedThenTrainGreen.ownerFull, H1, "red");
 		wRedThenTrainGreen.run(wRedThenTrainGreen.train, wRedThenTrainGreen.full, H1, "green");
 		expectDecided(wRedThenTrainGreen, (await wRedThenTrainGreen.ask()).text);
+	});
+});
+
+describe("code review r2: Jo's halt and stop hold the sign-off, a pending plan's review is no implementation review, only the disposition slice asks", () => {
+	/** Jo's `halt <W>` as the surface applies it: his instruction and `plan: halted <instruction>` on W. */
+	const halt = (w: World) => apply(w.ledger, interpret(w.ledger, `halt ${w.owner}`)!);
+	/** Jo's stop on the train at another PR (#106): a merge question on its disposition slice, answered `stop` by Jo. */
+	const stop = (w: World): string => {
+		const on = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 106), task: "#106 on the train", doneCondition: "terminal", inputs: "PR #106" });
+		const q = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: on, body: "#106 merged / skip / stop?", options: OPTIONS });
+		w.ledger.answerQuestion(q, { by: SURFACE_BY, author: "jo", channel: "surface", answer: "stop" });
+		return q;
+	};
+	/** The questions on the PR's disposition slice, as [state, options]. */
+	const onSl = (w: World) => w.ledger.questions(w.train).filter((q) => q.slice_id === w.sl).map((q) => [q.state, JSON.parse(q.options)]);
+	/** Raised on the disposition slice, other train rows (the stop's question) aside: open, paused, no `ruling-applied:`. */
+	const expectRaisedOnSl = (w: World, text: string) => {
+		expect(text).toStartWith("Raised question ");
+		expect(onSl(w)).toEqual([["open", OPTIONS]]);
+		expect(w.ledger.slice(w.sl)!.state).toBe("paused");
+		expect(w.applied()).toEqual([]);
+	};
+
+	test("finding 1: Jo halted W before the ask: raised", async () => {
+		const w = world();
+		passing(w);
+		expect(halt(w)).toContain(`${w.owner} is halted`);
+		expectRaised(w, (await w.ask()).text);
+	});
+
+	test("finding 1: Jo halts W while gh is read: raised", async () => {
+		const w = world();
+		passing(w);
+		expectRaised(w, (await w.ask(OPTIONS, () => void halt(w))).text);
+	});
+
+	test("finding 1: the auto-start's hold on W (its notice not yet delivered) holds the sign-off too: raised", async () => {
+		const w = world({ stakes: "normal" });
+		w.ledger.recordEntry({ by: ESCALATION_BY, workloadId: w.owner, kind: "assumption", body: planAutoApprovedBody("dg-dp-1") });
+		w.ledger.setStakes(w.owner, { by: SURFACE_BY, stakes: "production" });
+		passing(w);
+		expectRaised(w, (await w.ask()).text);
+	});
+
+	test("finding 1: Jo stopped the train at another PR before the ask: raised", async () => {
+		const w = world();
+		passing(w);
+		stop(w);
+		expectRaisedOnSl(w, (await w.ask()).text);
+	});
+
+	test("finding 1: Jo stops the train at another PR while gh is read: raised", async () => {
+		const w = world();
+		passing(w);
+		expectRaisedOnSl(w, (await w.ask(OPTIONS, () => void stop(w))).text);
+	});
+
+	test("finding 1: Jo's stop, then his resume `train <train> 101`: decided again", async () => {
+		const w = world();
+		passing(w);
+		stop(w);
+		expect(apply(w.ledger, interpret(w.ledger, `train ${w.train} ${PR}`)!)).toContain(`added #${PR} to merge train ${w.train}`);
+		const { text } = await w.ask();
+		expect(text).toStartWith("decided by Jo's ruling train-signoff: ");
+		expect(onSl(w)).toEqual([]);
+		expect(w.ledger.slice(w.sl)!.state).toBe("open");
+		expect(w.applied()).toEqual([[TRAIN_LANE, w.sl, `ruling-applied: train-signoff kind merge slice ${w.sl} answer merge`]]);
+	});
+
+	test("finding 2: W is plan-first, its plan slice's review passed, no plan question yet, no implementation review: raised", async () => {
+		const w = world();
+		// `work` is W's first open slice, so under `plan: first` it holds the plan role (`planSlice`); its review is the plan's.
+		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: w.owner, kind: "assumption", body: planFirstBody("stakes production") });
+		passing(w);
+		expect(w.ledger.questions(w.owner)).toEqual([]);
+		expectRaised(w, (await w.ask()).text);
+		expect(reviewSettledPassed(w.ledger, w.owner)).toEqual({ ok: false, reason: `${w.owner} has no review on any slice` });
+	});
+
+	test("finding 3: a merge question on the PR's -full-<r> slice gets no fact: no gh read, raised there, no ruling-applied", async () => {
+		const w = world();
+		passing(w);
+		const { text, calls } = await w.ask(OPTIONS, undefined, w.full);
+		expect(text).toStartWith("Raised question ");
+		expect(calls).toEqual([]);
+		expect(w.ledger.questions(w.train).map((q) => [q.slice_id, q.state])).toEqual([[w.full, "open"]]);
+		expect(w.applied()).toEqual([]);
+	});
+
+	test("finding 3: a question open on the PR's -full-<r> slice stays Jo's: asked on the disposition slice, raised", async () => {
+		const w = world();
+		passing(w);
+		const before = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: w.full, body: `#${PR} merged / skip / stop?`, options: OPTIONS });
+		expectRaisedOnSl(w, (await w.ask()).text);
+		expect(w.ledger.questions(w.train).find((q) => q.id === before)!.state).toBe("open");
 	});
 });
 

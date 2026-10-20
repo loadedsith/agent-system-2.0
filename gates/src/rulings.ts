@@ -228,7 +228,7 @@ export const STANDING_RULINGS: readonly Ruling[] = [
 		answer: () => "merge",
 		action: (_q, _k, f) => trainSignoffAction(f.trainSignoff as Extract<TrainSignoffFact, { ok: true }>),
 		exceptions:
-			"A PR whose merge question is already open (Jo's answer stands), a PR no Jo `train` word named, a PR with no ledger workload (non-`wl/` branch, fork), a workload not at production stakes or whose newest review has not passed or is still running, a head no green run tested, main's protection not verified ok live, or gh failing: asked.",
+			"A PR whose merge question is already open on any of its train slices (Jo's answer stands), a merge question asked on a full-suite slice rather than the PR's disposition slice, a train Jo stopped and has not resumed with his train word, a PR no Jo `train` word named, a PR with no ledger workload (non-`wl/` branch, fork), a workload not at production stakes, held by Jo's halt (or the auto-start's hold), whose plan is not yet approved, or whose newest review has not passed or is still running, a head no green run tested, main's protection not verified ok live, or gh failing: asked.",
 		ends: { at: null, event: "Jo's end-ruling train-signoff (jo-issues #155: Jo's train word is the production sign-off)" },
 	},
 ];
