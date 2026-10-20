@@ -63,18 +63,25 @@
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
+// Channel (PLAN wl-mv8vx7wdj5nx1c D2, D5; only while a channel session runs on this ledger handle, surface/src/channel.ts
+// `channelInForce`): each live `channel-propose:` of a configured sender is its own line, kind `proposal`, placed directly
+// after the answerable line of the target it names and carrying that target's number (numbering.ts's second pass), never
+// one of its own; a proposal whose target no longer waits has no target line, so it is not shown. Each recent
+// `channel-refused:` is one unnumbered line after the scratch lines (it takes no word).
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
+import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { isCeilingQuestion, openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
 import { questionSubject } from "./orchestrator-question";
+import { answerable } from "./numbering";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
 import { artifactFailures, laneDeaths, openPromptWaits, unrecordedLapse } from "./signals";
 import { parseTestRunFailed, testRuns } from "./test-run";
 import { ARTIFACT_FAILURES_SURFACED, DUE_PREFIX, HOLD_HOURS, MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, TEST_RUN_FAILED_PREFIX } from "./types";
 
-export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair";
+export type ErrorKind = "reserved" | "held" | "artifact" | "test-run" | "lane-died" | "question" | "due" | "idle" | "scratch" | "train" | "pair" | "proposal" | "channel-refused";
 
 /**
  * The open one of a pair of scratch control entries (PLAN wl-mv5oikd5jtquww § 1.5, § 1.6): the newest of `control`
@@ -104,6 +111,8 @@ export interface ErrorLine {
 	state?: string;
 	/** Held orchestrator-bound messages behind the line; a delivery consumes them (P-7c). */
 	messageIds?: string[];
+	/** A channel proposal line (kind `proposal`): the row id of the needs-you line it proposes a word for; its `n` is that line's. */
+	proposes?: string;
 	/** The session-stable number Jo answers with (`#<n>`); set by Numbering (surface/src/numbering.ts), never by errorLines. */
 	n?: number;
 }
@@ -392,7 +401,7 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 	};
 }
 
-/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines. */
+/** Every line owed right now, in § B3 order (1–3), the test-run lines, § B3 order (4–5) with the idle lines after the deaths, then the train notices, the due rows, then the scratch lines, then the channel refusals; each channel proposal directly after its target. */
 export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger.inFlight(), opts: ErrorOptions = {}): ErrorLine[] {
 	const now = opts.now ?? ledger.now();
 	const holdHours = opts.holdHours ?? HOLD_HOURS;
@@ -511,5 +520,30 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (over) scratch.push({ kind: "scratch", workloadId: wl, rowId: over.id, line: `scratch of ${label} over its cap: ${over.rest} (advisory: nothing is refused; ${over.createdBy} was told)` });
 		}
 	}
-	return [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch];
+	const all = [...reserved, ...held, ...artifact, ...testRun, ...died, ...idle, ...questions, ...train, ...due, ...scratch];
+	const channel = channelInForce(ledger);
+	if (!channel) return all;
+	const proposals = channelProposals(ledger, channel);
+	const out: ErrorLine[] = [];
+	for (const l of all) {
+		out.push(l);
+		if (!answerable(l)) continue;
+		for (const p of proposals) {
+			if (p.target !== l.rowId) continue;
+			out.push({ kind: "proposal", workloadId: l.workloadId, rowId: p.entryId, proposes: l.rowId, state: p.msgId, line: `${p.senderId} proposes ${p.word} ${p.target} (${p.msgId})` });
+		}
+	}
+	for (const r of channelRefusals(ledger, now)) {
+		// A late collision can refuse a message that had already reached Ilex (code review r1 #3), or whose row the
+		// `## from other agents` block may have shown without an aside (r2 #3): "nothing reached the model" only when no row exists.
+		const fate = r.reached === "confirmed"
+			? `${r.msgId}'s aside had already reached Ilex; it is withdrawn from later renders`
+			: r.reached === "handled-before-aside"
+				? `Ilex had already read and acted on ${r.msgId}; it is withdrawn from later renders`
+				: r.reached === "unconfirmed"
+					? `no aside of ${r.msgId} was confirmed (it may have been read in the ledger); it is withdrawn from later renders`
+					: "nothing reached the model";
+		out.push({ kind: "channel-refused", workloadId: STANDING_WORKLOAD_ID, rowId: r.id, line: `agent channel refused an envelope: ${r.rest} — quarantined in inbox/ilex as .invalid, ${fate} (shown ${CHANNEL_REFUSED_SHOWN_HOURS}h; takes no word)` });
+	}
+	return out;
 }
