@@ -102,6 +102,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
 import { END_RULING_WORD, endedRulings, endRulingBody, isRulingId, type RulingId, STANDING_RULINGS } from "../../gates/src/rulings";
+import { readPolicySection } from "../../gates/src/deploy-risk";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
 	countRounds, effectiveRoundLimit, type FindingKind, type Findings, parseReviewLimit, REVIEW_ROUND_DEFAULTS, reviewLoopEndBody,
@@ -121,7 +122,7 @@ import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstru
 import type { Numbering, Target } from "./numbering";
 import { ensureStandingWorkload } from "./identity";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
-import { PAIR_OPTION, type PairSite, pairOfferLine, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
+import { installedConfigPath, PAIR_OPTION, type PairSite, pairOfferLine, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
 import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
 import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -156,6 +157,7 @@ export type Command =
 	| { kind: "train-append"; workloadId: string; prs: number[] }
 	/** `end-ruling <ruling-id>`: Jo ends one standing ruling at once (gates/src/rulings.ts). */
 	| { kind: "end-ruling"; ruling: RulingId }
+	| { kind: "deploy-policy"; acceptance: string }
 	/** `halt <wl-…>`: Jo stops a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3): plan-first again, its live lane stopped, its PRs held. */
 	| { kind: "halt"; workloadId: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
@@ -209,6 +211,12 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === "cancel-slice") return cancelSliceCommand(ledger, words.slice(1), heartbeatOf);
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
 	if (word === END_RULING_WORD) return endRulingCommand(ledger, words.slice(1));
+	if (word === "deploy-policy") {
+		const acceptance = words[1]?.toLowerCase();
+		return words.length === 2 && acceptance && /^(?:[a-f0-9]{12}|off)$/.test(acceptance)
+			? { kind: "deploy-policy", acceptance }
+			: { kind: "refused", why: "deploy-policy takes the installed policy's first 12 hash digits or off: deploy-policy <sha12>|off" };
+	}
 	// `halt <wl-…>` is the command or `refused`; `halt` alone or naming no workload falls through, so an option named "halt" still answers.
 	if (word === HALT_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return haltCommand(ledger, words[1]!);
 	// `extend <wl-…>` likewise; `extend` alone or `extend <q-…>` falls through, so the round-limit question's `extend` still answers.
@@ -319,8 +327,8 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
  * `train [<wl-…>] <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`), everything else two.
  */
 export function maxWords(text: string): number {
-	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "waive-pr" || long === "train" ? Number.POSITIVE_INFINITY : 2;
+	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train|deploy-policy)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "waive-pr" || long === "train" || long === "deploy-policy" ? Number.POSITIVE_INFINITY : 2;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch (a train word inside one included, to be refused), or short enough for a word command. A false means prose, with no ledger read. */
@@ -1348,6 +1356,24 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 					relaunch = "; no lane holds it live, so a relaunch is requested";
 				}
 				return `added ${cmd.prs.map((n) => `#${n}`).join(", ")} to merge train ${cmd.workloadId} (instruction ${id}); order ${trainPrs(ledger.entries(cmd.workloadId), ledger.instructions(cmd.workloadId)).join(", ")}${relaunch}`;
+			});
+		}
+		case "deploy-policy": {
+			return ledger.write(() => {
+				let value = "off";
+				if (cmd.acceptance !== "off") {
+					let config: string | null = null;
+					try { config = readFileSync(installedConfigPath(process.env), "utf8"); } catch {}
+					const read = readPolicySection(config);
+					if (!read.ok) throw new Error(`deploy-policy refused: ${read.error}`);
+					if (!read.hash.startsWith(cmd.acceptance)) throw new Error(`deploy-policy hash mismatch; current hash ${read.hash} (deploy-policy ${read.hash.slice(0, 12)})`);
+					if (!read.parsed.ok) throw new Error(`deploy-policy refused: ${read.parsed.error}; current hash ${read.hash}`);
+					value = `sha256 ${read.hash}`;
+				}
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: `deploy-policy ${cmd.acceptance}` });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `deploy-policy: ${value} ${id}` });
+				return `deploy-policy ${value} (instruction ${id})`;
 			});
 		}
 		case "end-ruling": {

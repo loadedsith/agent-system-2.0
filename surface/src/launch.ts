@@ -22,6 +22,7 @@ import { labOf } from "../../classifier/src/lab";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
+import { DEPLOY_BY } from "./types";
 
 // ---- knobs -------------------------------------------------------------------------------------
 
@@ -89,6 +90,7 @@ export const CONTROL_PREFIXES = [
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"now", "ruling-conflict",
+	"deploy", "deploy-run", "deploy-settled", "deploy-merge", "merge-inflight", "merge-done", "deploy-policy",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -233,6 +235,13 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-audit": [SURFACE_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
+	deploy: [DEPLOY_BY],
+	"deploy-run": [DEPLOY_BY],
+	"deploy-settled": [DEPLOY_BY],
+	"deploy-merge": [DEPLOY_BY],
+	"merge-inflight": [DEPLOY_BY],
+	"merge-done": [DEPLOY_BY],
+	"deploy-policy": [SURFACE_BY],
 };
 
 export interface ControlEntry {

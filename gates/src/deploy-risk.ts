@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Ledger, Stakes } from "../../ledger/src/index";
 import { installedConfigPath } from "../../surface/src/pair-suggest";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
+import { DEPLOY_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 import { type Expansion, expandShell } from "./exec";
 
 // ---- the condition table ------------------------------------------------------------------------
@@ -461,6 +461,70 @@ export function authenticatePolicy(read: PolicyRead, newest: LedgerRow | null): 
 	return { authenticated: true, hash, policy, problem: parsed.ok ? null : `policy shape: ${parsed.error}` };
 }
 
+
+// Shared lifecycle wire format. Only DEPLOY_BY writes these rows; all readers use these parsers.
+export interface DeployRecord {
+	id: string;
+	target: string;
+	sha: string;
+	base: string | null;
+	checks: number;
+	warnings: ConditionInstance[];
+	approved?: string;
+}
+export function formatDeployRow(r: DeployRecord): string {
+	return `deploy: ${r.id} target ${r.target} sha ${r.sha} base ${r.base ?? "none"} checks ${r.checks} warn ${r.warnings.length ? canonicalJson(canonicalInstances(r.warnings)) : "none"}${r.approved ? ` approved ${r.approved}` : ""}`;
+}
+export function parseDeployRow(body: string): DeployRecord | null {
+	const m = /^deploy: (dp-\S+) target (\S+) sha (\S+) base (\S+) checks (\d+) warn (none|\[[^\n]*\])(?: approved (\S+))?$/.exec(body);
+	if (!m) return null;
+	try {
+		const warnings: unknown = m[6] === "none" ? [] : JSON.parse(m[6]!);
+		if (!Array.isArray(warnings) || warnings.some((w) => !isObj(w) || !["W1", "W2", "W3", "W4"].includes(String(w.id)) || !Array.isArray(w.facts) || w.facts.some((f: unknown) => typeof f !== "string"))) return null;
+		return { id: m[1]!, target: m[2]!, sha: m[3]!, base: m[4] === "none" ? null : m[4]!, checks: Number(m[5]), warnings: warnings as ConditionInstance[], ...(m[7] ? { approved: m[7] } : {}) };
+	} catch { return null; }
+}
+export interface DeployRunRecord { id: string; runId?: string; url?: string; exit?: number }
+export function formatDeployRunRow(r: DeployRunRecord): string {
+	return `deploy-run: ${r.id} ${r.runId ? `${r.runId}${r.url ? ` url ${r.url}` : ""}` : `exit ${r.exit}`}`;
+}
+export function parseDeployRunRow(body: string): DeployRunRecord | null {
+	const m = /^deploy-run: (dp-\S+) (?:(\d+)(?: url (https:\/\/github\.com\/\S+\/actions\/runs\/\d+))?|exit (-?\d+))$/.exec(body);
+	return m ? { id: m[1]!, ...(m[2] ? { runId: m[2], ...(m[3] ? { url: m[3] } : {}) } : { exit: Number(m[4]) }) } : null;
+}
+export interface DeploySettledRecord { id: string; outcome: "ok" | "failed"; evidence: string }
+export function formatDeploySettledRow(r: DeploySettledRecord): string {
+	return `deploy-settled: ${r.id} ${r.outcome} ${r.evidence}`;
+}
+export function parseDeploySettledRow(body: string): DeploySettledRecord | null {
+	const m = /^deploy-settled: (dp-\S+) (ok|failed)(?: ([\s\S]*))?$/.exec(body);
+	return m ? { id: m[1]!, outcome: m[2] as "ok" | "failed", evidence: m[3] ?? "" } : null;
+}
+export interface MergeInflightRecord { token: string; repo: string; pr: number }
+export function formatMergeInflightRow(r: MergeInflightRecord): string {
+	return `merge-inflight: ${r.token} ${r.repo} pr ${r.pr}`;
+}
+export function parseMergeInflightRow(body: string): MergeInflightRecord | null {
+	const m = /^merge-inflight: (\S+) ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+) pr ([1-9]\d*)$/.exec(body);
+	return m ? { token: m[1]!, repo: m[2]!, pr: Number(m[3]) } : null;
+}
+export interface MergeDoneRecord { token: string; exit: number }
+export function formatMergeDoneRow(r: MergeDoneRecord): string {
+	return `merge-done: ${r.token} exit ${r.exit}`;
+}
+export function parseMergeDoneRow(body: string): MergeDoneRecord | null {
+	const m = /^merge-done: (\S+) exit (-?\d+)$/.exec(body);
+	return m ? { token: m[1]!, exit: Number(m[2]) } : null;
+}
+
+export interface DeployMergeRecord { requestId: string; pr: number; head: string }
+export function formatDeployMergeRow(r: DeployMergeRecord): string {
+	return `deploy-merge: ${r.requestId} pr ${r.pr} head ${r.head}`;
+}
+export function parseDeployMergeRow(body: string): DeployMergeRecord | null {
+	const m = /^deploy-merge: (en-\S+) pr ([1-9]\d*) head ([0-9a-f]{40})$/.exec(body);
+	return m ? { requestId: m[1]!, pr: Number(m[2]), head: m[3]! } : null;
+}
 // ---- the facts (injectable) ---------------------------------------------------------------------
 
 /** One `gh api` read: a REST path (with its query string), every page when `paginate`, or a GraphQL query. */
@@ -480,7 +544,7 @@ export interface LedgerRow {
 	createdBy: string;
 	createdAt: string;
 }
-export type DeployPrefix = "deploy" | "deploy-settled" | "merge-inflight" | "merge-done" | "deploy-policy";
+export type DeployPrefix = "deploy" | "deploy-run" | "deploy-settled" | "deploy-merge" | "merge-inflight" | "merge-done" | "deploy-policy";
 export interface LedgerFacts {
 	/** M: the newest entry's rowid (0 for none). */
 	mark(): number;
@@ -505,10 +569,10 @@ export function ledgerFacts(ledger: Pick<Ledger, "db" | "workload">): LedgerFact
 		mark: () => ledger.db.query<{ m: number }, []>("SELECT coalesce(max(rowid), 0) AS m FROM entries").get()!.m,
 		rows: (prefix) =>
 			ledger.db
-				.query<{ rowid: number; id: string; workload_id: string; body: string; created_by: string; created_at: string }, [string]>(
-					"SELECT rowid, id, workload_id, body, created_by, created_at FROM entries WHERE kind = 'assumption' AND body GLOB ? ORDER BY rowid",
+				.query<{ rowid: number; id: string; workload_id: string; body: string; created_by: string; created_at: string }, [string, string, string, string]>(
+					"SELECT rowid, id, workload_id, body, created_by, created_at FROM entries WHERE kind = 'assumption' AND body GLOB ? AND created_by = ? AND (? = '' OR workload_id = ?) ORDER BY rowid",
 				)
-				.all(`${prefix}: *`)
+				.all(`${prefix}: *`, prefix === "deploy-policy" ? SURFACE_BY : DEPLOY_BY, prefix === "deploy-policy" ? STANDING_WORKLOAD_ID : "", prefix === "deploy-policy" ? STANDING_WORKLOAD_ID : "")
 				.map((r) => ({ rowid: r.rowid, id: r.id, workloadId: r.workload_id, body: r.body, createdBy: r.created_by, createdAt: r.created_at })),
 		stakes: (id) => ledger.workload(id)?.stakes ?? null,
 	};
@@ -625,6 +689,7 @@ function differingWords(call: BashCall, target: DeployTarget): string[] {
 	}
 	for (const w of left) out.push(`-${w}`);
 	for (const k of envKeys(call.toolEnv)) out.push(`+env ${k}`);
+	if (call.toolEnv !== undefined && envKeys(call.toolEnv).length === 0) out.push("+env present");
 	if (out.length === 0) out.push("~spacing-or-order");
 	return out.sort();
 }
@@ -637,7 +702,7 @@ function differingWords(call: BashCall, target: DeployTarget): string[] {
 export function matchCall(call: BashCall, policy: DeployPolicy): CallMatch {
 	const trimmed = call.command.trim();
 	const exact = policy.targets.find((t) => t.command === trimmed);
-	if (exact && envKeys(call.toolEnv).length === 0) return { kind: "exact", target: exact };
+	if (exact && call.toolEnv === undefined) return { kind: "exact", target: exact };
 	if (exact) return { kind: "near", target: exact, differing: differingWords(call, exact) };
 	let x: Expansion;
 	try {
@@ -745,30 +810,30 @@ interface InflightRow { token: string; repo: string; pr: number; rowid: number }
 
 function deployRows(ledger: LedgerFacts): DeployRow[] {
 	return ledger.rows("deploy").map((r) => {
-		const m = /^deploy: (dp-\S+) target (\S+) sha (\S+)/.exec(r.body.trim());
-		if (!m) throw new FactError(`ledger deploy row ${r.id}`, "does not parse");
-		return { id: m[1]!, rowid: r.rowid, target: m[2]!, sha: m[3]! };
+		const d = parseDeployRow(r.body);
+		if (!d) throw new FactError(`ledger deploy row ${r.id}`, "does not parse");
+		return { id: d.id, rowid: r.rowid, target: d.target, sha: d.sha };
 	});
 }
 function settleRows(ledger: LedgerFacts): SettleRow[] {
 	return ledger.rows("deploy-settled").map((r) => {
-		const m = /^deploy-settled: (dp-\S+) (ok|failed)\b/.exec(r.body.trim());
-		if (!m) throw new FactError(`ledger deploy-settled row ${r.id}`, "does not parse");
-		return { dp: m[1]!, rowid: r.rowid, ok: m[2] === "ok" };
+		const s = parseDeploySettledRow(r.body);
+		if (!s) throw new FactError(`ledger deploy-settled row ${r.id}`, "does not parse");
+		return { dp: s.id, rowid: r.rowid, ok: s.outcome === "ok" };
 	});
 }
 function inflightRows(ledger: LedgerFacts): InflightRow[] {
 	return ledger.rows("merge-inflight").map((r) => {
-		const m = /^merge-inflight: (\S+) (\S+) pr (\d+)\b/.exec(r.body.trim());
+		const m = parseMergeInflightRow(r.body);
 		if (!m) throw new FactError(`ledger merge-inflight row ${r.id}`, "does not parse");
-		return { token: m[1]!, repo: m[2]!, pr: Number(m[3]), rowid: r.rowid };
+		return { ...m, rowid: r.rowid };
 	});
 }
 function doneRows(ledger: LedgerFacts): { token: string; rowid: number }[] {
 	return ledger.rows("merge-done").map((r) => {
-		const m = /^merge-done: (\S+) exit (-?\d+)\b/.exec(r.body.trim());
+		const m = parseMergeDoneRow(r.body);
 		if (!m) throw new FactError(`ledger merge-done row ${r.id}`, "does not parse");
-		return { token: m[1]!, rowid: r.rowid };
+		return { token: m.token, rowid: r.rowid };
 	});
 }
 
@@ -871,7 +936,7 @@ export interface DeployCall extends BashCall {
  * it); with no parsed policy nothing can say a call is not a target, so the caller hands in only calls it already reads
  * as a workflow run. Otherwise every predicate is evaluated and every condition that holds is named.
  */
-export async function evaluateDeploy(call: DeployCall, facts: DeployFacts): Promise<DeployEvaluation> {
+export async function evaluateDeploy(call: DeployCall, facts: DeployFacts, shipped?: { sha: string; deployId: string }): Promise<DeployEvaluation> {
 	const auth = policyAuth(facts);
 	const match = auth.policy === null ? null : matchCall(call, auth.policy);
 	if (auth.policy !== null && match === null) return { kind: "not-target" };
@@ -892,7 +957,7 @@ export async function evaluateDeploy(call: DeployCall, facts: DeployFacts): Prom
 	if (stakes === "production") t.add("E1");
 	const history = await t.fact("ledger deploy rows", () => targetHistory(facts.ledger, target.name));
 	if (history) {
-		for (const dp of history.unsettled) t.add("U1", `deploy ${dp}`);
+		for (const dp of history.unsettled) if (dp !== shipped?.deployId) t.add("U1", `deploy ${dp}`);
 		if (history.newestFailed) t.add("E8");
 	}
 	const base = history?.base ?? null;
@@ -913,7 +978,7 @@ export async function evaluateDeploy(call: DeployCall, facts: DeployFacts): Prom
 			t.notes.push(`E0 ${repo}'s default branch is ${b}, the declared --ref is ${target.ref}`);
 		}
 	});
-	const head = (await t.fact("head", () => headOf(repo, target.ref, "head"))) ?? null;
+	const head = shipped ? sha(shipped.sha, "shipped head") : (await t.fact("head", () => headOf(repo, target.ref, "head"))) ?? null;
 
 	if (head !== null) {
 		await t.fact("workflow blob", async () => {
@@ -1095,7 +1160,7 @@ export async function evaluateDeploy(call: DeployCall, facts: DeployFacts): Prom
 	} else if (health.status !== target.health.status) t.add("E10", `health ${health.status}`);
 
 	// E3: the head read again at the end; U3: merge rows of the repo written since M.
-	if (head !== null) {
+	if (head !== null && !shipped) {
 		const again = await t.fact("head again", () => headOf(repo, target.ref, "head again"));
 		if (again !== undefined && again !== head) t.add("E3", "ref moved");
 	}
@@ -1105,6 +1170,17 @@ export async function evaluateDeploy(call: DeployCall, facts: DeployFacts): Prom
 	}
 
 	return { kind: "verdict", ...verdictOf(t, { target: target.name, repo, authenticated: true, head, base, mark: mark ?? null, checks }) };
+}
+
+/** Settle evaluates the commit that actually shipped with the same predicates, not a second condition engine. */
+export async function evaluateShippedDeploy(call: { workloadId: string; target: string; sha: string; deployId: string }, facts: DeployFacts): Promise<DeployEvaluation> {
+	const auth = policyAuth(facts);
+	const target = auth.policy?.targets.find((t) => t.name === call.target);
+	if (!target) {
+		const conditions: ConditionInstance[] = [{ id: "E0", facts: ["shipped target unavailable"] }];
+		return { kind: "verdict", outcome: "escalate", target: call.target, repo: null, authenticated: auth.authenticated, head: call.sha, base: null, mark: null, checks: 0, conditions, warnings: [], ids: ["E0"], sha256: instancesHash(conditions), notes: [auth.problem ?? "shipped target unavailable"] };
+	}
+	return evaluateDeploy({ workloadId: call.workloadId, command: target.command, cwd: ".", env: {} }, facts, { sha: call.sha, deployId: call.deployId });
 }
 
 /** A `gh pr merge` call's verdict (§ 3.4 M1 path, U2): hold > escalate > routine. `head` is the PR head M1 records. */

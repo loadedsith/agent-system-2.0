@@ -9,7 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Ledger, Stakes } from "../../ledger/src/index";
-import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
+import { DEPLOY_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 import {
 	CONDITION,
 	CONDITIONS,
@@ -154,10 +154,10 @@ function world(opts: { section?: Section; stakes?: Stakes; accept?: boolean; his
 	const w: World = {
 		ledger, workloadId, facts, gh, ghCalls, httpsCalls, ledgerCalls, config, health, clock,
 		accept: (x) => void ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `deploy-policy: sha256 ${policyHash(x)} in-accept${++acceptN}` }),
-		entry: (body, by = LANE, wl = workloadId) => void ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body }),
+		entry: (body, by = DEPLOY_BY, wl = workloadId) => void ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body }),
 		deploy: (dp, target, sha, settled) => {
 			w.entry(`deploy: ${dp} target ${target} sha ${sha} base none checks 1 warn none`);
-			if (settled !== null) w.entry(`deploy-settled: ${dp} ${settled} run 1 conclusion success health 200`, "deploy-settle");
+			if (settled !== null) w.entry(`deploy-settled: ${dp} ${settled} run 1 conclusion success health 200`, DEPLOY_BY);
 		},
 		eval: (command = WEB_CMD, toolEnv) => evaluateDeploy({ command, toolEnv, cwd: ROOT, env: {}, workloadId }, facts),
 		verdict: async (command, toolEnv) => {
@@ -316,7 +316,7 @@ describe("each condition alone gives its outcome", () => {
 	test("U1: an unsettled deploy of the target on any workload holds and names it", async () => {
 		const w = world();
 		const other = w.ledger.openWorkload({ by: SURFACE_BY, brief: "other", stakes: "normal", mode: "autonomous" });
-		w.entry(`deploy: dp-web2 target web sha ${H} base ${B} checks 1 warn none`, "lane-other", other);
+		w.entry(`deploy: dp-web2 target web sha ${H} base ${B} checks 1 warn none`, DEPLOY_BY, other);
 		expect(factsOf(await alone(w, "U1", "hold"), "U1")).toEqual([["deploy dp-web2"]]);
 	});
 
@@ -699,7 +699,7 @@ describe("gh pr merge: M1 and U2 (§ 3.4, § 2.4)", () => {
 		const v = await evaluateMerge({ repo: WEB, pr: 8 }, w.facts);
 		expect([v.outcome, v.conditions]).toEqual(["hold", [{ id: "U2", facts: ["deploy dp-web2"] }]]);
 		expect((await evaluateMerge({ repo: API, pr: 8 }, w.facts)).outcome).toBe("routine");
-		w.entry("deploy-settled: dp-web2 ok run 2", "deploy-settle");
+		w.entry("deploy-settled: dp-web2 ok run 2", DEPLOY_BY);
 		expect((await evaluateMerge({ repo: WEB, pr: 8 }, w.facts)).outcome).toBe("routine");
 	});
 });

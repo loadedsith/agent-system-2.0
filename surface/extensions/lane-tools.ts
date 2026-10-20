@@ -58,7 +58,8 @@ import {
 	rulingActive, subjectProblem,
 } from "../../gates/src/rulings";
 import { gateSession } from "../../gates/src/session";
-import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { ledgerFacts, parseDeployRow, parseDeploySettledRow } from "../../gates/src/deploy-risk";
+import type { EntryRow, HandoffResult, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
 import { reservedStates } from "../src/errors";
 import { readFacts } from "../src/facts";
@@ -363,6 +364,19 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		const hands = unsettledHands(own.ledger, own.workloadId, own.laneId);
 		if (hands.length === 0) return null;
 		return text(`hand(s) ${hands.map((h) => h.token).join(", ")} you spawned are still unsettled; keep your turn alive until each result is delivered, then release. Nothing was ${verb}.`);
+	};
+
+	const deploysUnsettled = (own: Owned): void => {
+		const facts = ledgerFacts(own.ledger);
+		const settled = new Set(facts.rows("deploy-settled").flatMap((r) => {
+			const s = parseDeploySettledRow(r.body);
+			return s ? [s.id] : [];
+		}));
+		const pending = facts.rows("deploy").filter((r) => r.workloadId === own.workloadId).flatMap((r) => {
+			const d = parseDeployRow(r.body);
+			return d && !settled.has(d.id) ? [d.id] : [];
+		});
+		if (pending.length) throw new Error(`unsettled deploy ${pending.join(", ")}; run ${pending.map((id) => `as2 deploy settle ${id}`).join("; ")} first`);
 	};
 
 	pi.registerTool({
@@ -838,6 +852,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 				// D4: the marker and the release commit together, release first; a refused release writes no marker, and a
 				// failed marker insert rolls the release back, so there is never an unmarked release of open work.
 				r = ledger.write(() => {
+					deploysUnsettled(o.own);
 					const released = ledger.releaseWorkload(workloadId, { by: laneId, holder: laneId });
 					if (!released.released) return released;
 					const entries = ledger.entries(workloadId);
@@ -870,7 +885,15 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			if (!o.ok) return o.result;
 			const refused = handsUnsettled(o.own, "handed off");
 			if (refused) return refused;
-			const r = o.own.ledger.handoffWorkload(o.own.workloadId, { by: o.own.laneId, holder: o.own.laneId, to: JO_HOLDER });
+			let r: HandoffResult;
+			try {
+				r = o.own.ledger.write(() => {
+					deploysUnsettled(o.own);
+					return o.own.ledger.handoffWorkload(o.own.workloadId, { by: o.own.laneId, holder: o.own.laneId, to: JO_HOLDER });
+				});
+			} catch (err) {
+				return text(`Workload ${o.own.workloadId} could not be handed off: ${err instanceof Error ? err.message : String(err)}; nothing was handed off.`);
+			}
 			if (!r.ok) return text(`Workload ${o.own.workloadId} is held by ${r.holder ?? "nobody"}, not by this lane; nothing was handed off.`);
 			return text(`Handed ${o.own.workloadId} to Jo (holder ${JO_HOLDER}, no lease). ${endSession(ctx)}`, { handedOff: true });
 		},

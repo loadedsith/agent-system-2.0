@@ -6,14 +6,47 @@
 // the one open workload the surface reads that belongs to no lane; a session entry alone never
 // reached the surface (M5 fix round 1, Codex S1 / fable F1a). The session entry is kept as the
 // transcript's own copy.
+import type { Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../../surface/src/identity";
-import { checkReserved, reservedAction, reservedRequestBody } from "../src/rows/r06-reserved";
+import { checkReserved, deploymentCandidate, judgeDeploy, recordDeployResult, type DeployPending, type MergeView, reservedAction, reservedRequestBody } from "../src/rows/r06-reserved";
 import { type GatesAPI, gateSession } from "../src/session";
+import type { DeployFacts } from "../src/deploy-risk";
 
-export default function reservedRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env): void {
-	pi.on("tool_call", (event, ctx) => {
+export default function reservedRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env, facts?: (ledger: Ledger) => DeployFacts, mergeView?: MergeView): void {
+	const pending = new Map<string, DeployPending>();
+	pi.on("tool_result", (event, ctx) => {
+		const admitted = event.toolCallId ? pending.get(event.toolCallId) : undefined;
+		if (!admitted || event.toolName !== "bash") return;
+		try {
+			const details = event.details && typeof event.details === "object" ? event.details : {};
+			const content = "content" in event && Array.isArray(event.content) ? event.content : [];
+			const output = content.filter((p) => p && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
+			recordDeployResult(gateSession(ctx, env).ledger(), admitted, { ...details, ...(output ? { output } : {}) }, event.isError);
+		} catch (err) {
+			ctx.ui.notify(`P-11 row 6 could not record deploy/merge result; outcome remains unsettled: ${String(err)}`, "warning");
+		} finally {
+			pending.delete(event.toolCallId!);
+		}
+	});
+	pi.on("tool_call", async (event, ctx) => {
 		const s = gateSession(ctx, env);
-		const refusal = checkReserved(event, { role: s.role, cwd: ctx.cwd, env, mode: s.mode?.mode });
+		const call = { ...event, input: s.originalInput(event) };
+		const callCtx = { role: s.role, cwd: ctx.cwd, env, mode: s.mode?.mode };
+		if (deploymentCandidate(call, callCtx)) {
+			try {
+				const ledger = s.ledger();
+				const judged = await judgeDeploy(call, callCtx, { ledger, workloadId: s.workloadId ?? ensureStandingWorkload(ledger), laneId: s.laneId, facts: facts?.(ledger), mergeView });
+				if (judged) {
+					const otherAction = reservedAction(judged.refusal);
+					if (otherAction) ledger.recordEntry({ workloadId: s.workloadId ?? ensureStandingWorkload(ledger), sliceId: s.workloadId ? s.currentSlice() : null, by: s.laneId, kind: "reserved-request", body: reservedRequestBody(call, otherAction, event.toolCallId) });
+					if (judged.pending && event.toolCallId) pending.set(event.toolCallId, judged.pending);
+					return judged.refusal ?? undefined;
+				}
+			} catch (err) {
+				return { block: true, reason: `P-11 row 6 hold: E0 deploy admission unavailable (${String(err)})` };
+			}
+		}
+		const refusal = checkReserved(call, callCtx);
 		const action = reservedAction(refusal);
 		if (action) {
 			const body = reservedRequestBody(event, action, event.toolCallId);

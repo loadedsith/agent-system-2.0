@@ -5,6 +5,10 @@
 // words and answers (PLAN wl-mupu0sx2o046io D9, D10); `cancel-slice`, `supersede` and the plan-first
 // approve receipt (PLAN wl-mv5i3lulwwbbi8 D1, D2, D4).
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { authenticatePolicy, ledgerFacts, newestPolicyRow, policyHash, readPolicySection } from "../../gates/src/deploy-risk";
+import { installedConfigPath } from "../src/pair-suggest";
 import { handSpawnBody, reviewParkBody } from "../../classifier/src/lab";
 import { askJo, checkRulings } from "../../gates/src/rulings";
 import { reviewStopOn } from "../../classifier/src/review-stop";
@@ -1424,5 +1428,45 @@ describe("waive-pr: Jo waives merged PRs on a workload for the close check (PLAN
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `waive-pr: ${forged[0]![1]}` });
 		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([]);
 		expect(waivedPrs(ledger.entries(wl), [...ledger.instructions(wl), ...ledger.instructions(other)])).toEqual([]);
+	});
+});
+
+describe("deploy-policy (R16)", () => {
+	test("installed section hash is verified; newest acceptance and off control authority", () => {
+		const { ledger, path } = tempLedger();
+		const oldHome = process.env.HOME;
+		try {
+			process.env.HOME = dirname(path);
+			const config = installedConfigPath(process.env);
+			mkdirSync(dirname(config), { recursive: true });
+			const a = { targets: [] };
+			const b = { targets: [], lines: { warn: 500 } };
+			const install = (deploy: unknown) => writeFileSync(config, JSON.stringify({ deploy }));
+			const auth = (deploy: unknown) => authenticatePolicy(readPolicySection(JSON.stringify({ deploy })), newestPolicyRow(ledgerFacts(ledger)));
+			install(a);
+			expect(() => apply(ledger, interpret(ledger, "deploy-policy 000000000000")!)).toThrow(policyHash(a));
+			expect(ledger.entries(STANDING_WORKLOAD_ID)).toHaveLength(0);
+			const accept = (deploy: unknown) => apply(ledger, interpret(ledger, `deploy-policy ${policyHash(deploy).slice(0, 12)}`)!);
+			accept(a); expect(auth(a).authenticated).toBe(true);
+			const instruction = ledger.instructions(STANDING_WORKLOAD_ID).at(-1)!;
+			expect(instruction.author).toBe("jo"); expect(instruction.channel).toBe("surface");
+			expect(ledger.entries(STANDING_WORKLOAD_ID).at(-1)).toMatchObject({ created_by: SURFACE_BY, body: `deploy-policy: sha256 ${policyHash(a)} ${instruction.id}` });
+			install(b); accept(b); expect(auth(b).authenticated).toBe(true);
+			install(a); expect(auth(a).authenticated).toBe(false);
+			accept(a); expect(auth(a).authenticated).toBe(true);
+			apply(ledger, interpret(ledger, "deploy-policy off")!);
+			expect(auth(a).authenticated).toBe(false);
+			ledger.recordEntry({ by: "lane-forger", workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `deploy-policy: sha256 ${policyHash(a)} in-forged` });
+			expect(auth(a).authenticated).toBe(false);
+		} finally {
+			if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+		}
+	});
+	test("malformed deploy-policy commands refuse rather than becoming prose", () => {
+		const { ledger } = tempLedger();
+		for (const line of ["deploy-policy", "deploy-policy xyz", "deploy-policy off extra words here"]) {
+			expect(commandShaped(line)).toBe(true);
+			expect(interpret(ledger, line)?.kind).toBe("refused");
+		}
 	});
 });

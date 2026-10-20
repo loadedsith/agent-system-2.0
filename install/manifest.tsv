@@ -23,6 +23,12 @@ install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
 install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agents}/com.agent-system-2.ledger-backup.plist
+# Routine deploy risk conditions (wl-mvgorfqqbuyyo0): evaluated in row 6 and settled by the CLI.
+gates/src/deploy-risk.ts	module	-
+gates/test/deploy-risk.test.ts	test	-
+gates/test/r06-deploy.test.ts	test	-
+surface/scripts/deploy.ts	module	-
+surface/test/deploy-settle.test.ts	test	-
 # M3/M4 (2026-09-29): tier files, the classifier and gates extensions with their modules, tests and
 # data, and the 2.0 profile template (config.yml + models.yml, the judge pin). All used in place:
 # the profile names the extension entry points by repo path. `profile` rows are the template the

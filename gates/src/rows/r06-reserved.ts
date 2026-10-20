@@ -21,6 +21,11 @@
 // and the browser pass. A `%load` is read and judged as the cell's code, or refused for a respelling.
 // Inline interpreter code in bash keeps every pass; its unreadable launches are respellings (D2).
 import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import type { Ledger } from "../../../ledger/src/index";
+import { DEPLOY_BY, SURFACE_BY } from "../../../surface/src/types";
+import { canonicalInstances, canonicalJson, type ConditionInstance, type DeployFacts, type GhResult, defaultFacts, evaluateDeploy, evaluateMerge, formatDeployMergeRow, formatDeployRow, formatDeployRunRow, formatMergeDoneRow, formatMergeInflightRow, instancesCoveredBy, instancesHash, ledgerFacts, mergesSince, parseDeployMergeRow, parseDeployRow, policyAuth, targetHistory } from "../deploy-risk";
 import { basename, dirname, resolve } from "node:path";
 import { BROWSER_WRITE_CALL, type CodeFacts, codeFacts, evalLoads, evalProcessStart, opaqueSpawn } from "../eval-code";
 import { bashCommand, type CodeFamily, codeCommands, codeInterpreterEnv, type Exec, type Expansion, execText, expandShell, type GitCall, gitCall, gitUnmodeled, interpreterEnv, interpreterFamily, OUTPUT_ONLY, physicalPath, readHeadUnmodeled, type ScratchWords, SHELLS, writeDestinations } from "../exec";
@@ -483,7 +488,7 @@ export function isRecursiveForceRm(seg: string, scratch?: Scratch): boolean {
  * segment. `skipPrinters` passes segments that start with `echo`/`printf`: the caller has checked
  * their output reaches nothing that runs it (astra review round 2 false positive, `printf "git reset --hard\n"`).
  */
-export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scratch): string | null {
+export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scratch, dispatch = false): string | null {
 	const c = cmd.replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
 	if (/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(c)) return "fork bomb";
 	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
@@ -491,7 +496,7 @@ export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scr
 		if (isRecursiveForceRm(seg, scratch)) return "rm -rf (recursive force-delete)";
 		const gh = ghApiInText(seg);
 		if (gh) return gh;
-		for (const { re, why } of RULES) if (re.test(seg)) return why;
+		for (const { re, why } of RULES) if (re.test(seg) && !(dispatch && why === WORKFLOW_WHY && /\bgh\s+workflow\s+run\b/.test(seg))) return why;
 	}
 	return null;
 }
@@ -807,7 +812,7 @@ function dataWords(cmd: string, x: Expansion, cwd: string, env: Record<string, s
  * The reserved action one parsed command reaches, or null. `data` are words left out of the final
  * rules match (dataWords). `scratch` turns on the scratch rules 1–3 for a bash call (scratchFor).
  */
-function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | null {
+function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch, dispatch = false): string | null {
 	const name = basename(e.argv[0]!.text);
 	// A word the shell expands when it runs (a substitution or a glob): its value is not known here.
 	const unread = (w: Word): boolean => w.opaque || w.glob === true;
@@ -858,7 +863,7 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | 
 	// command still reads, and a shell reading its output is expanded on its own (src/exec.ts).
 	if (OUTPUT_ONLY[name]) return null;
 	const text = execText(data ? { ...e, argv: e.argv.filter((w) => !data.has(w)) } : e).replace(/\n/g, " ");
-	for (const { re, why } of RULES) if (re.test(text)) return why;
+	for (const { re, why } of RULES) if (re.test(text) && !(dispatch && why === WORKFLOW_WHY && /\bgh\s+workflow\s+run\b/.test(text))) return why;
 	return null;
 }
 
@@ -1350,11 +1355,13 @@ export function namesAliasSwitch(cmd: string, env: unknown, x: Expansion): { wha
 const INTERPRETER_ENV_SPELLING =
 	"the command without that variable: code in a script or `-e` the gate reads, NODE_OPTIONS/BUN_OPTIONS of reporting and memory options only, and a warnings file only as a literal absolute path";
 
+const WORKFLOW_WHY = "gh workflow run triggers a workflow (deploy path)";
+
 /**
  * Row 6 over one tool call. A bash call the scratch rules (scratchFor) let through is marked confined
  * for the fence (session.ts markConfined).
  */
-export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
+export function checkReserved(call: ToolCall, ctx: CallContext, dispatch = false): Refusal {
 	const { toolName, input } = call;
 	if (toolName === "bash") {
 		const cmd = bashCommand(input);
@@ -1362,10 +1369,10 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		const x = expandShell(cmd, cwd, ctx.env, input.env);
 		const scratch = scratchFor(ctx, cmd, x, input.env) ?? undefined;
 		const data = dataWords(cmd, x, cwd, ctx.env);
-		const raw = reservedInShell(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env), scratch);
+		const raw = reservedInShell(data?.masked ?? cmd, printersOnlyPrint(cmd, cwd, ctx.env), scratch, dispatch);
 		if (raw) return refuse(raw, `Command: ${cmd}`);
 		for (const e of x.commands) {
-			const why = reservedInExec(e, data?.words, scratch) ?? barePushOfProtected(e, scratch);
+			const why = reservedInExec(e, data?.words, scratch, dispatch) ?? barePushOfProtected(e, scratch);
 			if (why) return refuse(why, `Command: ${cmd}`);
 		}
 		// Files an interpreter writes because of its environment (astra-7 B3): none inside .git.
@@ -1417,4 +1424,234 @@ export function checkReserved(call: ToolCall, ctx: CallContext): Refusal {
 		return null;
 	}
 	return null;
+}
+
+/** Machinery-owned admission state, keyed by the host's tool call id until tool_result. */
+export interface DeployPending { workloadId: string; deployId?: string; mergeToken?: string }
+export type MergeView = (selector: string | null, repo: string, cwd: string, env: Record<string, string | undefined>) => Promise<GhResult>;
+export interface DeployBinding { ledger: Ledger; workloadId: string | null; laneId: string; facts?: DeployFacts; mergeView?: MergeView }
+export interface DeployJudgment { refusal: Refusal; pending?: DeployPending }
+export interface DeployToolCall extends ToolCall { toolCallId?: string }
+
+export function deploymentCandidate(call: ToolCall, ctx: CallContext): boolean {
+	if (call.toolName !== "bash") return false;
+	if (reservedAction(checkReserved(call, ctx)) === WORKFLOW_WHY) return true;
+	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
+	return expandShell(bashCommand(call.input), cwd, ctx.env, call.input.env).commands.some((e) => basename(e.argv[0]?.text ?? "") === "gh" && e.argv.some((w, i) => w.text === "pr" && e.argv[i + 1]?.text === "merge"));
+}
+
+/** Deploy request wire format binds command, H and each condition instance, not only condition ids. */
+export function deployRequestBody(call: DeployToolCall, target: string, head: string | null, conditions: ConditionInstance[], deferred = false): string {
+	const instances = canonicalInstances(conditions);
+	return `${deferred ? `off-hours deploy (${target})` : `deploy (${target}, escalated: ${[...new Set(instances.map((i) => i.id))].join(",")})`} sha ${head ?? "unknown"} token dt-${randomUUID()} instances ${canonicalJson(instances)} sha256 ${instancesHash(instances)}: ${bashCommand(call.input).trim()} (P-11 row 6 refused tool call ${call.toolCallId ?? "unknown"})`;
+}
+
+function approvedRequest(ledger: Ledger, binding: DeployBinding, command: string, head: string | null, conditions: ConditionInstance[], now: Date): string | null {
+	if (!head || ledger.workload(binding.workloadId!)?.holder !== binding.laneId) return null;
+	const entries = ledger.entries(binding.workloadId!);
+	for (const r of entries.filter((e) => e.kind === "reserved-request" && e.created_by === binding.laneId).reverse()) {
+		const m = /^(?:deploy \([^\n]+\)|off-hours deploy \([^\n]+\)) sha (\S+) token (dt-\S+) instances (\[[\s\S]*\]) sha256 ([a-f0-9]{64}): ([\s\S]*) \(P-11 row 6 refused tool call \S+\)$/.exec(r.body);
+		if (!m || m[1] !== head || m[5] !== command) continue;
+		let instances: ConditionInstance[];
+		try {
+			const parsed: unknown = JSON.parse(m[3]!);
+			if (!Array.isArray(parsed) || parsed.some((i) => !i || typeof i !== "object" || typeof i.id !== "string" || !Array.isArray(i.facts) || i.facts.some((f: unknown) => typeof f !== "string"))) continue;
+			instances = parsed;
+			if (instancesHash(instances) !== m[4] || !instancesCoveredBy(conditions, instances)) continue;
+		} catch { continue; }
+		const holders = new Set(ledger.holders(binding.workloadId!));
+		if (entries.some((e) => holders.has(e.created_by) && new RegExp(`^reserved-withdrawn: ${r.id}(?:\\s|$)`).test(e.body))) continue;
+		const latest = ledger.instructions(binding.workloadId!).filter((i) => i.kind === "instruction" && i.author === "jo" && i.channel === "surface" && i.created_by === SURFACE_BY && /^(approve|deny)\s+\S+$/i.test(i.body.trim()) && i.body.trim().split(/\s+/)[1] === r.id && i.created_at >= r.created_at).at(-1);
+		if (!latest || !/^approve\s/i.test(latest.body.trim())) continue;
+		const age = now.getTime() - Date.parse(latest.created_at);
+		if (!Number.isFinite(age) || age < 0 || age >= 24 * 60 * 60 * 1000) continue;
+		const facts = ledgerFacts(ledger);
+		const consumed = facts.rows("deploy-merge").some((e) => {
+			const m = parseDeployMergeRow(e.body);
+			if (!m) throw new Error(`deploy-merge row ${e.id} does not parse`);
+			return m.requestId === r.id;
+		});
+		if (consumed || facts.rows("deploy").some((e) => parseDeployRow(e.body)?.approved === r.id)) continue;
+		return r.id;
+	}
+	return null;
+}
+
+/** Read-only branch/current-branch resolution; supported JSON fields: https://cli.github.com/manual/gh_pr_view. */
+const defaultMergeView: MergeView = async (selector, repo, cwd, env) => {
+	const r = spawnSync("gh", ["pr", "view", ...(selector ? [selector] : []), "-R", repo, "--json", "number,headRefOid,url"], { cwd, env: { ...env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1" }, encoding: "utf8", timeout: 20_000 });
+	if (r.error || r.status !== 0) return { ok: false, error: r.error?.message ?? `gh pr view exited ${r.status}`, notFound: false };
+	try { return { ok: true, json: JSON.parse(r.stdout) }; }
+	catch { return { ok: false, error: "gh pr view printed no JSON", notFound: false }; }
+};
+
+/** Resolve literal numeric/URL selectors directly, branch and omitted selectors through GitHub's read-only view. */
+async function mergeCalls(call: ToolCall, ctx: CallContext, view: MergeView): Promise<{ repo: string; pr: number; headGuard: string | null }[] | string> {
+	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
+	const x = expandShell(bashCommand(call.input), cwd, ctx.env, call.input.env);
+	const out: { repo: string; pr: number; headGuard: string | null }[] = [];
+	for (const e of x.commands) {
+		if (basename(e.argv[0]?.text ?? "") !== "gh") continue;
+		const args = e.argv.map((w) => w.text);
+		const at = args.indexOf("pr");
+		if (at < 1 || args[at + 1] !== "merge") continue;
+		if (e.argv.some((w) => w.opaque || w.glob)) return "merge repo or PR is not literal";
+		let repo: string | null = null;
+		let selector: string | null = null;
+		let headGuard: string | null = null;
+		for (let i = 1; i < args.length; i++) {
+			const a = args[i]!;
+			if (a === "-R" || a === "--repo") { repo = args[++i] ?? null; continue; }
+			if (a.startsWith("--repo=")) { repo = a.slice(7); continue; }
+			if (a.startsWith("-R") && a.length > 2) { repo = a.slice(2); continue; }
+			if (i <= at + 1) {
+				if (a !== "pr" && a !== "merge") return "unmodeled gh global option on merge";
+				continue;
+			}
+			if (["--match-head-commit", "--subject", "-t", "--body", "-b", "--body-file", "-F", "--author-email", "-A"].includes(a)) {
+				const v = args[++i];
+				if (a === "--match-head-commit") headGuard = v ?? null;
+				continue;
+			}
+			if (a.startsWith("--match-head-commit=")) { headGuard = a.slice(20); continue; }
+			if (["--auto", "--delete-branch", "-d", "--merge", "-m", "--rebase", "-r", "--squash", "-s"].includes(a)) continue;
+			if (a.startsWith("-") || selector) return "unmodeled merge option or selector";
+			selector = a;
+		}
+		const url = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/([1-9]\d*)$/.exec(selector ?? "");
+		if (url) {
+			if (repo && repo.toLowerCase() !== url[1]!.toLowerCase()) return "merge URL and -R disagree";
+			repo = url[1]!;
+			selector = url[2]!;
+		}
+		if (!repo) {
+			const r = spawnSync("git", ["remote", "get-url", "origin"], { cwd: e.dir, encoding: "utf8", timeout: 20_000, env: ctx.env });
+			const remote = r.status === 0 ? /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\s*$/.exec(r.stdout.trim()) : null;
+			repo = remote?.[1] ?? null;
+		}
+		if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return "merge repo could not be resolved to a GitHub origin or explicit -R";
+		if (!/^[1-9]\d*$/.test(selector ?? "")) {
+			const env = { ...ctx.env };
+			if (call.input.env && typeof call.input.env === "object") for (const [k, v] of Object.entries(call.input.env)) if (typeof v === "string") env[k] = v;
+			for (const w of e.mods.assigns) {
+				const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(w.text);
+				if (m) env[m[1]!] = m[2]!;
+			}
+			const r = await view(selector, repo, e.dir, env);
+			if (!r.ok || !r.json || typeof r.json !== "object") return "merge PR could not be resolved with gh pr view";
+			const json = r.json;
+			if (!("number" in json) || !Number.isSafeInteger(json.number) || Number(json.number) < 1 || !("headRefOid" in json) || typeof json.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(json.headRefOid) || !("url" in json) || typeof json.url !== "string") return "merge PR view returned incomplete facts";
+			const resolved = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/([1-9]\d*)$/.exec(json.url);
+			if (!resolved || resolved[1]!.toLowerCase() !== repo.toLowerCase() || Number(resolved[2]) !== json.number) return "merge PR view and resolved repo disagree";
+			selector = String(json.number);
+		}
+		out.push({ repo, pr: Number(selector), headGuard });
+	}
+	return out;
+}
+
+/**
+ * Row 6's deploy integration. Null leaves the unchanged reserved rules in charge. All admission rechecks and
+ * consumption happen under Ledger.write (BEGIN IMMEDIATE); no network operation runs while that lock is held.
+ */
+export async function judgeDeploy(call: DeployToolCall, ctx: CallContext, binding: DeployBinding): Promise<DeployJudgment | null> {
+	if (call.toolName !== "bash") return null;
+	const original = checkReserved(call, ctx);
+	const action = reservedAction(original);
+	if (original && action !== WORKFLOW_WHY) return null;
+	const command = bashCommand(call.input).trim();
+	const merges = await mergeCalls(call, ctx, binding.mergeView ?? defaultMergeView);
+	const plain = (reason: string): DeployJudgment => ({ refusal: { block: true, reason: `P-11 row 6 hold: ${reason}` } });
+	if (typeof merges === "string") return plain(`${merges}; use gh pr merge <number> -R <owner/repo> in its own bash call`);
+	if (!merges.length && action !== WORKFLOW_WHY) return null;
+	const { ledger, workloadId, laneId } = binding;
+	const facts = binding.facts ?? defaultFacts(ledger, ctx.env);
+	const eligible = ctx.role === "lane" && workloadId !== null && ledger.workload(workloadId)?.holder === laneId && !ledger.entries(workloadId).some((e) => /^(?:train|train-fix):/.test(e.body));
+	const request = (body: string): DeployJudgment => {
+		if (!workloadId) return plain("deploy admission needs a holding lane");
+		ledger.recordEntry({ workloadId, by: laneId, kind: "reserved-request", body });
+		return { refusal: { block: true, reason: `P-11 row 6 reserved request: ${body}` } };
+	};
+	try {
+		if (merges.length) {
+			if (original) return null;
+			// Multiple merges cannot share one result or one consumed approval; respell without side effects.
+			if (merges.length !== 1) return plain("run one gh pr merge per bash call");
+			const merge = merges[0]!;
+			const auth = policyAuth(facts);
+			const v = await evaluateMerge(merge, facts);
+			if (v.outcome === "hold") return plain(`U2 settle the unsettled deploy first: ${canonicalJson(v.conditions)}`);
+			if (v.outcome === "escalate" && !eligible) return request(deployRequestBody(call, merge.repo, v.head, v.conditions));
+			const targetRepo = auth.policy?.targets.some((t) => t.repo.toLowerCase() === merge.repo.toLowerCase()) ?? false;
+			return ledger.write(() => {
+				// U2 is repeated with live ledger facts under the admission lock, even for non-lanes.
+				const current = ledgerFacts(ledger);
+				const liveAuth = policyAuth(facts);
+				if (liveAuth.hash !== auth.hash || liveAuth.authenticated !== auth.authenticated) return plain("E0 deploy policy changed while merge was evaluated; retry");
+				const targets = liveAuth.policy?.targets;
+				if (targetRepo && (!workloadId || !call.toolCallId)) return plain("target repo merge needs a workload and tool call id for merge-inflight");
+				for (const d of current.rows("deploy")) {
+					const r = parseDeployRow(d.body);
+					if (!r) return plain("U2 deploy history is unreadable");
+					const t = targets?.find((t) => t.name === r.target);
+					if ((!t || t.repo.toLowerCase() === merge.repo.toLowerCase()) && targetHistory(current, r.target).unsettled.includes(r.id)) return plain(`U2 settle ${r.id} first: as2 deploy settle ${r.id}`);
+				}
+				let approved: string | null = null;
+				if (v.outcome === "escalate") {
+					approved = eligible && merge.headGuard === v.head && call.input.env === undefined ? approvedRequest(ledger, binding, command, v.head, v.conditions, facts.now()) : null;
+					if (!approved) return request(deployRequestBody(call, merge.repo, v.head, v.conditions));
+					ledger.recordEntry({ workloadId: workloadId!, by: DEPLOY_BY, kind: "assumption", body: formatDeployMergeRow({ requestId: approved, pr: merge.pr, head: v.head! }) });
+				}
+				if (targetRepo && workloadId) {
+					const token = `mt-${randomUUID()}`;
+					ledger.recordEntry({ workloadId, by: DEPLOY_BY, kind: "assumption", body: formatMergeInflightRow({ token, repo: merge.repo, pr: merge.pr }) });
+					return { refusal: null, pending: { workloadId, mergeToken: token } };
+				}
+				return { refusal: null };
+			});
+		}
+		if (!eligible) return null;
+		// Every non-workflow rule and unreadable-form check still runs before a deploy can be admitted.
+		const other = checkReserved(call, ctx, true);
+		if (other) return { refusal: other };
+		const auth = policyAuth(facts);
+		const v = await evaluateDeploy({ command, toolEnv: call.input.env, cwd: typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd, env: ctx.env, workloadId: workloadId! }, facts);
+		if (v.kind === "not-target") return null;
+		if (v.outcome === "hold") return plain(`${v.ids.join(",")} ${canonicalJson(v.conditions)}; deploy predecessors first or as2 deploy settle <dp-id>, then retry`);
+		return ledger.write(() => {
+			if (ledger.workload(workloadId!)?.holder !== laneId) return plain("only the current holding lane can deploy");
+			const current = ledgerFacts(ledger);
+			if (v.target) {
+				const unsettled = targetHistory(current, v.target).unsettled;
+				if (unsettled.length) return plain(`U1 settle ${unsettled.join(",")} first: as2 deploy settle ${unsettled[0]}`);
+			}
+			if (v.repo && v.mark !== null && mergesSince(current, v.repo, v.mark).length) return plain("U3 a merge started or finished during evaluation; retry with fresh facts");
+			const nowAuth = policyAuth(facts);
+			if (v.authenticated && (!nowAuth.authenticated || nowAuth.hash !== auth.hash)) return plain("E0 the authenticated deploy policy changed during evaluation; retry");
+			const approved = v.authenticated && call.input.env === undefined ? approvedRequest(ledger, binding, command, v.head, v.conditions, facts.now()) : null;
+			if (v.outcome !== "routine" && !approved) return request(deployRequestBody(call, v.target ?? "unknown", v.head, v.conditions, v.outcome === "defer"));
+			if (!v.target || !v.head || !call.toolCallId) return plain("E0 deploy target, head and tool call id must be known before admission");
+			const id = `dp-${randomUUID()}`;
+			ledger.recordEntry({ workloadId: workloadId!, by: DEPLOY_BY, kind: "assumption", body: formatDeployRow({ id, target: v.target, sha: v.head, base: v.base, checks: v.checks, warnings: v.warnings, ...(approved ? { approved } : {}) }) });
+			return { refusal: null, pending: { workloadId: workloadId!, deployId: id } };
+		});
+	} catch (err) {
+		return plain(`E0 admission could not be recorded or evaluated (${String(err)}); no action admitted`);
+	}
+}
+
+/** Record dispatch evidence only, never settle. A nonzero exit can follow an accepted dispatch. */
+export function recordDeployResult(ledger: Ledger, pending: DeployPending, details: unknown, isError: boolean): void {
+	const d = details && typeof details === "object" ? details as Record<string, unknown> : {};
+	if (d.async) return; // unknown outcome: no merge-done and no terminal dispatch evidence
+	const exit = typeof d.exitCode === "number" ? d.exitCode : typeof d.exit_code === "number" ? d.exit_code : isError ? 1 : 0;
+	ledger.write(() => {
+		if (pending.mergeToken) ledger.recordEntry({ workloadId: pending.workloadId, by: DEPLOY_BY, kind: "assumption", body: formatMergeDoneRow({ token: pending.mergeToken, exit }) });
+		if (pending.deployId) {
+			const text = [d.output, d.stdout, d.stderr].filter((v) => typeof v === "string").join("\n");
+			const url = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/(\d+)/.exec(text);
+			const runId = url?.[1] ?? (typeof d.runId === "number" || typeof d.runId === "string" ? String(d.runId) : undefined);
+			ledger.recordEntry({ workloadId: pending.workloadId, by: DEPLOY_BY, kind: "assumption", body: formatDeployRunRow({ id: pending.deployId, ...(runId && /^\d+$/.test(runId) ? { runId, ...(url ? { url: url[0] } : {}) } : { exit }) }) });
+		}
+	});
 }

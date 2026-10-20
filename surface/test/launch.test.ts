@@ -767,3 +767,15 @@ describe("plan approval by the auto-start's fixed writer (PLAN wl-mvfkv7llkp7nk0
 		expect(planFirst(control([first(), entry("lane-m-1", planHaltedBody("in-9"))]))).toMatchObject({ trigger: "your word" });
 	});
 });
+
+describe("deploy controls (R9)", () => {
+	test("seven prefixes reject lane forgeries and accept only their fixed writer", () => {
+		for (const prefix of ["deploy", "deploy-run", "deploy-settled", "deploy-merge", "merge-inflight", "merge-done", "deploy-policy"]) {
+			const by = prefix === "deploy-policy" ? SURFACE_BY : "deploy-gate";
+			expect(reservedPrefix(`  ${prefix}: row`)).toBe(prefix);
+			expect(control([entry("lane-m-1", `${prefix}: row`)], "lane-m-1")).toEqual([]);
+			expect(control([entry(by, `${prefix}: row`)])).toHaveLength(1);
+			expect(control([entry(prefix === "deploy-policy" ? "deploy-gate" : SURFACE_BY, `${prefix}: row`)])).toEqual([]);
+		}
+	});
+});
