@@ -601,6 +601,38 @@ export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<T
 	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
 }
 
+/** A waiter's row in runs.db's `queue` table: its run, its workload, and its place, the request's `created_at` in ms. */
+export interface QueueRow {
+	runId: string;
+	workloadId: string;
+	requestedAt: number;
+}
+
+/**
+ * A queued waiter blocks the runs behind it while its run is live (`recordLive`: not settled, and a heartbeat under 60 s old,
+ * or none yet inside the startup lease). A row whose request the ledger does not hold is dead.
+ */
+export function queueWaiterLive(rec: RunRecord | undefined, heartbeatAtMs: number | null, nowMs: number): boolean {
+	return rec !== undefined && recordLive(rec, heartbeatAtMs, nowMs);
+}
+
+/**
+ * The waiters ahead of `selfId`, oldest request first (requestedAt, then run id): every dead one before the first live one is
+ * reported for pruning, and that first live one is the blocker. Rows behind `selfId` are never judged. `selfId` must be among
+ * the rows (the runner registers in the same transaction).
+ */
+export function queueAhead(rows: readonly QueueRow[], selfId: string, live: (row: QueueRow) => boolean): { blocker: string | null; dead: string[] } {
+	need(rows.some((r) => r.runId === selfId), `${selfId} is not in the queue`);
+	const ordered = [...rows].sort((a, b) => a.requestedAt - b.requestedAt || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
+	const dead: string[] = [];
+	for (const row of ordered) {
+		if (row.runId === selfId) break;
+		if (live(row)) return { blocker: row.runId, dead };
+		dead.push(row.runId);
+	}
+	return { blocker: null, dead };
+}
+
 // ---- the full-suite slice ------------------------------------------------------------------------
 
 /** The slice the starter adds (§ 2.1): `sl-full-<wl without wl->-<n>`, n one past the highest taken. */

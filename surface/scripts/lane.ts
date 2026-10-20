@@ -17,10 +17,10 @@
 //                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
 //                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
 //                                        src/omp-probe.ts), since some run inside ledger writes. The quota guard
-//                                        (PLAN wl-mv71x5rwdu7eo0 § 4, classifier/src/headroom.ts) is here only: Jo's
-//                                        named model projected out spawns no omp (launch-failed: … headroom); an
-//                                        unnamed lane on an out lab is moved by set_model before its first prompt
-//                                        (lane-headroom:)
+//                                        (classifier/src/headroom.ts) is here only: configured budget comparisons may
+//                                        retain a week-only out source without changing its model. Otherwise Jo's
+//                                        named model refuses before omp (launch-failed: … headroom); an unnamed lane
+//                                        moves to a base-in-quota strong-row model before its first prompt (lane-headroom:)
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -1050,11 +1050,20 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let ranModel: string | null = null;
 	/**
 	 * Ready also waits for the first `get_state` (every lane, PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that
-	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when projected out of quota, must first be moved (`move`).
+	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when still out after budget comparison, must first be moved (`move`).
 	 */
 	let modelChecked = false;
 	/** The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests). */
 	const room = headroom();
+	// Installed strong-row order is counterfactual budget evidence, not verified spawn availability or permission to replace a pin.
+	// A broken table disables only comparison; ordinary admission remains possible and moveOff reports the existing failure.
+	let strongRow: string[] = [];
+	let strongRowFailure: string | null = null;
+	try {
+		strongRow = loadTierTable(profileConfig()).strong.map(modelIdentity);
+	} catch (err) {
+		strongRowFailure = oneLine(err);
+	}
 	/** An unnamed lane's move off an out lab: `set_model` to `to` was sent; ready waits for `get_state` to report `to` (set in `moveOff`). */
 	let move = null as { from: string; to: string; reason: string } | null;
 	/** omp's error on the first prompt that ended `error` (D3 keeps the first), for the death line. */
@@ -1370,10 +1379,14 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			resumeSkipped = start.skipped;
 			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
 			if (room.note !== null) process.stderr.write(`runner: ${laneId} quota guard open: ${room.note}\n`);
-			// PLAN wl-mv71x5rwdu7eo0 § 4: Jo's named model projected out of quota is refused before any omp, never replaced; the
-			// catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
-			const out = model === null ? null : room.outFor(model);
-			if (out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${out}`, STARTER_EXIT["not-launchable"]!);
+			// Budget comparison can retain Jo's named source, never substitute it. An out decision still fails before any omp,
+			// and the catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
+			if (model !== null) {
+				if (strongRowFailure !== null) process.stderr.write(`runner: ${laneId} quota guard comparison unavailable: the strong row could not be read: ${strongRowFailure}\n`);
+				const decision = room.decisionFor(model, strongRow);
+				if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
+				if (decision.out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${decision.out}`, STARTER_EXIT["not-launchable"]!);
+			}
 			argv = laneArgv({
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
@@ -1420,7 +1433,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
 		// waits for OMP's first get_state (PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that provider/id (item 85), and an
-		// unnamed lane on a lab projected out of quota is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
+		// unnamed lane still out after budget comparison is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
 		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
@@ -1484,22 +1497,19 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			omp.kill("SIGKILL");
 		};
 		/**
-		 * PLAN wl-mv71x5rwdu7eo0 § 4: an unnamed lane whose first get_state model `from` is projected out (`reason`) moves, before its
-		 * first prompt, to the first entry of the installed profile's strong row (`:level` dropped) that is not out, in row order:
-		 * `set_model`, then a get_state that must report it (omp://rpc.md § Model: `{ type: "set_model", provider, modelId }`).
-		 * An unreadable tier table or a row with every entry out is never-ready at stage `headroom`.
+		 * An unnamed lane whose first get_state model `from` remains out (`reason`) after budget comparison moves, before its
+		 * first prompt, to the first base-in-quota entry of the installed strong row (`:level` dropped), in row order.
+		 * Destination decisions never use comparators: retention protects the source, not another out destination.
+		 * `set_model`, then a get_state must report it. An unreadable tier table or every entry out is never-ready at `headroom`.
 		 */
 		const moveOff = (from: string, reason: string): void => {
-			let row: string[];
-			try {
-				row = loadTierTable(join(profileAgentDir(), "config.yml")).strong.map(modelIdentity);
-			} catch (err) {
-				failModel(`${from} is out (${reason}); the strong row could not be read: ${oneLine(err)}`, HEADROOM_STAGE);
+			if (strongRowFailure !== null) {
+				failModel(`${from} is out (${reason}); the strong row could not be read: ${strongRowFailure}`, HEADROOM_STAGE);
 				return;
 			}
-			const to = row.find((s) => room.outFor(s) === null);
+			const to = strongRow.find((s) => room.decisionFor(s).out === null);
 			if (to === undefined) {
-				failModel(`${from} is out (${reason}); every strong-row entry is out: ${row.map((s) => `${s} (${room.outFor(s)})`).join("; ")}`, HEADROOM_STAGE);
+				failModel(`${from} is out (${reason}); every strong-row entry is out: ${strongRow.map((s) => `${s} (${room.decisionFor(s).out})`).join("; ")}`, HEADROOM_STAGE);
 				return;
 			}
 			move = { from, to, reason };
@@ -1571,7 +1581,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
 				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it, and
-				// an unnamed lane's is checked against the quota signal (PLAN wl-mv71x5rwdu7eo0 § 4): not out, or no model reported, is ready.
+				// an unnamed lane's source receives the same budget comparison: in quota or retained, or no model reported, is ready.
 				if (o.type === "response" && o.id === STATE_ID && !stateSeen) {
 					stateSeen = true;
 					ranModel = stateModelOf(o);
@@ -1581,9 +1591,13 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						if (check.ok) modelChecked = true;
 						else failModel(check.reason);
 					} else {
-						const out = ranModel === null ? null : room.outFor(ranModel);
-						if (out === null) modelChecked = true;
-						else moveOff(ranModel!, out);
+						if (ranModel === null) modelChecked = true;
+						else {
+							const decision = room.decisionFor(ranModel, strongRow);
+							if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
+							if (decision.out === null) modelChecked = true;
+							else moveOff(ranModel, decision.out);
+						}
 					}
 				}
 				// The move's set_model answer: on success, ask OMP which model it now runs; a refusal fails the launch at `headroom`.

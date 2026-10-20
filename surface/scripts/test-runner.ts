@@ -13,7 +13,8 @@
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
 //   run <run id>
-//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it), `current` published
+//       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it; queued runs take it oldest
+//       request first, by their `test-requested:` entry's time in runs.db's `queue` table, skipping dead waiters), `current` published
 //       in the acquiring transaction, the install check (a drifted bundle is refreshed once through `sudo -n
 //       <libexec>/refresh`), sweep, probe, retention, the trusted clone and bundle, then every untrusted step through
 //       `sudo -n -u _as2test <exec> …`, a sweep after each part, then each failing part rerun on base when every part reported
@@ -64,8 +65,8 @@ import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
-	type PrView, pruneRuns, queuedTooLong, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, runsDbOf, runsRoot,
-	servedRepo, securityRedBody, securityRedOf, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
+	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
+	runsDbOf, runsRoot, servedRepo, securityRedBody, securityRedOf, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
@@ -234,7 +235,10 @@ export interface LockRow {
 	heartbeatAt: number;
 }
 
-/** `<root>/runs.db` with its one-row lock table; busy_timeout first. */
+/**
+ * `<root>/runs.db` with its one-row lock table and the `queue` table of the runs waiting for it (each waiter's request
+ * `created_at` in ms, `requestedAt`: the order they take the lock in); busy_timeout first.
+ */
 export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TEST_RUNNER_BUSY_MS", 5_000)): Database {
 	// Under test, a runs root or a runs.db (a symlink included) inside a live ledger root is refused before anything is created there.
 	assertNotLiveLedgerUnderTest(root);
@@ -245,6 +249,7 @@ export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TE
 	busyLoop(() => db.exec(
 		"CREATE TABLE IF NOT EXISTS lock (id INTEGER PRIMARY KEY CHECK (id = 1), runId TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, runDir TEXT NOT NULL, heartbeatAt INTEGER NOT NULL)",
 	));
+	busyLoop(() => db.exec("CREATE TABLE IF NOT EXISTS queue (runId TEXT PRIMARY KEY, workloadId TEXT NOT NULL, requestedAt INTEGER NOT NULL)"));
 	return db;
 }
 
@@ -591,6 +596,8 @@ class Runner {
 	private url = "";
 	/** The served repo's `owner/repo` (`servedOf`), every status post's target; empty until the run resolves it. */
 	private ownerRepo = "";
+	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
+	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
 
 	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig) {
@@ -598,6 +605,9 @@ class Runner {
 		this.stageRoot = join(this.as2root, "stage");
 		this.stage = stageDirOf(request.runId, this.as2root);
 		this.workDir = workDirOf(request.runId, this.as2root);
+		const rec = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId);
+		if (!rec) throw new Fail(`no test-requested: record for ${request.runId} on ${wl}`, START_EXIT.failed);
+		this.requestedAt = Date.parse(rec.request.createdAt);
 		this.lockDb = openLockDb(this.root);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
@@ -642,37 +652,80 @@ class Runner {
 		}
 	}
 
-	/** Wait for the lock (queued), take it clean or from a stale holder, and publish `current` in that same transaction. */
+	/**
+	 * Wait for the lock (queued, oldest request first), take it clean or from a stale holder, and publish `current` in that same
+	 * transaction. Every attempt is one BEGIN IMMEDIATE transaction: register in `queue` (a no-op once registered; a row pruned
+	 * while this run was suspended comes back with the same requestedAt), prune the dead waiters ahead and find the first live
+	 * one, then the holder check; a live holder or a live waiter ahead keeps the run queued. Taking the lock removes the run's row.
+	 */
 	async acquire(): Promise<void> {
 		const waitStart = Date.now();
 		const pollMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_POLL_MS", 2_000);
 		mkdirSync(this.stageRoot, { recursive: true });
-		for (;;) {
-			let took: { displaced: string | null } | null = null;
-			try {
-				took = this.lockDb.transaction(() => {
-					const row = lockRow(this.lockDb);
-					if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
-					this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
-						.run(this.id, process.pid, process.pid, this.runDir, Date.now());
-					writeCurrent(this.stageRoot, this.id);
-					hookSync(this.id, "acquire-tx");
-					return { displaced: row && row.runId !== this.id ? row.runId : null };
-				}).immediate();
-			} catch (e) {
-				if (!isBusy(e)) throw e;
-				hookMark(this.id, "acquire-busy");
+		try {
+			for (;;) {
+				let took: { displaced: string | null } | null = null;
+				try {
+					took = this.lockDb.transaction(() => {
+						this.lockDb.query("INSERT OR IGNORE INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(this.id, this.wl, this.requestedAt);
+						const blocker = this.queueBlocker();
+						const row = lockRow(this.lockDb);
+						if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
+						if (blocker !== null) return null;
+						this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
+							.run(this.id, process.pid, process.pid, this.runDir, Date.now());
+						this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id);
+						writeCurrent(this.stageRoot, this.id);
+						hookSync(this.id, "acquire-tx");
+						return { displaced: row && row.runId !== this.id ? row.runId : null };
+					}).immediate();
+				} catch (e) {
+					if (!isBusy(e)) throw e;
+					hookMark(this.id, "acquire-busy");
+				}
+				if (took) {
+					this.held = true;
+					hookMark(this.id, "acquired", took);
+					this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
+					this.beat();
+					return;
+				}
+				if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
+				hookMark(this.id, "queued");
+				await Bun.sleep(pollMs);
 			}
-			if (took) {
-				this.held = true;
-				hookMark(this.id, "acquired", took);
-				this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
-				this.beat();
-				return;
-			}
-			if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
-			hookMark(this.id, "queued");
-			await Bun.sleep(pollMs);
+		} catch (e) {
+			this.leaveQueue();
+			throw e;
+		}
+	}
+
+	/**
+	 * Inside the acquiring transaction, after this run registered: the first live waiter ahead of it in (requestedAt, run id)
+	 * order, or null. Each waiter ahead is judged on its ledger record and heartbeat file (`queueWaiterLive`, one entries read
+	 * per workload); the dead ones before the first live one are deleted.
+	 */
+	private queueBlocker(): string | null {
+		const rows = this.lockDb.query<QueueRow, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all();
+		const records = new Map<string, RunRecord[]>();
+		const now = Date.now();
+		const { blocker, dead } = queueAhead(rows, this.id, (q) => {
+			let recs = records.get(q.workloadId);
+			if (!recs) records.set(q.workloadId, (recs = testRuns(this.ledger.entries(q.workloadId))));
+			return queueWaiterLive(recs.find((r) => r.request.runId === q.runId), heartbeatOf(this.root, q.runId), now);
+		});
+		const prune = this.lockDb.query("DELETE FROM queue WHERE runId = ?");
+		for (const runId of dead) prune.run(runId);
+		if (dead.length > 0) this.log(`pruned the dead waiters ${dead.join(", ")} from the lock queue`);
+		return blocker;
+	}
+
+	/** Leave the lock queue (best effort): when acquire ends without the lock, and at the end of the run. */
+	private leaveQueue(): void {
+		try {
+			busyLoop(() => this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id));
+		} catch (e) {
+			this.log(`the lock queue row was not removed: ${errText(e)}`);
 		}
 	}
 
@@ -1204,6 +1257,7 @@ class Runner {
 					this.log(`the lock was not released: ${errText(e)}`);
 				}
 			}
+			this.leaveQueue();
 			this.lockDb.close();
 		}
 	}
