@@ -152,7 +152,7 @@ A notice is a needs-you line with nothing to answer, `notice on <workload> (noth
 unnumbered and shown until it has reached you once: a ceiling at 80 %, a ceiling stop, or a
 normal-stakes plan that started on its own after a cross-lab pass. Pass a notice on to Jo; never
 turn it into a question. For a plan that started on its own, Jo's `halt wl-…` stops it, and its
-PRs do not merge until 4 h after Jo's next message at the surface.
+PRs do not merge until 4 h after Jo's next plain-words message at the surface (a command word does not count).
 
 ## The five error lines
 
