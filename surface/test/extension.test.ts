@@ -16,7 +16,7 @@ import { ceilingOf } from "../src/input";
 import { planFirstBody } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { STANDING_WORKLOAD_ID, SURFACE_BY as SURFACE } from "../src/types";
-import { clock, ctxOf, fakePi, notices, timers, tmp } from "./helpers";
+import { clock, ctxOf, fakePi, loadTestText, notices, timers, tmp } from "./helpers";
 
 function env(over: Record<string, string> = {}): Record<string, string> {
 	const voice = join(tmp("voice"), "VOICE.md");
@@ -62,7 +62,7 @@ describe("surface extension adapter", () => {
 		orchestratorSurface(f.pi, e);
 		expect(f.registered().sort()).toEqual([
 			"as2_rank", "lane_add_slice", "lane_complete_slice", "lane_full_test", "lane_handoff", "lane_message", "lane_raise_question", "lane_read_facts", "lane_record_entry", "lane_release", "lane_train_return", "lane_withdraw_reserved",
-			"orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
+			"orchestrator_channel_done", "orchestrator_close_workload", "orchestrator_identity", "orchestrator_launch_lane", "orchestrator_ledger", "orchestrator_lower_ceiling", "orchestrator_open_workload", "orchestrator_raise_question", "orchestrator_record_instruction", "orchestrator_reply", "orchestrator_schedule", "orchestrator_wake_read", "slice_artifact",
 		]);
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
@@ -612,7 +612,7 @@ describe("surface extension adapter", () => {
 		const wl = seed.openWorkload({ by: "lane-a", brief: "Add a line to the README", stakes: "normal", mode: "autonomous" });
 		const sl = seed.addSlice({ by: "lane-a", workloadId: wl, task: "write the line", doneCondition: "README.md has it", inputs: "README.md" });
 		seed.close();
-		orchestratorSurface(f.pi, e);
+		await orchestratorSurface(f.pi, e, { loadText: loadTestText });
 		const ctx = ctxOf();
 		await f.emit("session_start", { type: "session_start" }, ctx);
 		const wake = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as Started;

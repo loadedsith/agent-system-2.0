@@ -2,8 +2,13 @@
 // carries at most one ask/QUESTION, hands Jo a command only as a script path, and puts the needs-you
 // block first and the closing ask last. On the orchestrator session it hands Jo no command at all,
 // not even a script path: a lane runs it, or the ask is one word (tiers/orchestrator.md § What you
-// never do). Refused, not warned. Runs on a top-level session's stop (hands never talk to Jo; OMP
-// never fires session_stop for subagents, omp://extensions.md:349). On the orchestrator it also runs
+// never do). One named exception (2026-10-17, migration/items/pair-offer-own-line.md, the exception
+// MIGRATION.md item 52 asked for): the by-hand `as2 lane wl-…` line that continues a user-driven
+// workload, in plain text or inline code, never inside a shell fence. The row needs no code for it:
+// `as2` is not a command head and not a script line, so it passes in prose and inline code, and a
+// shell fence refuses every non-comment line. Refused, not warned. Runs on a top-level session's
+// stop (hands never talk to Jo; OMP never fires session_stop for subagents,
+// omp://extensions.md:349). On the orchestrator it also runs
 // on the turn's finalized reply: a refused reply becomes one fixed marker line that quotes nothing
 // from the draft and is rewritten, so the history Jo keeps holds the marker and the rewrite; the
 // draft may show while it streams, because OMP does not retract streamed text
@@ -26,10 +31,10 @@ const SHELL_FENCE = /^(sh|bash|zsh|shell|console|terminal|shell-session)$/i;
 const CODE_FENCE =
 	/^(ts|tsx|typescript|js|jsx|javascript|mjs|cjs|json|jsonc|json5|yaml|yml|toml|ini|xml|html|css|scss|md|markdown|mermaid|diff|patch|py|python|rb|ruby|go|rs|rust|java|kt|kotlin|swift|c|cpp|h|hpp|cs|php|lua|sql|graphql|gql|csv|tsv|proto|dockerfile|makefile|nix|hcl|tf|text|txt|plain|plaintext|output|log)$/i;
 /** The first word of a line that runs something: the command heads a handed-over line starts with. */
-const COMMAND_LINE =
+export const COMMAND_LINE =
 	/^(?:\$\s+|%\s+|>\s+)?(?:sudo\s+)?(?:git|gh|npm|npx|pnpm|yarn|bun|bunx|node|deno|cd|rm|mv|cp|mkdir|rmdir|chmod|chown|ln|touch|curl|wget|brew|pip3?|python3?|uv|docker|kubectl|helm|make|just|cargo|go|ssh|scp|rsync|export|source|psql|mysql|sqlite3|terraform|tofu|echo|printf|cat|open|tar|unzip|launchctl|defaults|omp|claude|codex|vercel|netlify|fly|flyctl|aws|gcloud|supabase|doctl|heroku|wrangler|firebase|zsh|bash|sh|kill|pkill|killall|xargs|find|sed|awk)(?:\s|$)/;
 /** The one form a command handed to Jo takes: run a script file (SPEC-2.0.md § B16 item 2). */
-const SCRIPT_LINE = /^(?:\$\s*)?(?:zsh|bash|sh)\s+(?:~|\/)\S*\.(?:sh|zsh|bash)\s*$/;
+export const SCRIPT_LINE = /^(?:\$\s*)?(?:zsh|bash|sh)\s+(?:~|\/)\S*\.(?:sh|zsh|bash)\s*$/;
 /**
  * After the closing ask, only its option list, a recommendation line, or the count line as the
  * message's last line may follow.
@@ -324,7 +329,9 @@ export function checkTurnShape(message: string, role: "orchestrator" | "lane" = 
 	// The orchestrator hands over no command at all (tiers/orchestrator.md § What you never do): the
 	// same fences with no script-path exemption, plus a script line in its own prose or as a whole
 	// inline-code span. Inline code holding any other command is a receipt (`git status`), not a
-	// hand-over, and stays allowed.
+	// hand-over, and stays allowed. The by-hand `as2 lane wl-…` line passes in prose and inline code
+	// and is refused in a shell fence, which is the named exception of 2026-10-17
+	// (migration/items/pair-offer-own-line.md, MIGRATION.md item 52).
 	if (role === "orchestrator") {
 		const handed = orchestratorHandOver(lines, fences);
 		if (handed) problems.push(`it hands Jo a command (\`${handed}\`); a lane runs it, or ask Jo for one word`);
