@@ -13,14 +13,24 @@
 // for every role: eval and inline code may not load the ledger module at all, a database opened from code may
 // not name a `ledger.db` or sit under `.agent-system-2/`, and no call may set, unset or override the
 // agent-context tags or the names that move the live roots. Every refusal names the boundary.
-// G1 (scratch auth-forgery AUDIT.md § (e)), with its review rounds 1 and 2: a script an interpreter runs (bun, node,
+// G1 (scratch auth-forgery AUDIT.md § (e)), with its review rounds 1 to 3: a script an interpreter runs (bun, node,
 // tsx, ts-node, python, perl, ruby, deno, and any package bunx or npx runs on a file), the modules its options and
 // the cwd's bunfig.toml preload, the test files and preloads of `bun test`, the command line of a package.json
 // script (`bun run`, `bun <name>`, `npm run`, `npm start`, `node --run`), the module `python -m` runs from the
 // working directory, and the files code loads by a literal path are read at gate time and judged by the same rules
 // (scriptCrossing, codeLoadCrossing); a module or file loaded by a target computed at run time is refused in eval,
 // inline code and scripts outside every git repository (eval-code.ts computedModuleLoad, pythonLoads); `deno task`
-// is refused.
+// is refused. Test isolation is not trust (round 3, finding 4): a tree's test files, `.git` or not, run unread in a
+// `bun test` whose preload is that tree's isolate preload (isolationTree).
+//
+// G1 is a tripwire at accident grade, not a hard boundary (Jo: narrow, round 3). Its stated limits
+// (migration/items/jo-only-boundary.md) include: a package.json or bunfig.toml written in the same call is read as it
+// was before the call (bunfigPreloads, packageScript); JS `eval`/`Function` on a literal runs its body unread; inline
+// code a package runner runs (`bun x bun -e`, `npx tsx -e`, `npx zx --eval`) is not read; a raw bun:sqlite connection
+// never gets layer 1's TEMP triggers (ledger/src/authority.ts installBoundary runs only in Ledger.open), so anything
+// past this row writes with no trigger; and git-tracked is not reviewed (`git add` alone makes a file run unread). The
+// hard boundary is the follow-up 'ledger writer authentication' (G5: a capability the fence denies agents, plus
+// persistent triggers in the ledger file).
 import { spawnSync } from "node:child_process";
 import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, posix, resolve } from "node:path";
@@ -541,8 +551,13 @@ interface ScriptRun {
 	family: CodeFamily | "shell";
 	/** The program itself, not a module an option (`--preload`, `-r`, `--import`) loads before it. */
 	main: boolean;
-	/** Read even a checkout's own file: a test file `bun test` runs without the checkout's isolating preload. */
+	/** Read even a checkout's own file: a test file `bun test` runs outside its tree's isolated run. */
 	readCheckout?: boolean;
+	/**
+	 * The tree whose isolated `bun test` run lets this file run unread (isolationTree): a test file of that tree, or the
+	 * tree's isolate preload when it is the gate's own isolation code. Void when this call writes that tree's isolation code.
+	 */
+	isolation?: string;
 }
 
 /** What `bun x`, `bunx` and npx run on a file through its own options: the TypeScript runners and the two runtimes. Any other package's file arguments are read as scripts (packageRuns). */
@@ -734,13 +749,47 @@ const TEST_FILE = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
 const TEST_WALK_CAP = 50_000;
 /** A checkout's test preload that points the ledger at a scratch root (ledger/test/isolate-preload.ts). */
 const ISOLATE_PRELOAD = "/ledger/test/isolate-preload.ts";
+/** The tree the gate itself runs from; its isolate preload and the one module that preload loads are the reviewed isolation code. */
+const GATE_TREE = canonicalPath(resolve(import.meta.dir, "../../.."));
+/** The module ISOLATE_PRELOAD loads (`../src/locality`), extensionless as it imports it. */
+const ISOLATE_MODULE = "ledger/src/locality";
+
+/** Does `root` hold the gate's own isolation code byte for byte: ISOLATE_PRELOAD, and ISOLATE_MODULE resolving to `locality.ts` alone? */
+function gateOwnIsolation(root: string): boolean {
+	const base = join(root, ISOLATE_MODULE);
+	const candidates = [base, ...SCRIPT_EXTENSIONS.map((x) => base + x), ...SCRIPT_EXTENSIONS.map((x) => join(base, `index${x}`))];
+	if (candidates.filter((c) => existsSync(c)).join("\n") !== `${base}.ts`) return false;
+	return [ISOLATE_PRELOAD.slice(1), `${ISOLATE_MODULE}.ts`].every((rel) => {
+		try {
+			return readFileSync(join(root, rel)).equals(readFileSync(join(GATE_TREE, rel)));
+		} catch {
+			return false;
+		}
+	});
+}
+
+/**
+ * The tree whose test isolation a `bun test` preload is, or null (G1 review round 3, finding 4): the word names an
+ * existing `<root>/ledger/test/isolate-preload.ts` that is a checkout's own file (checkoutFile), or, in a tree git does
+ * not track (a `git archive` copy), one that is the gate's own isolation code (gateOwnIsolation; `own`, so the preload
+ * itself runs unread too). Isolation is not trust: it lets that tree's test files run unread in this run, nothing else.
+ */
+function isolationTree(word: Word, at: string): { root: string; own: boolean } | null {
+	if (opaqueWord(word)) return null;
+	const canonical = canonicalOrLexical(resolve(at, word.text));
+	if (!canonical.endsWith(ISOLATE_PRELOAD) || !existsSync(canonical)) return null;
+	const root = canonical.slice(0, -ISOLATE_PRELOAD.length);
+	if (checkoutFile(canonical)) return { root, own: false };
+	return gateOwnIsolation(root) ? { root, own: true } : null;
+}
 
 /**
  * What `bun test` runs (G1 review round 2, finding 1): its preloads (`-r`/`--preload` and the bunfig.toml's), each
  * file a path argument (`./x`, `../x`, `/x`) names, and the test files under its working directory, or under a
  * directory a path argument names, whose path holds a filter argument (every one with no filter; bun skips
- * `node_modules` and dot directories). A checkout's own test file runs unread only when the run's bunfig preloads that
- * checkout's ISOLATE_PRELOAD; every other test file is read like a script.
+ * `node_modules` and dot directories). A tree's test file runs unread only when a preload of the run, from the bunfig
+ * or the command line, is that tree's isolate preload (isolationTree, G1 review round 3, finding 4); every other test
+ * file is read like a script.
  */
 function bunTestRuns(args: Word[], loads: Word[], at: string, known: boolean, all: Word[]): ScriptRun[] | string {
 	const filters: string[] = [];
@@ -764,7 +813,9 @@ function bunTestRuns(args: Word[], loads: Word[], at: string, known: boolean, al
 	if (!known) return "`bun test` after a `cd` the gate could not follow, so the gate cannot find the test files it runs";
 	const preloads = bunfigPreloads(bunfigFile(all, at));
 	if (typeof preloads === "string") return preloads;
-	const isolated = new Set(preloads.map((p) => canonicalOrLexical(resolve(at, p))).flatMap((c) => (c.endsWith(ISOLATE_PRELOAD) ? [c.slice(0, -ISOLATE_PRELOAD.length)] : [])));
+	const preloadWords = [...loads, ...preloads.map(literalWord)];
+	const trees = preloadWords.map((w) => isolationTree(w, at));
+	const isolated = new Set(trees.flatMap((t) => (t ? [t.root] : [])));
 	const files: string[] = [];
 	const walks: [string, (f: string) => boolean][] = [];
 	const substrings = filters.filter((f) => !/^(?:\/|\.\.?(?:\/|$))/.test(f));
@@ -799,10 +850,12 @@ function bunTestRuns(args: Word[], loads: Word[], at: string, known: boolean, al
 			}
 		}
 	}
-	const runs = [...loads, ...preloads.map(literalWord)].map((word): ScriptRun => ({ via: "bun test", word, dir: at, dirKnown: true, family: "js", main: false }));
+	const runs = preloadWords.map((word, i): ScriptRun => ({ via: "bun test", word, dir: at, dirKnown: true, family: "js", main: false, ...(trees[i]?.own ? { isolation: trees[i]!.root } : {}) }));
 	for (const f of new Set(files)) {
-		const root = checkoutRoot(canonicalOrLexical(f));
-		runs.push({ via: "bun test", word: literalWord(f), dir: at, dirKnown: true, family: "js", main: true, readCheckout: root === null || !isolated.has(root) });
+		// The tree a test file belongs to: the nearest directory holding `ledger/schema.sql`, `.git` or not (a checkout, a worktree, a `git archive` copy).
+		const root = nearestDir(canonicalOrLexical(f), (dir) => existsSync(join(dir, "ledger", "schema.sql")));
+		const iso = root !== null && isolated.has(root);
+		runs.push({ via: "bun test", word: literalWord(f), dir: at, dirKnown: true, family: "js", main: true, readCheckout: !iso, ...(iso ? { isolation: root } : {}) });
 	}
 	return runs;
 }
@@ -935,7 +988,12 @@ function scriptFileCrossing(run: ScriptRun, family: CodeFamily, x: Expansion, pa
 	const path = resolve(run.dir, word.text);
 	const written = writtenScript(x, path, js);
 	if (written === null) return `${lead} ${path}, which this same call writes from text the gate cannot read`;
-	return fileCrossing(lead, path, written, family, paths, run.readCheckout === true, 0);
+	// A file of a tree's isolated `bun test` run (bunTestRuns) runs unread, unless this call writes into it or into that
+	// tree's isolation code (ISOLATE_PRELOAD, ISOLATE_MODULE), or into one of them from text the gate cannot read.
+	const iso = run.isolation;
+	const isolated = iso !== undefined && writtenScript(x, iso + ISOLATE_PRELOAD, false)?.length === 0 && writtenScript(x, join(iso, ISOLATE_MODULE), true)?.length === 0;
+	if (isolated && written.length === 0) return null;
+	return fileCrossing(lead, path, written, family, paths, run.readCheckout === true || (iso !== undefined && !isolated), 0);
 }
 
 /**

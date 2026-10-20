@@ -26,10 +26,13 @@
 // (skills/*/…/scripts/ included) runs unread. G1 review round 2 (sl-auth-forgery-review-r3): `bun test` files and
 // preloads outside an isolated checkout run are read; eval reads a file it loads by a literal path; a package.json
 // script, a bunfig.toml preload and `python3 -m <name>` are read; bunx/npx read a file argument of any package; a
-// checkout's tracked files run unread.
+// checkout's tracked files run unread. G1 review round 3 (sl-auth-forgery-review-r4, finding 4): test isolation is
+// recognised apart from the git-tracked trust exemption, so a `git archive` copy's tests (no `.git`) run unread from
+// its isolating bunfig, as does a CLI `--preload` of a tree's isolate-preload.ts running that tree's test files.
 // The probe strings below load modules on purpose: they are the module-loading boundary under test.
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import type { CallContext, Refusal, Role } from "../src/types";
@@ -88,6 +91,21 @@ mkdirSync(join(cwd, "tcfg"));
 writeFileSync(join(cwd, "tcfg", "bunfig.toml"), `[test]\npreload = ["../forge.ts"]\n`);
 mkdirSync(join(cwd, "dn"));
 writeFileSync(join(cwd, "dn", "deno.json"), JSON.stringify({ tasks: { forge: "deno run -A ../forge.ts" } }));
+/**
+ * Round 3, finding 4: a `git archive` copy of this repository (the isolating bunfig files, no `.git`), and one whose
+ * isolate-preload.ts is the forgery. Built under $AS2_SCRATCH (the system temp dir when it is unset) and removed after
+ * the run; nothing in them runs.
+ */
+const R3_ROOT = mkdtempSync(join(process.env.AS2_SCRATCH ?? tmpdir(), "narrow-"));
+afterAll(() => rmSync(R3_ROOT, { recursive: true, force: true }));
+const ARCHIVE = join(R3_ROOT, "archive");
+const FORGED = join(R3_ROOT, "forged");
+for (const tree of [ARCHIVE, FORGED]) {
+	for (const p of ["bunfig.toml", "ledger/schema.sql", "ledger/src", "ledger/test/bunfig.toml", "ledger/test/isolate-preload.ts", "ledger/test/authority.test.ts"]) {
+		cpSync(join(REPO, p), join(tree, p), { recursive: true });
+	}
+}
+writeFileSync(join(FORGED, "ledger", "test", "isolate-preload.ts"), FORGE);
 const ctxFor = (role: Role): CallContext => ({ role, cwd, env: { HOME, AS2_SCRATCH: cwd, AGENT_SYSTEM_LANE_ID: role === "orchestrator" ? undefined : "lane-x", AGENT_SYSTEM_WORKLOAD_ID: role === "orchestrator" ? undefined : "wl-x" } });
 const ROLES: Role[] = ["lane", "hand", "orchestrator"];
 const BOUNDARY = "Jo-only boundary";
@@ -320,6 +338,19 @@ const R2_ANY_PACKAGE: Probe[] = [
 	{ tool: "bash", command: `bun-profile ${cwd}/forge.ts` },
 ];
 
+/** Review round 3, finding 4: isolation is not trust. An archive copy's files outside its isolated `bun test`, a test file of another tree, a forged isolate preload, and a run whose isolation code this same call rewrites stay read. */
+const R3_NOT_ISOLATED: Probe[] = [
+	{ tool: "bash", command: `cd ${ARCHIVE} && bun ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `bun test ${ARCHIVE}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${ARCHIVE} && bun test ${cwd}/forge.test.ts` },
+	{ tool: "bash", command: `bun test --preload ${ARCHIVE}/ledger/test/isolate-preload.ts ${cwd}/forge.test.ts` },
+	{ tool: "bash", command: `bun test --preload ${REPO}/ledger/test/isolate-preload.ts ${ARCHIVE}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `bun test --preload ${ARCHIVE}/ledger/test/isolate-preload.ts ${REPO}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${FORGED} && bun test ./ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `bun test --preload ${FORGED}/ledger/test/isolate-preload.ts ${FORGED}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cat > ${ARCHIVE}/ledger/src/locality.ts <<'EOF'\n${FORGE}EOF\ncd ${ARCHIVE} && bun test ./ledger/test/authority.test.ts` },
+];
+
 const ALLOWED: Probe[] = [
 	{ tool: "bash", command: `sqlite3 -readonly ${LIVE} "SELECT id, stakes FROM workloads"` },
 	{ tool: "bash", command: `sqlite3 -readonly ${LIVE} ".tables"` },
@@ -359,6 +390,7 @@ for (const [group, probes] of [
 	["a package.json script, bunfig.toml preload or deno task (G1 review 2, finding 3, minor 6)", R2_LAUNCH_CONFIG],
 	["python -m on a module in the working directory (G1 review 2, finding 4)", R2_PYTHON_MODULE],
 	["bunx or npx with any package on a file, and versioned runtimes (G1 review 2, finding 5, minor 9)", R2_ANY_PACKAGE],
+	["an archive copy's files outside an isolated bun test, or a forged isolate preload (G1 review 3, finding 4)", R3_NOT_ISOLATED],
 ] as const) {
 	describe(`refused with "${BOUNDARY}": ${group}`, () => {
 		for (const role of ROLES) {
@@ -510,3 +542,26 @@ for (const [group, probes] of ALLOWED_R2) {
 		}
 	});
 }
+
+/** G1 review round 3, finding 4: isolated runs that main allowed, the trust exemption aside. */
+const ALLOWED_R3: Probe[] = [
+	{ tool: "bash", command: `cd ${ARCHIVE} && bun test ./ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${ARCHIVE} && bun test ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${ARCHIVE}/ledger/test && bun test authority.test.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bun test --preload ${ARCHIVE}/ledger/test/isolate-preload.ts ${ARCHIVE}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bun test --preload=${ARCHIVE}/ledger/test/isolate-preload.ts ${ARCHIVE}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bun test --preload ${REPO}/ledger/test/isolate-preload.ts ${REPO}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bun test -r ${REPO}/ledger/test/isolate-preload.ts ${REPO}/ledger/test/authority.test.ts` },
+];
+
+describe("G1 review 3 stays allowed: finding 4, an archive copy's or a CLI --preload's isolated tests", () => {
+	for (const role of ROLES) {
+		test(`role ${role}`, () => {
+			const refused = ALLOWED_R3.flatMap((p) => {
+				const r = call(p, role);
+				return r === null ? [] : [`${label(p)} → ${r.reason.slice(0, 200)}`];
+			});
+			expect(refused).toEqual([]);
+		});
+	}
+});
