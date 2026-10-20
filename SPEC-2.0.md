@@ -495,7 +495,8 @@ kind from its option set (`questionKind`: `review-park`, `open-workload`, `merge
 every option is a `provider/model` id the `subject` its asker declares, `lane-model` or `review-model`, refused when
 missing) and checks Jo's standing rulings (`STANDING_RULINGS`): `kimi-out` (in-mv5xafhywe3w8w, ends
 2026-11-01T00:00-07:00), `flow-repair` (in-mvfiyyv2kuha80), `merges` (in-mv91wdhs446ark), `models` (in-mv5qagioc4en0g,
-in-mvfiu1uyldnksg) and `gates-stakes` (in-mv0novd17fre9s), each with the scope, exceptions and end its source gives.
+in-mvfiu1uyldnksg) and `gates-stakes` (in-mv0novd17fre9s), each with the scope, exceptions and end its source gives;
+`train-signoff` (in-mvg8clpoo9xn28) joins them under § B4, *Amended 2026-10-20 — Jo's train word is the production sign-off*.
 When an active ruling covers the question, no question row is written and nothing pauses; the asker records
 `ruling-applied: <ruling> kind <k> slice <sl> answer <a>`, and the lane and orchestrator tools return the ruling and
 its action instead of a question id. Every other question, of kind `other` (round limit, merge train, plan, safety) or
@@ -519,7 +520,7 @@ fable time?"* exposed that A1.2/A1.3 had left the stakes→cap table unset.
 |---|---|---|---|
 | throwaway | fast | none | none |
 | normal | strong | a *judge* slice (runs on strong under the cap); merge proceeds on pass | told in one line after the merge |
-| production | deep | a *judge* slice on deep, **then Jo** | approves the merge; the deploy is a separate reserved one-liner (A4) |
+| production | deep | a *judge* slice on deep, **then Jo** | Jo's `train` word on the PR is his approval of the merge: the train merges it once green with its review passed and tells him in one line after (*Amended 2026-10-20*, below); the deploy is a separate reserved one-liner (A4) |
 
 So fable is spent only on production workloads' judge slices and on anything Jo raises. A judge
 slice's closing artifact (B1) is its written verdict plus the slice's runtime artifacts; how many
@@ -553,6 +554,29 @@ in one line after the merge" no longer holds: Jo hears only of a production-stak
 conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
 tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
 above unchanged; production auto-boarding is a non-goal.
+
+**Amended 2026-10-20 — Jo's train word is the production sign-off** (`migration/items/train-signoff-ruling.md`;
+jo-issues #155; Jo, 2026-10-19 9:10 PM PDT: *"i dont want to be asked twice"*; Jo's standing ruling, ledger input
+`in-mvg8clpoo9xn28`: *"my train word on a production-stakes PR is my merge approval. The train merges that PR once it
+is green and its review passes, without asking me again, and tells me in one line after it merges."*; Jo's
+`machinery` (in-mvg8ibntzpnzeo) to carry it in every train, and his `issue155` (instruction in-mvg9zz54ejepz4) to make it the
+permanent rule; plan `~/agent-scratch/agent-system-2.0/wl-mvg8itbt0rz3ls/PLAN.md` §§ 1–2; built in wl-mvg8itbt0rz3ls).
+This amends the production row above. Before it, a production PR needed Jo's `train <N>` to board, and then the train
+asked Jo merged / skip / stop before it merged. Now Jo's `train <N>` (or `train wl-<train> <N>`) is his approval of
+the merge. The mechanism is a standing ruling, `train-signoff`, in `gates/src/rulings.ts` (§ B3, *Amended 2026-10-19 —
+standing rulings are checked before a question*). It decides the train lane's merged / skip / stop question, answer
+`merge`, when all of these hold, read by the question tool and never taken from the lane's words: an authenticated
+`train` word of Jo's named the PR; the PR is on a same-repo `wl/` branch whose workload's newest review is settled and
+passed; the PR is green at its current head; and main's protection reads `ok` live. Then no question row is written,
+the question tool records `ruling-applied: train-signoff kind merge slice <sl> answer merge`, and the train lane merges
+at once with a merge commit pinned to the head it verified (`--match-head-commit`, never `--admin`). If any of these fails, or a
+`gh` read fails, Jo is asked as before. Auto-boarding still never boards a production PR, so a PR only the train tick
+boarded still asks. A question already open when this lands stays Jo's to answer. Jo's `end-ruling train-signoff`
+ends the ruling at once with no code change, and from then on every production PR asks again. **One line after each
+train merge:** the train tick sends Jo one notice per PR any train merged (`merged by train …`), once, naming either
+his train word (production) or normal stakes. Normal-stakes train merges therefore again send the one-line notice the
+normal row promises; this replaces the auto-board amendment's "no longer holds" sentence above. No notice is sent for a
+PR Jo merged himself or one the train skipped.
 
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
@@ -1003,7 +1027,8 @@ account for?"*). The five: (1) opening/closing a phase; (2) spend above a worklo
 raising one; (3) the A4 command list — `careful`'s enumeration, protected-branch push, deploy;
 (4) changes to the system's own rules or machinery, including a workload's exceptions field;
 (5) **production-stakes sign-off before merge** (P-4 "both", placed by B4) — in force before,
-now counted. *Closed by default* means: the orchestrator cannot grow the list; it **may always
+now counted; Jo's `train` word naming the PR is that sign-off (§ B4, *Amended 2026-10-20 — Jo's train word is the
+production sign-off*). *Closed by default* means: the orchestrator cannot grow the list; it **may always
 ask** about anything unlisted (escalating is not reserved, `PREFERENCES.md` § P-7b); additions
 are Jo's ruling under item 4; per-workload extras go in the Jo-only exceptions field (P-5);
 a scenario nobody foresaw costs one incident — B3 surfaces it, P-16 proposes the addition, Jo

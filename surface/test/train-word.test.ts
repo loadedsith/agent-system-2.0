@@ -167,6 +167,15 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
 		// the merged / skip / stop question is production's only
 		expect(lines.filter((l) => l.includes("merged / skip / stop"))).toEqual([lines[production]!]);
+		// PLAN wl-mvg8itbt0rz3ls D3 (R9): the production question goes through Jo's rulings; a train-signoff decision is acted on at once
+		const prod = lines[production]!;
+		expect(prod).toContain("goes through Jo's rulings");
+		expect(prod).toContain("`decided by Jo's ruling train-signoff`");
+		expect(prod.indexOf("decided by Jo's ruling train-signoff")).toBeLessThan(prod.indexOf("Otherwise do not wait for it"));
+		for (const s of ["c. to e. with the head a. read", "no question and no wait"]) expect(prod).toContain(s);
+		const rules = lines.find((l) => l.startsWith("Rules: "))!;
+		expect(rules).toContain("a production PR's merge is Jo's: his merged answer, or his ruling train-signoff deciding the question");
+		expect(rules).not.toContain("a production PR's merge is Jo's;");
 		const returning = lines.find((l) => l.startsWith("Returning a PR to its owner"))!;
 		expect(returning).toContain(`${LANE_TRAIN_RETURN_TOOL} { pr: <n>, kind: red | conflict | stack, detail: <absolute path of the detail file> }`);
 		// a red and a conflict go back to the owner; none asks Jo

@@ -23,7 +23,9 @@
 // `prompt-only:` lines list exactly the prompt-only ids (PLAN wl-mv8vwb04cy18n4 D1-D3); questions
 // already raised are never re-checked. Every question goes through Jo's standing rulings (gates/src/rulings.ts `askJo`,
 // PLAN wl-mvfkv7llkp7nk0 § 1): one a ruling decides writes no question row, records the lane's `ruling-applied:` and
-// returns what to do instead; a question whose every option is a `provider/model` id declares its `subject`.
+// returns what to do instead; a question whose every option is a `provider/model` id declares its `subject`. A merge
+// train's merge question on one of its own PR slices carries the `trainSignoff` fact, its gh half read live here (PLAN
+// wl-mvg8itbt0rz3ls D2, surface/src/merge-train.ts `trainSignoff`), so Jo's ruling train-signoff can decide it.
 // MIGRATION.md item 40 (PLAN wl-muq1v31q5ly7ls D4, D6): `lane_release` writes `released-open:` in the
 // release's own transaction when open or paused slices remain and no holder receipt stands, and the
 // terminal pair refuses while a hand this lane spawned is unsettled (surface/src/turn-end.ts);
@@ -46,7 +48,9 @@ import {
 	builderLabs, isBuilder, isReviewRouting, labOf, parkQuestions, parseHandSpawn, parseReviewSameLabRule, settledTokens, spentGrants, withheldTokens,
 } from "../../classifier/src/lab";
 import { countRounds, parseReviewGroup, parseReviewLimit, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
-import { type AskResult, askJo, decidedText, installedReviewModel, MODEL_SUBJECTS, type ModelSubject, RULING_APPLIED_PREFIX, rulingActive, subjectProblem } from "../../gates/src/rulings";
+import {
+	type AskResult, askJo, decidedText, installedReviewModel, MODEL_SUBJECTS, type ModelSubject, questionKind, RULING_APPLIED_PREFIX, rulingActive, subjectProblem, type TrainSignoffFact,
+} from "../../gates/src/rulings";
 import { gateSession } from "../../gates/src/session";
 import type { EntryRow, Ledger, QuestionRow, RoutingRow, WorkloadStatusRow } from "../../ledger/src/index";
 import { repoOf } from "../src/decision-log";
@@ -56,7 +60,11 @@ import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, doneBecause, heldLive, holdersOf, JO_HOLDER, PLAN_QUESTION_LINE_MAX, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_HEADING,
 	PLAN_FILE_MAX_BYTES, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planAutoStartNoticeBody, planFirst, planHalted, planQuestionBody, planQuestionProblem, planSlice, reservedPrefix,
 } from "../src/launch";
-import { checkoutOwnerRepo, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs } from "../src/merge-train";
+import {
+	checkoutOwnerRepo, mainProtectionGap, type Protection, recordTrainTask, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_DETAIL_MAX_BYTES, TRAIN_TASK_KINDS, type TrainTaskKind, trainPrs,
+	trainSignoff, trainSlicePr,
+} from "../src/merge-train";
+import { DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { NOTICE_PREFIX, sendNotice } from "../src/notice";
 import { PAIR_OPTION } from "../src/pair-suggest";
 import { testRuns } from "../src/test-run";
@@ -309,6 +317,46 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		return text(`hand(s) ${hands.map((h) => h.token).join(", ")} you spawned are still unsettled; keep your turn alive until each result is delivered, then release. Nothing was ${verb}.`);
 	};
 
+	/**
+	 * PLAN wl-mvg8itbt0rz3ls D2: the live reads `trainSignoff` needs for PR `pr` on train `workloadId`, through the same `pi.exec`
+	 * `lane_train_return` uses: `gh pr view <pr> --json TASK_VIEW_FIELDS`, main's rules, and every ruleset those rules name, then
+	 * `mainProtectionGap` over the prefetched answers. No repo, no exec, a failed gh call or a shape `taskViewOf` rejects: the reason.
+	 */
+	const signoffReads = async (
+		ledger: Ledger, workloadId: string, pr: number,
+	): Promise<{ ok: true; pr: number; view: TaskView; trainRepo: string; protection: Protection } | { ok: false; reason: string }> => {
+		const no = (reason: string) => ({ ok: false as const, reason });
+		const checkout = repoOf(ledger, workloadId);
+		const trainRepo = checkout === null ? null : checkoutOwnerRepo(checkout);
+		if (trainRepo === null) return no(`${workloadId} has no repo: checkout with a GitHub origin`);
+		const exec = pi.exec;
+		if (!exec) return no("the host has no exec for extensions, so gh could not be read");
+		const gh = async (args: string[]): Promise<unknown> => {
+			const r = await exec("gh", args, { timeout: STARTER_TIMEOUT_MS });
+			if (r.code !== 0 || r.killed) throw new Error(`gh ${args.join(" ")} failed (exit ${r.code}): ${r.stderr.trim() || r.stdout.trim()}`);
+			return JSON.parse(r.stdout);
+		};
+		try {
+			const view = taskViewOf(await gh(["pr", "view", String(pr), "-R", trainRepo, "--json", TASK_VIEW_FIELDS]));
+			if (view === null) return no(`gh pr view ${pr} -R ${trainRepo} returned an unexpected shape`);
+			const rules = await gh(["api", `repos/${trainRepo}/rules/branches/${DEFAULT_BRANCH}`]);
+			const ids = new Set<number>();
+			for (const rule of Array.isArray(rules) ? (rules as unknown[]) : []) {
+				const id = typeof rule === "object" && rule !== null && "ruleset_id" in rule ? rule.ruleset_id : undefined;
+				if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) ids.add(id);
+			}
+			const rulesets = new Map<number, unknown>();
+			for (const id of ids) rulesets.set(id, await gh(["api", `repos/${trainRepo}/rulesets/${id}`]));
+			const protection = mainProtectionGap(rules, (id) => {
+				if (!rulesets.has(id)) throw new Error(`ruleset ${id} was not read`);
+				return rulesets.get(id);
+			});
+			return { ok: true, pr, view, trainRepo, protection };
+		} catch (err) {
+			return no(`gh could not be read: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	};
+
 	pi.registerTool({
 		name: LANE_ADD_SLICE_TOOL,
 		loadMode: "essential",
@@ -489,7 +537,14 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const subject = typeof params.subject === "string" && params.subject !== "" ? (params.subject as ModelSubject) : null;
 			const subjectWrong = subjectProblem(options, subject);
 			if (subjectWrong !== null) return text(`${subjectWrong}; nothing was asked.`);
+			// PLAN wl-mvg8itbt0rz3ls D2: a train's merge question on one of its own PR slices carries the `trainSignoff` fact Jo's
+			// ruling train-signoff reads; gh is read here, before the write, and the ledger half is computed inside it.
+			const train = trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0;
+			const signoffPr = train && questionKind(options, subject) === "merge" ? trainSlicePr(slice, workloadId) : null;
+			const reads = signoffPr === null ? null : await signoffReads(ledger, workloadId, signoffPr);
 			const asked: AskResult = ledger.write(() => {
+				const signoff: TrainSignoffFact | null =
+					reads === null ? null : reads.ok ? trainSignoff(ledger, workloadId, reads.pr, reads.view, reads.trainRepo, reads.protection) : { ok: false, reason: reads.reason };
 				const r = askJo(
 					ledger,
 					{ by: o.own.laneId, workloadId, sliceId: slice, body, options, subject },
@@ -497,7 +552,8 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 						asker: "lane",
 						builders: builderLabs(ledger, workloadId),
 						stakes: o.own.workload.stakes,
-						train: trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0,
+						train,
+						...(signoff === null ? {} : { trainSignoff: signoff }),
 						reviewModel: () => installedReviewModel(env),
 					},
 				);

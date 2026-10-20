@@ -1,7 +1,9 @@
 // The merge-train workload kind (PLAN wl-mv8s8srodefytc rev 17.1 § 1, part 1): Jo's `train <N> [<N> …]` opens a
 // workload that takes green PRs one at a time, merges main in without rebasing, lets the resolver
 // (surface/scripts/merge-train.ts) fix the conflicts it knows, runs the full suite, then merges a normal-stakes PR
-// itself and asks Jo about a production-stakes one; a PR it cannot land goes back to its owner as a task (part 2).
+// itself and asks Jo about a production-stakes one, unless Jo's ruling train-signoff decides that question (his train word
+// is the sign-off, PLAN wl-mvg8itbt0rz3ls D1-D3: `trainSignoff`), when it merges it as a normal one; a PR it cannot land
+// goes back to its owner as a task (part 2).
 // This module holds the procedure text the lane reads as its brief (`trainBrief`), a PR's stakes (`prStakes`, D1; it
 // reads the ledger and the `repo:` checkout's origin), the check on main's protection (`mainProtectionGap`, D2), the
 // bodies of Jo's instruction and the surface's `train:` entry, the train's PR order (`trainPrs`), the slice id rule
@@ -18,18 +20,19 @@
 // repository's usable train (opening one when there is none), and `trainBrief` reads its members from `merge-train.ts list`.
 // Part 4 (PLAN wl-mvbjiettjrfpxc D1, D6, D7): the train tick's boarding scan (`autoboardCandidates`, `boardedWorkloads`,
 // `boardSkips`), main's protection read live (`protectionGap`) with its episodes, and the main-red notices, on the standing workload.
-import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
+import { parseHandSpawn } from "../../classifier/src/lab";
+import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import { meter } from "./rank-launch";
 import {
 	type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard, parseTrainFix,
 	planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
-import { askJo, raisedId } from "../../gates/src/rulings";
+import { askJo, raisedId, type TrainSignoffFact } from "../../gates/src/rulings";
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
 import { NOTICE_PREFIX } from "./notice";
-import { ownerRepoOf, pushDestBody, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns } from "./test-run";
+import { ownerRepoOf, pushDestBody, type RunRecord, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns } from "./test-run";
 import {
 	ESCALATION_BY, HOLD_HOURS, LANE_FULL_TEST_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -381,7 +384,8 @@ export const HOLD_PREFIX = "hold: main protection unverified";
  * lane-written `train-hold:` and is passed over, its slices open, until the tick's `hold-expired` wake. Step 6 takes a green, or a `red-main` (every failure also fails on main: the lane
  * files or finds the `main-red` issue, records `main-red:`, and goes on). Step 7 lands a green PR: one readiness check for both
  * stakes (the tested head, mergeable, main contained), the stakes read again, then a normal PR merges itself (merge with
- * `--match-head-commit`, verify, record) and a production PR gets Jo's question while the train goes on. A moved head goes
+ * `--match-head-commit`, verify, record) and a production PR's question goes through Jo's rulings (PLAN wl-mvg8itbt0rz3ls
+ * D3): decided by `train-signoff`, the lane merges it at once as c. to e.; otherwise it is Jo's question while the train goes on. A moved head goes
  * back to step 2's fresh worktree, a moved main to step 3. A red, a conflict or a stack problem goes back to the PR's owner
  * through `lane_train_return` (D6), and the train passes over the PR; a second refused merge or runner error is a lane-written
  * `train-error:` the tick retries. Before done-because the lane reads `list` once more and works any PR it has not seen.
@@ -478,7 +482,9 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 		`   e. Record: complete \`${sl}\` with artifact \`merged by train <merge commit sha> (run <id>)\`, then the next PR.`,
 		`   Production stakes, reached only from b. after a. passed: raise the question on \`${sl}\`: PR green and mergeable at <the ` +
 			"head a. read> on main <the origin/main a. fetched>, run <the green run at that head>, <pass>/<fail>/<skip>, b.'s stakes " +
-			"reason, the chain, item file if any; options merged / skip / stop. Do not wait for it: go on to the next PR while it is " +
+			"reason, the chain, item file if any; options merged / skip / stop. The question goes through Jo's rulings: when " +
+			"lane_raise_question answers `decided by Jo's ruling train-signoff` (Jo's train word on this PR is his sign-off), no question " +
+			"was raised: do what it says at once, c. to e. with the head a. read, no question and no wait. Otherwise do not wait for it: go on to the next PR while it is " +
 			`open. merged → \`gh pr view\` shows MERGED, complete \`${sl}\` with artifact \`merged by Jo <merge commit>\`; skip → Jo's ` +
 			"answer cancels the PR's open train slices; stop → record it and release the lane with no done-because (slices stay open, " +
 			`the workload stays open; Jo's ${append} relaunches it).`,
@@ -490,8 +496,9 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			"(`train-task-settled:`), the train's next pass works the PR from step 1 at its current head: green → merge; red, conflict or " +
 			`stack → return it again (the tool sets the next attempt). When ${LANE_TRAIN_RETURN_TOOL} refuses because attempt 2 settled failed, pass the ` +
 			"PR over: the tick raises Jo's alert. A PR passed over with `train-error:` is worked again on a later pass.",
-		"Rules: one live run per workload; no code edit beyond the resolver's output; merge only at step 7 c., on b.'s `normal`, as a " +
-			"merge commit; a production PR's merge is Jo's; a held PR is never merged while its hold stands. Record per PR with lane_record_entry: stakes and reason, head tested, run id, " +
+		"Rules: one live run per workload; no code edit beyond the resolver's output; merge only at step 7 c., on b.'s `normal` or Jo's " +
+			"ruling train-signoff deciding the production question, as a merge commit; a production PR's merge is Jo's: his merged answer, " +
+			"or his ruling train-signoff deciding the question; a held PR is never merged while its hold stands. Record per PR with lane_record_entry: stakes and reason, head tested, run id, " +
 			"verdict and counts, item file written if any, and its outcome.",
 		`The train's stop: after Jo answers stop on a question on one of this train's slices, the test runner refuses lane_full_test for every PR until Jo's next ${append}. No other question holds a run.`,
 		`Terminal outcomes: \`${sl}\` completed (\`merged by train …\`, \`merged by Jo …\`, \`skipped: <state>\`) ` +
@@ -1643,6 +1650,73 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	return { ready: true, workloadId: wl, pr: pr!, sha: sha!, run: newestRun.request.runId, review: review.entryId, checkout, repo, closedAt: w.closed_at };
 }
 
+/**
+ * PLAN wl-mvg8itbt0rz3ls D2 rule 3, stricter than the auto-board `reviewPassed`: W's review is settled and passed. The reviewed
+ * slices are every slice of W that is not a plan question's slice and has any `review-group:`, review `hand-spawn: … review yes`
+ * or `review-round:` entry; at least one exists; each one's newest `review-loop-end:` (from a holder lane or the surface, as
+ * `reviewPassed` reads it) is `pass` or `accept`, and after it that slice has no `review-group:`, review `hand-spawn:` or
+ * `review-round:` (the later-entry rule of `planAutoStartRound`, surface/extensions/lane-tools.ts): a review dispatched after a
+ * pass and not yet settled fails. Otherwise the first failing slice, as a reason.
+ */
+export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | { ok: false; reason: string } {
+	const no = (reason: string) => ({ ok: false as const, reason });
+	const entries = ledger.entries(wl);
+	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
+	const planQuestions = new Set(controlEntries(entries, holders).filter((c) => c.prefix === "plan-question").map((c) => c.rest.split(/\s/)[0]));
+	const planSlices = new Set(ledger.questions(wl).filter((q) => planQuestions.has(q.id)).map((q) => q.slice_id));
+	/** The slice a review dispatch or round entry is about, or null for any other entry. */
+	const reviewOf = (e: EntryRow): string | null => {
+		if (e.kind !== "assumption") return null;
+		const body = e.body.trim();
+		if (parseHandSpawn(body)?.review === true) return e.slice_id;
+		return parseReviewGroup(body)?.slice ?? parseReviewRound(body)?.slice ?? null;
+	};
+	const reviewed = [...new Set(entries.map(reviewOf).filter((sl): sl is string => sl !== null && !planSlices.has(sl)))];
+	if (reviewed.length === 0) return no(`${wl} has no review on any slice`);
+	for (const sl of reviewed) {
+		const endAt = entries.findLastIndex(
+			(e) => e.kind === "assumption" && (holders.includes(e.created_by) || e.created_by === SURFACE_BY) && parseReviewLoopEnd(e.body)?.slice === sl,
+		);
+		if (endAt < 0) return no(`the review of ${sl} on ${wl} has not ended`);
+		const reason = parseReviewLoopEnd(entries[endAt]!.body)!.reason;
+		if (reason !== "pass" && reason !== "accept") return no(`the review of ${sl} on ${wl} ended ${reason}, not pass or accept`);
+		if (entries.slice(endAt + 1).some((e) => reviewOf(e) === sl)) return no(`a review of ${sl} on ${wl} was dispatched after its loop ended ${reason} and has not settled`);
+	}
+	return { ok: true };
+}
+
+/**
+ * PLAN wl-mvg8itbt0rz3ls D2: the `trainSignoff` fact Jo's ruling `train-signoff` (gates/src/rulings.ts) reads for PR `pr` on train
+ * `train` (repository `trainRepo`), from the ledger, gh's `view` of the PR (TASK_VIEW_FIELDS) and main's `protection` as read
+ * live (`mainProtectionGap`). Ok only when all hold, else the first failing rule as the reason:
+ * (1) an authenticated Jo `train:` binding on the train names `pr` (`trainBindings` with source jo, every binding: a later
+ *     `train <N>` or resume counts, a PR only the tick boarded does not);
+ * (2) `branchWorkload` (prStakes' D1 lookup) finds the PR's workload W, and W's stakes are production;
+ * (3) W's review is settled and passed (`reviewSettledPassed`);
+ * (4) the newest full-suite run on `pr` with a result, on the train or on W (`testRuns`, request order), is green or red-main
+ *     at the PR's current head `view.headRefOid`;
+ * (5) `protection` is ok.
+ */
+export function trainSignoff(ledger: Ledger, train: string, pr: number, view: TaskView, trainRepo: string, protection: Protection): TrainSignoffFact {
+	const no = (reason: string): TrainSignoffFact => ({ ok: false, reason });
+	const trainEntries = ledger.entries(train);
+	if (view.number !== pr) return no(`gh's view is of #${view.number}, not #${pr}`);
+	if (!trainBindings(trainEntries, ledger.instructions(train)).some((b) => b.source === "jo" && b.prs.includes(pr))) return no(`no train word of Jo's on ${train} names #${pr}`);
+	const b = branchWorkload(view, trainRepo, ledger);
+	if (!b.ok) return no(b.reason);
+	if (b.w.stakes !== "production") return no(`${b.id}'s stakes are ${b.w.stakes}, not production`);
+	const review = reviewSettledPassed(ledger, b.id);
+	if (!review.ok) return no(review.reason);
+	const runs = [...testRuns(trainEntries), ...testRuns(ledger.entries(b.id))].filter((r) => r.request.pr === pr && r.result !== null);
+	const newest = runs.reduce<RunRecord | null>((a, r) => (a === null || r.request.createdAt >= a.request.createdAt ? r : a), null);
+	if (newest === null) return no(`no full-suite run on #${pr} has a result`);
+	const result = newest.result!;
+	if (!SETTLING_VERDICTS.includes(result.verdict)) return no(`the newest run ${result.runId} on #${pr} is ${result.verdict}`);
+	if (result.sha !== view.headRefOid) return no(`the newest run ${result.runId} on #${pr} tested ${result.sha}, not its head ${view.headRefOid}`);
+	if (protection.state !== "ok") return no(`main's protection on ${trainRepo} is ${protection.state}: ${protection.text}`);
+	return { ok: true, pr, slice: trainSliceId(train, pr), repo: trainRepo, head: view.headRefOid, run: result.runId };
+}
+
 /** Train `wl`'s newest metered spend (`meter`, surface/src/rank-launch.ts) against its ceiling (D3): true while both halves are under TRAIN_ROTATE_SHARE. */
 function underRotateShare(ledger: Ledger, wl: string): boolean {
 	const { ceiling, spend } = meter(ledger, wl);
@@ -1650,7 +1724,7 @@ function underRotateShare(ledger: Ledger, wl: string): boolean {
 }
 
 /** Every workload, open or closed, that ever carried a membership entry (`train:` or `train-board:`) and is a train, oldest first. */
-function everyTrain(ledger: Ledger): string[] {
+export function everyTrain(ledger: Ledger): string[] {
 	return ledger.db.query<{ id: string }, [string, string]>(
 		`SELECT w.id AS id FROM workloads w WHERE EXISTS (
 		   SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption' AND (
