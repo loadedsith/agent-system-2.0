@@ -328,3 +328,15 @@ pairSuggest: all
 jevRank:
   mode: show
   parallelBudgetUsd: 0
+
+# ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
+# The other agents that may message Ilex, the orchestrator surface, each with its transport and authority.
+# omp-mailbox: the OMP seat mailbox ($OMP_PERSISTENT_SEAT_MAILBOX_ROOT, else ~/.omp/agent/seat-mailboxes), drained
+# from inbox/ilex/ at session start and every 2 s. notes: the only authority this phase builds; a message is a note
+# Ilex reads, or a proposal Jo may take by typing his own word, and nothing in it is ever applied or authored as Jo.
+# Read at the orchestrator's session start: an unknown key, transport or authority refuses the whole block with a
+# notice, and the channel is off for that session. OMP has no registration for the key and keeps it in the raw layer.
+# Reversal: delete the block (no block, no channel).
+channel:
+  senders:
+    - { id: plumb, transport: omp-mailbox, authority: notes }
