@@ -989,10 +989,16 @@ function scriptFileCrossing(run: ScriptRun, family: CodeFamily, x: Expansion, pa
 	const written = writtenScript(x, path, js);
 	if (written === null) return `${lead} ${path}, which this same call writes from text the gate cannot read`;
 	// A file of a tree's isolated `bun test` run (bunTestRuns) runs unread, unless this call writes into it or into that
-	// tree's isolation code (ISOLATE_PRELOAD, ISOLATE_MODULE), or into one of them from text the gate cannot read.
+	// tree's isolation code (ISOLATE_PRELOAD, ISOLATE_MODULE), or into one of them from text the gate cannot read. In a
+	// git checkout only the checkout's own files do (checkoutFile): isolation is not trust, so an untracked test file
+	// there is read, as before round 3 (G1 review round 4).
 	const iso = run.isolation;
 	const isolated = iso !== undefined && writtenScript(x, iso + ISOLATE_PRELOAD, false)?.length === 0 && writtenScript(x, join(iso, ISOLATE_MODULE), true)?.length === 0;
-	if (isolated && written.length === 0) return null;
+	if (isolated && written.length === 0) {
+		const file = scriptFile(path, js);
+		const canonical = file ? canonicalOrLexical(file) : null;
+		if (canonical === null || checkoutRoot(canonical) === null || checkoutFile(canonical)) return null;
+	}
 	return fileCrossing(lead, path, written, family, paths, run.readCheckout === true || (iso !== undefined && !isolated), 0);
 }
 

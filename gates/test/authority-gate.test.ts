@@ -31,6 +31,7 @@
 // its isolating bunfig, as does a CLI `--preload` of a tree's isolate-preload.ts running that tree's test files.
 // The probe strings below load modules on purpose: they are the module-loading boundary under test.
 import { afterAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -106,6 +107,12 @@ for (const tree of [ARCHIVE, FORGED]) {
 	}
 }
 writeFileSync(join(FORGED, "ledger", "test", "isolate-preload.ts"), FORGE);
+/** Round 4, the major: the same tree as a git checkout (its six files tracked) holding an UNTRACKED test file that forges. */
+const GIT_TREE = join(R3_ROOT, "checkout");
+cpSync(ARCHIVE, GIT_TREE, { recursive: true });
+for (const args of [["init", "-q"], ["add", "."]]) spawnSync("git", ["-C", GIT_TREE, ...args]);
+writeFileSync(join(GIT_TREE, "forge.test.ts"), FORGE);
+writeFileSync(join(GIT_TREE, "ledger", "test", "forge.test.ts"), FORGE);
 const ctxFor = (role: Role): CallContext => ({ role, cwd, env: { HOME, AS2_SCRATCH: cwd, AGENT_SYSTEM_LANE_ID: role === "orchestrator" ? undefined : "lane-x", AGENT_SYSTEM_WORKLOAD_ID: role === "orchestrator" ? undefined : "wl-x" } });
 const ROLES: Role[] = ["lane", "hand", "orchestrator"];
 const BOUNDARY = "Jo-only boundary";
@@ -349,6 +356,11 @@ const R3_NOT_ISOLATED: Probe[] = [
 	{ tool: "bash", command: `cd ${FORGED} && bun test ./ledger/test/authority.test.ts` },
 	{ tool: "bash", command: `bun test --preload ${FORGED}/ledger/test/isolate-preload.ts ${FORGED}/ledger/test/authority.test.ts` },
 	{ tool: "bash", command: `cat > ${ARCHIVE}/ledger/src/locality.ts <<'EOF'\n${FORGE}EOF\ncd ${ARCHIVE} && bun test ./ledger/test/authority.test.ts` },
+	// Review round 4: in a git checkout, isolation does not make an untracked test file the checkout's own code.
+	{ tool: "bash", command: `cd ${GIT_TREE} && bun test ./forge.test.ts` },
+	{ tool: "bash", command: `cd ${GIT_TREE} && bun test ./ledger/test/forge.test.ts` },
+	{ tool: "bash", command: `cd ${GIT_TREE}/ledger/test && bun test forge.test.ts` },
+	{ tool: "bash", command: `bun test --preload ${GIT_TREE}/ledger/test/isolate-preload.ts ${GIT_TREE}/forge.test.ts` },
 ];
 
 const ALLOWED: Probe[] = [
@@ -552,6 +564,7 @@ const ALLOWED_R3: Probe[] = [
 	{ tool: "bash", command: `cd ${cwd} && bun test --preload=${ARCHIVE}/ledger/test/isolate-preload.ts ${ARCHIVE}/ledger/test/authority.test.ts` },
 	{ tool: "bash", command: `cd ${cwd} && bun test --preload ${REPO}/ledger/test/isolate-preload.ts ${REPO}/ledger/test/authority.test.ts` },
 	{ tool: "bash", command: `cd ${cwd} && bun test -r ${REPO}/ledger/test/isolate-preload.ts ${REPO}/ledger/test/authority.test.ts` },
+	{ tool: "bash", command: `cd ${GIT_TREE} && bun test ./ledger/test/authority.test.ts` },
 ];
 
 describe("G1 review 3 stays allowed: finding 4, an archive copy's or a CLI --preload's isolated tests", () => {
