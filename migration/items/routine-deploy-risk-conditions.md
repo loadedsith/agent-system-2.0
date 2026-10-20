@@ -2,7 +2,7 @@
 title: Routine deploys run without Jo; a deploy escalates only on a named risk condition
 status: in-progress
 workload: wl-mvgorfqqbuyyo0
-pr: pending
+pr: https://github.com/thewolff/agent-system-2.0/pull/291
 ---
 Routine deploys (Jo, `in-mvgor1imswhbsw` and `in-mvgpe7k1np4xkw`; plan `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvgorfqqbuyyo0/PLAN.md` rev 9; builds on escalation phase 2, PR #278). Before this change row 6 refused every deploy command, and a merge to a repo that deploys on push was not seen as a deploy at all.
 
