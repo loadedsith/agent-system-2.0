@@ -1105,6 +1105,7 @@ ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
+surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
@@ -1129,6 +1130,8 @@ surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/scripts/test-run-waits.ts	module	-
+surface/test/test-run-waits.test.ts	test	-
 surface/src/merge-train.ts	module	-
 surface/src/merge-train-resolve.ts	module	-
 surface/src/merge-train-stack.ts	module	-
