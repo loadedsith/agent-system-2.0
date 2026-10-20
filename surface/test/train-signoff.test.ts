@@ -11,10 +11,10 @@ import orchestratorSurface from "../index";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
-import { trainBoardBody } from "../src/launch";
+import { JO_HOLDER, planAutoApprovedBody, trainBoardBody } from "../src/launch";
 import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
-import { LANE_RAISE_QUESTION_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, LANE_RAISE_QUESTION_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, tempLedger, tmp } from "./helpers";
 
 const REPO = "thewolff/product";
@@ -59,7 +59,8 @@ interface World {
 	reviewed: (token: string) => void;
 	loopEnd: (reason: LoopEndReason) => void;
 	answers: Record<keyof Gh, Answer>;
-	ask: (options?: string[]) => Promise<{ text: string; calls: { command: string; args: string[] }[] }>;
+	/** `duringGh` runs inside the fake gh's `pr view`, before its answer reaches the tool: after the tool's guards, before its write. */
+	ask: (options?: string[], duringGh?: () => void) => Promise<{ text: string; calls: { command: string; args: string[] }[] }>;
 	applied: () => (string | null)[][];
 }
 
@@ -67,8 +68,8 @@ interface World {
  * The world: W (branch `wl/<W>`, production, on a checkout of REPO, held by OWNER_LANE) and a train on REPO held by TRAIN_LANE
  * (`source` jo: opened by Jo's `train 101`; board: opened by the tick's `train-board:` alone). Defaults make the decided case.
  */
-function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production" } = {}): World {
-	const { ledger, path } = tempLedger();
+function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production"; now?: () => string } = {}): World {
+	const { ledger, path } = tempLedger(o.now);
 	const owner = ledger.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header", stakes: o.stakes ?? "production", mode: "autonomous" });
 	recordRepo(ledger, owner, checkout());
 	expect(ledger.claimWorkload(owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 600_000 }).won).toBe(true);
@@ -120,13 +121,16 @@ function world(o: { source?: "jo" | "board"; stakes?: "normal" | "production" } 
 	const answers: Record<keyof Gh, Answer> = { ...gh };
 
 	/** Ask the merge question through the real tool, as TRAIN_LANE; the reply text and the gh calls it made. */
-	const ask = async (options = OPTIONS) => {
+	const ask = async (options = OPTIONS, duringGh?: () => void) => {
 		const env = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: train, AGENT_SYSTEM_LANE_ID: TRAIN_LANE, HOME: "/nonexistent-home" };
 		const f = fakePi(undefined, { exec: true });
 		const reply = (a: Answer) => (a === FAIL ? { stdout: "", stderr: "HTTP 502", code: 1, killed: false } : { stdout: JSON.stringify(a), stderr: "", code: 0, killed: false });
 		f.execs.answer = (command, args) => {
 			if (command !== "gh") return { stdout: "", stderr: "not gh", code: 127, killed: false };
-			if (args[0] === "pr" && args[1] === "view") return reply(answers.view);
+			if (args[0] === "pr" && args[1] === "view") {
+				duringGh?.();
+				return reply(answers.view);
+			}
 			if (args[1] === `repos/${REPO}/rules/branches/main`) return reply(answers.rules);
 			if (args[1] === `repos/${REPO}/rulesets/${RULESET}`) return reply(answers.ruleset);
 			return { stdout: "", stderr: `unexpected gh ${args.join(" ")}`, code: 1, killed: false };
@@ -352,6 +356,103 @@ describe("R3: Jo's end-ruling train-signoff ends it with no code change", () => 
 		passing(w);
 		endRuling(w.ledger);
 		expectRaised(w, (await w.ask()).text);
+	});
+});
+
+describe("code review r1: the decision re-reads authority, leaves an open question Jo's, skips an auto-started plan's review, orders runs as the ledger does", () => {
+	/** Nothing was written: no question row, the slice as it was left, no `ruling-applied:`. */
+	const expectNothing = (w: World, state: string) => {
+		expect(w.ledger.questions(w.train)).toEqual([]);
+		expect(w.ledger.slice(w.sl)!.state).toBe(state);
+		expect(w.applied()).toEqual([]);
+	};
+
+	test("finding 1: Jo takes the train while gh is read: refused as the guard refuses, no decision", async () => {
+		const w = world();
+		passing(w);
+		const { text } = await w.ask(OPTIONS, () => {
+			expect(w.ledger.releaseWorkload(w.train, { by: TRAIN_LANE, holder: TRAIN_LANE }).released).toBe(true);
+			expect(w.ledger.claimWorkload(w.train, { by: SURFACE_BY, holder: JO_HOLDER, leaseMs: null }).won).toBe(true);
+		});
+		expect(text).toBe(`Workload ${w.train} is held by ${JO_HOLDER}, not by this lane (${TRAIN_LANE}) under a live lease; nothing was asked.`);
+		expectNothing(w, "open");
+	});
+
+	test("finding 1: the train lane's lease lapses while gh is read: refused, no decision", async () => {
+		const w = world();
+		passing(w);
+		const { text } = await w.ask(OPTIONS, () => {
+			expect(w.ledger.claimWorkload(w.train, { by: LANE_STARTER_BY, holder: TRAIN_LANE, leaseMs: -60_000 }).won).toBe(true);
+		});
+		expect(text).toBe(`Workload ${w.train} is held by ${TRAIN_LANE} under a lapsed lease, not by this lane (${TRAIN_LANE}) under a live lease; nothing was asked.`);
+		expectNothing(w, "open");
+	});
+
+	test("finding 1: the PR slice is cancelled while gh is read: refused, no decision", async () => {
+		const w = world();
+		passing(w);
+		const { text } = await w.ask(OPTIONS, () => w.ledger.cancelSlice(w.sl, { by: SURFACE_BY }));
+		expect(text).toBe(`Slice ${w.sl} is cancelled; nothing was asked.`);
+		expectNothing(w, "cancelled");
+	});
+
+	test("finding 2: a merge question already open on the PR slice stays Jo's: asked again with every rule ok, a second question is raised", async () => {
+		const w = world();
+		passing(w);
+		const before = w.ledger.raiseQuestion({ by: TRAIN_LANE, workloadId: w.train, sliceId: w.sl, body: `#${PR} merged / skip / stop?`, options: OPTIONS });
+		const { text } = await w.ask();
+		expect(text).toStartWith("Raised question ");
+		const open = w.ledger.questions(w.train).filter((q) => q.slice_id === w.sl && q.state === "open").map((q) => q.id);
+		expect(open).toHaveLength(2);
+		expect(open).toContain(before);
+		expect(w.ledger.slice(w.sl)!.state).toBe("paused");
+		expect(w.applied()).toEqual([]);
+	});
+
+	test("finding 3: an auto-started plan's passed review is no implementation review once W is production; a settled one then decides", async () => {
+		/** W at normal stakes, its plan reviewed (ended pass) and started by the auto-start (no question row), then raised to production. */
+		const autoStarted = (): World => {
+			const w = world({ stakes: "normal" });
+			const plan = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "plan the header move", doneCondition: "plan approved", inputs: "the brief" });
+			w.ledger.recordEntry({ by: OWNER_LANE, workloadId: w.owner, sliceId: plan, kind: "assumption", body: "hand-spawn: dp-1 session /sessions/dp-1 spawn - review yes group dg-dp-1 row openai-codex/gpt-6.1-sol" });
+			w.ledger.recordEntry({ by: CLASSIFIER_BY, workloadId: w.owner, sliceId: plan, kind: "assumption", body: reviewRoundBody({ slice: plan, round: 1, token: "dp-1", group: "dg-dp-1", verdict: "accepted", findings: UNKNOWN }) });
+			w.ledger.recordEntry({ by: OWNER_LANE, workloadId: w.owner, sliceId: plan, kind: "assumption", body: reviewLoopEndBody(plan, "pass") });
+			w.ledger.recordEntry({ by: ESCALATION_BY, workloadId: w.owner, sliceId: plan, kind: "assumption", body: planAutoApprovedBody("dg-dp-1") });
+			w.ledger.completeSlice(plan, { by: OWNER_LANE, artifact: "/plans/PLAN.md" });
+			w.ledger.setStakes(w.owner, { by: SURFACE_BY, stakes: "production" });
+			w.run(w.train, w.full, H1, "green");
+			return w;
+		};
+		const planOnly = autoStarted();
+		expect(planOnly.ledger.questions(planOnly.owner)).toEqual([]);
+		expectRaised(planOnly, (await planOnly.ask()).text);
+		const implemented = autoStarted();
+		implemented.reviewed("dt-1");
+		implemented.loopEnd("pass");
+		expectDecided(implemented, (await implemented.ask()).text);
+	});
+
+	test("finding 4: runs in one millisecond on the train and on W are ordered as written, in both directions", async () => {
+		/** A world on a stopped clock: every entry it writes has the same created_at. */
+		const stopped = (): World => {
+			const t = new Date().toISOString();
+			const w = world({ now: () => t });
+			w.reviewed("dt-1");
+			w.loopEnd("pass");
+			return w;
+		};
+		const wThenTrainRed = stopped();
+		wThenTrainRed.run(wThenTrainRed.owner, wThenTrainRed.ownerFull, H1, "green");
+		wThenTrainRed.run(wThenTrainRed.train, wThenTrainRed.full, H1, "red");
+		expectRaised(wThenTrainRed, (await wThenTrainRed.ask()).text);
+		const trainThenWRed = stopped();
+		trainThenWRed.run(trainThenWRed.train, trainThenWRed.full, H1, "green");
+		trainThenWRed.run(trainThenWRed.owner, trainThenWRed.ownerFull, H1, "red");
+		expectRaised(trainThenWRed, (await trainThenWRed.ask()).text);
+		const wRedThenTrainGreen = stopped();
+		wRedThenTrainGreen.run(wRedThenTrainGreen.owner, wRedThenTrainGreen.ownerFull, H1, "red");
+		wRedThenTrainGreen.run(wRedThenTrainGreen.train, wRedThenTrainGreen.full, H1, "green");
+		expectDecided(wRedThenTrainGreen, (await wRedThenTrainGreen.ask()).text);
 	});
 });
 

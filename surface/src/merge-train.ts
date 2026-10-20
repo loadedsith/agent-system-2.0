@@ -1652,7 +1652,8 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 
 /**
  * PLAN wl-mvg8itbt0rz3ls D2 rule 3, stricter than the auto-board `reviewPassed`: W's review is settled and passed. The reviewed
- * slices are every slice of W that is not a plan question's slice and has any `review-group:`, review `hand-spawn: … review yes`
+ * slices are every slice of W that is not a plan slice (a plan question's slice, or the slice of the auto-start's
+ * `plan: approved auto …`, which raises no question row) and has any `review-group:`, review `hand-spawn: … review yes`
  * or `review-round:` entry; at least one exists; each one's newest `review-loop-end:` (from a holder lane or the surface, as
  * `reviewPassed` reads it) is `pass` or `accept`, and after it that slice has no `review-group:`, review `hand-spawn:` or
  * `review-round:` (the later-entry rule of `planAutoStartRound`, surface/extensions/lane-tools.ts): a review dispatched after a
@@ -1662,8 +1663,13 @@ export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | 
 	const no = (reason: string) => ({ ok: false as const, reason });
 	const entries = ledger.entries(wl);
 	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
-	const planQuestions = new Set(controlEntries(entries, holders).filter((c) => c.prefix === "plan-question").map((c) => c.rest.split(/\s/)[0]));
-	const planSlices = new Set(ledger.questions(wl).filter((q) => planQuestions.has(q.id)).map((q) => q.slice_id));
+	const control = controlEntries(entries, holders);
+	const planQuestions = new Set(control.filter((c) => c.prefix === "plan-question").map((c) => c.rest.split(/\s/)[0]));
+	const sliceOf = new Map(entries.map((e) => [e.id, e.slice_id]));
+	const planSlices = new Set([
+		...ledger.questions(wl).filter((q) => planQuestions.has(q.id)).map((q) => q.slice_id),
+		...control.filter((c) => c.prefix === "plan" && /^approved auto\b/.test(c.rest)).map((c) => sliceOf.get(c.id) ?? null),
+	]);
 	/** The slice a review dispatch or round entry is about, or null for any other entry. */
 	const reviewOf = (e: EntryRow): string | null => {
 		if (e.kind !== "assumption") return null;
@@ -1689,18 +1695,22 @@ export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | 
  * PLAN wl-mvg8itbt0rz3ls D2: the `trainSignoff` fact Jo's ruling `train-signoff` (gates/src/rulings.ts) reads for PR `pr` on train
  * `train` (repository `trainRepo`), from the ledger, gh's `view` of the PR (TASK_VIEW_FIELDS) and main's `protection` as read
  * live (`mainProtectionGap`). Ok only when all hold, else the first failing rule as the reason:
+ * (0) the PR's disposition slice has no open question (D6: a merge question already open stays Jo's);
  * (1) an authenticated Jo `train:` binding on the train names `pr` (`trainBindings` with source jo, every binding: a later
  *     `train <N>` or resume counts, a PR only the tick boarded does not);
  * (2) `branchWorkload` (prStakes' D1 lookup) finds the PR's workload W, and W's stakes are production;
  * (3) W's review is settled and passed (`reviewSettledPassed`);
- * (4) the newest full-suite run on `pr` with a result, on the train or on W (`testRuns`, request order), is green or red-main
- *     at the PR's current head `view.headRefOid`;
+ * (4) the newest full-suite run on `pr` with a result, on the train or on W (`testRuns`; their requests in the ledger's own
+ *     order across both workloads, created_at then rowid), is green or red-main at the PR's current head `view.headRefOid`;
  * (5) `protection` is ok.
  */
 export function trainSignoff(ledger: Ledger, train: string, pr: number, view: TaskView, trainRepo: string, protection: Protection): TrainSignoffFact {
 	const no = (reason: string): TrainSignoffFact => ({ ok: false, reason });
 	const trainEntries = ledger.entries(train);
 	if (view.number !== pr) return no(`gh's view is of #${view.number}, not #${pr}`);
+	const slice = trainSliceId(train, pr);
+	const asked = ledger.questions(train).find((q) => q.slice_id === slice && q.state === "open");
+	if (asked !== undefined) return no(`${slice} has open question ${asked.id}: Jo's answer stands`);
 	if (!trainBindings(trainEntries, ledger.instructions(train)).some((b) => b.source === "jo" && b.prs.includes(pr))) return no(`no train word of Jo's on ${train} names #${pr}`);
 	const b = branchWorkload(view, trainRepo, ledger);
 	if (!b.ok) return no(b.reason);
@@ -1708,13 +1718,20 @@ export function trainSignoff(ledger: Ledger, train: string, pr: number, view: Ta
 	const review = reviewSettledPassed(ledger, b.id);
 	if (!review.ok) return no(review.reason);
 	const runs = [...testRuns(trainEntries), ...testRuns(ledger.entries(b.id))].filter((r) => r.request.pr === pr && r.result !== null);
-	const newest = runs.reduce<RunRecord | null>((a, r) => (a === null || r.request.createdAt >= a.request.createdAt ? r : a), null);
+	// The ledger's own order over both workloads' entries (`Ledger.entries` orders by created_at, then rowid): two requests in
+	// one millisecond are ordered as they were written, never by which workload they are on.
+	const order = new Map(
+		ledger.db.query<{ id: string }, [string, string]>("SELECT id FROM entries WHERE workload_id IN (?1, ?2) ORDER BY created_at, rowid").all(train, b.id)
+			.map((e, i) => [e.id, i] as const),
+	);
+	const at = (r: RunRecord): number => order.get(r.request.entryId)!;
+	const newest = runs.reduce<RunRecord | null>((a, r) => (a === null || at(r) > at(a) ? r : a), null);
 	if (newest === null) return no(`no full-suite run on #${pr} has a result`);
 	const result = newest.result!;
 	if (!SETTLING_VERDICTS.includes(result.verdict)) return no(`the newest run ${result.runId} on #${pr} is ${result.verdict}`);
 	if (result.sha !== view.headRefOid) return no(`the newest run ${result.runId} on #${pr} tested ${result.sha}, not its head ${view.headRefOid}`);
 	if (protection.state !== "ok") return no(`main's protection on ${trainRepo} is ${protection.state}: ${protection.text}`);
-	return { ok: true, pr, slice: trainSliceId(train, pr), repo: trainRepo, head: view.headRefOid, run: result.runId };
+	return { ok: true, pr, slice, repo: trainRepo, head: view.headRefOid, run: result.runId };
 }
 
 /** Train `wl`'s newest metered spend (`meter`, surface/src/rank-launch.ts) against its ceiling (D3): true while both halves are under TRAIN_ROTATE_SHARE. */

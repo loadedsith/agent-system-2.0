@@ -542,24 +542,31 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 			const train = trainPrs(ledger.entries(workloadId), ledger.instructions(workloadId)).length > 0;
 			const signoffPr = train && questionKind(options, subject) === "merge" ? trainSlicePr(slice, workloadId) : null;
 			const reads = signoffPr === null ? null : await signoffReads(ledger, workloadId, signoffPr);
-			const asked: AskResult = ledger.write(() => {
+			const asked: AskResult | { refused: ToolResult } = ledger.write(() => {
+				// The gh reads awaited outside any transaction: the holder, its live lease and the slice are read again here, in
+				// the write that decides or raises, and refused as the guards before the reads refuse.
+				const again = owned(ctx, "asked");
+				if (!again.ok) return { refused: again.result };
+				const still = sliceOn(again.own, slice, "asked");
+				if (!still.ok) return { refused: still.result };
 				const signoff: TrainSignoffFact | null =
 					reads === null ? null : reads.ok ? trainSignoff(ledger, workloadId, reads.pr, reads.view, reads.trainRepo, reads.protection) : { ok: false, reason: reads.reason };
 				const r = askJo(
 					ledger,
-					{ by: o.own.laneId, workloadId, sliceId: slice, body, options, subject },
+					{ by: again.own.laneId, workloadId, sliceId: slice, body, options, subject },
 					{
 						asker: "lane",
 						builders: builderLabs(ledger, workloadId),
-						stakes: o.own.workload.stakes,
+						stakes: again.own.workload.stakes,
 						train,
 						...(signoff === null ? {} : { trainSignoff: signoff }),
 						reviewModel: () => installedReviewModel(env),
 					},
 				);
-				if (plan && "raised" in r) ledger.recordEntry({ by: o.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(r.raised) });
+				if (plan && "raised" in r) ledger.recordEntry({ by: again.own.laneId, workloadId, sliceId: slice, kind: "assumption", body: planQuestionBody(r.raised) });
 				return r;
 			});
+			if ("refused" in asked) return asked.refused;
 			if ("decided" in asked) return text(`${decidedText(asked.decided)}.`, { ruling: asked.decided.ruling, answer: asked.decided.answer });
 			const id = asked.raised;
 			return text(`Raised question ${id} on ${slice} (${options.join(" / ")}); the slice is paused until Jo answers.`, { id });
