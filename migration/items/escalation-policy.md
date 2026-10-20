@@ -42,11 +42,13 @@ It retains every round and behavioral assertion; the read-only review and finger
 still exercise real git. Neither repair increases a test or readiness timeout.
 
 The merge with main retains the one-live-lane reservation and spawn guards alongside the
-notice-only ceiling meter and the unmetered paired path. Train head wakes and hold-expiry
-wakes both count at the launch-request boundary, not only when this tick's launcher succeeds:
-a capped request later served by the drain consumes the expiry once. A ceiling refusal
-writes no request, calls no launcher and leaves an expired hold due until Jo raises the ceiling.
-`surface/test/train-tick.test.ts`, under `retries of a released train and fork PRs`, covers
-the capped-expiry/drain and ceiling-refusal/raise interactions. The standing rulings,
+notice-only ceiling meter and the unmetered paired path. Train head-wake accounting remains
+unchanged: a wake counts when the tick writes the request or its launcher succeeds, deduplicated
+per request. Hold-expiry wakes count whenever a new or already-pending launch request exists,
+even when the launcher remains capped; the drain can serve that request without waking the same
+hold again. A ceiling refusal writes no request, calls no launcher and leaves an expired hold
+due until Jo raises the ceiling. `surface/test/train-tick.test.ts`, under
+`retries of a released train and fork PRs`, covers capped expiry/drain for requests newly written
+at expiry and already pending before expiry, plus the ceiling-refusal/raise interaction. The standing rulings,
 auto-start veto window and paired-workload ceiling exception are unchanged.
 

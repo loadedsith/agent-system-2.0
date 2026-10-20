@@ -330,7 +330,7 @@ export function tick(d: TickDeps): string[] {
 		// A head the train has not worked: one wake per request the tick made for it, whichever starter serves the request, so a
 		// request refused here and served by another starter still counts. A request still pending when the head is due again is
 		// the same wake, not a second (PLAN wl-mvgn310dpi5gcg D1); the head stays retried under the backoff (`trainRetries`).
-		// An expired hold is consumed at that same boundary: a capped request later served by the drain must not wake it twice.
+		// An expired hold is consumed by a new or pending request, even if the capped launcher leaves it for the drain to serve.
 		// A ceiling refusal writes no request and consumes neither a head wake nor a hold's expiry.
 		const r = why.length > 0 ? request(wl, why.join("; ")) : null;
 		if (r && (r.wrote || r.code === 0)) {
@@ -341,8 +341,8 @@ export function tick(d: TickDeps): string[] {
 				if (after.some((e, i) => i >= from && e.created_by === MERGE_TRAIN_BY && e.kind === "assumption" && e.body === body)) continue;
 				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 			}
-			for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
 		}
+		if (r) for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
 	}
 
 	// 5. Alerts.

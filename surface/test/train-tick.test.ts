@@ -11,7 +11,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "..
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody } from "../src/launch";
+import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody } from "../src/launch";
 import {
 	actionable, fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs,
 	trainRetries, trainSliceId, type TrainTask, trainWakeBody,
@@ -427,38 +427,42 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		expect(holdWakes(w, holdId)).toBe(1);
 	});
 
-	test("a capped hold-expiry request served by the drain consumes the expiry once, without a second launch", () => {
-		const w = world([101]);
-		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: `launch: ${TRAIN_LANE} cause first requested-by ${SURFACE_BY}` });
-		const holdId = held(w, TRAIN_LANE, "2026-10-01T12:00:00.000Z");
-		w.c.at("2026-10-01T12:00:00.000Z");
-		let calls = 0;
-		const pass = () => tick({
-			ledger: w.ledger, gh: w.g.gh, notify: () => true,
-			launch: () => {
-				calls += 1;
-				return { code: 6, line: "lane-x not launched: cap" };
-			},
+	for (const pending of [false, true]) {
+		test(`a capped hold-expiry request (${pending ? "pending before expiry" : "newly written"}) served by the drain consumes the expiry once, without a second launch`, () => {
+			const w = world([101]);
+			w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: `launch: ${TRAIN_LANE} cause first requested-by ${SURFACE_BY}` });
+			const holdId = held(w, TRAIN_LANE, "2026-10-01T12:00:00.000Z");
+			const pendingId = pending ? w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: w.train, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, w.c.now(), "prior wake") }) : null;
+			w.c.at("2026-10-01T12:00:00.000Z");
+			let calls = 0;
+			const pass = () => tick({
+				ledger: w.ledger, gh: w.g.gh, notify: () => true,
+				launch: () => {
+					calls += 1;
+					return { code: 6, line: "lane-x not launched: cap" };
+				},
+			});
+			const requests = () => controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY);
+			pass();
+			expect(requests()).toHaveLength(1);
+			if (pendingId !== null) expect(requests()[0]!.id).toBe(pendingId);
+			expect(holdWakes(w, holdId)).toBe(1);
+			expect(actionable(w.ledger, w.train)).toEqual([]);
+			// Another starter consumes the request the tick could not serve.
+			w.c.plusHours(0.01);
+			const r = w.ledger.reserveLane(w.train, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: LANE_RUNNER_BY, decide: decideLaunch });
+			expect(r).toMatchObject({ ok: true, cause: `request ${requests()[0]!.id}` });
+			if (!r.ok) throw new Error(r.reason);
+			expect(w.ledger.releaseWorkload(w.train, { by: r.laneId, holder: r.laneId }).released).toBe(true);
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(r.laneId, { code: 0, signal: null, outcome: "released" }) });
+			w.c.plusHours(1);
+			pass();
+			pass();
+			expect(calls).toBe(1);
+			expect(requests()).toHaveLength(1);
+			expect(holdWakes(w, holdId)).toBe(1);
 		});
-		const requests = () => controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY);
-		pass();
-		expect(requests()).toHaveLength(1);
-		expect(holdWakes(w, holdId)).toBe(1);
-		expect(actionable(w.ledger, w.train)).toEqual([]);
-		// Another starter consumes the request the tick could not serve.
-		w.c.plusHours(0.01);
-		const r = w.ledger.reserveLane(w.train, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: LANE_RUNNER_BY, decide: decideLaunch });
-		expect(r).toMatchObject({ ok: true, cause: `request ${requests()[0]!.id}` });
-		if (!r.ok) throw new Error(r.reason);
-		expect(w.ledger.releaseWorkload(w.train, { by: r.laneId, holder: r.laneId }).released).toBe(true);
-		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(r.laneId, { code: 0, signal: null, outcome: "released" }) });
-		w.c.plusHours(1);
-		pass();
-		pass();
-		expect(calls).toBe(1);
-		expect(requests()).toHaveLength(1);
-		expect(holdWakes(w, holdId)).toBe(1);
-	});
+	}
 
 	test("an expired hold at the ceiling stays unconsumed until Jo raises the ceiling, then wakes once", () => {
 		const w = world([101]);
