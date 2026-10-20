@@ -84,9 +84,11 @@ export interface TestRunnerConfig {
 	soloCapMin: number;
 	reportCapMb: number;
 	queueMaxMin: number;
+	/** Workers for the PR's full part (`bun test --parallel=<n>` when over 1, written into caps.json); base reruns stay serial. */
+	fullWorkers: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 1 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -115,6 +117,11 @@ export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerCo
 		if (v === undefined) continue;
 		if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return { ok: false, error: `testRunner.${key} is not a positive number` };
 		out[key] = v;
+	}
+	if (b.fullWorkers !== undefined) {
+		const v = b.fullWorkers;
+		if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return { ok: false, error: "testRunner.fullWorkers is not an integer of 1 or more" };
+		out.fullWorkers = v;
 	}
 	return { ok: true, config: out };
 }
