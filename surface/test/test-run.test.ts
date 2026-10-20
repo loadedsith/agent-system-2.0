@@ -14,8 +14,8 @@ import {
 	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
-	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queuedTooLong, type RangeCommit, recordLive, reportCapBytes,
-	reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
+	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
+	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf,
 } from "../src/test-run";
@@ -773,6 +773,42 @@ describe("liveness from the heartbeat", () => {
 	test("the full-suite slice the starter adds", () => {
 		expect(fullSuiteSlice("wl-muraerdsgw7gn4", 17, [])).toEqual({ id: "sl-full-muraerdsgw7gn4-1", task: "full suite outside the fence at PR #17", doneCondition: "a green test-run at the PR head" });
 		expect(fullSuiteSlice("wl-m", 3, ["sl-full-m-1", "sl-full-m-4", "sl-full-mx-9", "sl-other"]).id).toBe("sl-full-m-5");
+	});
+	test("T4: a queued waiter is live on its own record: none or settled is dead; a fresh heartbeat keeps an old request live; no heartbeat lives only in the startup lease", () => {
+		const r1 = request("tr-1", 17, A);
+		const rec = testRuns([reqEntry(r1)])[0]!;
+		const requestedAt = Date.parse(rec.request.createdAt);
+		expect(queueWaiterLive(undefined, requestedAt, requestedAt + 1_000)).toBe(false);
+		const settled = testRuns([reqEntry(r1), runEntry(runnerDiedRun(r1))])[0]!;
+		expect(queueWaiterLive(settled, requestedAt + 1_000, requestedAt + 2_000)).toBe(false);
+		expect(queueWaiterLive(rec, requestedAt + 599_000, requestedAt + 600_000)).toBe(true);
+		expect(queueWaiterLive(rec, requestedAt + 539_000, requestedAt + 600_000)).toBe(false);
+		expect(queueWaiterLive(rec, null, requestedAt + 5_000)).toBe(true);
+		expect(queueWaiterLive(rec, null, requestedAt + 121_000)).toBe(false);
+	});
+	test("T4: queueAhead orders by requestedAt then run id, reports the dead rows ahead, stops at the first live one, never judges rows behind", () => {
+		const row = (runId: string, requestedAt: number): QueueRow => ({ runId, workloadId: "wl-t", requestedAt });
+		const rows = [row("tr-c", 30), row("tr-self", 20), row("tr-b", 10), row("tr-a", 10), row("tr-z", 5)];
+		const judged: string[] = [];
+		const liveSet = (live: string[]) => (q: QueueRow) => {
+			judged.push(q.runId);
+			return live.includes(q.runId);
+		};
+		expect(queueAhead(rows, "tr-self", liveSet([]))).toEqual({ blocker: null, dead: ["tr-z", "tr-a", "tr-b"] });
+		expect(judged).toEqual(["tr-z", "tr-a", "tr-b"]);
+		judged.length = 0;
+		expect(queueAhead(rows, "tr-self", liveSet(["tr-b", "tr-c"]))).toEqual({ blocker: "tr-b", dead: ["tr-z", "tr-a"] });
+		judged.length = 0;
+		expect(queueAhead(rows, "tr-self", liveSet(["tr-z", "tr-a"]))).toEqual({ blocker: "tr-z", dead: [] });
+		expect(judged).toEqual(["tr-z"]);
+		// the oldest waiter has no one ahead; rows behind it, live or not, are never judged
+		judged.length = 0;
+		expect(queueAhead(rows, "tr-z", liveSet(["tr-a", "tr-c"]))).toEqual({ blocker: null, dead: [] });
+		expect(judged).toEqual([]);
+		// a tie on requestedAt goes by run id: tr-a is ahead of tr-b
+		expect(queueAhead(rows, "tr-b", liveSet(["tr-a"]))).toEqual({ blocker: "tr-a", dead: ["tr-z"] });
+		expect(queueAhead(rows, "tr-a", liveSet(["tr-b"]))).toEqual({ blocker: null, dead: ["tr-z"] });
+		expect(() => queueAhead(rows, "tr-missing", liveSet([]))).toThrow(TestRunShapeError);
 	});
 });
 
