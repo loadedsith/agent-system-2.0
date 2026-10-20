@@ -13,10 +13,14 @@
 // for every role: eval and inline code may not load the ledger module at all, a database opened from code may
 // not name a `ledger.db` or sit under `.agent-system-2/`, and no call may set, unset or override the
 // agent-context tags or the names that move the live roots. Every refusal names the boundary.
-import { basename, dirname, posix, resolve } from "node:path";
+// G1 (scratch auth-forgery AUDIT.md § (e)): a script bun or node runs is read at gate time and judged by the
+// same rules (scriptCrossing), and a module loaded by a specifier computed at run time is refused in eval,
+// inline code and scripts (eval-code.ts computedModuleLoad).
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, join, posix, resolve } from "node:path";
 import { BOUNDARY, boundaryEnvName } from "../../../ledger/src/authority";
 import { canonicalPath, DEFAULT_LEDGER_RELATIVE, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { boundaryEnvWrite, type CodeFacts, callArgs, codeFacts, computedMember, dbConstructorEscape, evalProcessStart, ledgerModuleImport, SPAWN_API, WRITE_API } from "../eval-code";
+import { boundaryEnvWrite, type CodeFacts, callArgs, codeFacts, computedMember, computedModuleLoad, dbConstructorEscape, evalProcessStart, ledgerModuleImport, SPAWN_API, WRITE_API } from "../eval-code";
 import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, type Expansion, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Fragment, Word } from "../shell-parse";
 import { writeTargets } from "../targets";
@@ -234,15 +238,15 @@ function writeNamesLedger(w: Word, e: Exec, paths: LedgerPaths): boolean {
 	});
 }
 
-/** The script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code, an option (`--preload`, `-r` load other code first) or none. */
-function executedScript(e: Exec): string | null {
+/** The word naming the script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code, an option (`--preload`, `-r` load other code first) or none. */
+function scriptWord(e: Exec): Word | null {
 	const name = basename(e.argv[0]!.text);
 	if (name !== "bun" && name !== "node") return null;
 	let args = e.argv.slice(1);
 	if (name === "bun" && args[0]?.text === "run") args = args.slice(1);
 	const w = args[0];
 	if (!w || w.opaque || w.expanded || w.text.startsWith("-")) return null;
-	return resolve(e.dir, w.text);
+	return w;
 }
 
 /**
@@ -412,9 +416,116 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 		const why = unmodeledSqlite(e, paths);
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
 	}
-	const script = executedScript(e);
-	if (script && canonicalOrLexical(script).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
+	const script = scriptWord(e);
+	if (script && canonicalOrLexical(resolve(e.dir, script.text)).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
 	return `\`${head}\` on the ledger file outside the ledger module (${e.argv.map((w) => w.text).join(" ")})`;
+}
+
+/**
+ * bun's own subcommands (`bun --help`, bun 1.3.14): the word after `bun` that names one is not a script bun
+ * runs. `bun test` is never read: test files open scratch ledgers under the test preload, which keeps them off
+ * the live roots.
+ */
+const BUN_SUBCOMMANDS: Record<string, true> = Object.fromEntries(
+	"test x repl exec install i add a remove rm update audit outdated link unlink publish patch patch-commit pm info why build init create c upgrade feedback completions help"
+		.split(" ")
+		.map((n) => [n, true]),
+);
+/** What bun and node try after a script path that names no file (`bun forge` runs `forge.ts`; live, bun 1.3.14 and node, 2026-10-19). */
+const SCRIPT_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+/** The most of one script the gate reads; a larger one is refused rather than read in part. */
+const SCRIPT_CAP = 256 * 1024;
+/**
+ * A checkout's tracked script directories, relative to its root. Why these run unread: lanes run them every day
+ * (`bun surface/scripts/invariants.ts`, `lane.ts`), they load the ledger module by design, and their text is
+ * the reviewed code of an agent-system-2.0 checkout or lane worktree, not code a model wrote this session. The
+ * root is found by walking up to a directory holding `ledger/schema.sql` and a `.git` (a checkout or a lane
+ * worktree, whose `.git` is a file). A file a model places there by hand is a deliberate act, beyond the
+ * accident grade, and shows in the worktree's diff. Reaching machinery stamps through these scripts (`lane.ts
+ * run`, `ctx-index --by`, the tick scripts) is G7, the follow-up (migration/items/jo-only-boundary.md).
+ */
+const REPO_SCRIPT_DIRS = ["surface/scripts/", "ledger/scripts/", "classifier/scripts/", "gates/scripts/", "install/scripts/", "bin/"];
+
+/** Is `canonical` a script in a tracked script directory of an agent-system-2.0 checkout (REPO_SCRIPT_DIRS)? */
+function repoScript(canonical: string): boolean {
+	for (let dir = dirname(canonical); dirname(dir) !== dir; dir = dirname(dir)) {
+		if (existsSync(join(dir, "ledger", "schema.sql")) && existsSync(join(dir, ".git"))) {
+			const rel = canonical.slice(dir.length + 1);
+			return REPO_SCRIPT_DIRS.some((d) => rel.startsWith(d));
+		}
+	}
+	return false;
+}
+
+/** The file bun or node runs for `path`: the path itself, else with an extension, else a directory's index file; null if none. */
+function scriptFile(path: string): string | null {
+	const candidates = [path, ...SCRIPT_EXTENSIONS.map((x) => path + x), ...SCRIPT_EXTENSIONS.map((x) => join(path, `index${x}`))];
+	return candidates.find((c) => existsSync(c) && statSync(c).isFile()) ?? null;
+}
+
+/**
+ * The program text a command in this call writes into the script before it runs (a heredoc or herestring into
+ * `cat > f`/`tee f`, an `echo`/`printf` redirected to it), or null when a writer's text cannot be read (`cp`,
+ * `curl -o`, a pipe). Empty when nothing in the call writes it.
+ */
+function writtenScript(x: Expansion, path: string): string[] | null {
+	const names = new Set([path, ...SCRIPT_EXTENSIONS.map((ext) => path + ext)]);
+	const texts: string[] = [];
+	for (const e of x.commands) {
+		if (!writeDestinations(e).some((w) => !w.opaque && names.has(resolve(e.dir, w.text)))) continue;
+		const bodies = e.redirects.flatMap((r) => (r.body !== null ? [r.body] : []));
+		const head = basename(e.argv[0]!.text);
+		if (head === "echo" || head === "printf") bodies.push(e.argv.slice(1).map((w) => w.text).join(" "));
+		if (bodies.length === 0) return null;
+		texts.push(...bodies);
+	}
+	return texts;
+}
+
+/**
+ * Why a script bun or node runs crosses the Jo-only boundary, or null (G1). The script is read at gate time,
+ * with what this same call writes into it, and judged as eval code is (rawWriteInCode): it may not load the
+ * ledger module, name a `ledger.db` in an open or write, open a database under `.agent-system-2/`, or load a
+ * module by a computed specifier. A script that cannot be read is refused: over SCRIPT_CAP, unreadable, or
+ * written in this call from text the gate does not see (`cp`, `curl -o`). A script that is missing and that no
+ * command in this call is seen to write runs nothing (bun and node fail on it), so it passes; one written by a
+ * writer the gate does not parse (a compiler's output, an unzip) is beyond the accident grade, as a transitive
+ * import is. Not read: `bun test` and bun's other subcommands, a bare name that is no file (`bun run
+ * typecheck`, a package.json script), the ledger module's own scripts, and a checkout's tracked scripts
+ * (REPO_SCRIPT_DIRS), unless this call writes into them.
+ */
+function scriptCrossing(e: Exec, x: Expansion, paths: LedgerPaths): string | null {
+	const head = basename(e.argv[0]!.text);
+	if (head === "bun" && Object.hasOwn(BUN_SUBCOMMANDS, e.argv[1]?.text ?? "")) return null;
+	const word = scriptWord(e);
+	if (!word) return null;
+	// A bare name (no `/`, no `.`) that is no file is a package.json script or a bin: what it runs is not this word's text.
+	const bare = !/[./]/.test(word.text);
+	if (!e.dirKnown && !word.text.startsWith("/")) {
+		return bare ? null : `\`${head}\` running ${word.text} after a \`cd\` the gate could not follow, so it cannot read the script; run it by its absolute path`;
+	}
+	const path = resolve(e.dir, word.text);
+	const written = writtenScript(x, path);
+	if (written === null) return `\`${head}\` running ${path}, which this same call writes from text the gate cannot read`;
+	const file = scriptFile(path);
+	if (!file && written.length === 0) return null;
+	const texts = [...written];
+	const canonical = file ? canonicalOrLexical(file) : null;
+	if (canonical && !canonical.startsWith(`${LEDGER_SCRIPTS}/`) && !repoScript(canonical)) {
+		let size: number;
+		try {
+			size = statSync(canonical).size;
+			if (size <= SCRIPT_CAP) texts.push(readFileSync(canonical, "utf8"));
+		} catch (err) {
+			return `\`${head}\` running ${canonical}, which the gate cannot read (${err instanceof Error ? err.message : String(err)})`;
+		}
+		if (size > SCRIPT_CAP) return `\`${head}\` running ${canonical}, ${size} bytes, over the ${SCRIPT_CAP / 1024} KiB the gate reads of a script`;
+	}
+	for (const text of texts) {
+		const why = rawWriteInCode(text, paths, dirname(path), "js");
+		if (why) return `\`${head}\` running ${canonical ?? path}: ${why}`;
+	}
+	return null;
 }
 
 /**
@@ -663,8 +774,10 @@ const LEDGER_ROOT = new RegExp(String.raw`(?:^|[/"'\x60])${dirname(DEFAULT_LEDGE
 const namesLedgerFile = (text: string) => SIBLINGS.some((s) => basename(text) === LEDGER_FILE + s);
 
 /**
- * Why eval (or inline `bun -e`) code crosses the Jo-only boundary or writes the ledger raw, or null.
- * Code may not load the ledger module (`ledger/src`, by import, dynamic import or require) nor set,
+ * Why eval code, inline `bun -e` code, or a script bun or node runs (scriptCrossing) crosses the Jo-only
+ * boundary or writes the ledger raw, or null.
+ * Code may not load the ledger module (`ledger/src`, by import, dynamic import or require), load any module
+ * by a specifier computed at run time (JS: eval-code.ts computedModuleLoad, G1), nor set,
  * unset or override a boundary name in the environment (eval-code.ts boundaryEnvWrite). Code names
  * the ledger when it carries its path (constant concatenations folded), its file name or any
  * `ledger.db`, the env var, or any literal path that canonicalizes (the direct-write realpath
@@ -681,7 +794,9 @@ const namesLedgerFile = (text: string) => SIBLINGS.some((s) => basename(text) ==
 function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined): string | null {
 	const facts = codeFacts(code, family);
 	const spec = ledgerModuleImport(facts);
-	if (spec) return `code loading the ledger module ("${spec}"); eval and inline code never load it`;
+	if (spec) return `code loading the ledger module ("${spec}"); eval, inline code and the scripts an agent runs never load it`;
+	const load = family === "js" ? computedModuleLoad(facts) : null;
+	if (load) return `code loading a module whose specifier is computed at run time (${load}), which may be the ledger module; an import() or require() takes one literal string`;
 	const env = boundaryEnvWrite(facts);
 	if (env) return env;
 	const file = basename(paths.files[0]!);
@@ -718,7 +833,8 @@ function refuse(what: string): Refusal {
 		reason:
 			`P-11 row 10 refused this: ${what}. This is the ${BOUNDARY} (ledger/src/authority.ts, migration/items/jo-only-boundary.md): ` +
 			`the ledger is written only by the ledger module in the processes Jo's machinery starts (the surface, the lane runner, a lane's ledger tools), ` +
-			`never from eval or inline code; and no call may set, unset or override AGENT_SYSTEM_ROLE, AGENT_SYSTEM_LANE_ID, AGENT_SYSTEM_WORKLOAD_ID, ` +
+			`never from eval, inline code or a script an agent runs with bun or node (a checkout's own surface/, ledger/, classifier/, gates/, install/ scripts and bin/ run unread); ` +
+			`and no call may set, unset or override AGENT_SYSTEM_ROLE, AGENT_SYSTEM_LANE_ID, AGENT_SYSTEM_WORKLOAD_ID, ` +
 			`AGENT_SYSTEM_LEDGER_DB or an AS2_TEST_* name (reading them is fine). The ledger's rules live in the file and its writer is the ledger module ` +
 			`(ledger/src/index.ts, SPEC-2.0.md § B2); a raw write bypasses its provenance and would be refused by the file's triggers or corrupt WAL state. ` +
 			`Write through your tools (a lane's lane_* tools, the orchestrator's orchestrator_* tools). ` +
@@ -807,7 +923,7 @@ export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 		const crossing = boundaryEnvInShell(x);
 		if (crossing) return refuse(crossing);
 		for (const e of x.commands) {
-			const why = rawWriteInExec(e, paths) ?? sqliteOnLedgerName(e);
+			const why = rawWriteInExec(e, paths) ?? sqliteOnLedgerName(e) ?? scriptCrossing(e, x, paths);
 			if (why) return refuse(why);
 			// git appends its trace to the file a GIT_TRACE* variable names (astra-6 B7).
 			if (gitCall(e)) {

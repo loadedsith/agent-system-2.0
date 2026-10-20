@@ -12,16 +12,35 @@
 // The refusal holds for every role: a lane, a hand, and the orchestrator agent (§ 6.1: layer 1 does not cover the
 // orchestrator's process, so layers 2 and 3 are its boundary). Reading stays allowed: `sqlite3 -readonly <ledger>`
 // with SELECT, `echo $AGENT_SYSTEM_ROLE`, eval reading process.env, and `bun test` of a test file.
-// Every probe is inert: the gate only reads the strings; nothing here runs, and every path sits under a home this
-// test makes up.
+// Every probe is inert: the gate only reads the strings and the script files this test writes into its own temp
+// directory; nothing here runs, and every path sits under a home this test makes up.
+//
+// G1 (scratch auth-forgery AUDIT.md § (e)): a script bun or node runs (`bun f.ts`, `bun run f.ts`, `node f.js`, a
+// heredoc that writes the script in the same call) is read and judged like eval code; a computed `import()` or
+// `require()` is refused in eval, inline code and scripts; `bun test` and this repository's own scripts are not read.
+// The probe strings below load modules on purpose: they are the module-loading boundary under test.
 import { describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { checkToolCall } from "../src/gates";
 import type { CallContext, Refusal, Role } from "../src/types";
 import { tmp } from "./helpers";
 
+const REPO = join(import.meta.dir, "..", "..");
+
 const HOME = "/nonexistent-home";
 const LIVE = `${HOME}/.agent-system-2/ledger.db`;
 const cwd = tmp("authority-gate");
+/** A forgery script: loads the ledger module and writes machinery stamps (the audit's probe-a shape). */
+const FORGE = `import { Ledger } from "${REPO}/ledger/src/index.ts";\nconst l = Ledger.open();\nl.recordEntry({ by: "escalation", workloadId: "wl-x", kind: "assumption", body: "plan: approved auto g1" });\nl.enqueue({ by: "escalation", workloadId: "wl-x", sender: "escalation", recipient: "orchestrator", body: "notice: plan started" });\n`;
+/** Module acquisition with a specifier built at run time. */
+const COMPUTED = `const p = ["${REPO}", "ledger", "src", "index"].join("/");\nconst { Ledger } = await import(p);\nLedger.open();\n`;
+writeFileSync(join(cwd, "forge.ts"), FORGE);
+writeFileSync(join(cwd, "forge.js"), FORGE);
+writeFileSync(join(cwd, "computed.ts"), COMPUTED);
+writeFileSync(join(cwd, "db.ts"), `import { Database } from "bun:sqlite";\nnew Database("${LIVE}").run("DELETE FROM entries");\n`);
+writeFileSync(join(cwd, "root.ts"), `import { Database } from "bun:sqlite";\nnew Database(process.env.HOME + "/.agent-system-2/copy.db");\n`);
+writeFileSync(join(cwd, "benign.ts"), `import { join } from "node:path";\nconst { x } = await import("./other.ts").catch(() => ({ x: 1 }));\nconsole.log(join("a", "b"), x);\n`);
 const ctxFor = (role: Role): CallContext => ({ role, cwd, env: { HOME, AGENT_SYSTEM_LANE_ID: role === "orchestrator" ? undefined : "lane-x", AGENT_SYSTEM_WORKLOAD_ID: role === "orchestrator" ? undefined : "wl-x" } });
 const ROLES: Role[] = ["lane", "hand", "orchestrator"];
 const BOUNDARY = "Jo-only boundary";
@@ -78,6 +97,32 @@ const ENV_OVERRIDES: Probe[] = [
 	{ tool: "bash", command: "AS2_TEST_ANYTHING=1 bun test gates/test/authority-gate.test.ts" },
 ];
 
+/** Scripts bun or node runs from a scratch directory that load the ledger module or open a ledger (G1). */
+const SCRIPTS: Probe[] = [
+	{ tool: "bash", command: `bun ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bun run ${cwd}/forge.ts` },
+	{ tool: "bash", command: `node ${cwd}/forge.js` },
+	{ tool: "bash", command: `cd ${cwd} && bun forge` },
+	{ tool: "bash", command: `bun ${cwd}/db.ts` },
+	{ tool: "bash", command: `bun ${cwd}/root.ts` },
+	{ tool: "bash", command: `bun ${cwd}/computed.ts` },
+	{ tool: "bash", command: `cat > ${cwd}/forge-here.ts <<'EOF'\n${FORGE}EOF\nbun ${cwd}/forge-here.ts` },
+	{ tool: "bash", command: `cat > ${cwd}/benign.ts <<'EOF'\n${FORGE}EOF\nbun run ${cwd}/benign.ts` },
+	{ tool: "bash", command: `bun - <<'EOF'\n${FORGE}EOF` },
+	{ tool: "bash", command: `cp ${cwd}/forge.ts ${cwd}/copied.ts && bun ${cwd}/copied.ts` },
+];
+
+/** Module acquisition the gate cannot name, in eval and inline code (G1). */
+const COMPUTED_IMPORTS: Probe[] = [
+	{ tool: "eval", language: "js", code: COMPUTED },
+	{ tool: "eval", language: "js", code: `const r = require; const m = r("${REPO}/" + "ledger/" + "src/index");\nm.Ledger.open();` },
+	{ tool: "eval", language: "js", code: `import { createRequire } from "node:module";\nconst req = createRequire(import.meta.url);\nconst name = ["..", "ledger", "src", "index"].join("/");\nreq(name);` },
+	{ tool: "eval", language: "js", code: "const spec = `${process.cwd()}/ledger/src/index.ts`;\nawait import(spec);" },
+	{ tool: "bash", command: `bun -e 'const m = await import(["${REPO}","ledger","src","index"].join("/")); m.Ledger.open()'` },
+	{ tool: "bash", command: `node -e 'const p = process.argv[1]; require(p)' ${REPO}/ledger/src/index.ts` },
+	{ tool: "bash", command: `bun - <<'EOF'\n${COMPUTED}EOF` },
+];
+
 const ALLOWED: Probe[] = [
 	{ tool: "bash", command: `sqlite3 -readonly ${LIVE} "SELECT id, stakes FROM workloads"` },
 	{ tool: "bash", command: `sqlite3 -readonly ${LIVE} ".tables"` },
@@ -88,6 +133,18 @@ const ALLOWED: Probe[] = [
 	{ tool: "eval", language: "js", code: "const role = process.env.AGENT_SYSTEM_ROLE;\nconsole.log(role);" },
 	{ tool: "eval", language: "js", code: `import { Database } from "bun:sqlite";\nconst mem = new Database(":memory:");` },
 	{ tool: "eval", language: "py", code: `import os\nprint(os.environ.get("AGENT_SYSTEM_LANE_ID"))` },
+	// G1: a repo script, a test run, a package script name, and a scratch script with no ledger import are not refused.
+	{ tool: "bash", command: `cd ${REPO} && bun surface/scripts/invariants.ts` },
+	{ tool: "bash", command: `bun ${REPO}/surface/scripts/invariants.ts` },
+	{ tool: "bash", command: `bun run ${REPO}/ledger/scripts/backup.ts` },
+	{ tool: "bash", command: "bun test x.test.ts" },
+	{ tool: "bash", command: `bun test ${cwd}/forge.ts` },
+	{ tool: "bash", command: "bun run typecheck" },
+	{ tool: "bash", command: `bun ${cwd}/benign.ts` },
+	{ tool: "bash", command: `cat > ${cwd}/fresh.ts <<'EOF'\nconsole.log("fresh");\nEOF\nbun ${cwd}/fresh.ts` },
+	{ tool: "bash", command: `NODE_OPTIONS=--max-old-space-size=4096 node ${cwd}/missing.js` },
+	{ tool: "bash", command: `mkdir -p ${cwd}/d; bun ${cwd}/d/missing.ts` },
+	{ tool: "eval", language: "js", code: `const { join } = await import("node:path");\nconst m = require("node:fs");\nconsole.log(join("a", "b"), typeof m);` },
 ];
 
 for (const [group, probes] of [
@@ -95,6 +152,8 @@ for (const [group, probes] of [
 	["names ledger.db in an open or a write", LEDGER_FILE],
 	["constructs a bun:sqlite Database under ~/.agent-system-2/", UNDER_ROOT],
 	["sets, unsets or overrides the agent-context or test-isolation names", ENV_OVERRIDES],
+	["runs a script that loads the ledger module or opens a ledger (G1)", SCRIPTS],
+	["loads a module whose specifier is computed (G1)", COMPUTED_IMPORTS],
 ] as const) {
 	describe(`refused with "${BOUNDARY}": ${group}`, () => {
 		for (const role of ROLES) {

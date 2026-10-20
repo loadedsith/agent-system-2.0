@@ -562,6 +562,37 @@ export function ledgerModuleImport(facts: CodeFacts): string | null {
 	return null;
 }
 
+/** `import(` or `require(` whose first argument is not one plain string literal (masked to `"___"`; more arguments may follow). */
+const DYNAMIC_LOAD = /(?<![\w$.])(?:import|require)\s*\(\s*(?!(["'`])_*\1\s*[,)])/;
+/** `require` as a value (aliased or passed on): not called, not a member read (`require.resolve`), not an object key. */
+const REQUIRE_VALUE = /(?<![\w$.])require(?![\w$])(?!\s*[(.:])/g;
+/** A declaration binding `require` itself, or `typeof require`: names, not a load. */
+const REQUIRE_NAMED = /(?:\b(?:const|let|var|function|typeof)\s+)$/;
+/** A name bound to `createRequire(…)`: a require function under another name. */
+const REQUIRE_FACTORY = /(?<![\w$.])(?:const|let|var)\s+([\w$]+)\s*=\s*(?:[\w$]+\s*\.\s*)?createRequire\s*\(/g;
+
+/**
+ * The first module acquisition in JS code whose specifier the gate cannot read, or null (G1, scratch
+ * auth-forgery AUDIT.md § (a)): an `import()` or `require()` whose first argument is not one literal string,
+ * `require` taken as a value (`const r = require; r(p)`), or a `createRequire` result called with a computed
+ * argument. The specifier may name the ledger module (`["…", "ledger", "src", "index"].join("/")`), so the gate
+ * refuses what it cannot name. Read on `uncommented`: string bodies are masked and comments blanked.
+ */
+export function computedModuleLoad(facts: CodeFacts): string | null {
+	const code = facts.uncommented;
+	const show = (at: number) => facts.folded.slice(at, at + 60).split("\n")[0]!.trim();
+	const load = DYNAMIC_LOAD.exec(code);
+	if (load) return show(load.index);
+	for (const m of code.matchAll(REQUIRE_VALUE)) {
+		if (!REQUIRE_NAMED.test(code.slice(Math.max(0, m.index! - 20), m.index!))) return show(m.index!);
+	}
+	for (const f of code.matchAll(REQUIRE_FACTORY)) {
+		const call = new RegExp(String.raw`(?<![\w$.])${f[1]!.replaceAll("$", "\\$")}\s*\(\s*(?!(["'\`])_*\1\s*[,)])`).exec(code);
+		if (call) return show(call.index);
+	}
+	return null;
+}
+
 /** The process environment as a receiver: `process.env`, `Bun.env`, Python's `os.environ` or a bare `environ`. */
 const ENV = String.raw`(?:(?<![\w$.])(?:process|Bun)\s*\.\s*env|(?<![\w$.])(?:os\s*\.\s*)?environ)`;
 /** Writes to one variable; group 1 is its name. Bracket keys are already member names (`dotAccess`). */
