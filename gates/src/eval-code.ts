@@ -603,11 +603,15 @@ function maskTemplateText(code: string): string {
 	});
 }
 
+/** JS `eval(…)`, `Function(…)` or `new Function(…)`: code built from its arguments (G1 review round 2, finding 2). */
+const JS_CODE_RUN = /(?<![\w$.])(?:new\s+)?(?:eval|Function)\s*\(/g;
+
 /**
  * The first module acquisition in JS code whose specifier the gate cannot read, or null (G1, scratch
  * auth-forgery AUDIT.md § (a)): an `import()` or `require()` whose first argument is not one literal string,
- * `require` taken as a value (`const r = require; r(p)`), or a `createRequire` result called with a computed
- * argument. The specifier may name the ledger module (`["…", "ledger", "src", "index"].join("/")`), so the gate
+ * `require` taken as a value (`const r = require; r(p)`), a `createRequire` result called with a computed
+ * argument, or `eval`/`Function` on code that is not one literal string each (`eval(readFileSync(p, "utf8"))`, G1
+ * review round 2). The specifier may name the ledger module (`["…", "ledger", "src", "index"].join("/")`), so the gate
  * refuses what it cannot name. Read on `uncommented` (string bodies masked, comments blanked) with the static
  * text of `${…}` templates masked too (maskTemplateText).
  */
@@ -623,7 +627,123 @@ export function computedModuleLoad(facts: CodeFacts): string | null {
 		const call = new RegExp(String.raw`(?<![\w$.])${f[1]!.replaceAll("$", "\\$")}\s*\(\s*(?!(["'\`])_*\1\s*[,)])`).exec(code);
 		if (call) return show(call.index);
 	}
+	for (const m of code.matchAll(JS_CODE_RUN)) {
+		const args = argTexts(facts, m.index! + m[0].length - 1);
+		if (args === null || args.some((a) => !PLAIN_LITERAL.test(a))) return show(m.index!);
+	}
 	return null;
+}
+
+/** A string literal with no interpolation: a target the gate can read. */
+export const PLAIN_LITERAL = /^(?:(["'])[^"'\\]*\1|`[^`$\\]*`)$/;
+
+/** A call's top-level arguments as spans of `folded`, split on `masked` (same positions); null if unbalanced. */
+export function argTexts(facts: CodeFacts, open: number): string[] | null {
+	const inner = callArgs(facts.masked, open);
+	if (inner === null) return null;
+	const out: string[] = [];
+	let depth = 0;
+	let from = open + 1;
+	for (let i = open + 1; i <= open + inner.length; i++) {
+		const c = facts.masked[i];
+		if (c === "(" || c === "[" || c === "{") depth++;
+		else if (c === ")" || c === "]" || c === "}") depth--;
+		else if (c === "," && depth === 0) {
+			out.push(facts.folded.slice(from, i).trim());
+			from = i + 1;
+		}
+	}
+	out.push(facts.folded.slice(from, open + 1 + inner.length).trim());
+	return out.filter((a) => a !== "");
+}
+
+/** The module specifiers JS code loads, outside comments and literals (`from "x"`, `import "x"`, `import("x")`, `require("x")`). */
+export function moduleSpecifiers(facts: CodeFacts): string[] {
+	return [...facts.folded.matchAll(IMPORT_SPEC)].filter((m) => isCode(facts, m.index!)).map((m) => m[2]!);
+}
+
+/**
+ * Python's loads of code by path or by module name: group 1 a builtin called bare (`exec`, `eval`, `compile`,
+ * `execfile`, `__import__`; `re.compile` is a method, not this), group 2 a loader reached on any receiver
+ * (`runpy.run_path`, `importlib.import_module`, `importlib.util.spec_from_file_location`, `SourceFileLoader`,
+ * `imp.load_source`, `site.addsitedir`).
+ */
+const PY_LOAD_CALL =
+	/(?<![\w$.])(exec|eval|compile|execfile|__import__)\s*\(|(?<![\w$])(?:[\w$]+\s*\.\s*)*(run_path|run_module|import_module|spec_from_file_location|SourceFileLoader|load_source|addsitedir)\s*\(/g;
+/** A file's text read in one expression: `open("p").read()`, `io.open("p", "r").read()`, `Path("p").read_text()`. */
+const PY_FILE_READ = /^(?:(?:io|codecs)\s*\.\s*)?open\s*\(\s*((["'])[^"'\\]*\2)[^()]*\)\s*\.\s*read\s*\(\s*\)$|^(?:pathlib\s*\.\s*)?Path\s*\(\s*((["'])[^"'\\]*\4)\s*\)\s*\.\s*read_(?:text|bytes)\s*\(\s*\)$/;
+/** A write to `sys.path`: `insert`/`append`/`extend`, `+=`, assignment, slice assignment. */
+const PY_SYS_PATH = /(?<![\w$.])sys\s*\.\s*path\s*(?:\.\s*(insert|append|extend)\s*\(|(\+=|=(?!=)|\[[^\]\n]*\]\s*=(?!=)))/g;
+
+/** What Python code loads (G1 review round 2, findings 2 and 4): files by literal path, modules by name, the directories it puts on sys.path, literal code it runs, and the first load whose target is computed. */
+export interface PythonLoads {
+	paths: string[];
+	modules: string[];
+	dirs: string[];
+	texts: string[];
+	computed: string | null;
+}
+
+/**
+ * Python code's loads (PythonLoads): `exec`/`eval`/`compile` of a literal (its text) or of one file read
+ * (`open(p).read()`, `Path(p).read_text()`), `runpy.run_path`, `execfile`, `spec_from_file_location`,
+ * `SourceFileLoader`, `load_source` (a path), `__import__`, `import_module`, `run_module` and statement imports (a
+ * module), and `sys.path` writes and `site.addsitedir` (a directory). An argument that is not a plain literal is a
+ * load the gate cannot name (`computed`).
+ */
+export function pythonLoads(facts: CodeFacts): PythonLoads {
+	const out: PythonLoads = { paths: [], modules: [], dirs: [], texts: [], computed: null };
+	const code = facts.uncommented;
+	const value = (a: string | undefined): string | null => (a !== undefined && PLAIN_LITERAL.test(a) ? a.slice(1, -1) : null);
+	const computed = (at: number) => {
+		out.computed ??= facts.folded.slice(at, at + 60).split("\n")[0]!.trim();
+	};
+	const take = (into: string[], a: string | undefined, at: number) => {
+		const v = value(a);
+		if (v === null) computed(at);
+		else into.push(v);
+	};
+	const literalList = (a: string | undefined, at: number) => {
+		const items = a !== undefined && /^[[(].*[\])]$/s.test(a) ? topLevelArgs(a.slice(1, -1)).filter((x) => x !== "") : null;
+		if (items === null || items.some((x) => value(x) === null)) computed(at);
+		else out.dirs.push(...items.map((x) => value(x)!));
+	};
+	for (const m of code.matchAll(PY_LOAD_CALL)) {
+		const name = m[1] ?? m[2]!;
+		const args = argTexts(facts, m.index! + m[0].length - 1);
+		if (args === null) {
+			computed(m.index!);
+			continue;
+		}
+		if (name === "exec" || name === "eval" || name === "compile") {
+			const a = args[0];
+			const text = value(a);
+			if (text !== null) out.texts.push(text);
+			else if (a !== undefined && /^compile\s*\(/.test(a)) continue; // judged as its own call
+			else {
+				const read = a === undefined ? null : PY_FILE_READ.exec(a);
+				take(out.paths, read?.[1] ?? read?.[3], m.index!);
+			}
+		} else if (name === "execfile" || name === "run_path") take(out.paths, args[0], m.index!);
+		else if (name === "spec_from_file_location" || name === "SourceFileLoader" || name === "load_source") take(out.paths, args[1], m.index!);
+		else if (name === "addsitedir") take(out.dirs, args[0], m.index!);
+		else take(out.modules, args[0], m.index!);
+	}
+	for (const m of code.matchAll(PY_SYS_PATH)) {
+		if (m[1] === "insert") take(out.dirs, argTexts(facts, m.index! + m[0].length - 1)?.[1], m.index!);
+		else if (m[1] === "append") take(out.dirs, argTexts(facts, m.index! + m[0].length - 1)?.[0], m.index!);
+		else if (m[1] === "extend") literalList(argTexts(facts, m.index! + m[0].length - 1)?.[0], m.index!);
+		else literalList(facts.folded.slice(m.index! + m[0].length).split("\n")[0]!.trim(), m.index!);
+	}
+	for (const m of code.matchAll(PY_IMPORT_STMT)) {
+		for (const item of m[1]!.split(",")) {
+			const name = /^\s*([\w.]+)/.exec(item)?.[1];
+			if (name) out.modules.push(name);
+		}
+	}
+	// `from . import x` is relative to the importing package, which the gate does not resolve.
+	for (const m of code.matchAll(PY_FROM_STMT)) if (!m[1]!.startsWith(".")) out.modules.push(m[1]!);
+	return out;
 }
 
 /** The process environment as a receiver: `process.env`, `Bun.env`, Python's `os.environ` or a bare `environ`. */

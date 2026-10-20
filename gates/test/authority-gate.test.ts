@@ -11,18 +11,22 @@
 //   input, and in eval `process.env.X = …`, `delete process.env.X`, `os.environ[…] = …`, `os.environ.pop(…)`.
 // The refusal holds for every role: a lane, a hand, and the orchestrator agent (§ 6.1: layer 1 does not cover the
 // orchestrator's process, so layers 2 and 3 are its boundary). Reading stays allowed: `sqlite3 -readonly <ledger>`
-// with SELECT, `echo $AGENT_SYSTEM_ROLE`, eval reading process.env, and `bun test` of a test file.
+// with SELECT, `echo $AGENT_SYSTEM_ROLE`, eval reading process.env, and `bun test` of this repository's test files from
+// a directory whose bunfig.toml isolates the ledger.
 // Every probe is inert: the gate only reads the strings and the script files this test writes into its own temp
 // directory; nothing here runs, and every path sits under a home this test makes up.
 //
 // G1 (scratch auth-forgery AUDIT.md § (e)): a script bun or node runs (`bun f.ts`, `bun run f.ts`, `node f.js`, a
 // heredoc that writes the script in the same call) is read and judged like eval code; a computed `import()` or
-// `require()` is refused in eval, inline code and scripts outside every git repository; `bun test` and this
-// repository's own scripts are not read. G1 review round 1 (sl-auth-forgery-review): a script word with a `$NAME`,
+// `require()` is refused in eval, inline code and scripts outside every git repository; this repository's own
+// scripts are not read. G1 review round 1 (sl-auth-forgery-review): a script word with a `$NAME`,
 // `${NAME}` or `~` is resolved and read, and one the gate cannot resolve is refused; bun's and node's options before
 // the script are skipped and a preloaded module is read; `bun exec`, `bun x`, `bunx` and `npx` running tsx, ts-node,
 // node or bun on a file are read; python, perl, ruby and deno scripts are read; every script directory of a checkout
-// (skills/*/…/scripts/ included) runs unread.
+// (skills/*/…/scripts/ included) runs unread. G1 review round 2 (sl-auth-forgery-review-r3): `bun test` files and
+// preloads outside an isolated checkout run are read; eval reads a file it loads by a literal path; a package.json
+// script, a bunfig.toml preload and `python3 -m <name>` are read; bunx/npx read a file argument of any package; a
+// checkout's tracked files run unread.
 // The probe strings below load modules on purpose: they are the module-loading boundary under test.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -57,6 +61,33 @@ writeFileSync(join(cwd, "tmpl.ts"), "const name = `x`;\nconsole.log(`run require
 /** Another product's build script in a git repository: a runtime-selected import() and no ledger name. */
 mkdirSync(join(cwd, "product", ".git"), { recursive: true });
 writeFileSync(join(cwd, "product", "build.ts"), "const p = process.argv[2] ?? \"./plugin.ts\";\nconst m = await import(p);\nconsole.log(m);\n");
+// G1 review round 2 fixtures.
+const RAW_TS = `import { Database } from "bun:sqlite";\nnew Database(process.env.HOME + "/.agent-system-2/ledger.db").run("DELETE FROM entries");\n`;
+writeFileSync(join(cwd, "forge.test.ts"), FORGE);
+writeFileSync(join(cwd, "raw.test.ts"), RAW_TS);
+writeFileSync(join(cwd, "rawabs.test.ts"), `import { Database } from "bun:sqlite";\nnew Database("${LIVE}").run("DELETE FROM entries");\n`);
+writeFileSync(join(cwd, "benign.test.ts"), `import { test } from "bun:test";\ntest("x", () => {});\n`);
+writeFileSync(join(cwd, "pyrun.py"), "import runpy, sys\nrunpy.run_path(sys.argv[1])\n");
+mkdirSync(join(cwd, "pymod"));
+writeFileSync(join(cwd, "pymod", "__main__.py"), PYFORGE);
+/** package.json scripts that run the forgery under another name, and one with a pre-script. */
+mkdirSync(join(cwd, "pkg", "sub"), { recursive: true });
+writeFileSync(join(cwd, "pkg", "package.json"), JSON.stringify({ name: "pkg", scripts: { go: "bun ../forge.ts", start: "bun ../forge.ts", test: "bun ../forge.ts", hush: "echo hi", prehush: "bun ../forge.ts", tool: "bun" } }));
+/** Both a script `hello` and a benign `hello.ts`: bun runs the script (minor 6). */
+mkdirSync(join(cwd, "both"));
+writeFileSync(join(cwd, "both", "package.json"), JSON.stringify({ name: "both", scripts: { hello: "bun ../forge.ts" } }));
+writeFileSync(join(cwd, "both", "hello.ts"), `console.log("hi");\n`);
+mkdirSync(join(cwd, "pkgok"));
+writeFileSync(join(cwd, "pkgok", "package.json"), JSON.stringify({ name: "pkgok", scripts: { hi: "echo hi", start: "bun ../benign.ts", build: "tsc -p ." } }));
+/** A bunfig.toml whose runtime preload is the forgery, and one whose test preload is. */
+mkdirSync(join(cwd, "cfg"));
+writeFileSync(join(cwd, "cfg", "bunfig.toml"), `preload = ["./forge.ts"]\n`);
+writeFileSync(join(cwd, "cfg", "forge.ts"), FORGE);
+writeFileSync(join(cwd, "cfg", "benign.ts"), `console.log("hi");\n`);
+mkdirSync(join(cwd, "tcfg"));
+writeFileSync(join(cwd, "tcfg", "bunfig.toml"), `[test]\npreload = ["../forge.ts"]\n`);
+mkdirSync(join(cwd, "dn"));
+writeFileSync(join(cwd, "dn", "deno.json"), JSON.stringify({ tasks: { forge: "deno run -A ../forge.ts" } }));
 const ctxFor = (role: Role): CallContext => ({ role, cwd, env: { HOME, AS2_SCRATCH: cwd, AGENT_SYSTEM_LANE_ID: role === "orchestrator" ? undefined : "lane-x", AGENT_SYSTEM_WORKLOAD_ID: role === "orchestrator" ? undefined : "wl-x" } });
 const ROLES: Role[] = ["lane", "hand", "orchestrator"];
 const BOUNDARY = "Jo-only boundary";
@@ -212,6 +243,83 @@ const OTHER_INTERPRETERS: Probe[] = [
 	{ tool: "bash", command: `ruby -C ${cwd} forge.rb` },
 ];
 
+/** Review round 2, finding 1: `bun test` files and preloads outside an isolated checkout run are read. */
+const R2_BUN_TEST: Probe[] = [
+	{ tool: "bash", command: `cd ${cwd} && bun test forge.test.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bun test raw.test.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bun test` },
+	{ tool: "bash", command: `cd ${cwd} && bun test ./rawabs.test.ts` },
+	{ tool: "bash", command: `cd ${REPO} && bun test ${cwd}/raw.test.ts` },
+	{ tool: "bash", command: `cd ${REPO} && bun test ${cwd}/rawabs.test.ts` },
+	{ tool: "bash", command: `bun test ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bun test --preload ${cwd}/forge.ts ${cwd}/benign.test.ts` },
+	{ tool: "bash", command: `cd ${REPO} && bun test -r ${cwd}/forge.ts gates/test/authority-gate.test.ts` },
+	{ tool: "bash", command: `cd ${REPO} && bun test --preload=${cwd}/forge.ts gates/test/authority-gate.test.ts` },
+	// a repository test file run from a directory with no isolating bunfig.toml runs with the real HOME
+	{ tool: "bash", command: `bun test ${REPO}/ledger/test/authority.test.ts` },
+];
+
+/** Review round 2, finding 2: eval code that loads a file by a literal path reads that file. */
+const R2_EVAL_LOADS: Probe[] = [
+	{ tool: "eval", language: "js", code: `await import("${cwd}/forge.ts");` },
+	{ tool: "eval", language: "js", code: `const m = require("${cwd}/forge.js");` },
+	{ tool: "eval", language: "js", code: `import "${cwd}/forge.ts";` },
+	{ tool: "eval", language: "py", code: `exec(open("${cwd}/forge.py").read())` },
+	{ tool: "eval", language: "py", code: `import runpy\nrunpy.run_path("${cwd}/forge.py")` },
+	{ tool: "eval", language: "py", code: `import sys\nsys.path.insert(0, "${cwd}")\nimport forge` },
+	{ tool: "eval", language: "py", code: `%load "${cwd}/forge.py"` },
+	{ tool: "eval", language: "py", code: "import runpy, sys\nrunpy.run_path(sys.argv[1])" },
+	{ tool: "eval", language: "py", code: "code = open(p).read()\nexec(code)" },
+	{ tool: "bash", command: `cd ${cwd} && python3 -c 'import forge'` },
+	{ tool: "bash", command: `bun -e 'await import("${cwd}/forge.ts")'` },
+	{ tool: "bash", command: `python3 ${cwd}/pyrun.py ${cwd}/forge.py` },
+];
+
+/** Review round 2, finding 3 (and minor 6): a package.json script, a bunfig.toml preload, deno task. */
+const R2_LAUNCH_CONFIG: Probe[] = [
+	{ tool: "bash", command: `cd ${cwd}/pkg && bun run go` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && bun go` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && bun start` },
+	{ tool: "bash", command: `cd ${cwd}/pkg/sub && bun run go` },
+	{ tool: "bash", command: `bun --cwd ${cwd}/pkg run go` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && npm run go` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && npm start` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && npm test` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && npm run hush` },
+	{ tool: "bash", command: `cd ${cwd}/pkg && npm run tool -- ${cwd}/forge.ts` },
+	{ tool: "bash", command: `cd ${cwd}/pkg/sub && node --run go` },
+	{ tool: "bash", command: `cd ${cwd}/both && bun run hello` },
+	{ tool: "bash", command: `cd ${cwd}/both && bun hello` },
+	{ tool: "bash", command: `cd ${cwd}/cfg && bun benign.ts` },
+	{ tool: "bash", command: `bun --config=${cwd}/cfg/bunfig.toml ${cwd}/cfg/benign.ts` },
+	{ tool: "bash", command: `cd ${cwd}/tcfg && bun test x.test.ts` },
+	{ tool: "bash", command: `cd ${cwd}/dn && deno task forge` },
+];
+
+/** Review round 2, finding 4: `python3 -m <name>` runs `<cwd>/<name>.py` or its package's `__main__.py`. */
+const R2_PYTHON_MODULE: Probe[] = [
+	{ tool: "bash", command: `cd ${cwd} && python3 -m forge` },
+	{ tool: "bash", command: "python3 -m forge" },
+	{ tool: "bash", command: `cd ${cwd} && python3 -u -m pymod` },
+	{ tool: "bash", command: `cd ${cwd} && python3 -mforge` },
+];
+
+/** Review round 2, finding 5 (and minor 9): bunx or npx with any package reads a file argument; versioned interpreter names. */
+const R2_ANY_PACKAGE: Probe[] = [
+	{ tool: "bash", command: `bunx vite-node ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bunx jiti ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bunx ts-node-dev ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bunx nodemon ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bunx esno ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bunx zx ${cwd}/forge.js` },
+	{ tool: "bash", command: `npx vite-node ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bun x jiti ${cwd}/forge.ts` },
+	{ tool: "bash", command: `cd ${cwd} && bunx esno forge` },
+	{ tool: "bash", command: `node22 ${cwd}/forge.js` },
+	{ tool: "bash", command: `bun-canary ${cwd}/forge.ts` },
+	{ tool: "bash", command: `bun-profile ${cwd}/forge.ts` },
+];
+
 const ALLOWED: Probe[] = [
 	{ tool: "bash", command: `sqlite3 -readonly ${LIVE} "SELECT id, stakes FROM workloads"` },
 	{ tool: "bash", command: `sqlite3 -readonly ${LIVE} ".tables"` },
@@ -227,7 +335,6 @@ const ALLOWED: Probe[] = [
 	{ tool: "bash", command: `bun ${REPO}/surface/scripts/invariants.ts` },
 	{ tool: "bash", command: `bun run ${REPO}/ledger/scripts/backup.ts` },
 	{ tool: "bash", command: "bun test x.test.ts" },
-	{ tool: "bash", command: `bun test ${cwd}/forge.ts` },
 	{ tool: "bash", command: "bun run typecheck" },
 	{ tool: "bash", command: `bun ${cwd}/benign.ts` },
 	{ tool: "bash", command: `cat > ${cwd}/fresh.ts <<'EOF'\nconsole.log("fresh");\nEOF\nbun ${cwd}/fresh.ts` },
@@ -247,6 +354,11 @@ for (const [group, probes] of [
 	["a script after bun or node options, or preloaded (G1 review 1, finding 3)", SCRIPT_OPTIONS],
 	["a script run through bun exec, bun x, bunx or npx (G1 review 1, finding 4)", PACKAGE_RUNNERS],
 	["a python, perl, ruby or deno script (G1 review 1, finding 5)", OTHER_INTERPRETERS],
+	["a bun test file or preload outside an isolated checkout run (G1 review 2, finding 1)", R2_BUN_TEST],
+	["eval or inline code loading a file by a literal path (G1 review 2, finding 2)", R2_EVAL_LOADS],
+	["a package.json script, bunfig.toml preload or deno task (G1 review 2, finding 3, minor 6)", R2_LAUNCH_CONFIG],
+	["python -m on a module in the working directory (G1 review 2, finding 4)", R2_PYTHON_MODULE],
+	["bunx or npx with any package on a file, and versioned runtimes (G1 review 2, finding 5, minor 9)", R2_ANY_PACKAGE],
 ] as const) {
 	describe(`refused with "${BOUNDARY}": ${group}`, () => {
 		for (const role of ROLES) {
@@ -319,6 +431,74 @@ const ALLOWED_R1: [string, Probe[]][] = [
 
 for (const [group, probes] of ALLOWED_R1) {
 	describe(`G1 review 1 stays allowed: ${group}`, () => {
+		for (const role of ROLES) {
+			test(`role ${role}`, () => {
+				const refused = probes.flatMap((p) => {
+					const r = call(p, role);
+					return r === null ? [] : [`${label(p)} → ${r.reason.slice(0, 160)}`];
+				});
+				expect(refused).toEqual([]);
+			});
+		}
+	});
+}
+
+/** G1 review round 2: what must keep running, by finding. */
+const ALLOWED_R2: [string, Probe[]][] = [
+	[
+		"finding 1: this repository's tests from an isolating bunfig, and scratch tests with no ledger use",
+		[
+			{ tool: "bash", command: `cd ${REPO} && bun test gates/test/authority-gate.test.ts` },
+			{ tool: "bash", command: `cd ${REPO} && bun test ledger/test/authority.test.ts classifier/test/authority-readers.test.ts gates/test/authority-gate.test.ts gates/test/guard-replay.test.ts` },
+			{ tool: "bash", command: `cd ${REPO} && bun test ./ledger/test/authority.test.ts` },
+			{ tool: "bash", command: `cd ${REPO}/gates && bun test test/authority-gate.test.ts` },
+			{ tool: "bash", command: `cd ${REPO} && bun test` },
+			{ tool: "bash", command: `cd ${REPO} && bun test --preload ${cwd}/benign.ts gates/test/authority-gate.test.ts` },
+			{ tool: "bash", command: `cd ${cwd} && bun test benign.test.ts` },
+			{ tool: "bash", command: `bun test ${cwd}/benign.test.ts` },
+		],
+	],
+	[
+		"finding 2: eval loading a file with no ledger use, or a package",
+		[
+			{ tool: "eval", language: "js", code: `await import("${cwd}/cfg/benign.ts");` },
+			{ tool: "eval", language: "py", code: `exec(open("${cwd}/hello.py").read())` },
+			{ tool: "eval", language: "py", code: `import sys\nsys.path.insert(0, "${cwd}")\nimport hello` },
+			{ tool: "eval", language: "py", code: `exec("print(1)")` },
+			{ tool: "eval", language: "js", code: `await import("${REPO}/surface/scripts/lane.ts");` },
+		],
+	],
+	[
+		"finding 3: package.json scripts and bunfig preloads with no ledger use",
+		[
+			{ tool: "bash", command: `cd ${cwd}/pkgok && bun run hi` },
+			{ tool: "bash", command: `cd ${cwd}/pkgok && bun start` },
+			{ tool: "bash", command: `cd ${cwd}/pkgok && npm run build` },
+			{ tool: "bash", command: `cd ${cwd}/pkgok && node --run hi` },
+			{ tool: "bash", command: `cd ${cwd}/pkgok && npm run missing` },
+			{ tool: "bash", command: `cd ${REPO} && bun run typecheck` },
+		],
+	],
+	["finding 4: python -m on a standard or benign module", [{ tool: "bash", command: "echo '{}' | python3 -m json.tool" }, { tool: "bash", command: `cd ${cwd} && python3 -m hello` }]],
+	[
+		"finding 5: bunx or npx on directories, repository files and benign files",
+		[
+			{ tool: "bash", command: `cd ${REPO} && bunx tsc --noEmit -p gates` },
+			{ tool: "bash", command: `cd ${REPO} && bunx biome check surface/src/launch.ts` },
+			{ tool: "bash", command: `bunx prettier --check ${cwd}/benign.ts` },
+		],
+	],
+	[
+		"minor 8: this repository's tracked files outside scripts/ and bin/",
+		[
+			{ tool: "bash", command: `cd ${REPO} && bun surface/src/as2test.ts render-refresh` },
+			{ tool: "bash", command: `cd ${REPO} && bun surface/src/launch.ts` },
+		],
+	],
+];
+
+for (const [group, probes] of ALLOWED_R2) {
+	describe(`G1 review 2 stays allowed: ${group}`, () => {
 		for (const role of ROLES) {
 			test(`role ${role}`, () => {
 				const refused = probes.flatMap((p) => {

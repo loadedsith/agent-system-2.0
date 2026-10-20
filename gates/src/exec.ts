@@ -91,9 +91,12 @@ const WRAPPERS: Record<string, { operands: number; valueFlags: RegExp }> = {
 	"sandbox-exec": { operands: 0, valueFlags: /^-[fnpD]$/ },
 };
 
-/** The code family an interpreter name runs, or null (`python3.12` → python, `nodejs` → js). */
+/**
+ * The code family an interpreter name runs, or null (`python3.12` → python, `nodejs` → js). A runtime with a version
+ * or a build suffix (`node22`, `bun-canary`, `bun-profile`, `deno2`) is that runtime (G1 review round 2, minor 9).
+ */
 export function interpreterFamily(name: string): CodeFamily | null {
-	if (/^(node|nodejs|bun|deno)$/.test(name)) return "js";
+	if (/^(node|nodejs|bun|deno)(\d[\d.]*)?(-(canary|profile|debug|nightly))?$/.test(name)) return "js";
 	if (/^(python|pypy)[\d.]*$/.test(name)) return "python";
 	if (/^perl[\d.]*$/.test(name)) return "perl";
 	if (/^j?ruby[\d.]*$/.test(name)) return "ruby";
@@ -512,10 +515,12 @@ export interface InterpreterArgs {
 	loads: Word[];
 	/** The directory an option runs the program from (bun `--cwd`, ruby `-C`); the last one wins. */
 	cwd: Word | null;
+	/** The module python `-m` runs, found on sys.path, whose first entry is the working directory. */
+	module: Word | null;
 }
 
 export function interpreterArgs(family: CodeFamily, name: string, args: Word[]): InterpreterArgs {
-	const out: InterpreterArgs = { code: [], stdin: false, unknown: false, operand: -1, loads: [], cwd: null };
+	const out: InterpreterArgs = { code: [], stdin: false, unknown: false, operand: -1, loads: [], cwd: null, module: null };
 	if (name === "deno") {
 		const sub = args[0]?.text;
 		if (sub === "eval") {
@@ -590,7 +595,11 @@ function scanOptions(short: Record<string, OptRole>, long: LongOpts, family: Cod
 					}
 					break;
 				}
-				if (role === "module") return; // python -m: a module runs, not stdin
+				if (role === "module") {
+					// python -m: a module runs, not stdin
+					out.module = k + 1 < t.length ? { text: t.slice(k + 1), opaque: false } : (args[i + 1] ?? null);
+					return;
+				}
 				if (role === "valueNext" || role === "load" || role === "cwd") {
 					const value = k + 1 >= t.length ? args[++i] : { text: t.slice(k + 1), opaque: false };
 					if (value && role === "load") out.loads.push(value);

@@ -21,13 +21,20 @@ const SCRIPT = join(import.meta.dir, "..", "scripts", "guard-replay.ts");
 /** The fixture's call count: a CLI run that parses fewer has lost calls, not passed. */
 const CORPUS_CALLS = 41;
 /**
- * The intended NEW-CATCHes, by corpus line. Line 62's eval loads the ledger module and writes a scratch ledger
- * stamped orchestrator-surface; it passed live, and the Jo-only boundary (PLAN wl-mv654hoqwpfhmo § 6.3 item 2)
- * refuses it. Lines 64 and 66 load `${R}/surface/scripts/lane.ts` by a template specifier computed at run time
- * (line 64 then writes the runner's `lane-runner` rows); G1 (scratch auth-forgery AUDIT.md § (e)) refuses a
- * computed import() whatever it names.
+ * The intended NEW-CATCHes, by corpus line. Line 2 runs `bun test "$f"` over a `for` loop's values: row 6 refused
+ * it live and still does, and G1 review round 2 (finding 1) reads every test file `bun test` runs, so row 10 now
+ * refuses an argument it cannot read too (the gate does not model loop values). Line 62's eval loads the ledger
+ * module and writes a scratch ledger stamped orchestrator-surface; it passed live, and the Jo-only boundary (PLAN
+ * wl-mv654hoqwpfhmo § 6.3 item 2) refuses it. Lines 64 and 66 load `${R}/surface/scripts/lane.ts` by a template
+ * specifier computed at run time (line 64 then writes the runner's `lane-runner` rows); G1 (scratch auth-forgery
+ * AUDIT.md § (e)) refuses a computed import() whatever it names.
  */
-const BOUNDARY_NEW_CATCH = [{ line: 62, reason: "code loading the ledger module" }, { line: 64, reason: "specifier is computed" }, { line: 66, reason: "specifier is computed" }];
+const BOUNDARY_NEW_CATCH = [
+	{ line: 2, reason: "`bun test` with an argument not known until it runs" },
+	{ line: 62, reason: "code loading the ledger module" },
+	{ line: 64, reason: "specifier is computed" },
+	{ line: 66, reason: "specifier is computed" },
+];
 
 const corpus = () => collectCalls([FIXTURES], 0);
 

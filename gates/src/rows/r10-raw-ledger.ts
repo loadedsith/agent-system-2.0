@@ -5,23 +5,44 @@
 // defaultLedgerPath and canonicalPath from ledger/src/locality.ts; the siblings are derived by suffix.
 //
 // No text grants authority (astra review B2): a comment naming `ledger/src/index` or a trailing
-// argument shaped like `ledger/scripts/x.ts` authorises nothing. The one exemption is running a
-// script that canonically resolves inside this repository's `ledger/scripts/`, as the one program bun
-// or node executes, with no inline code and no preloaded module.
+// argument shaped like `ledger/scripts/x.ts` authorises nothing. What runs unread is a checkout's own code
+// (checkoutFile): the ledger module's scripts, every file under a checkout's `scripts/` directories and `bin/`,
+// and every file git tracks in the checkout (G1 review rounds 1 and 2).
 //
 // The row is the Jo-only boundary's layer 2 (PLAN wl-mv654hoqwpfhmo § 6.3 item 2, ledger/src/authority.ts),
 // for every role: eval and inline code may not load the ledger module at all, a database opened from code may
 // not name a `ledger.db` or sit under `.agent-system-2/`, and no call may set, unset or override the
 // agent-context tags or the names that move the live roots. Every refusal names the boundary.
-// G1 (scratch auth-forgery AUDIT.md § (e)), with its review round 1: a script an interpreter runs (bun, node,
-// tsx, ts-node, bunx/npx on those, python, perl, ruby, deno) and the modules its options preload are read at gate
-// time and judged by the same rules (scriptCrossing), and a module loaded by a specifier computed at run time is
-// refused in eval, inline code and scripts outside every git repository (eval-code.ts computedModuleLoad).
-import { existsSync, readFileSync, statSync } from "node:fs";
+// G1 (scratch auth-forgery AUDIT.md § (e)), with its review rounds 1 and 2: a script an interpreter runs (bun, node,
+// tsx, ts-node, python, perl, ruby, deno, and any package bunx or npx runs on a file), the modules its options and
+// the cwd's bunfig.toml preload, the test files and preloads of `bun test`, the command line of a package.json
+// script (`bun run`, `bun <name>`, `npm run`, `npm start`, `node --run`), the module `python -m` runs from the
+// working directory, and the files code loads by a literal path are read at gate time and judged by the same rules
+// (scriptCrossing, codeLoadCrossing); a module or file loaded by a target computed at run time is refused in eval,
+// inline code and scripts outside every git repository (eval-code.ts computedModuleLoad, pythonLoads); `deno task`
+// is refused.
+import { spawnSync } from "node:child_process";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import { BOUNDARY, boundaryEnvName } from "../../../ledger/src/authority";
 import { canonicalPath, DEFAULT_LEDGER_RELATIVE, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
-import { boundaryEnvWrite, type CodeFacts, callArgs, codeFacts, computedMember, computedModuleLoad, dbConstructorEscape, evalProcessStart, ledgerModuleImport, SPAWN_API, WRITE_API } from "../eval-code";
+import {
+	argTexts,
+	boundaryEnvWrite,
+	type CodeFacts,
+	codeFacts,
+	computedMember,
+	computedModuleLoad,
+	dbConstructorEscape,
+	evalLoads,
+	evalProcessStart,
+	ledgerModuleImport,
+	moduleSpecifiers,
+	PLAIN_LITERAL,
+	pythonLoads,
+	SPAWN_API,
+	WRITE_API,
+} from "../eval-code";
 import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, type Expansion, expandShell, gitCall, gitTraceFiles, interpreterArgs, interpreterEnv, interpreterFamily, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Fragment, Word } from "../shell-parse";
 import { writeTargets } from "../targets";
@@ -415,10 +436,7 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 
 /**
  * bun's own subcommands (`bun --help`, bun 1.3.14): the word after `bun` (and its options) that names one is not a
- * script bun runs. `run`, `x` and `exec` are read on (scriptRuns). `bun test` is never read: test files open scratch
- * ledgers under the test preload, which `bunfig.toml` wires at this repository's root, module roots and test
- * directories only (ledger/test/isolate-preload.ts), so a `bun test` run from a directory under no such bunfig runs
- * its files with the real HOME, unread (a stated limit, migration/items/jo-only-boundary.md).
+ * script bun runs. `run`, `x`, `exec` and `test` are read on (scriptRuns, bunTestRuns); the others run no file.
  */
 const BUN_SUBCOMMANDS: Record<string, true> = Object.fromEntries(
 	"test x repl exec install i add a remove rm update audit outdated link unlink publish patch patch-commit pm info why build init create c upgrade feedback completions help"
@@ -429,8 +447,10 @@ const BUN_SUBCOMMANDS: Record<string, true> = Object.fromEntries(
 const SCRIPT_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
 /** The most of one script the gate reads; a larger one is refused rather than read in part. */
 const SCRIPT_CAP = 256 * 1024;
-/** How deep a command line `bun exec` or `npx -c` runs is read into (each is a shell running another command line). */
+/** How deep a command line `bun exec`, `npx -c` or a package.json script runs is read into (each is a shell running another command line). */
 const SHELL_RUN_DEPTH = 4;
+/** How deep the gate follows files that code loads by a literal path (codeLoadCrossing). */
+const LOAD_DEPTH = 4;
 
 /** The nearest directory holding `p` (the directory of `p`, then each above it) for which `test` holds, or null. */
 function nearestDir(p: string, test: (dir: string) => boolean): string | null {
@@ -440,24 +460,47 @@ function nearestDir(p: string, test: (dir: string) => boolean): string | null {
 	}
 }
 
+/** The agent-system-2.0 checkout holding `canonical`: the nearest directory with `ledger/schema.sql` and a `.git` (a checkout or a lane worktree, whose `.git` is a file). */
+function checkoutRoot(canonical: string): string | null {
+	return nearestDir(canonical, (dir) => existsSync(join(dir, "ledger", "schema.sql")) && existsSync(join(dir, ".git")));
+}
+
 /**
- * Is `canonical` a tracked script of an agent-system-2.0 checkout: a file under a `scripts` directory anywhere in
- * it (`surface/scripts/`, `ledger/scripts/`, `skills/cross-model-review/references/panel/scripts/`, …) or under its
+ * Is `canonical` a script of an agent-system-2.0 checkout: a file under a `scripts` directory anywhere in it
+ * (`surface/scripts/`, `ledger/scripts/`, `skills/cross-model-review/references/panel/scripts/`, …) or under its
  * `bin/`? Why these run unread: lanes run them every day (`bun surface/scripts/invariants.ts`, `lane.ts`, the
  * cross-model-review panel's `panel.ts` that skills/cross-model-review/SKILL.md has a lane run), several load the
  * ledger module by design, and their text is the checkout's reviewed code, not code a model wrote this session.
- * The root is the nearest directory holding `ledger/schema.sql` and a `.git` (a checkout or a lane worktree, whose
- * `.git` is a file). A file a model places there by hand in a checkout or lane worktree is a deliberate act, beyond
- * the accident grade, and shows in that worktree's diff. A scratch clone of the repository has the same shape, so its
- * scripts run unread too, and a model may edit a scratch clone: that is a stated limit (migration/items/
- * jo-only-boundary.md). Reaching machinery stamps through these scripts (`lane.ts run`, `ctx-index --by`, the tick
- * scripts) is G7, the follow-up.
+ * A file a model places there by hand in a checkout or lane worktree is a deliberate act, beyond the accident grade,
+ * and shows in that worktree's diff. A scratch clone of the repository has the same shape, so its scripts run unread
+ * too, and a model may edit a scratch clone: that is a stated limit (migration/items/jo-only-boundary.md). Reaching
+ * machinery stamps through these scripts (`lane.ts run`, `ctx-index --by`, the tick scripts) is G7, the follow-up.
  */
 function repoScript(canonical: string): boolean {
-	const root = nearestDir(canonical, (dir) => existsSync(join(dir, "ledger", "schema.sql")) && existsSync(join(dir, ".git")));
+	const root = checkoutRoot(canonical);
 	if (root === null) return false;
 	const parts = canonical.slice(root.length + 1).split("/");
 	return (parts[0] === "bin" && parts.length > 1) || parts.slice(0, -1).includes("scripts");
+}
+
+/** Per tool call (reset by checkRawLedgerWrite): `git ls-files` of each checkout root asked about (null when git could not list it), and the files already read. */
+const callState = { tracked: new Map<string, Set<string> | null>(), judged: new Set<string>() };
+
+/**
+ * Does `canonical` run unread as a checkout's own code: the ledger module's scripts, a repoScript, or a file git
+ * tracks in its checkout (G1 review round 2, minor 8: `bun surface/src/as2test.ts`, `bun surface/src/launch.ts` and
+ * this repository's tests are the checkout's reviewed code). Tracking a file is `git add`, a deliberate act that shows
+ * in the worktree's status, the same grade as placing a file under `scripts/`.
+ */
+function checkoutFile(canonical: string): boolean {
+	if (canonical.startsWith(`${LEDGER_SCRIPTS}/`) || repoScript(canonical)) return true;
+	const root = checkoutRoot(canonical);
+	if (root === null) return false;
+	if (!callState.tracked.has(root)) {
+		const r = spawnSync("git", ["-C", root, "ls-files", "-z"], { encoding: "utf8", timeout: 5000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+		callState.tracked.set(root, r.status === 0 ? new Set(r.stdout.split("\0")) : null);
+	}
+	return callState.tracked.get(root)?.has(canonical.slice(root.length + 1)) ?? false;
 }
 
 /** The file an interpreter runs for `path`: the path itself, else (bun and node) with an extension or a directory's index file; null if none. */
@@ -494,49 +537,152 @@ interface ScriptRun {
 	/** The directory a relative word resolves against, and whether it is known (a `cd` the gate could not follow). */
 	dir: string;
 	dirKnown: boolean;
-	/** The code family the file is judged as; `shell` for the command line `bun exec` or `npx -c` runs. */
+	/** The code family the file is judged as; `shell` for the command line `bun exec`, `npx -c` or a package.json script runs. */
 	family: CodeFamily | "shell";
 	/** The program itself, not a module an option (`--preload`, `-r`, `--import`) loads before it. */
 	main: boolean;
+	/** Read even a checkout's own file: a test file `bun test` runs without the checkout's isolating preload. */
+	readCheckout?: boolean;
 }
 
-/** What `bun x`, `bunx` and npx may run on a file the gate then reads: the TypeScript runners and the two runtimes. */
+/** What `bun x`, `bunx` and npx run on a file through its own options: the TypeScript runners and the two runtimes. Any other package's file arguments are read as scripts (packageRuns). */
 const FILE_RUNNERS: Record<string, true> = { tsx: true, "ts-node": true, "ts-node-esm": true, node: true, bun: true };
 /** bunx's and npx's options that take the next word (`bunx --help`, bun 1.3.14; `npm help exec`): the package to install. */
 const PACKAGE_RUNNER_VALUE = /^(?:-p|--package)$/;
 
 const opaqueWord = (w: Word): boolean => w.opaque || w.glob === true;
+/** A literal word: a path or a command line the gate built, not one the command spelled. */
+const literalWord = (text: string): Word => ({ text, opaque: false });
+/** The code family a file's extension names: python, perl, ruby, else js. */
+const familyOfFile = (path: string): CodeFamily => (/\.py$/.test(path) ? "python" : /\.p[lm]$/.test(path) ? "perl" : /\.rb$/.test(path) ? "ruby" : "js");
 
 /**
- * The files a command runs as programs, the modules its options load first, and the command lines it hands to a
- * shell, or why the gate cannot name them (an option or a program word not known until it runs). Options are read
- * by exec.ts interpreterArgs: an unknown one is a flag with no value. Read: bun and node (and tsx, ts-node) after
- * their options, `bun run`, bun's `--cwd` and ruby's `-C`, every `--preload`/`-r`/`--require`/`--import`/`--loader`
- * module, `bun exec`'s and `npx -c`'s command line, `bun x`/`bunx`/npx running a FILE_RUNNERS name, and python,
- * perl, ruby and deno (`deno run|serve|watch <file>`, `deno <file>`). None for bun's other subcommands (`bun test`
- * included), deno's other subcommands, python `-m`, php and osascript.
+ * The `preload` entries of a bunfig.toml, every section (top level, `[test]`, `[run]`); empty when the file does not
+ * exist, a string when it has a preload the gate cannot read. bun reads `bunfig.toml` from the working directory only,
+ * or the file `--config=<path>` names, and resolves a preload against the working directory (live, bun 1.3.14,
+ * 2026-10-20: a parent directory's bunfig, `~/.bunfig.toml` and `$XDG_CONFIG_HOME/.bunfig.toml` were not loaded).
+ */
+function bunfigPreloads(file: string): string[] | string {
+	if (!existsSync(file)) return [];
+	let text: string;
+	try {
+		text = readFileSync(file, "utf8");
+	} catch (err) {
+		return `a bunfig.toml the gate cannot read (${file}: ${err instanceof Error ? err.message : String(err)})`;
+	}
+	// A preload path holds no `#`, so a `#` starts a TOML comment, which may mention preloads.
+	const body = text.replace(/#.*$/gm, "");
+	const out: string[] = [];
+	const lines = [...body.matchAll(/^[ \t]*preload[ \t]*=[ \t]*(\[[^\]\n]*\]|"[^"\n]*"|'[^'\n]*')[ \t]*$/gm)];
+	for (const m of lines) for (const s of m[1]!.matchAll(/"([^"\n]*)"|'([^'\n]*)'/g)) out.push(s[1] ?? s[2]!);
+	// Every `preload =` key (an inline table's or a dotted `test.preload` too) must be one the line form above read.
+	if (lines.length !== [...body.matchAll(/(?:^|[\s{,.])["']?preload["']?[ \t]*=/gm)].length) return `a bunfig.toml (${file}) whose preload the gate cannot read; write it as \`preload = ["<path>"]\` on one line`;
+	return out;
+}
+
+/** The bunfig.toml a bun run reads: the last `--config=<path>` among its words, else the working directory's. */
+function bunfigFile(args: Word[], at: string): string {
+	const config = args.findLast((w) => /^(?:--config|-c)=/.test(w.text));
+	return config ? resolve(at, config.text.slice(config.text.indexOf("=") + 1)) : join(at, "bunfig.toml");
+}
+
+/**
+ * The command lines script `name` runs from the nearest package.json at or above `dir` (bun, npm and `node --run`
+ * look upward; live, 2026-10-20), with `pre<name>` first and `post<name>` last when `hooks` (bun run and npm run them,
+ * `node --run` does not) and `extra` appended to the script itself; null when that package.json has no such script, a
+ * string when it cannot be read.
+ */
+function packageScript(dir: string, name: string, extra: Word[], hooks: boolean): { dir: string; lines: string[] } | null | string {
+	const root = nearestDir(join(dir, "package.json"), (d) => existsSync(join(d, "package.json")));
+	if (root === null) return null;
+	let scripts: Record<string, unknown>;
+	try {
+		const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts?: Record<string, unknown> };
+		scripts = pkg.scripts && typeof pkg.scripts === "object" ? pkg.scripts : {};
+	} catch (err) {
+		return `a package.json the gate cannot read (${join(root, "package.json")}: ${err instanceof Error ? err.message : String(err)})`;
+	}
+	const own = scripts[name];
+	if (typeof own !== "string") return null;
+	const quoted = extra.map((w) => `'${w.text.replaceAll("'", `'\\''`)}'`).join(" ");
+	const lines = [quoted ? `${own} ${quoted}` : own];
+	const pre = scripts[`pre${name}`];
+	const post = scripts[`post${name}`];
+	if (hooks && typeof pre === "string") lines.unshift(pre);
+	if (hooks && typeof post === "string") lines.push(post);
+	return { dir: root, lines };
+}
+
+/** A package.json script's command lines (packageScript) as ScriptRuns judged from the package's directory; null when there is no such script. */
+function packageScriptRuns(via: string, dir: string, dirKnown: boolean, name: Word, extra: Word[], hooks: boolean): ScriptRun[] | string | null {
+	if (opaqueWord(name) || extra.some(opaqueWord)) return `\`${via}\` with a script name or an argument not known until it runs`;
+	if (!dirKnown) return `\`${via} ${name.text}\` after a \`cd\` the gate could not follow, so the gate cannot find its package.json`;
+	const script = packageScript(dir, name.text, extra, hooks);
+	if (script === null || typeof script === "string") return script;
+	return script.lines.map((line) => ({ via: `${via} ${name.text}`, word: literalWord(line), dir: script.dir, dirKnown: true, family: "shell", main: true }));
+}
+
+/**
+ * The files `python -m <module>` may run from `base` (the working directory, sys.path's first entry), or code that
+ * imports `<module>` with `base` on sys.path: each package's `__init__.py` on the way, the module's `.py`, and a
+ * package's `__main__.py`. A module found in none of them is the standard library's or an installed one.
+ */
+function pythonModuleFiles(base: string, module: string): string[] {
+	const parts = module.split(".");
+	const out: string[] = [];
+	for (let i = 1; i <= parts.length; i++) {
+		const p = join(base, ...parts.slice(0, i));
+		out.push(`${p}.py`, join(p, "__init__.py"));
+	}
+	out.push(join(base, ...parts, "__main__.py"));
+	return out.filter((f) => existsSync(f) && statSync(f).isFile());
+}
+
+/**
+ * The files, modules and command lines a command runs, or why the gate cannot name them (an option, a program word or
+ * a script name not known until it runs). Options are read by exec.ts interpreterArgs: an unknown one is a flag with
+ * no value. Read: bun and node (and tsx, ts-node) after their options, `bun run`, bun's `--cwd` and ruby's `-C`, every
+ * `--preload`/`-r`/`--require`/`--import`/`--loader` module and the working directory's (or `--config=`'s) bunfig.toml
+ * preloads, `bun test` (bunTestRuns), a package.json script (`bun run <name>`, `bun <name>`, npm (npmRuns), `node
+ * --run`), `bun exec`'s and `npx -c`'s command line, `bun x`/`bunx`/npx (packageRuns), python, perl, ruby and deno
+ * (`deno run|serve|watch <file>`, `deno <file>`), and python `-m`'s module from the working directory. Refused:
+ * `deno task`. None for bun's other subcommands, deno's other subcommands, php and osascript.
  */
 function scriptRuns(head: string, args: Word[], dir: string, dirKnown: boolean): ScriptRun[] | string {
 	if (head === "bunx" || head === "npx") return packageRuns(head, args, dir, dirKnown);
-	const family = head === "bun" || head === "node" || !Object.hasOwn(FILE_RUNNERS, head) ? interpreterFamily(head) : "js";
+	if (head === "npm") return npmRuns(args, dir, dirKnown);
+	const family = /^(?:bun|node)/.test(head) || !Object.hasOwn(FILE_RUNNERS, head) ? interpreterFamily(head) : "js";
 	if (family === null || family === "php" || family === "osascript") return [];
+	if (/^deno/.test(head) && args[0]?.text === "task") return "`deno task` runs a deno.json task, which the gate does not read";
 	const cannot = `\`${head}\` with an option or a program path not known until it runs`;
 	const a = interpreterArgs(family, head, args);
 	if (a.unknown) return cannot;
+	// node --run <name> runs a package.json script (interpreterArgs takes its name as an option value).
+	const nodeRun = /^node/.test(head) ? args.findIndex((w) => w.text === "--run" || w.text.startsWith("--run=")) : -1;
+	if (nodeRun >= 0) {
+		const flag = args[nodeRun]!.text;
+		const name = flag === "--run" ? args[nodeRun + 1] : literalWord(flag.slice("--run=".length));
+		if (!name) return [];
+		const extra = args.slice(nodeRun + (flag === "--run" ? 2 : 1)).filter((w) => w.text !== "--");
+		return packageScriptRuns("node --run", dir, dirKnown, name, extra, false) ?? [];
+	}
 	const loads = [...a.loads];
 	let cwd = a.cwd;
 	let rest = a.operand < 0 ? [] : args.slice(a.operand);
 	let via = head;
-	// bun's subcommand, when the first operand names one: `run` is read on, `x` and `exec` below, the others run no file read here.
-	const sub = head === "bun" ? rest[0]?.text : undefined;
+	// bun's subcommand, when the first operand names one: `run` is read on, `x`, `exec` and `test` below, the others run no file read here.
+	const bun = /^bun/.test(head);
+	const sub = bun ? rest[0]?.text : undefined;
+	let runArgs: Word[] = [];
 	if (sub === "run") {
-		const r = interpreterArgs("js", head, rest.slice(1));
+		runArgs = rest.slice(1);
+		const r = interpreterArgs("js", head, runArgs);
 		if (r.unknown) return cannot;
 		loads.push(...r.loads);
 		cwd = r.cwd ?? cwd;
-		rest = r.operand < 0 ? [] : rest.slice(1 + r.operand);
+		rest = r.operand < 0 ? [] : runArgs.slice(r.operand);
 		via = "bun run";
-	} else if (sub !== undefined && Object.hasOwn(BUN_SUBCOMMANDS, sub)) rest = [];
+	} else if (sub !== undefined && sub !== "test" && Object.hasOwn(BUN_SUBCOMMANDS, sub)) rest = [];
 	let at = dir;
 	let known = dirKnown;
 	if (cwd) {
@@ -544,7 +690,28 @@ function scriptRuns(head: string, args: Word[], dir: string, dirKnown: boolean):
 		at = resolve(dir, cwd.text);
 		known = dirKnown || cwd.text.startsWith("/");
 	}
-	const runs: ScriptRun[] = loads.map((word) => ({ via, word, dir: at, dirKnown: known, family, main: false }));
+	const preloaded = () => loads.map((word): ScriptRun => ({ via, word, dir: at, dirKnown: known, family, main: false }));
+	if (a.module) {
+		// python -m: the module from the working directory, sys.path's first entry (G1 review round 2, finding 4).
+		if (opaqueWord(a.module)) return `\`${head} -m\` with a module not known until it runs`;
+		if (!known) return `\`${head} -m ${a.module.text}\` after a \`cd\` the gate could not follow, so the gate cannot find the module`;
+		const files = pythonModuleFiles(at, a.module.text);
+		return [...preloaded(), ...files.map((f): ScriptRun => ({ via: `${head} -m`, word: literalWord(f), dir: at, dirKnown: true, family, main: true }))];
+	}
+	if (sub === "test") return bunTestRuns(args.slice(a.operand + 1), loads, at, known, args);
+	if (bun && rest[0] && sub !== "x" && sub !== "exec") {
+		// `bun run <name>`, `bun <name>`: a package.json script of that name runs, not a file of that name (minor 6).
+		const scripted = packageScriptRuns(via, at, known, rest[0], rest.slice(1), true);
+		if (typeof scripted === "string") return scripted;
+		if (scripted) return [...preloaded(), ...scripted];
+	}
+	if (bun && (rest[0] !== undefined || a.code.length > 0) && sub !== "x" && sub !== "exec") {
+		if (!known) return `\`${via}\` after a \`cd\` the gate could not follow, so the gate cannot read its bunfig.toml`;
+		const preloads = bunfigPreloads(bunfigFile([...args, ...runArgs], at));
+		if (typeof preloads === "string") return preloads;
+		loads.push(...preloads.map(literalWord));
+	}
+	const runs = preloaded();
 	if (sub === "x") {
 		const more = packageRuns("bun x", args.slice(a.operand + 1), at, known);
 		return typeof more === "string" ? more : [...runs, ...more];
@@ -557,15 +724,140 @@ function scriptRuns(head: string, args: Word[], dir: string, dirKnown: boolean):
 	return runs;
 }
 
-/** What `bunx`, `bun x` or npx runs (scriptRuns): a FILE_RUNNERS name on its file, or npx `-c`'s command line; none for any other package. */
+/** `bun test` options that take the next word (`bun test --help`, bun 1.3.14): a test-name pattern, a preload, a directory, an env file. */
+const BUN_TEST_VALUE = /^(?:-t|--test-name-pattern|-r|--preload|--require|--import|--cwd|--env-file|--tsconfig-override)$/;
+/** `bun test` options whose value is a module it loads first. */
+const BUN_TEST_LOAD = /^(?:-r|--preload|--require|--import)$/;
+/** The file names `bun test` runs: `*.test.*`, `*_test.*`, `*.spec.*`, `*_spec.*` in JS and TS. */
+const TEST_FILE = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
+/** The most directory entries the gate walks to find the test files a `bun test` runs; beyond it the run is refused. */
+const TEST_WALK_CAP = 50_000;
+/** A checkout's test preload that points the ledger at a scratch root (ledger/test/isolate-preload.ts). */
+const ISOLATE_PRELOAD = "/ledger/test/isolate-preload.ts";
+
+/**
+ * What `bun test` runs (G1 review round 2, finding 1): its preloads (`-r`/`--preload` and the bunfig.toml's), each
+ * file a path argument (`./x`, `../x`, `/x`) names, and the test files under its working directory, or under a
+ * directory a path argument names, whose path holds a filter argument (every one with no filter; bun skips
+ * `node_modules` and dot directories). A checkout's own test file runs unread only when the run's bunfig preloads that
+ * checkout's ISOLATE_PRELOAD; every other test file is read like a script.
+ */
+function bunTestRuns(args: Word[], loads: Word[], at: string, known: boolean, all: Word[]): ScriptRun[] | string {
+	const filters: string[] = [];
+	let cwd: Word | null = null;
+	for (let i = 0; i < args.length; i++) {
+		const t = args[i]!.text;
+		if (opaqueWord(args[i]!)) return "`bun test` with an argument not known until it runs";
+		if (BUN_TEST_VALUE.test(t)) {
+			const v = args[++i];
+			if (v && opaqueWord(v)) return "`bun test` with an option value not known until it runs";
+			if (v && BUN_TEST_LOAD.test(t)) loads.push(v);
+			if (v && t === "--cwd") cwd = v;
+		} else if (/^(?:-r|--preload|--require|--import)=/.test(t)) loads.push(literalWord(t.slice(t.indexOf("=") + 1)));
+		else if (t.startsWith("--cwd=")) cwd = literalWord(t.slice("--cwd=".length));
+		else if (t !== "--" && !t.startsWith("-")) filters.push(t);
+	}
+	if (cwd) {
+		at = resolve(at, cwd.text);
+		known ||= cwd.text.startsWith("/");
+	}
+	if (!known) return "`bun test` after a `cd` the gate could not follow, so the gate cannot find the test files it runs";
+	const preloads = bunfigPreloads(bunfigFile(all, at));
+	if (typeof preloads === "string") return preloads;
+	const isolated = new Set(preloads.map((p) => canonicalOrLexical(resolve(at, p))).flatMap((c) => (c.endsWith(ISOLATE_PRELOAD) ? [c.slice(0, -ISOLATE_PRELOAD.length)] : [])));
+	const files: string[] = [];
+	const walks: [string, (f: string) => boolean][] = [];
+	const substrings = filters.filter((f) => !/^(?:\/|\.\.?(?:\/|$))/.test(f));
+	for (const f of filters) {
+		if (substrings.includes(f)) continue;
+		const p = resolve(at, f);
+		if (existsSync(p) && statSync(p).isDirectory()) walks.push([p, () => true]);
+		else {
+			const file = scriptFile(p, true);
+			if (file) files.push(file);
+		}
+	}
+	if (filters.length === 0 || substrings.length > 0) walks.push([at, (f) => substrings.length === 0 || substrings.some((s) => f.includes(s))]);
+	let seen = 0;
+	for (const [root, keep] of walks) {
+		const stack = [root];
+		while (stack.length > 0) {
+			const d = stack.pop()!;
+			let entries: Dirent[];
+			try {
+				entries = readdirSync(d, { withFileTypes: true });
+			} catch {
+				continue;
+			}
+			seen += entries.length;
+			if (seen > TEST_WALK_CAP) return `\`bun test\` in ${at}, which holds more than ${TEST_WALK_CAP} entries for the gate to find the test files in; run named test files by path`;
+			for (const e of entries) {
+				if (e.name.startsWith(".") || e.name === "node_modules") continue;
+				const p = join(d, e.name);
+				if (e.isDirectory()) stack.push(p);
+				else if (e.isFile() && TEST_FILE.test(e.name) && keep(p)) files.push(p);
+			}
+		}
+	}
+	const runs = [...loads, ...preloads.map(literalWord)].map((word): ScriptRun => ({ via: "bun test", word, dir: at, dirKnown: true, family: "js", main: false }));
+	for (const f of new Set(files)) {
+		const root = checkoutRoot(canonicalOrLexical(f));
+		runs.push({ via: "bun test", word: literalWord(f), dir: at, dirKnown: true, family: "js", main: true, readCheckout: root === null || !isolated.has(root) });
+	}
+	return runs;
+}
+
+/** npm's commands that run a package.json script (`npm help run-script`, `npm help start`, …): the script the command names, or null when its operand does. */
+const NPM_SCRIPT_COMMANDS: Record<string, string | null> = { run: null, "run-script": null, rum: null, urn: null, start: "start", test: "test", t: "test", tst: "test", restart: "restart", stop: "stop" };
+
+/**
+ * What npm runs (G1 review round 2, finding 3): a package.json script with its pre and post scripts (`npm run <name>`,
+ * `npm start`, `npm test`, `npm restart` (with stop and start), `npm stop`; `npm start` with no start script runs
+ * `node server.js`), and `npm exec`/`npm x` as npx. A `--prefix` or workspace option, which moves the package.json, is
+ * refused; npm's other commands (install and its lifecycle scripts included) are not read.
+ */
+function npmRuns(args: Word[], dir: string, dirKnown: boolean): ScriptRun[] | string {
+	const i = args.findIndex((w) => opaqueWord(w) || !w.text.startsWith("-"));
+	if (args.slice(0, i < 0 ? args.length : i).some((w) => /^(?:--prefix|-C|-w|--workspace|--workspaces|--ws)(?:=|$)/.test(w.text))) {
+		return "`npm` with a --prefix or workspace option, which the gate does not follow to its package.json";
+	}
+	const command = args[i];
+	if (!command) return [];
+	if (opaqueWord(command)) return "`npm` with a command not known until it runs";
+	if (command.text === "exec" || command.text === "x") return packageRuns("npm exec", args.slice(i + 1), dir, dirKnown);
+	if (!Object.hasOwn(NPM_SCRIPT_COMMANDS, command.text)) return [];
+	const named = NPM_SCRIPT_COMMANDS[command.text];
+	const operands = args.slice(i + 1).filter((w) => w.text === "--" || opaqueWord(w) || !w.text.startsWith("-"));
+	const name = named ? literalWord(named) : operands[0];
+	if (!name) return [];
+	const extra = (named ? operands : operands.slice(1)).filter((w) => w.text !== "--");
+	const runs = packageScriptRuns("npm run", dir, dirKnown, name, extra, true);
+	if (runs === null && name.text === "start") return [{ via: "npm start", word: literalWord("node server.js"), dir, dirKnown, family: "shell", main: true }];
+	if (typeof runs === "string" || name.text !== "restart") return runs ?? [];
+	const out = [...(runs ?? [])];
+	for (const step of ["stop", "start"]) {
+		const more = packageScriptRuns("npm run", dir, dirKnown, literalWord(step), [], true);
+		if (typeof more === "string") return more;
+		out.push(...(more ?? []));
+	}
+	return out;
+}
+
+/**
+ * What `bunx`, `bun x`, npx or `npm exec` runs (scriptRuns): a FILE_RUNNERS name on its file, npx's `-c` command
+ * line, and for any other package every argument that names an existing file, read as a script (G1 review round 2,
+ * finding 5: `bunx jiti f.ts`, `bunx vite-node f.ts`, `bunx zx f.js` run it). Reading every file argument is the
+ * fail-closed choice over a list of file-running packages, which a package not on the list escapes; a formatter or
+ * linter handed a file that writes the ledger is refused too.
+ */
 function packageRuns(via: string, args: Word[], dir: string, dirKnown: boolean): ScriptRun[] | string {
 	for (let i = 0; i < args.length; i++) {
 		const w = args[i]!;
 		if (opaqueWord(w)) return `\`${via}\` with a package or an option not known until it runs`;
 		const t = w.text;
-		if (via === "npx" && (t === "-c" || t === "--call" || t.startsWith("--call="))) {
-			const line = t.startsWith("--call=") ? { text: t.slice("--call=".length), opaque: false } : args[i + 1];
-			return line ? [{ via: "npx -c", word: line, dir, dirKnown, family: "shell", main: true }] : [];
+		if ((via === "npx" || via === "npm exec") && (t === "-c" || t === "--call" || t.startsWith("--call="))) {
+			const line = t.startsWith("--call=") ? literalWord(t.slice("--call=".length)) : args[i + 1];
+			return line ? [{ via: `${via} -c`, word: line, dir, dirKnown, family: "shell", main: true }] : [];
 		}
 		if (PACKAGE_RUNNER_VALUE.test(t)) {
 			i++;
@@ -574,9 +866,14 @@ function packageRuns(via: string, args: Word[], dir: string, dirKnown: boolean):
 		if (t.startsWith("-")) continue;
 		// `tsx@4` and `@scope/name@1` name the package without the version.
 		const pkg = t.replace(/(?!^)@[^/]*$/, "");
-		if (!Object.hasOwn(FILE_RUNNERS, pkg)) return [];
-		const runs = scriptRuns(pkg, args.slice(i + 1), dir, dirKnown);
-		return typeof runs === "string" ? runs : runs.map((r) => ({ ...r, via: `${via} ${r.via}` }));
+		if (Object.hasOwn(FILE_RUNNERS, pkg)) {
+			const runs = scriptRuns(pkg, args.slice(i + 1), dir, dirKnown);
+			return typeof runs === "string" ? runs : runs.map((r) => ({ ...r, via: `${via} ${r.via}` }));
+		}
+		return args
+			.slice(i + 1)
+			.filter((a) => a.text !== "--" && !a.text.startsWith("-"))
+			.map((word): ScriptRun => ({ via: `${via} ${pkg}`, word, dir, dirKnown, family: familyOfFile(word.text), main: true }));
 	}
 	return [];
 }
@@ -593,16 +890,17 @@ function callEnv(env: Record<string, string | undefined>, toolEnv: unknown): Rec
  * Why a command's programs cross the Jo-only boundary, or null (G1). Each file scriptRuns names is read at gate
  * time with what this same call writes into it, and judged as eval code is (rawWriteInCode, in the interpreter's
  * family): it may not load the ledger module, name a `ledger.db` in an open or write, open a database under
- * `.agent-system-2/`, or, outside every git repository (a scratch script), load a module by a computed specifier.
+ * `.agent-system-2/`, or, outside every git repository (a scratch script), load a module or a file by a target
+ * computed at run time; the files it loads by a literal path are read the same way (codeLoadCrossing).
  * A program word with an expansion is read at the value the session's environment gives it (`"$AS2_SCRATCH/f.ts"`,
  * `~/f.ts`); one the gate cannot resolve (a substitution, an unset variable) is refused. A script that cannot be
  * read is refused: over SCRIPT_CAP, unreadable, or written in this call from text the gate does not see (`cp`,
  * `curl -o`). A script that is missing and that no command in this call is seen to write runs nothing (the
  * interpreter fails on it), so it passes; one written by a writer the gate does not parse (a compiler's output, an
- * unzip) is beyond the accident grade, as a transitive import is. A command line `bun exec` or `npx -c` runs is
- * judged as a bash call of its own (bashCrossing). Not read: `bun test`, bun's and deno's other subcommands, a bare
- * name that is no file (`bun run typecheck`, a package.json script, a preload's package name), the ledger module's
- * own scripts, and a checkout's tracked scripts (repoScript), unless this call writes into them.
+ * unzip) is beyond the accident grade. A command line `bun exec`, `npx -c` or a package.json script runs is judged
+ * as a bash call of its own (bashCrossing). Not read: bun's and deno's other subcommands, a bare name that is no file
+ * and no package.json script (a bin, a preload's package name), and a checkout's own files (checkoutFile), unless
+ * this call writes into them.
  */
 function scriptCrossing(e: Exec, x: Expansion, paths: LedgerPaths, env: Record<string, string | undefined>, depth: number): string | null {
 	const runs = scriptRuns(basename(e.argv[0]!.text), e.argv.slice(1), e.dir, e.dirKnown);
@@ -614,7 +912,7 @@ function scriptCrossing(e: Exec, x: Expansion, paths: LedgerPaths, env: Record<s
 	return null;
 }
 
-/** Why the command line `bun exec` or `npx -c` runs crosses the boundary: it is judged as a bash call of its own, from the same directory. */
+/** Why the command line `bun exec`, `npx -c` or a package.json script runs crosses the boundary: it is judged as a bash call of its own, from its directory. */
 function shellRunCrossing(run: ScriptRun, paths: LedgerPaths, env: Record<string, string | undefined>, depth: number): string | null {
 	if (opaqueWord(run.word)) return `\`${run.via}\` running a command line not known until it runs, so the gate cannot read it`;
 	if (!run.dirKnown) return `\`${run.via}\` after a \`cd\` the gate could not follow, so the gate cannot read what it runs`;
@@ -629,7 +927,7 @@ function scriptFileCrossing(run: ScriptRun, family: CodeFamily, x: Expansion, pa
 	const lead = `\`${run.via}\` ${run.main ? "running" : "preloading"}`;
 	if (opaqueWord(word)) return `${lead} ${valuesShown(word)}, a path not known until it runs, so the gate cannot read the script; name it by a literal path or a variable the session sets`;
 	const js = family === "js";
-	// A bare name (no `/`, no `.`) that is no file is, for bun and node, a package.json script, a bin or a preload's package: what runs is not this word's text.
+	// A bare name (no `/`, no `.`) that is no file is, for bun and node, a bin or a preload's package: what runs is not this word's text.
 	const bare = js && !/[./]/.test(word.text);
 	if (!run.dirKnown && !word.text.startsWith("/")) {
 		return bare ? null : `${lead} ${word.text} after a \`cd\` the gate could not follow, so it cannot read the script; run it by its absolute path`;
@@ -637,11 +935,23 @@ function scriptFileCrossing(run: ScriptRun, family: CodeFamily, x: Expansion, pa
 	const path = resolve(run.dir, word.text);
 	const written = writtenScript(x, path, js);
 	if (written === null) return `${lead} ${path}, which this same call writes from text the gate cannot read`;
-	const file = scriptFile(path, js);
+	return fileCrossing(lead, path, written, family, paths, run.readCheckout === true, 0);
+}
+
+/**
+ * Why the file at `path` (with the `written` texts this call writes into it) crosses the boundary when code runs or
+ * loads it, or null. It is read unless missing or a checkout's own file (checkoutFile; `readCheckout` reads that
+ * too), refused when over SCRIPT_CAP or unreadable, and judged by rawWriteInCode at load depth `depth`. A file this
+ * tool call already read is not read again (an import cycle).
+ */
+function fileCrossing(lead: string, path: string, written: string[], family: CodeFamily, paths: LedgerPaths, readCheckout: boolean, depth: number): string | null {
+	const file = scriptFile(path, family === "js");
 	if (!file && written.length === 0) return null;
 	const texts = [...written];
 	const canonical = file ? canonicalOrLexical(file) : null;
-	if (canonical && !canonical.startsWith(`${LEDGER_SCRIPTS}/`) && !repoScript(canonical)) {
+	if (canonical && (readCheckout || !checkoutFile(canonical))) {
+		if (texts.length === 0 && callState.judged.has(canonical)) return null;
+		callState.judged.add(canonical);
 		let size: number;
 		try {
 			size = statSync(canonical).size;
@@ -656,8 +966,41 @@ function scriptFileCrossing(run: ScriptRun, family: CodeFamily, x: Expansion, pa
 	// wrote: refused only outside every repository (G1 review round 1).
 	const computedLoads = nearestDir(canonical ?? path, (dir) => existsSync(join(dir, ".git"))) === null;
 	for (const text of texts) {
-		const why = rawWriteInCode(text, paths, dirname(path), family, computedLoads);
+		const why = rawWriteInCode(text, paths, dirname(path), family, computedLoads, depth);
 		if (why) return `${lead} ${canonical ?? path}: ${why}`;
+	}
+	return null;
+}
+
+/**
+ * Why a file the code loads by a literal path crosses the boundary, or null (G1 review round 2, finding 2). JS: each
+ * `import`/`import()`/`require()` specifier that is a path (`/…`, `./…`, `../…`, `~/…`, `file://…`); a package name is
+ * not read. Python (eval-code.ts pythonLoads): `exec`/`compile` of one file read (`open(p).read()`), `runpy.run_path`,
+ * `execfile`, `spec_from_file_location`, `SourceFileLoader`, `load_source`, the eval tool's `%load`, a module imported
+ * from the code's directory or a directory it puts on sys.path, and the literal code `exec` runs; a load whose target
+ * is computed is refused where `computedLoads` holds. Each file is read and judged as a script (fileCrossing), at most
+ * LOAD_DEPTH files deep.
+ */
+function codeLoadCrossing(facts: CodeFacts, paths: LedgerPaths, dir: string, family: CodeFamily | undefined, computedLoads: boolean, depth: number): string | null {
+	const files: string[] = [];
+	const local = (p: string) => resolve(dir, p.replace(/^file:\/\//, "").replace(/^~(?=\/)/, process.env.HOME ?? "~"));
+	if (family === "js") {
+		for (const s of moduleSpecifiers(facts)) if (/^(?:\/|\.\.?\/|~\/|file:\/\/)/.test(s)) files.push(local(s));
+	} else if (family === "python") {
+		const py = pythonLoads(facts);
+		if (py.computed && computedLoads) return `code loading a file or module computed at run time (${py.computed}), which may run code that writes the ledger; load it by a literal path or name`;
+		for (const text of py.texts) {
+			const why = depth >= LOAD_DEPTH ? `literal code nested more than ${LOAD_DEPTH} deep` : rawWriteInCode(text, paths, dir, family, computedLoads, depth + 1);
+			if (why) return `code running the literal code "${text.slice(0, 40)}": ${why}`;
+		}
+		files.push(...[...py.paths, ...evalLoads(facts, family).map((p) => p.replace(/^(["'])(.*)\1$/, "$2"))].map(local));
+		const bases = [dir, ...py.dirs.map(local)];
+		for (const m of py.modules) for (const base of bases) files.push(...pythonModuleFiles(base, m));
+	}
+	for (const f of files) {
+		if (depth >= LOAD_DEPTH) return `code loading ${f} more than ${LOAD_DEPTH} files deep, which the gate does not read`;
+		const why = fileCrossing("code loading", f, [], family === "js" ? "js" : familyOfFile(f), paths, false, depth + 1);
+		if (why) return why;
 	}
 	return null;
 }
@@ -741,26 +1084,6 @@ function readOnlyConstant(facts: CodeFacts): boolean {
 		if (ASSIGN.test(after.slice(2).replace(/([(,]\s*)[A-Za-z_]\w*\s*=(?!=)/g, "$1")) || /\b(?:del|for|as|global|nonlocal|lambda|def|class)\b/.test(before)) return false;
 	}
 	return true;
-}
-
-/** A call's top-level arguments as spans of `folded`, split on `masked` (same positions); null if unbalanced. */
-function argTexts(facts: CodeFacts, open: number): string[] | null {
-	const inner = callArgs(facts.masked, open);
-	if (inner === null) return null;
-	const out: string[] = [];
-	let depth = 0;
-	let from = open + 1;
-	for (let i = open + 1; i <= open + inner.length; i++) {
-		const c = facts.masked[i];
-		if (c === "(" || c === "[" || c === "{") depth++;
-		else if (c === ")" || c === "]" || c === "}") depth--;
-		else if (c === "," && depth === 0) {
-			out.push(facts.folded.slice(from, i).trim());
-			from = i + 1;
-		}
-	}
-	out.push(facts.folded.slice(from, open + 1 + inner.length).trim());
-	return out.filter((a) => a !== "");
 }
 
 /** A trailing callback argument (`fs.open(p, "r", () => {})`): where the call reports, not how it opens. */
@@ -886,8 +1209,6 @@ function dbOpenVerdict(facts: CodeFacts, module: string): string | null {
 	}
 	return opens === 0 ? `eval code loading the database module "${module}" with no open the gate can find (it cannot tell which call opens a database, or on what)` : null;
 }
-/** A string literal with no interpolation: a target the gate can read. */
-const PLAIN_LITERAL = /^(?:(["'])[^"'\\]*\1|`[^`$\\]*`)$/;
 
 /** The database module this code loads, by specifier literal or Python statement import; null if none. */
 function dbModule(facts: CodeFacts): string | null {
@@ -926,12 +1247,14 @@ const namesLedgerFile = (text: string) => SIBLINGS.some((s) => basename(text) ==
  * database whose target is computed at run time, refuses too: the target may be the ledger
  * (`new Database([…].join("/"))`, adversarial-1).
  */
-function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined, computedLoads = true): string | null {
+function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined, computedLoads = true, depth = 0): string | null {
 	const facts = codeFacts(code, family);
 	const spec = ledgerModuleImport(facts);
 	if (spec) return `code loading the ledger module ("${spec}"); eval, inline code and the scripts an agent runs never load it`;
 	const load = family === "js" && computedLoads ? computedModuleLoad(facts) : null;
 	if (load) return `code loading a module whose specifier is computed at run time (${load}), which may be the ledger module; an import() or require() takes one literal string`;
+	const loaded = codeLoadCrossing(facts, paths, dir, family, computedLoads, depth);
+	if (loaded) return loaded;
 	const env = boundaryEnvWrite(facts);
 	if (env) return env;
 	const file = basename(paths.files[0]!);
@@ -968,7 +1291,7 @@ function refuse(what: string): Refusal {
 		reason:
 			`P-11 row 10 refused this: ${what}. This is the ${BOUNDARY} (ledger/src/authority.ts, migration/items/jo-only-boundary.md): ` +
 			`the ledger is written only by the ledger module in the processes Jo's machinery starts (the surface, the lane runner, a lane's ledger tools), ` +
-			`never from eval, inline code or a script an agent runs with bun or node (a checkout's own surface/, ledger/, classifier/, gates/, install/ scripts and bin/ run unread); ` +
+			`never from eval, inline code or a script an agent runs (a checkout's own files run unread: those git tracks, and those under its scripts/ directories and bin/); ` +
 			`and no call may set, unset or override AGENT_SYSTEM_ROLE, AGENT_SYSTEM_LANE_ID, AGENT_SYSTEM_WORKLOAD_ID, ` +
 			`AGENT_SYSTEM_LEDGER_DB or an AS2_TEST_* name (reading them is fine). The ledger's rules live in the file and its writer is the ledger module ` +
 			`(ledger/src/index.ts, SPEC-2.0.md § B2); a raw write bypasses its provenance and would be refused by the file's triggers or corrupt WAL state. ` +
@@ -977,7 +1300,7 @@ function refuse(what: string): Refusal {
 			`Plain byte readers (cat, head, tail, wc, stat, hexdump, strings, cmp, diff, …) may name the ledger without a redirect into it. ` +
 			`No in-process database handle to the ledger is modeled, \`readonly: true\` included. ` +
 			`Raw bytes may be read in eval with a literal read-only open of the literal path: \`open(path, "rb")\`, or \`import os\` then \`os.open(path, os.O_RDONLY)\`. ` +
-			`Run a test file with plain \`bun test <file>\`.`,
+			`Run this repository's test files with \`bun test <file>\` from the checkout or a module directory, whose bunfig.toml isolates the ledger.`,
 	};
 }
 
@@ -1088,6 +1411,8 @@ function bashCrossing(cmd: string, cwd: string, sessionEnv: Record<string, strin
 /** Row 10 over one tool call. */
 export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 	const paths = ledgerPaths(ctx.env);
+	callState.tracked.clear();
+	callState.judged.clear();
 	if (call.toolName === "bash") {
 		const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 		const why = bashCrossing(bashCommand(call.input), cwd, ctx.env, call.input.env, paths, 0);
