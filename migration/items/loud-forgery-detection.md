@@ -2,9 +2,9 @@
 title: Loud forgery detection: a Jo-authority row no Jo channel wrote raises an alarm and holds its workload
 status: building
 workload: wl-mvfxw3c4zqfzls
-pr: none
+pr: 275
 ---
-**Built on branch `wl/wl-mvfxw3c4zqfzls`, PR pending.** Workload `wl-mvfxw3c4zqfzls` (production stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mvfxw3c4zqfzls/PLAN.md`, approved by Jo). Jo's ruling (`in-mvfxvdxyywhds0`): detection, not prevention, at accident grade. A check flags a Jo-authority row that no Jo channel wrote, and a lane that resolves its own question. A hit alarms loudly and holds the workload until Jo confirms or reverses the row. Jo's typed answers in a by-hand lane must pass.
+**Built on branch `wl/wl-mvfxw3c4zqfzls`, PR #275.** Workload `wl-mvfxw3c4zqfzls` (production stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mvfxw3c4zqfzls/PLAN.md`, approved by Jo). Jo's ruling (`in-mvfxvdxyywhds0`): detection, not prevention, at accident grade. A check flags a Jo-authority row that no Jo channel wrote, and a lane that resolves its own question. A hit alarms loudly and holds the workload until Jo confirms or reverses the row. Jo's typed answers in a by-hand lane must pass.
 
 **Depends on PR #261** (the Jo-only boundary, `migration/items/jo-only-boundary.md`). This PR stacks on it and merges after it. It adds AUTHORITY rows in `ledger/src/authority.ts` and changes none of #261's trigger rules.
 
