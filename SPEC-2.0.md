@@ -729,6 +729,26 @@ code manually at some point?"*
   (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
   diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
 
+**Amended 2026-10-19 — inbound agent channel** (`migration/items/agent-channel.md`; Jo, answering
+q-mv8wcymfkx3y0w: *"notes"*, ledger input `in-mv8yzvhuwz9jwg`; plan
+`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8vx7wdj5nx1c/PLAN.md` rev 6; built in
+wl-mv8vx7wdj5nx1c). Other agents reach the orchestrator through one inbound channel, never
+through Jo's steering path. Each sender is configured in `profile/config.yml` under
+`channel.senders[]` with an `id`, a `transport` and an `authority`; the authority belongs to the
+sender, not to anything a message says. Phase 1 has one sender, `{ id: plumb, transport:
+omp-mailbox, authority: notes }`, and `notes` (notes and proposals) is the only authority built.
+A message is never authored as Jo: it is a `messages` row on `wl-orchestrator` with sender
+`plumb`, created_by `channel:plumb` and the body prefix `channel-note from plumb:`, and the
+channel writes no instruction, answer, stakes or mode flip, or ceiling change. The orchestrator
+reads it as information from that sender, and replies with `orchestrator_reply` or closes it
+with `orchestrator_channel_done`. A line that names a waiting needs-you row and a word that
+answers it is a proposal: it renders as `#n plumb proposes <word> <target>` and carries the
+target's own number, never one of its own, and only Jo's typed `n <word>` (or another word that
+fits the row) applies, as Jo's ordinary row. Flip and ceiling words from a sender answer no
+numbered row, so they stay notes. A sender's `from` is self-claimed, so a spoof costs a
+misattributed note, never an action. Grant words wait for a phase with sender proof; phase 2
+(Juno, remote, notes only) starts only after Jo's go is recorded as an instruction.
+
 ### B6 · Spec-and-plan option is offered inside the lane (P-12)
 
 **Ruled 2026-09-23.** Jo: *"inside the lane"*. The orchestrator opens the workload and lane as

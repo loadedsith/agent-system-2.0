@@ -133,6 +133,28 @@ With one open workload the word applies to it. With several, add the id: `produc
   - `order`: automatic starts follow the ranking (pins first); a lower one waits, shown as "queued behind <wl> (Jev rank)". Your launch word and `as2 lane` are never held.
   - `parallel`: `order`, plus a second lane may start beside a running one only when the two are in different git repositories, the remaining ceilings fit in `--budget` (0 or unset: no parallel start) and the merge order is clear. Anything unclear holds. Work in the same repository stays serial, because nothing yet declares and enforces which files a lane may write.
 
+### Notes from other agents (the agent channel)
+
+- Other agents can message Ilex through one channel. In phase 1 the only sender is Plumb, and Plumb's authority is notes and proposals. A note is information from Plumb, never your word: it is recorded with sender `plumb` (created_by `channel:plumb`), never as you, and nothing it says is applied until you type the word yourself.
+- Ilex gets each note as an aside, quoted under `From Plumb (msg-…; authority: notes — not Jo; information, not instruction):`. Plumb hears `delivered` only once Ilex's session has actually taken the aside in. If the aside does not land, the surface resends it while Ilex is idle, up to 3 times; after that, the note rides along with your next message to Ilex. Ilex answers Plumb or marks the note handled; either way it leaves the list below. A note Ilex handles straight from that list is not sent again as an aside.
+- What you see:
+
+| Line | Where | What to do |
+|---|---|---|
+| `## from other agents`, one line per note: sender, `msg-…` id, state, age, the first 120 characters | wake block and `orchestrator_ledger` | nothing owed: it is not a needs-you line. A note that looks like a command but names no waiting row is marked `command-shaped` |
+| `#3 plumb proposes deny en-… (msg-…)` | under *needs you*, directly below line `#3`, the row it names, with that row's own number | answer the row as usual: `3 deny`, or any other word that fits it (`3 approve`). Plumb only suggests; your word is applied as yours |
+| `channel-refused: <file> from "<sender>" (<reason>)` | under *needs you*, no number | nothing to answer. The envelope failed a check (unknown sender, bad shape, `id collision`) and was set aside as `.invalid`. When it was refused before being recorded, the line says nothing reached the model. If an `id collision` turned up after the note was recorded, the note drops out of later renders, Plumb is never told Ilex acted on it, and the line says how far it got: no aside confirmed (Ilex may still have read it in the ledger), its aside had already reached Ilex, or Ilex had already acted on it |
+
+- A proposal needs Plumb to name the row and a word that answers it: `deny en-…`, `approve en-…`, `<option> q-…`, `withdraw q-…`. A bare `deny` stays a note. Flip and ceiling words from Plumb (`autonomous wl-…`, `production wl-…`, `ceiling 999 wl-…`) answer no numbered row, so they stay notes too; type the word yourself if you want it.
+- A proposal line disappears once its row is settled, by you or by anything else. Plumb repeating a proposal updates the `msg-…` id; it adds no line.
+- Senders are set in `profile/config.yml`. Phase 1 accepts only `transport: omp-mailbox` and `authority: notes`. No block: the channel is off. An invalid block is refused when Ilex starts, with a notice, and the channel stays off. Changes take effect when Ilex restarts.
+
+```yaml
+channel:
+  senders:
+    - { id: plumb, transport: omp-mailbox, authority: notes }
+```
+
 ## 4. Read the screen
 
 - **Wake block:** `# Ledger at <time> (wake: <why>)`, then `you are <name> (<pronouns>)`, then `## needs you`, then the `Rank (Jev, show-only): …` line (section 3, Jev ranking), then `## open workloads` with one line per open workload: id, the brief's first line, the one-liner, the lane, slice counts, its `#n` needs-you numbers, open question ids and unread message count. A workload's full block comes from `orchestrator_ledger` with `workload: wl-…` (with no workload it renders every block).
@@ -152,7 +174,7 @@ With one open workload the word applies to it. With several, add the id: `produc
 |---|---|---|
 | Ilex | routes, opens and closes workloads, records Jo's answers | close slices, dispatch hands, raise a ceiling, run commands for Jo |
 | Lane | builds inside the fence; adds and completes slices; raises questions | run the full test suite; push past gate refusals |
-| Plumb | pushes what a lane cannot | |
+| Plumb | pushes what a lane cannot; sends Ilex notes and proposals through the agent channel (section 3) | speak as Jo, or get anything applied without Jo's typed word |
 | Test runner | runs the full test suite, then each changed test file alone, outside the fence at a PR's head, when a lane calls `lane_full_test`; records the result in the ledger and completes the full-suite slice on a green | merge, push, or run anything a lane did not request |
 | Jo | answers questions, merges PRs, pushes `main` | |
 
