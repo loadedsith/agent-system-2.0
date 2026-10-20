@@ -2,7 +2,7 @@
 title: as2test per-run temporary isolation and legacy native sweep
 status: open
 workload: wl-mvgrfniqa0kd8g
-pr: null
+pr: https://github.com/thewolff/agent-system-2.0/pull/289
 ---
 
 ## Why
