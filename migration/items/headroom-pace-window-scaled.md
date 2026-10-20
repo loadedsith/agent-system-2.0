@@ -2,14 +2,14 @@
 title: Window-scaled headroom pace and budget protection
 status: building
 workload: wl-mv958y95fk07wg
-pr: none
+pr: 269
 ---
 
 ## Scope and delivery boundary
 
-Workload `wl-mv958y95fk07wg` replaces the fixed pace warm-up and adds measured budget protection to the [original headroom guard](headroom-guard.md). The approved plan is revision 2, **Headroom brake fix — widened plan**, in the workload's scratch `PLAN.md`; the policy and operational boundaries are recorded here so they do not depend on scratch retention. The original item's workload, PR and migration number remain historical metadata. This item has no assigned migration number; the lane fills its actual PR number when available.
+Workload `wl-mv958y95fk07wg` replaces the fixed pace warm-up and adds measured budget protection to the [original headroom guard](headroom-guard.md). The approved plan is revision 2, **Headroom brake fix — widened plan**; the policy and operational boundaries are recorded here so they do not depend on scratch retention. The original item's workload, PR and migration number remain historical metadata. This item has no assigned migration number.
 
-The implementation and focused proof described below have been supplied at this documentation handoff. Independent production code review, the runner suite and an outside-fence full-suite green at the final pushed PR head are still pending. This is not a claim of merge, installation or removal of the live workaround. The lane does not merge this production change.
+At the PR metadata snapshot, implementation, focused proof and independent production code review are complete; the outside-fence runner has not yet run. The PR's `as2/full-suite` check records the authoritative exact-head delivery result. This is not a claim of merge, installation or removal of the live workaround. The lane does not merge this production change.
 
 ## Original bug and scaled warm-up
 
@@ -63,15 +63,15 @@ Budget comparison is **not spawn authorization**:
 
 ## Observed proof and pending delivery
 
-These are the supplied lane proof receipts, not commands rerun by this documentation slice:
+These are lane proof receipts at the PR metadata snapshot:
 
-- `bun test classifier/test/headroom.test.ts`: **86 pass, 0 fail**.
+- `bun test classifier/test/headroom.test.ts`: **110 pass, 0 fail**, including exhaustion before weekly warm-up.
 - `bun test classifier/test/crosslab.test.ts`: **104 pass, 0 fail**.
 - Actual-helper scratch smoke: the old helper refused the 6%-at-60-minutes weekly case with projection **10.08**; the new helper admitted it before the scaled weekly warm-up.
 - In the mature weekly smoke, source usage **0.21** projected to **1.05**. The new helper retained that source against Claude burning **32.31 quota points/hour**, versus source **2.31**, and returned the retained explanation.
 - The same actual-helper smoke reported ordinary refusal with a slower target budget and refusal of a hard-out source. The quota-out comparator at **0.87** usage was itself refused; serving as a budget benchmark did not admit it. This helper result is not proof of the runner's actual-move integration.
 
-The smoke establishes those observed cases, not every integration path. `surface/test/lane-headroom-script.test.ts` has **not yet run** at this handoff. Independent code review and outside-fence full-suite proof, including changed-file-alone runner coverage at the actual PR head, are **not yet green**. Focused passes and scratch smoke do not replace those delivery gates. No PR landing or live-checkout completion is asserted here.
+The smoke establishes those observed cases, not every integration path. At the PR metadata snapshot, `surface/test/lane-headroom-script.test.ts` has **not yet run**. Independent Anthropic production review passed after both delivery blockers were fixed; the scoped compatibility behavior for non-week/no-reset exhaustion remains documented above. Outside-fence full-suite proof, including changed-file-alone runner coverage, is reported by the PR's exact-head check, not inferred from focused passes. No PR landing or live-checkout completion is asserted here.
 
 ## Plumb handoff — after merge, before pull
 
