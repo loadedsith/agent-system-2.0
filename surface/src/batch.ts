@@ -9,7 +9,8 @@
 //    80 %, or the stop at 100 % (PLAN wl-mvfkv7llkp7nk0 § 4);
 // 3. `idle` whose `lane-exit:` is `outcome stop reason ceiling`: a ceiling stop;
 // 4. `test-run`: a red or error full-suite run at a PR head;
-// 5. `pair` (PLAN wl-mvb9mw00ycfjeo D4): a taken line.
+// 5. `pair` (PLAN wl-mvb9mw00ycfjeo D4): a taken line;
+// 6. `security-red` (PLAN wl-mvg1vs0rhnu3gg § 3.3): a run with a failing security test, whatever holds the workload.
 // Everything else waits for the window, every other `notice` line (surface/src/notice.ts) among them.
 import { LANE_RUNNER_BY, type Ledger } from "../../ledger/src/index";
 import { parseCeilingNotice } from "./ceiling";
@@ -54,6 +55,7 @@ export function onFire(ledger: Ledger, line: ErrorLine): boolean {
 			return parsed !== null && parsed.outcome === "stop" && parsed.reason === "ceiling";
 		}
 		case "test-run":
+		case "security-red":
 			return true;
 		default:
 			return false;

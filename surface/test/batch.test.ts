@@ -6,6 +6,10 @@ import { describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { recordRepo } from "../src/decision-log";
+import { consumeLines } from "../src/delivery";
+import { applyTrain, interpret } from "../src/input";
+import { recordTrainTask } from "../src/merge-train";
 import orchestratorSurface from "../index";
 import { onFire } from "../src/batch";
 import { ceilingNoticeBody } from "../src/ceiling";
@@ -15,7 +19,9 @@ import { sendNotice } from "../src/notice";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { surfaceSession } from "../src/session";
 import { laneDiedShutdownBody } from "../src/signals";
-import { testRunFailedBody } from "../src/test-run";
+import {
+	type Failure, makeRunId, notifiesOrchestrator, securityRedBody, securityRedOf, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf,
+} from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { clock, ctxOf, fakePi, notices, type Sent, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
 
@@ -126,6 +132,102 @@ describe("onFire: the kinds that go out on their own poll", () => {
 		expect(fire("idle", stopped)).toBe(true);
 		expect(fire("idle", parked)).toBe(false);
 		expect(fire("test-run", red)).toBe(true);
+	});
+});
+
+describe("security-red (PLAN wl-mvg1vs0rhnu3gg § 3.3): a failing gate test is on fire whatever holds the workload or routes its run", () => {
+	const SHA = "b".repeat(40);
+	const SEC: Failure = { part: "full", name: "gates/test/rows.test.ts > row 3 > refuses", firstError: "error: expected a refusal" };
+	const PLAIN: Failure = { part: "full", name: "surface/test/x.test.ts > broken", firstError: "error: nope" };
+	let seq = 0;
+	/**
+	 * The runner's finish (surface/scripts/test-runner.ts): the request and its red `test-run:` on `wl`, then the messages it
+	 * enqueues to the orchestrator, decided as it decides them. Returns the two message ids (null for one not sent).
+	 */
+	function finish(l: Ledger, wl: string, sl: string, pr: number, failures: Failure[]) {
+		const runId = makeRunId(Date.parse(l.now()) + ++seq, "abcd");
+		l.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr, sha: SHA, slice: sl, by: "lane-a" }) });
+		const run: TestRun = {
+			runId, verdict: "red", sha: SHA, pr, reason: null, headAtEnd: SHA, base: null, mergeBase: null,
+			full: { pass: 1, fail: failures.length, skip: 0, exit: 1, ms: 10, error: null }, solo: [], failures, runDir: `/runs/${runId}`, preflight: null,
+		};
+		l.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRunBody(run) });
+		const heldLive = l.liveLaneHolders().some((h) => h.workloadId === wl);
+		const failed = notifiesOrchestrator(run.verdict, heldLive) ? testRunFailedOf(wl, sl, run) : null;
+		const security = securityRedOf(wl, sl, run);
+		const [ordinary = null, secure = null] = [failed && testRunFailedBody(failed), security && securityRedBody(security)]
+			.map((body) => (body ? l.enqueue({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body }) : null));
+		return { runId, ordinary, security: secure };
+	}
+
+	test("while a lane holds the workload live: the security red is shown and on fire, an ordinary red shows nothing", () => {
+		const c = clock();
+		const { ledger: l } = tempLedger(c.now);
+		const { wl, sl } = workloadWithSlice(l);
+		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === wl);
+		// with no lane, the ordinary red is the test-run line
+		const before = finish(l, wl, sl, 17, [PLAIN]);
+		expect(before.security).toBeNull();
+		expect(lines().map((x) => [x.kind, x.rowId])).toEqual([["test-run", before.ordinary]]);
+		c.plusHours(0.1);
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-a-1", leaseMs: 3_600_000 }).won).toBe(true);
+		expect(l.liveLaneHolders().some((h) => h.workloadId === wl)).toBe(true);
+		// the lane is live: the ordinary red already sent and a new one both show nothing
+		c.plusHours(0.1);
+		expect(finish(l, wl, sl, 17, [PLAIN])).toMatchObject({ ordinary: null, security: null });
+		expect(lines()).toEqual([]);
+		// a run failing a gate test: the runner sends the security red alone, and it is shown and on fire
+		c.plusHours(0.1);
+		const sec = finish(l, wl, sl, 17, [PLAIN, SEC]);
+		expect(sec.ordinary).toBeNull();
+		expect(sec.security).not.toBeNull();
+		const shown = lines();
+		expect(shown).toEqual([{
+			kind: "security-red", workloadId: wl, rowId: sec.security!, messageIds: [sec.security!],
+			line: `security tests red on ${wl}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
+		}]);
+		expect(onFire(l, shown[0]!)).toBe(true);
+		// delivery consumes it
+		expect(consumeLines(l, shown)).toBe(1);
+		expect(lines()).toEqual([]);
+	});
+
+	test("while the run is routed to a train task: the security red is shown and on fire, an ordinary red shows nothing", () => {
+		const c = clock();
+		const { ledger: l } = tempLedger(c.now);
+		const url = "https://github.com/thewolff/product.git";
+		const checkout = () => {
+			const dir = tmp("security-red-repo");
+			for (const args of [["init", "-q"], ["config", "remote.origin.url", url]]) expect(Bun.spawnSync(["git", "-C", dir, ...args]).exitCode).toBe(0);
+			return dir;
+		};
+		const cmd = interpret(l, "train 101");
+		if (cmd?.kind !== "train") throw new Error("not a train");
+		const train = applyTrain(l, cmd, checkout()).workloadId;
+		expect(l.claimWorkload(train, { by: LANE_STARTER_BY, holder: "lane-train-1", leaseMs: 600_000 }).won).toBe(true);
+		const owner = l.openWorkload({ by: SURFACE_BY, brief: "Fix the feed header", stakes: "normal", mode: "autonomous" });
+		recordRepo(l, owner, checkout());
+		const view = { number: 101, headRefName: `wl/${owner}`, headRefOid: SHA, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		const task = recordTrainTask(l, { train, by: "lane-train-1", pr: 101, kind: "red", detail: `run tr-x red at ${SHA}\nsrc/x.test.ts > case 1: boom`, view, trainRepo: "thewolff/product" });
+		expect(task.ok).toBe(true);
+		c.plusHours(0.1);
+		const sl = l.addSlice({ by: "lane-owner-1", workloadId: owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const lines = () => errorLines(l, undefined, { now: c.now() }).filter((x) => x.workloadId === owner);
+		// no lane holds the owner, so the runner sends the ordinary red; the task routes it off needs-you
+		const plain = finish(l, owner, sl, 101, [PLAIN]);
+		expect(plain.ordinary).not.toBeNull();
+		expect(plain.security).toBeNull();
+		expect(lines()).toEqual([]);
+		// a run failing a gate test: its ordinary red is routed too, its security red is shown and on fire
+		c.plusHours(0.1);
+		const sec = finish(l, owner, sl, 101, [SEC]);
+		expect(sec.ordinary).not.toBeNull();
+		const shown = lines();
+		expect(shown).toEqual([{
+			kind: "security-red", workloadId: owner, rowId: sec.security!, messageIds: [sec.security!],
+			line: `security tests red on ${owner}: run ${sec.runId} at bbbbbbb (slice ${sl}) has 1 failing under gates/test/, first ${SEC.name} — a lane asks you before it changes such a test`,
+		}]);
+		expect(onFire(l, shown[0]!)).toBe(true);
 	});
 });
 
