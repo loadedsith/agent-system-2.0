@@ -939,8 +939,9 @@ const SETTLED_AT_RE = /\bat ([0-9a-f]{40})\b/;
 const HEAD_WOKEN_RE = /^train-head-woken: pr ([1-9]\d*) ([0-9a-f]{40})$/;
 
 /**
- * `train-head-woken: pr <n> <sha>`: the tick (MERGE_TRAIN_BY) launched the train for PR n's head `sha` (`trainRetries`). It is
- * not an acknowledgment: the head stays due, under the pass-over backoff, until the train works it.
+ * `train-head-woken: pr <n> <sha>`: the tick (MERGE_TRAIN_BY) requested a lane on the train for PR n's head `sha`, once per
+ * request, whichever starter served it (`trainRetries`). It is not an acknowledgment: the head stays due, under the pass-over
+ * backoff, until the train works it.
  */
 export function trainHeadWokenBody(pr: number, sha: string): string {
 	return `train-head-woken: pr ${pr} ${sha}`;
@@ -957,7 +958,7 @@ export function trainHoldBody(pr: number, sha: string, until: string): string {
 	return `train-hold: pr ${pr} head ${sha} until ${until}`;
 }
 
-/** `train-wake: pr <n> hold <entry id>`: the tick (MERGE_TRAIN_BY) launched the train for that `train-hold:`'s expiry (`expiredHolds`). */
+/** `train-wake: pr <n> hold <entry id>`: the tick (MERGE_TRAIN_BY) requested a lane for that `train-hold:`'s expiry (`expiredHolds`), whichever starter serves it. */
 export function trainWakeBody(pr: number, holdId: string): string {
 	return `train-wake: pr ${pr} hold ${holdId}`;
 }
@@ -1072,10 +1073,11 @@ export function actionable(
  *   `train:` naming it, or its `train-board:`; another PR's entry resets nothing, review wl-mvbjiettjrfpxc r1 #1), has passed since that exit;
  * - untested: the PR came back from its owner (a settled task) and its head in `heads` (the tick's `gh pr view`) is one the
  *   train has not worked: no train run requested at it, not a task's head, not the sha a settle names, and no `train-error:
- *   pr <n>` from a holder since the tick's newest `train-head-woken:` for it. A wake is not the work: a head woken k times is
- *   due again once TRAIN_RETRY_BASE_MS × 2^(k-1), capped at TRAIN_RETRY_MAX_MS, has passed since the newest of that wake and
- *   the train's last lane end after it (`lane-exit:` or `launch-failed:`), so a launch that died before the work is retried
- *   and never every tick. While a lane holds the train live the tick wakes nothing.
+ *   pr <n>` from a holder since the tick's newest `train-head-woken:` for it. A wake is not the work: a head woken (a lane
+ *   requested for it) k times is due again once TRAIN_RETRY_BASE_MS × 2^(k-1), capped at TRAIN_RETRY_MAX_MS, has passed since
+ *   the newest of that wake and the train's last lane end after it (`lane-exit:` or `launch-failed:`), so a request served late
+ *   is measured from that lane's end, a launch that died before the work is retried, and never every tick. While a lane holds
+ *   the train live the tick wakes nothing.
  * "Before" and "since" are ledger order (entries in the order written), so rows written in one millisecond still order.
  */
 export function trainRetries(ledger: Ledger, wl: string, heads: ReadonlyMap<number, string>): TrainRetries {

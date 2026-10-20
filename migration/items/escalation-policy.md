@@ -41,3 +41,12 @@ uses the existing fingerprint injection to isolate loop accounting from repeated
 It retains every round and behavioral assertion; the read-only review and fingerprint tests
 still exercise real git. Neither repair increases a test or readiness timeout.
 
+The merge with main retains the one-live-lane reservation and spawn guards alongside the
+notice-only ceiling meter and the unmetered paired path. Train head wakes and hold-expiry
+wakes both count at the launch-request boundary, not only when this tick's launcher succeeds:
+a capped request later served by the drain consumes the expiry once. A ceiling refusal
+writes no request, calls no launcher and leaves an expired hold due until Jo raises the ceiling.
+`surface/test/train-tick.test.ts`, under `retries of a released train and fork PRs`, covers
+the capped-expiry/drain and ceiling-refusal/raise interactions. The standing rulings,
+auto-start veto window and paired-workload ceiling exception are unchanged.
+
