@@ -85,7 +85,7 @@ export const CONTROL_PREFIXES = [
 	"lane-decided", "worktree", "branch", "plan", "done", "done-because", "repo", "ceiling", "spend", "artifact-tree",
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
-	"train-task", "train-task-settled", "train-fix", "train-alert",
+	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 ] as const;
@@ -156,6 +156,10 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * valid `train:` on that train listing n. The tick also writes a fix workload's `repo:` and `done:` and `launch-requested:` as MERGE_TRAIN_BY.
  * `train-alert: <q> level <n> sending|notified|sent [<url>]` and `train-alert: <q> acked|closed <why>` are the train tick's alone
  * (MERGE_TRAIN_BY, PLAN rev 17.1 D9): its send ladder for an alert question; surface/src/errors.ts reads them for the LOUD line.
+ * The auto-boarding rows (PLAN wl-mvbjiettjrfpxc D1-D3, D6, surface/src/merge-train.ts) are the train tick's alone too (MERGE_TRAIN_BY):
+ * `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>` on a train makes PR n a member as Jo's
+ * `train:` does (`trainBindings`; `boundPrs` admits it); `train-board-skip:`, `train-notice:` and `train-autoboard: on <iso>`
+ * (the cutover) are its records on the standing workload. A lane-written copy of any of them is dropped here.
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -201,6 +205,10 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-task-settled": [MERGE_TRAIN_BY],
 	"train-fix": [MERGE_TRAIN_BY],
 	"train-alert": [MERGE_TRAIN_BY],
+	"train-board": [MERGE_TRAIN_BY],
+	"train-board-skip": [MERGE_TRAIN_BY],
+	"train-notice": [MERGE_TRAIN_BY],
+	"train-autoboard": [MERGE_TRAIN_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
@@ -1107,7 +1115,10 @@ export function prBindings(entries: readonly EntryRow[], instructions: readonly 
 	return out;
 }
 
-/** A fix workload's binding (PLAN wl-mv8s8srodefytc rev 17.1 D8): the train's repository, the PR, the train and the `train:` entry listing it. */
+/**
+ * A fix workload's binding (PLAN wl-mv8s8srodefytc rev 17.1 D8): the train's repository, the PR, the train and the membership
+ * entry listing the PR there (Jo's `train:` or the tick's `train-board:`, PLAN wl-mvbjiettjrfpxc D2).
+ */
 export interface TrainFix {
 	repo: string;
 	pr: number;
@@ -1125,27 +1136,75 @@ export function parseTrainFix(rest: string): TrainFix | null {
 	return m ? { repo: m[1]!, pr: Number(m[2]), train: m[3]!, trainEntry: m[4]! } : null;
 }
 
+/** A board (PLAN wl-mvbjiettjrfpxc D2): the train tick put PR `pr` of lane workload `workload` on a train, at head `head`, green in run `run`, reviewed by entry `review`. */
+export interface TrainBoard {
+	pr: number;
+	workload: string;
+	head: string;
+	run: string | null;
+	review: string | null;
+}
+/** `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>`, the train tick's alone (MERGE_TRAIN_BY). */
+export function trainBoardBody(b: TrainBoard): string {
+	return `train-board: pr ${b.pr} workload ${b.workload} head ${b.head} run ${b.run ?? "none"} review ${b.review ?? "none"}`;
+}
+const TRAIN_BOARD_RE = /^pr ([1-9]\d*) workload (wl-[a-z0-9]+) head ([0-9a-f]{40}) run (tr-[a-z0-9]+|none) review (en-[a-z0-9]+|none)$/;
+/** A valid `train-board:` entry's rest, parsed; null when it is not that shape. */
+export function parseTrainBoard(rest: string): TrainBoard | null {
+	const m = TRAIN_BOARD_RE.exec(rest);
+	return m ? { pr: Number(m[1]), workload: m[2]!, head: m[3]!, run: m[4] === "none" ? null : m[4]!, review: m[5] === "none" ? null : m[5]! } : null;
+}
+
 /**
- * The PR numbers Jo bound to this workload for a run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2), each
- * with the instruction that binds it: every valid `test-pr:` binding and, on a merge train (PLAN
- * wl-mv8s8srodefytc § 1), every valid `train:` binding (`prBindings`). Bindings accumulate, oldest first;
- * a number bound twice keeps its first instruction. Pass the workload's entries and its instructions.
+ * One membership entry of a merge train (PLAN wl-mvbjiettjrfpxc D2): Jo's valid `train:` binding (`prBindings`, its PRs in Jo's
+ * order, `by` Jo's instruction) or the tick's valid `train-board:` (one PR, `by` the board entry itself, `board` parsed).
+ */
+export interface TrainBinding {
+	source: "jo" | "board";
+	prs: number[];
+	by: string;
+	entryId: string;
+	createdAt: string;
+	board: TrainBoard | null;
+}
+
+/** Every membership entry on a workload, in entry order, none deduplicated: what `trainMembers` (surface/src/merge-train.ts) reads. */
+export function trainBindings(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): TrainBinding[] {
+	const jo = new Map(prBindings(entries, instructions, ["train"]).map((b) => [b.entryId, b]));
+	const out: TrainBinding[] = [];
+	for (const c of controlEntries(entries)) {
+		const b = c.prefix === "train" ? jo.get(c.id) : undefined;
+		if (b) out.push({ source: "jo", prs: b.prs, by: b.instructionId, entryId: c.id, createdAt: c.createdAt, board: null });
+		const board = c.prefix === "train-board" ? parseTrainBoard(c.rest) : null;
+		if (board) out.push({ source: "board", prs: [board.pr], by: c.id, entryId: c.id, createdAt: c.createdAt, board });
+	}
+	return out;
+}
+
+/**
+ * The PR numbers bound to this workload for a run with no push (PLAN wl-mv5qdfvv82ivwg § 2.2), each with what binds it (`by`):
+ * every valid `test-pr:` binding (Jo's instruction) and, on a merge train (PLAN wl-mv8s8srodefytc § 1), every member
+ * (`trainBindings`: Jo's `train:` names his instruction, the tick's `train-board:` itself, PLAN wl-mvbjiettjrfpxc D2). Bindings
+ * accumulate in entry order; a number bound twice keeps its first. Pass the workload's entries and its instructions.
  * With `trains` (the ledger), a fix workload's `train-fix:` binds its PR too (rev 17.1 D8), but only when the entry it names is a
- * valid `train:` binding on that train listing the PR; it carries that entry's instruction, Jo's own `train` word.
+ * membership entry on that train listing the PR; it carries that entry's `by`.
  */
 export function boundPrs(
 	entries: readonly EntryRow[], instructions: readonly InstructionRow[], trains?: { entries(id: string): EntryRow[]; instructions(id: string): InstructionRow[] },
-): { pr: number; instructionId: string }[] {
-	const out: { pr: number; instructionId: string }[] = [];
-	for (const b of prBindings(entries, instructions, ["test-pr", "train"])) {
-		for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, instructionId: b.instructionId });
-	}
+): { pr: number; by: string }[] {
+	const order = new Map(entries.map((e, i) => [e.id, i]));
+	const bindings = [
+		...prBindings(entries, instructions, ["test-pr"]).map((b) => ({ entryId: b.entryId, prs: b.prs, by: b.instructionId })),
+		...trainBindings(entries, instructions),
+	].sort((a, b) => order.get(a.entryId)! - order.get(b.entryId)!);
+	const out: { pr: number; by: string }[] = [];
+	for (const b of bindings) for (const pr of b.prs) if (!out.some((x) => x.pr === pr)) out.push({ pr, by: b.by });
 	if (trains === undefined) return out;
 	for (const c of controlEntries(entries)) {
 		const f = c.prefix === "train-fix" ? parseTrainFix(c.rest) : null;
 		if (f === null || out.some((x) => x.pr === f.pr)) continue;
-		const b = prBindings(trains.entries(f.train), trains.instructions(f.train), ["train"]).find((x) => x.entryId === f.trainEntry);
-		if (b?.prs.includes(f.pr)) out.push({ pr: f.pr, instructionId: b.instructionId });
+		const b = trainBindings(trains.entries(f.train), trains.instructions(f.train)).find((x) => x.entryId === f.trainEntry);
+		if (b?.prs.includes(f.pr)) out.push({ pr: f.pr, by: b.by });
 	}
 	return out;
 }
@@ -1335,6 +1394,10 @@ export interface PromptInput {
 	scratch?: { root: string; capMb: number };
 	/** The unsettled merge-train tasks this workload owns (PLAN wl-mv8s8srodefytc rev 17.1 D7; surface/src/merge-train.ts `ownerTasks`), oldest first. */
 	trainTasks?: readonly OwnerTrainTask[];
+	/** The test runner serves this repository (`testRunner.repos`, surface/src/test-run.ts `servedRepo`); surface/scripts/lane.ts reads it at launch. */
+	runnerServed?: boolean;
+	/** This workload is a merge train or a train's fix workload (surface/src/merge-train.ts `isTrainOrFix`). */
+	trainOrFix?: boolean;
 }
 
 /** A merge-train task as its owner lane reads it (D7): the task, its detail, and the PR's open full-suite slice on the owner, if any. */
@@ -1368,8 +1431,17 @@ export function trainTaskLines(t: OwnerTrainTask): string[] {
 	];
 }
 
-/** Decision 11's completion policy: Jo integrates this machinery repo; a product repo merges per SPEC-2.0.md § stakes. */
+/** The merge line of a lane whose PR the merge train lands (PLAN wl-mvbjiettjrfpxc D10): it never sends the PR to Jo. */
+export const TRAIN_LANDS_LINE =
+	`never merge it yourself and never hand it to Jo: a cross-lab review slice is required before the PR is done; once the PR is green at its head in a full suite (\`${LANE_FULL_TEST_TOOL}\`) and that review has passed, record done-because and release. The surface closes the workload and the merge train lands the PR.`;
+
+/**
+ * Decision 11's completion policy: an autonomous normal-stakes lane on a repo the test runner serves, other than a merge
+ * train or a fix workload, hands its green reviewed PR to the merge train (PLAN wl-mvbjiettjrfpxc D10, `TRAIN_LANDS_LINE`);
+ * otherwise Jo integrates this machinery repo, and a product repo merges per SPEC-2.0.md § stakes.
+ */
 function mergeLine(p: PromptInput): string {
+	if (p.runnerServed === true && p.trainOrFix !== true && p.workload.mode === "autonomous" && p.workload.stakes === "normal") return TRAIN_LANDS_LINE;
 	if (p.machinery) return "never merge on this repo: Jo integrates it. A merge-train lane merges other PRs only as its brief's self-merge step allows, never its own branch.";
 	if (p.workload.stakes === "production") return "the merge is Jo's: a judge slice, then Jo approves the merge.";
 	if (p.workload.stakes === "normal") return "merge proceeds on a judge slice's pass; tell Jo in one line after the merge.";
