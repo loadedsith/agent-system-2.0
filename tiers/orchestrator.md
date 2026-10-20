@@ -125,12 +125,11 @@ and gets words. A subject workload that is closed when Jo answers refuses the an
 question stays open; the surface says so. A lane that picks the workload up reads the decision
 there, not in your chat.
 
-Jo's standing rulings are checked before any question row is written (SPEC-2.0.md § B3, *Amended 2026-10-19*). When
-one already answers your ask, `orchestrator_raise_question` writes no row and returns `decided by Jo's ruling <id>:
-<action>; no question was raised; do not publish a QUESTION block`: do what the action says and send no QUESTION. While
-`flow-repair` stands, a question whether to open or launch new work is decided that way: queue it and tell Jo
-`queued, position N`. When every option is a `provider/model` id, pass `subject` (`lane-model` or `review-model`). Jo
-ends a ruling with the surface word `end-ruling <id>`.
+Jo's standing rulings are checked before any question row (SPEC-2.0.md § B3, *Amended
+2026-10-19*). When one answers your ask, `orchestrator_raise_question` writes no row and returns
+`decided by Jo's ruling <id>: <action>`: do the action and send no QUESTION (under `flow-repair`,
+new work is queued: tell Jo `queued, position N`). Options that are all model ids need `subject`.
+Jo ends one with `end-ruling <id>`.
 
 ## Messages from other agents
 
@@ -172,17 +171,15 @@ normal, and shown as an inference, never asked. Either half flips in one word fr
 (`throwaway`, `normal`, `production`, `autonomous`, `user-driven`); the flip is a ledgered
 instruction, not a mental note.
 The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours, with
-`orchestrator_lower_ceiling`; raising it is Jo's, by the words `ceiling <usd> [<hours>] [wl-…]` and
-`extend wl-…` (one more block of the workload's own size), either of which relaunches a lane the
-ceiling stopped. There is no ceiling question: at 80 % Jo gets a notice and the lane goes on, and
-at 100 % an autonomous lane stops and Jo gets a notice (SPEC-2.0.md § B11, *Amended 2026-10-19*).
-Nothing extends on its own. A lane Jo runs by hand is never stopped at its ceiling.
+`orchestrator_lower_ceiling`; raising it is Jo's: `ceiling <usd> [<hours>] [wl-…]` or `extend wl-…`
+(one block more), each relaunching a lane the ceiling stopped. No ceiling question: 80 % sends a
+notice; 100 % stops an autonomous lane and sends one (SPEC-2.0.md § B11, *Amended 2026-10-19*).
+Nothing extends on its own; a lane Jo runs by hand never stops at its ceiling.
 
-A notice is a needs-you line with nothing to answer, `notice on <workload> (nothing to answer): …`,
-unnumbered and shown until it has reached you once: a ceiling at 80 %, a ceiling stop, or a
-normal-stakes plan that started on its own after a cross-lab pass. Pass a notice on to Jo; never
-turn it into a question. For a plan that started on its own, Jo's `halt wl-…` stops it, and its
-PRs do not merge until 4 h after Jo's next plain-words message at the surface (a command word does not count).
+A notice (`notice on <workload> (nothing to answer): …`) is unnumbered, shown until it reaches you
+once: ceiling 80 %, ceiling stop, or a normal plan auto-started after a cross-lab pass. Pass it on,
+never as a question. `halt wl-…` stops an auto-started plan; its PRs wait 4 h after Jo's next
+plain-words message (not a command word).
 
 ## The five error lines
 
