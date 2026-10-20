@@ -84,6 +84,7 @@ import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConf
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
+import { homeModel, type LabWaitContext, readLabWaitContext, recordLabWait, waits } from "../src/lab-wait";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { readCleanShell } from "../../gates/src/clean-shell";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
@@ -346,9 +347,13 @@ class Refused extends Error {
 export function reserve(
 	ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig(),
 	probeFor: (laneId: string) => RunnerProbe = (laneId) => runnerProbe(wl, laneId),
+	wait?: LabWaitContext,
 ): ReserveResult {
 	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
-	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? decideRanked(ledger, rows, config) });
+	if (!interactive) {
+		const context = wait ?? readLabWaitContext(ledger);
+		return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? decideRanked(ledger, rows, config, context) });
+	}
 	try {
 		return ledger.write(() => {
 			const r = ledger.reserveLane(wl, {
@@ -515,18 +520,19 @@ async function cmdDrain(after: string): Promise<number> {
 			// Waits for the spawning runner's exit write to commit (BEGIN IMMEDIATE): the reads below see the freed slot.
 			ledger.write(() => undefined);
 			const cap = laneCap(process.env);
+			const wait = readLabWaitContext(ledger);
 			for (;;) {
 				const config = readRankConfig();
 				const order = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, ledger.now());
 				const next = order.find((id) => {
 					if (tried.has(id)) return false;
 					const rows = ledger.launchRows(id, cap);
-					return rows !== null && verdictOf(rows).launch;
+					return rows !== null && verdictOf(rows, wait).launch;
 				});
 				if (next === undefined) break;
 				if (config.mode === "show") {
 					try {
-						drainLine(rankShadowLine(ledger, process.pid, next, tried, cap, config));
+						drainLine(rankShadowLine(ledger, process.pid, next, tried, cap, config, wait));
 					} catch (err) {
 						drainLine(`rank-shadow ${process.pid} failed: ${String(err)}`);
 					}
@@ -1146,17 +1152,19 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let readinessFailure: string | null = null;
 	/**
 	 * The stage those two bodies name, set once beside the failure: `readiness`, `model` for a named model OMP did not confirm
-	 * (R3-1) or a `get_state` that never answered, or `headroom` for an unnamed lane's move off an out lab that failed (PLAN
-	 * wl-mv71x5rwdu7eo0 § 4).
+	 * (R3-1) or a `get_state` that never answered, or `headroom` for a failed move off an out lab or return to the lane's home.
 	 */
 	let readinessStage = "readiness";
 	/** Jo's named model for this spawn (`laneModel`), why a recorded session was not resumed, and what `get_state` reported (MIGRATION.md item 85). */
 	let model: string | null = null;
 	let resumeSkipped: string | null = null;
 	let ranModel: string | null = null;
+	/** First get_state's model never changes; home is the eligible target or the excluded lane's confirmed destination. */
+	let startModel: string | null = null;
+	let home: string | null = null;
 	/**
-	 * Ready also waits for the first `get_state` (every lane, PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that
-	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when still out after budget comparison, must first be moved (`move`).
+	 * Ready also waits for the first `get_state`: eligible lanes wait for or return to their home; excluded lanes
+	 * retain the named check (`stateModelCheck`) or the existing move off an out lab (`moveOff`).
 	 */
 	let modelChecked = false;
 	/** The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests). */
@@ -1170,7 +1178,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	} catch (err) {
 		strongRowFailure = oneLine(err);
 	}
-	/** An unnamed lane's move off an out lab: `set_model` to `to` was sent; ready waits for `get_state` to report `to` (set in `moveOff`). */
+	/** A model move sent through set_model; readiness waits for get_state to confirm its target. */
 	let move = null as { from: string; to: string; reason: string } | null;
 	/** omp's error on the first prompt that ended `error` (D3 keeps the first), for the death line. */
 	let promptError: PromptError | null = null;
@@ -1240,7 +1248,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				throw new Fail("run", `${laneId} not started: omp pid ${c.pid}'s start time, which its lane-started: records, could not be read (${oneLine(err)}); omp is killed and its start not recorded`, STARTER_EXIT.unknown!);
 			}
 		}
-		return laneStartedBody(laneId, { pid: c?.pid ?? 0, start: ompStart ?? "", session, argv, runnerPid: process.pid, model, ranModel, resumeSkipped });
+		return laneStartedBody(laneId, { pid: c?.pid ?? 0, start: ompStart ?? "", session, argv, runnerPid: process.pid, model, ranModel, startModel, homeModel: home, resumeSkipped });
 	};
 
 	// The ceiling meter (DESIGN-workload-ceiling.md § 2 items 3, 4): the offsets live as long as the run and the first scan starts
@@ -1539,9 +1547,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		send({ id: STATE_ID, type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
-		// waits for OMP's first get_state (PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that provider/id (item 85), and an
-		// unnamed lane still out after budget comparison is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
-		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
+		// waits for OMP's first get_state: an eligible lane waits without a prompt or confirms its home; an excluded lane
+		// keeps the named check (item 85) or moveOff path. Ready means the claim, model, lane-ready: receipt and prompt all
+		// landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
@@ -1582,8 +1590,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}, READY_POLL_MS);
 		timers.push(readyPoll);
 		/**
-		 * A named model OMP did not confirm (item 85), a get_state that never answered, or an unnamed lane's failed move off an
-		 * out lab (stage `headroom`, PLAN wl-mv71x5rwdu7eo0 § 4): the never-ready path with that stage, so one launch-failed: and one
+		 * A named model OMP did not confirm (item 85), a get_state that never answered, or a failed move off an out lab or
+		 * return home (stage `headroom`): the never-ready path with that stage, so one launch-failed: and one
 		 * lane-died: name it (R3-1). The death is decided here and enqueued before the kill, whatever the holder: a stop accepted
 		 * between the kill and finish() makes the end read as intended, and finish()'s held branch would then write none. The
 		 * body is the one finish() writes for never-ready; finish() retries it, and enqueueRunnerDeath keeps it to one per lane.
@@ -1687,13 +1695,32 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
-				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it, and
-				// an unnamed lane's source receives the same budget comparison: in quota or retained, or no model reported, is ready.
-				if (o.type === "response" && o.id === STATE_ID && !stateSeen) {
+				// Fresh eligibility at the first answer, not the spawn snapshot: an eligible lane's recorded home wins over
+				// OMP's resumed/default model. Keep the first reported model immutable when a later get_state confirms a move.
+				if (o.type === "response" && o.id === STATE_ID && !stateSeen && outcome === null) {
 					stateSeen = true;
-					ranModel = stateModelOf(o);
-					rerecord = ranModel !== null;
-					if (model !== null) {
+					startModel = stateModelOf(o);
+					ranModel = startModel;
+					const entries = ledger.entries(wl);
+					const cur = ledger.workload(wl);
+					const control = controlEntries(entries, holdersOf(entries, cur?.holder ?? null));
+					const eligible = cur !== null && waits(cur, control, entries, ledger.instructions(wl));
+					home = eligible ? homeModel(control) ?? startModel : startModel;
+					rerecord = true;
+					if (eligible && home !== null) {
+						const decision = room.decisionFor(home, strongRow);
+						if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
+						if (decision.out !== null) {
+							recordLabWait(ledger, wl, home, decision.out, LANE_RUNNER_BY);
+							// Persist intent before stdin EOF. No claim is needed: finish() releases even a claim that lands later.
+							conclude("waiting", null);
+						} else if (ranModel !== home) {
+							move = { from: ranModel ?? "unknown", to: home, reason: "own lab" };
+							process.stderr.write(`runner: ${laneId} moving ${move.from} -> ${home}: own lab\n`);
+							const slash = home.indexOf("/");
+							send({ id: SET_MODEL_ID, type: "set_model", provider: home.slice(0, slash), modelId: home.slice(slash + 1) });
+						} else modelChecked = true;
+					} else if (model !== null) {
 						const check = stateModelCheck(model, o);
 						if (check.ok) modelChecked = true;
 						else failModel(check.reason);
@@ -1718,6 +1745,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					if (now === move.to) {
 						record(laneHeadroomBody(laneId, move.from, move.to, move.reason));
 						ranModel = now;
+						home = now;
 						rerecord = true;
 						modelChecked = true;
 					} else failModel(`set_model ${move.to} sent, get_state reported ${now ?? "no provider/id model"}`, HEADROOM_STAGE);

@@ -236,6 +236,9 @@ export interface FakeRecord {
 	command?: string;
 	provider?: string;
 	modelId?: string;
+	/** At EOF or a deliberately late claim: the real shared classifier's intent and current workload holder. */
+	intended?: boolean;
+	holder?: string | null;
 }
 /** One step of the fake omp's script (surface/test/fake-omp.ts header). */
 export type FakeStep =
@@ -247,6 +250,12 @@ export type FakeStep =
 /** The fake omp's script (surface/test/fake-omp.ts header). */
 export interface FakeScript {
 	claim?: boolean;
+	/** Claim only after stdin EOF, deterministically later than the runner's first state decision. */
+	claimOnEof?: boolean;
+	/** Exit on EOF without the extension shutdown, to exercise the runner's late-claim release. */
+	shutdownOnEof?: boolean;
+	/** Record the real shared exit classifier's answer at EOF before the extension shuts down. */
+	inspectEofIntent?: boolean;
 	noSession?: boolean;
 	/** get_state's `data.model` instead of the one `--model` names; null: no model at all (MIGRATION.md item 85). */
 	stateModel?: { provider?: string; id?: string } | null;
@@ -254,6 +263,11 @@ export interface FakeScript {
 	stateFail?: boolean;
 	/** get_state answers this many ms late. */
 	stateDelayMs?: number;
+	/** Hold the state response until the test creates this file (fresh eligibility changes after spawn). */
+	stateWaitUntil?: string;
+	/** Reject set_model, or acknowledge it without changing the reported model. */
+	setModelFail?: boolean;
+	setModelUnconfirmed?: boolean;
 	steps?: FakeStep[];
 	/** The n-th turn (prompt or woken turn) runs `prompts[n]`, falling back to `steps`. */
 	prompts?: FakeStep[][];
