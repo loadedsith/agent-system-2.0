@@ -6,9 +6,9 @@ import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, revie
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
+	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
 	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planQuestionProblem, requirementsProblem, reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
-	type Resolution, resumePlan, resumeSession, verdictOf,
+	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 } from "../src/launch";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
@@ -217,6 +217,75 @@ describe("control writers (Codex review 2, R4)", () => {
 		for (const forger of [holder, "lane-x-9", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(control([entry(forger, body)], holder)).toEqual([]);
 		expect(reservedPrefix(body)).toBe("test-pr");
 	});
+	test("waive-pr: (PLAN wl-mvfjen3q5mqi2o D3) is the surface's alone; the lane tools' refusal sees it as reserved", () => {
+		const body = "waive-pr: 79 70 in-1";
+		const holder = "lane-m-1";
+		expect(control([entry(SURFACE_BY, body)]).map((c) => [c.prefix, c.laneId, c.rest, c.createdBy])).toEqual([["waive-pr", null, "79 70 in-1", SURFACE_BY]]);
+		for (const forger of [holder, "lane-x-9", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(control([entry(forger, body)], holder)).toEqual([]);
+		expect(reservedPrefix(body)).toBe("waive-pr");
+	});
+});
+
+describe("waivedPrs: Jo's waive-pr binding (PLAN wl-mvfjen3q5mqi2o D3, D5)", () => {
+	let n = 0;
+	const instruction = (over: Partial<InstructionRow> = {}): InstructionRow => ({
+		id: `in-w${++n}`, workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface",
+		author: "jo", body: "", created_by: SURFACE_BY, created_at: NOW, ...over,
+	});
+	/** Jo's instruction for `prs` on wl-m plus the surface's entry naming it, as `apply` writes them. */
+	const waive = (prs: number[], over: Partial<InstructionRow> = {}) => {
+		const ins = instruction({ body: waivePrInstructionBody("wl-m", prs), ...over });
+		return { ins, ent: entry(SURFACE_BY, waivePrBody(prs, ins.id)) };
+	};
+	test("the bodies: Jo's instruction and the surface's entry naming it", () => {
+		expect(waivePrInstructionBody("wl-m", [79, 70])).toBe("waive-pr wl-m 79 70");
+		expect(waivePrBody([79, 70], "in-1")).toBe("waive-pr: 79 70 in-1");
+	});
+	test("a surface entry naming Jo's surface instruction with the same numbers waives them, with that instruction; never as a test-run binding", () => {
+		const { ins, ent } = waive([79, 70]);
+		expect(waivedPrs([ent], [ins])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
+		expect(boundPrs([ent], [ins])).toEqual([]);
+		expect(boundPrs([ent], [ins], { entries: () => [ent], instructions: () => [ins] })).toEqual([]);
+		// and a test-pr binding is no waiver
+		const t = instruction({ body: testPrInstructionBody("wl-m", [73]) });
+		const te = entry(SURFACE_BY, testPrBody([73], t.id));
+		expect(waivedPrs([ent, te], [ins, t])).toEqual([{ pr: 79, instructionId: ins.id }, { pr: 70, instructionId: ins.id }]);
+		expect(boundPrs([ent, te], [ins, t])).toEqual([{ pr: 73, by: t.id }]);
+	});
+	test("a lane-written or other machinery-written entry waives nothing, even naming Jo's real instruction", () => {
+		const { ins } = waive([79]);
+		for (const forger of ["lane-m-1", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) expect(waivedPrs([entry(forger, waivePrBody([79], ins.id))], [ins])).toEqual([]);
+	});
+	test("a surface entry naming an instruction that is not Jo's surface instruction, or on another workload, waives nothing", () => {
+		for (const over of [{ author: "lane-m-1" }, { created_by: "lane-m-1" }, { kind: "answer" as const }, { channel: "direct" as const, created_by: "lane-m-1" }, { workload_id: "wl-other" }]) {
+			const { ins, ent } = waive([79], over);
+			expect(waivedPrs([ent], [ins])).toEqual([]);
+		}
+		const { ent } = waive([79]);
+		expect(waivedPrs([ent], [])).toEqual([]);
+		const elsewhere = instruction({ workload_id: "wl-other", body: waivePrInstructionBody("wl-other", [79]) });
+		expect(waivedPrs([entry(SURFACE_BY, waivePrBody([79], elsewhere.id))], [elsewhere])).toEqual([]);
+	});
+	test("numbers that differ from the instruction's, or another word's instruction, waive nothing", () => {
+		const ins = instruction({ body: waivePrInstructionBody("wl-m", [79]) });
+		expect(waivedPrs([entry(SURFACE_BY, waivePrBody([79, 70], ins.id))], [ins])).toEqual([]);
+		expect(waivedPrs([entry(SURFACE_BY, waivePrBody([70], ins.id))], [ins])).toEqual([]);
+		expect(waivedPrs([entry(SURFACE_BY, `waive-pr: 079 ${ins.id}`)], [instruction({ id: ins.id, body: "waive-pr wl-m 079" })])).toEqual([]);
+		expect(waivedPrs([entry(SURFACE_BY, `waive-pr: ${ins.id}`)], [ins])).toEqual([]);
+		const testPr = instruction({ body: testPrInstructionBody("wl-m", [79]) });
+		expect(waivedPrs([entry(SURFACE_BY, waivePrBody([79], testPr.id))], [testPr])).toEqual([]);
+	});
+	test("the orchestrator's recorded instruction shape waives nothing", () => {
+		const ins = instruction({ body: 'Jo: "waive-pr wl-m 79" — reading: waive PR 79 on wl-m for the close check' });
+		expect(waivedPrs([entry(SURFACE_BY, waivePrBody([79], ins.id))], [ins])).toEqual([]);
+	});
+	test("two words accumulate in order; a number waived twice keeps its first instruction", () => {
+		const one = waive([79, 70]);
+		const two = waive([73, 79]);
+		expect(waivedPrs([one.ent, two.ent], [one.ins, two.ins])).toEqual([
+			{ pr: 79, instructionId: one.ins.id }, { pr: 70, instructionId: one.ins.id }, { pr: 73, instructionId: two.ins.id },
+		]);
+	});
 });
 
 describe("resume session (Codex review B6)", () => {
@@ -341,6 +410,32 @@ describe("first prompt merge line (decision 11, Codex review S7)", () => {
 		expect(prompt(false, "production")).toContain("the merge is Jo's");
 		expect(prompt(false, "normal")).toContain("merge proceeds on a judge slice's pass");
 		expect(prompt(false, "throwaway")).toContain("merge when green");
+	});
+
+	test("R13: an autonomous normal lane on a runner-served repo is told the merge train lands its PR, never to have Jo integrate it", () => {
+		const lane = (over: Partial<WorkloadRow>, runnerServed: boolean, trainOrFix: boolean, machinery = true) => firstPrompt({
+			workload: workload({ stakes: "normal", mode: "autonomous", ...over }), laneId: "lane-m-1", repo: "/r", worktree: "/r-lanes/wl-m", branch: "wl/wl-m", done: "it works",
+			planFirst: null, decisionLog: "", facts: "", resolved: [], instructions: [], machinery, tools: ["lane_release"], runnerServed, trainOrFix,
+		});
+		const line = (text: string) => text.split("\n").find((l) => l.startsWith("worktree: "))!;
+		for (const machinery of [true, false]) {
+			const served = line(lane({}, true, false, machinery));
+			expect(served).toEndWith(TRAIN_LANDS_LINE);
+			expect(served).not.toContain("Jo integrates");
+			expect(served).not.toContain("tell Jo");
+			for (const s of ["cross-lab review", "green at its head", "record done-because and release", "the merge train lands the PR"]) expect(served).toContain(s);
+		}
+		// everyone else keeps the current text: a repo the runner does not serve, a train or fix lane, other stakes, a user-driven lane
+		expect(line(lane({}, false, false))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, false, false, false))).toContain("merge proceeds on a judge slice's pass");
+		expect(line(lane({}, true, true))).toContain("never merge on this repo: Jo integrates it.");
+		expect(line(lane({}, true, true, false))).toContain("merge proceeds on a judge slice's pass");
+		expect(line(lane({ stakes: "production" }, true, false, false))).toContain("the merge is Jo's");
+		expect(line(lane({ stakes: "throwaway" }, true, false, false))).toContain("merge when green");
+		expect(line(lane({ mode: "user-driven" }, true, false))).toContain("never merge on this repo: Jo integrates it.");
+		for (const text of [lane({}, false, false), lane({}, true, true), lane({ stakes: "production" }, true, false), lane({ mode: "user-driven" }, true, false)]) {
+			expect(line(text)).not.toContain(TRAIN_LANDS_LINE);
+		}
 	});
 });
 

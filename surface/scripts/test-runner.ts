@@ -437,15 +437,16 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const bound = boundBranches(wl, entries, holdersOf(entries, w.holder, ledger.holders(wl)));
-	// A fix workload's `train-fix:` binds its PR through the train's own `train:` entry (PLAN wl-mv8s8srodefytc rev 17.1 D8).
-	const jo = boundPrs(entries, instructions, ledger);
-	const admissible = prAdmissible(view, bound, jo.map((b) => b.pr));
+	// A train member is bound by Jo's `train:` or the tick's `train-board:` (PLAN wl-mvbjiettjrfpxc D2); a fix workload's
+	// `train-fix:` binds its PR through that membership entry on the train (PLAN wl-mv8s8srodefytc rev 17.1 D8).
+	const bindings = boundPrs(entries, instructions, ledger);
+	const admissible = prAdmissible(view, bound, bindings.map((b) => b.pr));
 	if (!admissible.ok) throw new Fail(admissible.reason, START_EXIT.refused);
 	// A merge train lands dependencies first (§ 1b): checked on gh before the reservation; off a train nothing changes.
 	const stacked = trainPrs(entries, instructions).length > 0 ? stackRefusal(ownerRepo, view) : null;
 	if (stacked !== null) throw new Fail(stacked, START_EXIT.refused);
-	// Admitted only through Jo's `test-pr` binding: the starter's line names the instruction, so every such run is traceable to it.
-	const boundBy = bound.includes(view.headRefName) ? null : (jo.find((b) => b.pr === view.number)?.instructionId ?? null);
+	// Admitted only through a binding: the starter's line names it (Jo's instruction, or the train's board entry), so every such run is traceable to it.
+	const boundBy = bound.includes(view.headRefName) ? null : (bindings.find((b) => b.pr === view.number)?.by ?? null);
 
 	const root = runsRoot(process.env);
 	mkdirSync(root, { recursive: true, mode: 0o700 });

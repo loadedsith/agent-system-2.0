@@ -12,7 +12,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "..
 import { CEILING_OPTIONS } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
-import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf } from "../src/launch";
+import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody } from "../src/launch";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
@@ -1185,7 +1185,7 @@ describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN 
 		expect(i).toMatchObject({ kind: "instruction", body: `test-pr ${wl} 79 70`, author: "jo", channel: "surface", created_by: SURFACE_BY });
 		expect(ledger.entries(wl).filter((e) => e.body.startsWith("test-pr")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `test-pr: 79 70 ${i!.id}`]]);
 		expect(receipt).toBe(`PRs #79, #70 bound to ${wl} for test runs with no push (instruction ${i!.id})`);
-		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, instructionId: i!.id }, { pr: 70, instructionId: i!.id }]);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, by: i!.id }, { pr: 70, by: i!.id }]);
 		// one PR reads singular; a second word adds to the first
 		const one = apply(ledger, interpret(ledger, `test-pr ${wl} 73`)!);
 		expect(one).toStartWith(`PR #73 bound to ${wl}`);
@@ -1278,5 +1278,142 @@ describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN 
 			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: `test-pr ${wl} 79 x`, why: ["x is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"] }],
 			held: [],
 		});
+	});
+});
+
+describe("waive-pr: Jo waives merged PRs on a workload for the close check (PLAN wl-mvfjen3q5mqi2o D3)", () => {
+	/** Every row the word could write on `wl`: its instructions and the surface's `waive-pr:` entries. */
+	const written = (ledger: Ledger, wl: string) => [...ledger.instructions(wl), ...ledger.entries(wl).filter((e) => e.body.startsWith("waive-pr"))];
+	const usage = "waive-pr <wl-…> <N> [<N> …]";
+
+	test("`waive-pr wl-x 79 70` writes Jo's instruction, then the surface's waive-pr: naming it, and echoes the waiver", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `waive-pr ${wl} 79 70`)!;
+		expect(cmd).toEqual({ kind: "waive-pr", workloadId: wl, prs: [79, 70] });
+		const receipt = apply(ledger, cmd);
+		const [i] = ledger.instructions(wl);
+		expect(i).toMatchObject({ kind: "instruction", body: `waive-pr ${wl} 79 70`, author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("waive-pr")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `waive-pr: 79 70 ${i!.id}`]]);
+		expect(receipt).toBe(`PRs #79, #70 waived on ${wl} for the close check (instruction ${i!.id})`);
+		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, instructionId: i!.id }, { pr: 70, instructionId: i!.id }]);
+		// one PR reads singular; a second word adds to the first, a number waived twice keeping its first instruction
+		const one = apply(ledger, interpret(ledger, `waive-pr ${wl} 73 79`)!);
+		expect(one).toStartWith(`PRs #73, #79 waived on ${wl}`);
+		expect(apply(ledger, interpret(ledger, `waive-pr ${wl} 74`)!)).toStartWith(`PR #74 waived on ${wl} for the close check (instruction in-`);
+		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => [b.pr, b.instructionId === i!.id])).toEqual([[79, true], [70, true], [73, false], [74, false]]);
+	});
+
+	test("a waiver never binds a PR for a test run, and a test-pr binding is no waiver", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		apply(ledger, interpret(ledger, `waive-pr ${wl} 79`)!);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([]);
+		apply(ledger, interpret(ledger, `test-pr ${wl} 70`)!);
+		expect(boundPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([70]);
+		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl)).map((b) => b.pr)).toEqual([79]);
+	});
+
+	test("commas and spaces both separate; duplicates dropped in Jo's order; the word is case-insensitive", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpret(ledger, `waive-pr ${wl} 79,70, 73 79 ,70`)).toEqual({ kind: "waive-pr", workloadId: wl, prs: [79, 70, 73] });
+		expect(interpret(ledger, `Waive-PR ${wl}, 79`)).toEqual({ kind: "waive-pr", workloadId: wl, prs: [79] });
+		apply(ledger, interpret(ledger, `waive-pr ${wl} 79,70, 73 79`)!);
+		expect(ledger.instructions(wl)[0]!.body).toBe(`waive-pr ${wl} 79 70 73`);
+	});
+
+	test("refused, writing nothing: no workload named, one not open or not known, the standing workload, no number, a bad number, too many", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		ensureStandingWorkload(ledger);
+		const closed = ledger.openWorkload({ by: SURFACE_BY, brief: "Closed", stakes: "normal", mode: "autonomous" });
+		ledger.closeWorkload(closed, { by: SURFACE_BY });
+		const many = Array.from({ length: TEST_PR_MAX + 1 }, (_, k) => k + 1).join(" ");
+		const cases: [string, string][] = [
+			// the workload is never inferred, even with one in view
+			["waive-pr 79 70", `waive-pr names the workload first: ${usage}`],
+			["waive-pr", `waive-pr names the workload first: ${usage}`],
+			[`waive-pr ${closed} 79`, `${closed} is closed: only an open workload is bound`],
+			["waive-pr wl-nope 79", "no workload wl-nope"],
+			[`waive-pr ${STANDING_WORKLOAD_ID} 79`, "the standing workload takes no waive-pr binding"],
+			[`waive-pr ${wl}`, `waive-pr names at least one PR number: ${usage}`],
+			[`waive-pr ${wl} 79 0`, `0 is not a PR number (a positive whole number): ${usage}`],
+			[`waive-pr ${wl} -1`, `-1 is not a PR number (a positive whole number): ${usage}`],
+			[`waive-pr ${wl} #79`, `#79 is not a PR number (a positive whole number): ${usage}`],
+			[`waive-pr ${wl} 7a`, `7a is not a PR number (a positive whole number): ${usage}`],
+			[`waive-pr ${wl} 079`, `079 is not a PR number (a positive whole number): ${usage}`],
+			[`waive-pr ${wl} ${many}`, `waive-pr binds at most ${TEST_PR_MAX} PRs at once; ${TEST_PR_MAX + 1} named`],
+		];
+		for (const [text, why] of cases) {
+			const cmd = interpret(ledger, text);
+			expect(cmd).toEqual({ kind: "refused", why });
+			expect(() => apply(ledger, cmd!)).toThrow("refused, never applied");
+		}
+		for (const w of [wl, closed, STANDING_WORKLOAD_ID]) expect(written(ledger, w)).toEqual([]);
+		const cap = Array.from({ length: TEST_PR_MAX }, (_, k) => k + 1);
+		expect(interpret(ledger, `waive-pr ${wl} ${cap.join(" ")}`)).toEqual({ kind: "waive-pr", workloadId: wl, prs: cap });
+	});
+
+	test("apply checks the workload again: closed between the reading and the apply, it throws and writes nothing", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const cmd = interpret(ledger, `waive-pr ${wl} 79`)!;
+		ledger.completeSlice(sl, { by: "lane-a", artifact: "done" });
+		ledger.closeWorkload(wl, { by: SURFACE_BY });
+		expect(() => apply(ledger, cmd)).toThrow(`${wl} is closed: only an open workload is bound`);
+		expect(written(ledger, wl)).toEqual([]);
+	});
+
+	test("a waive-pr line of any length is command-shaped and never a numbered batch", () => {
+		const long = `waive-pr wl-x ${Array.from({ length: TEST_PR_MAX }, (_, k) => k + 1).join(" ")}`;
+		expect(maxWords(long)).toBe(Number.POSITIVE_INFINITY);
+		expect(commandShaped(long)).toBe(true);
+		expect(commandShaped("waive-pr")).toBe(true);
+		expect(parseBatch("waive-pr wl-x 79, 70")).toBeNull();
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		expect(interpretBatch(ledger, numbered(ledger), `waive-pr ${wl} 79, 70`)).toBeNull();
+	});
+
+	test("a waive-pr: entry written by a lane or any other writer waives nothing, even naming Jo's real instruction", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const ins = ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: `waive-pr ${wl} 79`, author: "jo", channel: "surface" });
+		for (const forger of ["lane-a", LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY]) {
+			ledger.recordEntry({ by: forger, workloadId: wl, kind: "assumption", body: waivePrBody([79], ins) });
+		}
+		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([]);
+		// the same body from the surface waives it
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: waivePrBody([79], ins) });
+		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([{ pr: 79, instructionId: ins }]);
+	});
+
+	test("a surface entry naming a mismatched or non-Jo instruction waives nothing", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger);
+		const other = ledger.openWorkload({ by: SURFACE_BY, brief: "Other", stakes: "normal", mode: "autonomous" });
+		const jo = (body: string, over: { by?: string; author?: string; channel?: "surface" | "direct"; workloadId?: string } = {}) =>
+			ledger.recordInstruction({ by: over.by ?? SURFACE_BY, workloadId: over.workloadId ?? wl, body, author: over.author ?? "jo", channel: over.channel ?? "surface" });
+		const forged: [number[], string][] = [
+			// numbers that differ from the instruction's
+			[[79, 70], jo(`waive-pr ${wl} 79`)],
+			[[70], jo(`waive-pr ${wl} 79`)],
+			// another word's instruction, another workload's, and instructions that are not Jo's through the surface
+			[[79], jo(`test-pr ${wl} 79`)],
+			[[79], jo(`waive-pr ${other} 79`, { workloadId: other })],
+			[[79], jo(`waive-pr ${wl} 79`, { workloadId: other })],
+			[[79], jo(`waive-pr ${wl} 79`, { author: "orchestrator" })],
+			[[79], jo(`waive-pr ${wl} 79`, { by: "lane-a" })],
+			[[79], jo(`waive-pr ${wl} 79`, { by: "lane-a", channel: "direct" })],
+			// the orchestrator's recorded instruction shape: Jo's words quoted with a reading
+			[[79], jo(`Jo: "waive-pr ${wl} 79" — reading: waive PR 79 on ${wl} for the close check`)],
+			// no instruction at all
+			[[79], "in-nope"],
+		];
+		for (const [prs, ins] of forged) ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: waivePrBody(prs, ins) });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `waive-pr: ${forged[0]![1]}` });
+		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([]);
+		expect(waivedPrs(ledger.entries(wl), [...ledger.instructions(wl), ...ledger.instructions(other)])).toEqual([]);
 	});
 });

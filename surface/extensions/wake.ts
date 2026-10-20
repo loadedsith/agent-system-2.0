@@ -63,6 +63,7 @@ import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
+import { trainMembers } from "../src/merge-train";
 import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
 import { readRankConfig } from "../src/rank-launch";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
@@ -404,11 +405,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						continue;
 					}
 					s.stuckFinished.delete(id);
+					// PLAN wl-mvbjiettjrfpxc D10 (R19): a merge train's merges are news only through the tick's notices and its questions,
+					// so its close is not pushed; an owner's close notice stays.
+					const isTrain = trainMembers(ledger.entries(id), ledger.instructions(id)).length > 0;
 					try {
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd: ctx.cwd, receipt: null });
 						if (r.closed) {
 							s.refusedClose.delete(id);
-							tick(s, ctx, `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
+							if (!isTrain) tick(s, ctx, `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
 						} else if (s.refusedClose.get(id) !== r.text) {
 							// Refused: retried every poll, told once per distinct refusal.
 							s.refusedClose.set(id, r.text);

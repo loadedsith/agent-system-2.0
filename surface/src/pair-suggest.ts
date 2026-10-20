@@ -1,8 +1,9 @@
-// The suggest-only `pair` trigger (PLAN wl-mv67564rdkfvnk § 2 D1–D9, PR 1). Two existing raise sites — the classifier's
-// round-limit question (classifier/extension.ts `roundSettled`) and the lane runner's ceiling question
-// (surface/scripts/lane.ts `raiseCeilingQuestion`) — add the option `pair` and one last `pair: <reasons>. <tail>` line
-// when the installed profile's `pairSuggest` switch covers the workload and a signal fired (`pairOffer`). Nothing else
-// changes at a raise: with nothing to offer the question is byte-identical to the raise without this module.
+// The suggest-only `pair` trigger (PLAN wl-mv67564rdkfvnk § 2 D1–D9, PR 1; PLAN wl-mvb9mw00ycfjeo D1–D3). Two existing
+// raise sites — the classifier's round-limit question (classifier/extension.ts `roundSettled`) and the lane runner's
+// ceiling question (surface/scripts/lane.ts `raiseCeilingQuestion`) — store the option `pair` last and write a
+// `pair-offer:` entry when the installed profile's `pairSuggest` switch covers the workload and a signal fired
+// (`pairOffer`). The body is never touched: it is byte-identical to the raise without this module, and every surface
+// render shows the offer as its own line instead (`pairOfferLine`, `pairPendingLine`), reading the `pair-offer:` entry.
 //
 // Signals (D3), each computed from ledger rows only:
 //   a  the slice's review loop is stalled: two or more complete rounds with a known blocking count, the last at least
@@ -32,7 +33,7 @@ import {
 	CLASSIFIER_BY, type EntryRow, type InstructionRow, LANE_RUNNER_BY, type Ledger, type SliceRow, type WorkloadRow,
 } from "../../ledger/src/index";
 import { homeDir } from "../../ledger/src/locality";
-import { controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
+import { byHandLine, controlEntries, holdersOf, isPlanQuestionIn } from "./launch";
 import { SURFACE_BY } from "./types";
 
 export const PAIR_OPTION = "pair";
@@ -180,7 +181,6 @@ export function pairOfferStamp(site: PairSite): string {
 
 interface Fired {
 	id: PairSignalId;
-	reason: string | null;
 }
 
 /** The workload's rows read once, cut by `upTo` to those written at or before `at`. */
@@ -207,28 +207,22 @@ function upTo(rows: Rows, at: string): Rows {
 	};
 }
 
-/** A: a stalled loop's reason, `blocking 2 → 2 → 2 over rounds 1–3`, or null. */
-function stalled(count: RoundCount): string | null {
+/** A: is the loop stalled — two or more complete rounds with a known blocking count, the last at least the first. */
+function stalled(count: RoundCount): boolean {
 	const rounds = count.rounds.filter((r) => r.complete && r.blocking !== null);
-	if (rounds.length < 2) return null;
-	const first = rounds[0]!;
-	const last = rounds[rounds.length - 1]!;
-	if (last.blocking! < first.blocking!) return null;
-	return `blocking ${rounds.map((r) => r.blocking).join(" → ")} over rounds ${first.n}–${last.n}`;
+	if (rounds.length < 2) return false;
+	return rounds[rounds.length - 1]!.blocking! >= rounds[0]!.blocking!;
 }
 
-/** A over every slice with review rounds in `rows`: the first stalled loop's reason, or null. */
-function stalledAnywhere(rows: Rows): string | null {
+/** A over every slice with review rounds in `rows`: is any loop stalled. */
+function stalledAnywhere(rows: Rows): boolean {
 	const slices = new Set<string>();
 	for (const e of rows.entries) {
 		const r = e.kind === "assumption" ? parseReviewRound(e.body) : null;
 		if (r) slices.add(r.slice);
 	}
-	for (const sl of slices) {
-		const reason = stalled(countRounds(rows.entries, sl));
-		if (reason) return reason;
-	}
-	return null;
+	for (const sl of slices) if (stalled(countRounds(rows.entries, sl))) return true;
+	return false;
 }
 
 /** Jo's own words in a surface instruction: the quoted words of a relay, else the whole body. */
@@ -262,8 +256,6 @@ function jevSignal(rows: Rows): PairSignalEntry | null {
 	return null;
 }
 
-const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? "" : "s"}`;
-
 /**
  * The signals firing over `rows`, in the canonical order. `a`: from `count` (the round-limit site), from every slice
  * (`"anywhere"`, the mechanical read), or not at all (`null`). `c`: only when `withC` and another signal fired.
@@ -271,20 +263,19 @@ const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? "" 
  */
 function signalsOf(rows: Rows, o: { a: RoundCount | "anywhere" | null; withC: boolean; jev: boolean }): Fired[] {
 	const fired: Fired[] = [];
-	const a = o.a === null ? null : o.a === "anywhere" ? stalledAnywhere(rows) : stalled(o.a);
-	if (a) fired.push({ id: "a", reason: a });
+	const a = o.a === null ? false : o.a === "anywhere" ? stalledAnywhere(rows) : stalled(o.a);
+	if (a) fired.push({ id: "a" });
 	const steers = longSteers(rows);
-	const revises = planRevises(rows);
-	const d2 = revises >= PLAN_REVISES;
+	const d2 = planRevises(rows) >= PLAN_REVISES;
 	if (steers + (d2 ? 1 : 0) >= LONG_STEERS) {
-		fired.push({ id: "b", reason: `${plural(steers, "long steer")} from you since open` });
-		if (d2) fired.push({ id: "d2", reason: `${plural(revises, "revise answer")} on the plan` });
+		fired.push({ id: "b" });
+		if (d2) fired.push({ id: "d2" });
 	}
 	const signal = o.jev ? jevSignal(rows) : null;
-	if (signal?.ambiguous.yes && signal.ambiguous.confidence >= PAIR_CONFIDENCE) fired.push({ id: "d1", reason: `jev: ambiguous brief (${signal.ambiguous.text})` });
-	if (signal?.taste.yes && signal.taste.confidence >= PAIR_CONFIDENCE) fired.push({ id: "e", reason: `jev: UI/taste work (${signal.taste.text})` });
+	if (signal?.ambiguous.yes && signal.ambiguous.confidence >= PAIR_CONFIDENCE) fired.push({ id: "d1" });
+	if (signal?.taste.yes && signal.taste.confidence >= PAIR_CONFIDENCE) fired.push({ id: "e" });
 	const done = rows.slices.some((s) => !s.id.startsWith("sl-ceiling-") && s.state === "done");
-	if (o.withC && fired.length > 0 && !done) fired.push({ id: "c", reason: "no slice done yet" });
+	if (o.withC && fired.length > 0 && !done) fired.push({ id: "c" });
 	return fired.sort((x, y) => PAIR_SIGNALS.indexOf(x.id) - PAIR_SIGNALS.indexOf(y.id));
 }
 
@@ -303,14 +294,7 @@ function mechanicalAt(rows: Rows, at: string): { eligible: boolean; signals: Pai
 	return { eligible: signals.includes("a") || signals.includes("b"), signals };
 }
 
-// ---- the offer (D1, D5, D6) -----------------------------------------------------------------------------------------
-
-/** D6: the line's tail, saying what answering pair does at this site. */
-export function pairTail(site: PairSite, workloadId: string): string {
-	return site === "round-limit"
-		? `Answering pair stops this review loop like stop and switches this workload to user-driven, so you steer the lane yourself (as2 lane ${workloadId}).`
-		: `Answering pair is stop plus a switch to user-driven: the autonomous lane stops at the ceiling, and you continue it yourself (as2 lane ${workloadId}).`;
-}
+// ---- the offer (D1, D5) ---------------------------------------------------------------------------------------------
 
 /** D5: may the workload take another offer now, with `fired` firing? */
 function capsAllow(ledger: PairLedger, rows: Rows, site: PairSite, fired: readonly Fired[], now: string): boolean {
@@ -337,23 +321,64 @@ function capsAllow(ledger: PairLedger, rows: Rows, site: PairSite, fired: readon
 /**
  * D1: the `pair` offer for a question about to be raised at `site`, or null. Null unless the switch (`ctx.config`, the
  * parsed installed config) covers the workload, the stakes are not throwaway, the mode is autonomous, a signal fired
- * and D5's caps allow it. `ctx.count` is the round count the round-limit raise read (signal A). The line is the
- * question's last line; `signals` go in the site's `pair-offer:` entry.
+ * and D5's caps allow it. `ctx.count` is the round count the round-limit raise read (signal A). `signals` go in the
+ * site's `pair-offer:` entry; the question's body is left as it is (PLAN wl-mvb9mw00ycfjeo D1).
  */
 export function pairOffer(
 	ledger: PairLedger,
 	workloadId: string,
 	site: PairSite,
 	ctx: { config: unknown; count?: RoundCount },
-): { line: string; signals: PairSignalId[] } | null {
+): { signals: PairSignalId[] } | null {
 	if (!pairSuggestOn(ctx.config, workloadId)) return null;
 	const w = ledger.workload(workloadId);
 	if (!w || w.stakes === "throwaway" || w.mode !== "autonomous") return null;
 	const rows = readRows(ledger, w);
 	const fired = signalsOf(rows, { a: site === "round-limit" ? (ctx.count ?? null) : null, withC: site === "ceiling", jev: true });
 	if (fired.length === 0 || !capsAllow(ledger, rows, site, fired, ledger.now())) return null;
-	const reasons = fired.flatMap((f) => (f.reason ? [f.reason] : []));
-	return { line: `pair: ${reasons.join("; ")}. ${pairTail(site, workloadId)}`, signals: fired.map((f) => f.id) };
+	return { signals: fired.map((f) => f.id) };
+}
+
+// ---- the text Jo reads (PLAN wl-mvb9mw00ycfjeo D2–D5) ---------------------------------------------------------------
+
+/** D3: one phrase per signal id, short and fixed (no counts, so never wrong). */
+export const PAIR_REASONS: Readonly<Record<PairSignalId, string>> = {
+	a: "the review loop is not converging",
+	b: "you sent several long steers",
+	c: "no slice done yet",
+	d1: "the brief reads as ambiguous",
+	d2: "the plan was revised more than once",
+	e: "it reads as UI or taste work",
+};
+
+/** The phrases of `signals` (a `pair-offer:` entry's ids, in its order) joined with `; `; an id this module does not know is skipped. */
+export function pairReasons(signals: readonly string[]): string {
+	return signals.flatMap((s) => ((PAIR_SIGNALS as readonly string[]).includes(s) ? [PAIR_REASONS[s as PairSignalId]] : [])).join("; ");
+}
+
+/** A question's options as Jo reads them: the stored `pair` left out (D2); the offer has its own line. */
+export function shownOptions(options: readonly string[]): string[] {
+	return options.filter((o) => o.toLowerCase() !== PAIR_OPTION);
+}
+
+/** D3: the needs-you and ledger-render offer line, `pair offer on <words> (q-…): <reasons>. Answer pair q-… to stop …`. */
+export function pairOfferLine(words: string, questionId: string, workloadId: string, signals: readonly string[]): string {
+	return `pair offer on ${words} (${questionId}): ${pairReasons(signals)}. Answer pair ${questionId} to stop the lane and drive it yourself (${byHandLine(workloadId)}).`;
+}
+
+/** D4: the pending block's offer line, indented under its question's answer line or overflow sentence, with D3's tail. */
+export function pairPendingLine(questionId: string, workloadId: string, signals: readonly string[]): string {
+	return `  ↳ pair offer: ${pairReasons(signals)}. Answer pair ${questionId} instead to stop the lane and drive it yourself (${byHandLine(workloadId)}).`;
+}
+
+/** D5: the taken line, its by-hand command on a line of its own. */
+export function pairTakenLine(words: string, questionId: string, workloadId: string): string {
+	return `you took pair on ${words} (${questionId}); its lane has ended. Continue it in another terminal:\n${byHandLine(workloadId)}`;
+}
+
+/** The question id a `pair-taken: <q> by <answer> mode user-driven` control entry's rest names, or null when malformed. */
+export function pairTakenQuestion(rest: string): string | null {
+	return /^(\S+) by \S+ mode user-driven$/.exec(rest)?.[1] ?? null;
 }
 
 // ---- the health number (D8) -----------------------------------------------------------------------------------------
