@@ -12,9 +12,10 @@
 // flip from the prompt and applies it first; the wake row's before_agent_start then renders the
 // ledger (already reflecting the flip), injects the voice document and carries the receipt into the
 // turn's context; the plan-path row then puts open plan questions' paths under the orchestrator's
-// messages (PLAN wl-mv61a8dh4aeneo D3); the workload, launch, ceiling, question and rank rows only
-// register tools (the rank row's `as2_rank` on every session, PLAN wl-mv8k039gvogt8g D4); the lane
-// rows register last.
+// messages (PLAN wl-mv61a8dh4aeneo D3); the agent channel row then drains other agents' notes into the ledger and
+// Ilex's context (PLAN wl-mv8vx7wdj5nx1c D2: after the wake row, so its session_start drain follows the wake's); the
+// workload, launch, ceiling, question and rank rows only register tools (the rank row's `as2_rank` on every session,
+// PLAN wl-mv8k039gvogt8g D4); the lane rows register last.
 //
 // This is the extension entry, so it is the one file here that may bare-import `@oh-my-pi/*`
 // (loader rule, gates/src/host.ts): the plan-first size judge (decision 15) resolves through the
@@ -22,6 +23,7 @@
 // load the surface without the host on the module path and pass a stub judge instead.
 import type { KindJudge } from "../classifier/src/classify";
 import { type HostModules, hostSettings } from "../gates/src/host";
+import agentChannelRow from "./extensions/agent-channel";
 import ceilingRow from "./extensions/ceiling";
 import laneRow from "./extensions/lane";
 import laneToolsRow from "./extensions/lane-tools";
@@ -62,6 +64,7 @@ export default function orchestratorSurface(pi: SurfaceAPI, env: Record<string, 
 	surfaceInputRow(ledgerPi, env);
 	const textReady = wakeRow(ledgerPi, env, deps.loadText ?? hostText);
 	planPathRow(ledgerPi, env);
+	agentChannelRow(ledgerPi, env);
 	workloadRow(pi, env, deps);
 	launchRow(pi, env);
 	ceilingRow(pi, env);

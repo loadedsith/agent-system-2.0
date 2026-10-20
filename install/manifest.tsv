@@ -1128,8 +1128,11 @@ surface/test/merge-train-resolve.test.ts	test	-
 surface/test/train-word.test.ts	test	-
 surface/test/merge-train-stack.test.ts	test	-
 surface/test/train-return.test.ts	test	-
+surface/test/train-board.test.ts	test	-
 surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
+surface/test/train-world.ts	test	-
+surface/test/train-escalation.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
@@ -1227,6 +1230,7 @@ surface/test/pair-suggest-ceiling.test.ts	test	-
 surface/test/pair-suggest-forgery.test.ts	test	-
 surface/test/pair-suggest-module.test.ts	test	-
 surface/test/pair-suggest-switch.test.ts	test	-
+surface/test/pair-offer-visible.test.ts	test	-
 # Base-prompt voice and contract (migration/items/base-prompt-voice-contract.md): bin/as2 renders the
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
 surface/scripts/orchestrator-prompt.ts	module	-
@@ -1265,6 +1269,12 @@ surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
 surface/test/phoenix-run.test.ts	test	-
+# Agent channel, phase 1 (migration/items/agent-channel.md): Plumb sends Ilex notes and proposals through
+# the OMP seat mailbox; never authored as Jo. Loaded by surface/index.ts for the orchestrator only.
+surface/src/channel.ts	module	-
+surface/extensions/agent-channel.ts	module	-
+surface/test/channel.test.ts	test	-
+surface/test/channel-reply.test.ts	test	-
 # Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
 # jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
 # profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.

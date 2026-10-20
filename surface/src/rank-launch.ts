@@ -145,8 +145,8 @@ export function repoIdentity(ledger: Ledger, workloadId: string): { identity: st
 	}
 }
 
-/** The ceiling now in force and the newest metered `spend:` (the runner's running total; zero when none). */
-function meter(ledger: Ledger, workloadId: string): { ceiling: Ceiling; spend: Spend } {
+/** The ceiling now in force and the newest metered `spend:` (the runner's running total; zero when none); the train tick's rotation reads it too (surface/src/merge-train.ts `boardLanding`). */
+export function meter(ledger: Ledger, workloadId: string): { ceiling: Ceiling; spend: Spend } {
 	const w = ledger.workload(workloadId)!;
 	const control = controlEntries(ledger.entries(workloadId, "assumption"));
 	const ceiling = effectiveCeiling(control, ledger.instructions(workloadId), w.stakes);

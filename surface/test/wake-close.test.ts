@@ -14,9 +14,9 @@ import { launchVerdict } from "../extensions/launch";
 import orchestratorSurface from "../index";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
-import { doneBody } from "../src/launch";
+import { doneBody, trainBoardBody } from "../src/launch";
 import { surfaceSession } from "../src/session";
-import { SURFACE_BY } from "../src/types";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { ctxOf, fakePi, timers, tmp } from "./helpers";
 
 const ORIGIN_URL = "https://github.com/example/repo.git";
@@ -36,10 +36,11 @@ function env(): Record<string, string> {
 const open = (e: Record<string, string>) => Ledger.open(e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
 const HAND = "lane-plumb-by-hand";
 
-/** A by-hand holder's released workload with its `done-because:` receipt standing: awaiting close, nothing open. */
-function awaitingClose(e: Record<string, string>, repo: string): string {
+/** A by-hand holder's released workload with its `done-because:` receipt standing: awaiting close, nothing open. A `train` one is a merge train boarded with #7. */
+function awaitingClose(e: Record<string, string>, repo: string, train = false): string {
 	const l = open(e);
 	const wl = l.openWorkload({ by: SURFACE_BY, brief: "Add a verify line to the README", stakes: "normal", mode: "autonomous" });
+	if (train) l.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainBoardBody({ pr: 7, workload: wl, head: "a".repeat(40), run: null, review: null }) });
 	recordRepo(l, wl, repo);
 	l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody("README.md carries a verify line") });
 	expect(l.claimWorkload(wl, { by: HAND, holder: HAND, leaseMs: 60_000 }).won).toBe(true);
@@ -156,6 +157,36 @@ describe("the tick's refused close is told once per refusal", () => {
 		await tick();
 		expect(await applied()).toEqual([]);
 		expect(f.execs.calls.filter((c) => c.command === "bun")).toEqual([]);
+	});
+});
+
+describe("a merge train's auto-close is not pushed (PLAN wl-mvbjiettjrfpxc D10)", () => {
+	test("R19: one tick closes a merge train and an owner workload: the owner's close notice is pushed, the train's is not", async () => {
+		const e = env();
+		const repo = tmp("repo");
+		const owner = awaitingClose(e, repo);
+		const train = awaitingClose(e, repo, true);
+		const f = fakePi(undefined, { exec: true });
+		// No origin: the repo is not served, so each close goes through without the runner's green.
+		f.execs.answer = () => ({ stdout: "", stderr: "", code: 1, killed: false });
+		orchestratorSurface(f.pi, e, {});
+		const ctx = ctxOf({ cwd: repo });
+		const s = surfaceSession(ctx, e);
+		timers.length = 0;
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		timers[0]!.fn();
+		while (s.launching) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+		}
+		const after = open(e);
+		expect([after.workload(owner)!.status, after.workload(train)!.status]).toEqual(["closed", "closed"]);
+		after.close();
+		const turn = (await f.emit("before_agent_start", { prompt: "hi", systemPrompt: [] }, ctx)) as { messages: { content: string }[] };
+		const text = turn.messages[0]?.content ?? "";
+		expect(text).toContain(`- tick: closed ${owner}: README.md carries a verify line`);
+		expect(text).not.toContain(`closed ${train}`);
 	});
 });
 

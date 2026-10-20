@@ -511,6 +511,25 @@ Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md
 review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
 "approved" was undefined.
 
+**Amended 2026-10-19 — the merge train lands a normal lane's PR** (`migration/items/merge-train-auto-board.md`;
+jo-issues #132; Jo, ledger input `in-mvbjiylsgdtqf4`: "it is of the utmost importance to me that agents can
+merge autonomsly"; built in wl-mvbjiettjrfpxc, plan revision 6). This amends the normal row above and the
+completion rule of `DESIGN-lane-launcher.md` decision 11 (on this repository a lane never merges: Jo
+integrates). An autonomous normal-stakes lane on a repository the test runner serves
+(`testRunner.repos`), a merge train or train fix lane excepted, never asks Jo to integrate. A
+cross-lab review slice must pass before the PR is done. Once the PR is green at its head with that
+review passed, the lane records `done-because:` and releases, the surface closes the workload, and
+the merge train boards and lands the PR; a done line's "merged on main" is met by that hand-off. The
+train tick boards a PR only when its workload is closed, was autonomous at normal stakes, carries a
+holder `done-because:` newer than the tick's `train-autoboard: on` cutover row, has its newest
+full-suite run green at the PR's head (a head ahead of it only by `.ai/decision-log/` commits
+counts), and has its cross-lab review passed. A PR that fails a test gets a `train-board-skip:`
+ledger row, no line to Jo, and Jo's `train <N>` still lands it. For these PRs the normal row's "told
+in one line after the merge" no longer holds: Jo hears only of a production-stakes merge, a
+conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
+tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
+above unchanged; production auto-boarding is a non-goal.
+
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
 or kimi. if those are unavailable due to spend reasons or login issues i should be alerted and
@@ -685,6 +704,26 @@ code manually at some point?"*
   recreates the shared-checkout collision the 1.x charter already recorded once
   (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
   diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
+
+**Amended 2026-10-19 — inbound agent channel** (`migration/items/agent-channel.md`; Jo, answering
+q-mv8wcymfkx3y0w: *"notes"*, ledger input `in-mv8yzvhuwz9jwg`; plan
+`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8vx7wdj5nx1c/PLAN.md` rev 6; built in
+wl-mv8vx7wdj5nx1c). Other agents reach the orchestrator through one inbound channel, never
+through Jo's steering path. Each sender is configured in `profile/config.yml` under
+`channel.senders[]` with an `id`, a `transport` and an `authority`; the authority belongs to the
+sender, not to anything a message says. Phase 1 has one sender, `{ id: plumb, transport:
+omp-mailbox, authority: notes }`, and `notes` (notes and proposals) is the only authority built.
+A message is never authored as Jo: it is a `messages` row on `wl-orchestrator` with sender
+`plumb`, created_by `channel:plumb` and the body prefix `channel-note from plumb:`, and the
+channel writes no instruction, answer, stakes or mode flip, or ceiling change. The orchestrator
+reads it as information from that sender, and replies with `orchestrator_reply` or closes it
+with `orchestrator_channel_done`. A line that names a waiting needs-you row and a word that
+answers it is a proposal: it renders as `#n plumb proposes <word> <target>` and carries the
+target's own number, never one of its own, and only Jo's typed `n <word>` (or another word that
+fits the row) applies, as Jo's ordinary row. Flip and ceiling words from a sender answer no
+numbered row, so they stay notes. A sender's `from` is self-claimed, so a spoof costs a
+misattributed note, never an action. Grant words wait for a phase with sender proof; phase 2
+(Juno, remote, notes only) starts only after Jo's go is recorded as an instruction.
 
 ### B6 · Spec-and-plan option is offered inside the lane (P-12)
 
@@ -1115,7 +1154,11 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    failure, tees to a fixed log path; the ledger row that handed it over records the log path;
    the script's exit writes a row (exit code, log path). **The lane listens**, not the hand: the
    hand that wrote the script may be closed when Jo runs it; the lane is bound to the workload
-   for its life (P-2, P-5). A non-zero exit is one of B3's error lines.
+   for its life (P-2, P-5). A non-zero exit is one of B3's error lines. One named exception
+   (amended 2026-10-17, `migration/items/pair-offer-own-line.md`, the exception MIGRATION.md
+   item 52 asked for): the orchestrator may give Jo the by-hand `as2 lane wl-…` line that
+   continues a user-driven workload, bare, in plain text or inline code, never inside a shell
+   fence. It names the lane Jo starts in his own terminal; there is no script to log.
 3. **Mechanical, not prose — the OMP settings and the gate.** *Ask before acting*: a lane runs
    under `tools.approvalMode: write` with per-tool `tools.approval` overrides
    (`omp://approval-mode.md:14-30`) in the profile template (B8 machinery). *Ask as a
@@ -1130,7 +1173,10 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    since OMP does not retract streamed text (amended 2026-10-07, MIGRATION.md item 37). One
    marker shows per prompt: a later hold in the same prompt (a refused rewrite) shows "…" in
    each text block instead, and still blocks with its full reason and original; the marker
-   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08).
+   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08). The
+   item 2 exception passes the gate: on the orchestrator, row 1 lets the bare `as2 lane wl-…`
+   line through in prose and in inline code and still refuses it inside a shell fence (amended
+   2026-10-17, `migration/items/pair-offer-own-line.md`, MIGRATION.md item 52).
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.
