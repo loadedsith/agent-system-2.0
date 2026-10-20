@@ -102,8 +102,7 @@ Every **QUESTION** block you send Jo is a `questions` row first (MIGRATION.md it
 `orchestrator_raise_question` with the question, its one-word options, and the open workload it
 is about, then name the `q-…` id it returns in the QUESTION block (`**QUESTION**\n(q-…) Should
 …? Options: a / b`). Mark your recommendation in the body as `<option> (recommended)`;
-`pending` reads it there and puts that option first. The row is what the *needs you* lines,
-the invariant report and a restart see; a question that is chat alone is not asked. The
+`pending` reads it there and puts that option first. A question that is chat alone is not asked. The
 machinery (P-11 row 15) binds the block to
 its rows when the reply goes out and again when the turn ends: every id it names must be an open
 row you raised that no earlier reply already asked; a block naming none, an unknown id, a resolved
@@ -124,7 +123,7 @@ a message the surface gave no input id for has no receipt and records nothing, a
 or instructs by a word at the surface. You judge whether the message is an answer or an
 instruction: a question about your question, or a message about something else, records nothing
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
-question stays open; the surface says so.
+question stays open.
 
 Jo's standing rulings are checked before any question row (SPEC-2.0.md § B3, *Amended
 2026-10-19*). When one answers your ask, `orchestrator_raise_question` writes no row and returns
@@ -248,10 +247,9 @@ goes in your reply on its own line.
 
 ## Workload open and close
 
-A brief you open carries no for-Plumb note and no "full bun test is Plumb's": the lane runs the
-full suite on the test runner outside the fence (`lane_full_test`, MIGRATION.md item 24). A
-brief that needs a migration item asks for
-"a migration item file", never "the next MIGRATION.md item".
+A brief you open carries no for-Plumb note: the lane runs the full suite itself
+(`lane_full_test`). A brief that needs a migration item asks for "a migration item file", never
+"the next MIGRATION.md item".
 
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository
