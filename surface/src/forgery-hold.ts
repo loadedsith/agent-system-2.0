@@ -16,13 +16,14 @@
 //   standing workload, `closedReversals`) keeps the boarding, landing and `stakes --hold-ok` refusal for good (D5's last
 //   row): nothing in the ledger undoes a closed workload's row, so its PR never boards. Only the unanswered hit is LOUD.
 // - The train tick's pass (`forgeryPass`) runs over every open workload and every workload closed within the
-//   autoboard window, records the new hits, and requests a stop of a held workload's live autonomous lane; the
-//   caller raises one alarm per pass with new hits (`alarmLine`, surface/src/notify.ts).
-import type { EntryRow, Ledger } from "../../ledger/src/index";
+//   autoboard window, records the new hits, and requests a stop of a held workload's live lane unless its launch was by hand
+//   (`byHandLane`: the lane's own `launch:` attempt decides, the workload's mode only for a lane no attempt names); the caller
+//   raises one alarm per pass with new hits (`alarmLine`, surface/src/notify.ts).
+import { type EntryRow, LANE_STARTER_BY, LAUNCH_ATTEMPT_GLOB, type Ledger } from "../../ledger/src/index";
 import { joForgeryAnswer, surfaceMarks } from "../../ledger/src/jo-channel";
 import { checkForgery, type ForgeryHit, type ForgeryRule } from "./forgery";
 import {
-	attempts, type ControlEntry, controlEntries, FORGERY_HOLD_REASON, forgeryHitBody, heldLive, holdersOf, laneStopRequestBody,
+	type Attempt, attempts, type ControlEntry, controlEntries, FORGERY_HOLD_REASON, forgeryHitBody, heldLive, holdersOf, laneStopRequestBody,
 	parseForgeryAnswer, parseForgeryHit, parseTrainBoard,
 } from "./launch";
 import type { Notify, Speak } from "./notify";
@@ -81,6 +82,30 @@ export function scanWorkload(ledger: Ledger, wl: string): ForgeryHit[] {
 function controlOf(ledger: Ledger, wl: string, entries: readonly EntryRow[] = ledger.entries(wl)): ControlEntry[] {
 	const w = ledger.workload(wl);
 	return controlEntries(entries, holdersOf(entries, w?.holder ?? null, ledger.holders(wl)));
+}
+
+/**
+ * `wl`'s launch attempts as written, oldest first: every `launch:` row stamped by its one writer (the starter, LANE_STARTER_BY,
+ * which `controlEntries` admits for the prefix), read raw. A launch is history, not a decision: the lane it started ran, whatever a
+ * later row says, so no reversal hides one here (a reversal is surface-stamped, so none is among these rows for `controlEntries`
+ * to apply). The decision readers keep reading attempts through `controlEntries` over every entry.
+ */
+function launchHistory(ledger: Ledger, wl: string): Attempt[] {
+	const rows = ledger.db.query<EntryRow, [string, string, string]>(
+		"SELECT * FROM entries WHERE workload_id = ?1 AND kind = 'assumption' AND created_by = ?2 AND body GLOB ?3 ORDER BY created_at, rowid",
+	).all(wl, LANE_STARTER_BY, LAUNCH_ATTEMPT_GLOB);
+	return attempts(controlEntries(rows));
+}
+
+/**
+ * Whether `w`'s holder is a by-hand lane (`as2 lane <wl>`, Jo's terminal), from the lane's own launch rather than the workload's
+ * mode, which a forged flip may have set: the first attempt naming the lane (`launchHistory`) has cause `interactive` exactly when
+ * `decideInteractive` admitted it, and a lane id names one attempt (`reserveLane`'s ordinal), so a later row naming the same lane
+ * cannot recast it. Only a holder no attempt names (a lane claimed outside the starter, which no runner polls) falls back to the mode.
+ */
+function byHandLane(ledger: Ledger, w: { id: string; mode: string; holder: string }): boolean {
+	const own = launchHistory(ledger, w.id).find((a) => a.laneId === w.holder);
+	return own ? own.cause?.kind === "interactive" : w.mode !== "autonomous";
 }
 
 /** A hit's answer: which word, its entry, and the workload the entry sits on. */
@@ -186,12 +211,13 @@ function passWorkloads(ledger: Ledger, windowMs: number): string[] {
 }
 
 /**
- * Request a stop of `wl`'s live autonomous lane while it is held: `lane-stop: <lane> requested forgery-hold by forgery-check`,
- * once per lane. A by-hand lane (on a user-driven workload) gets none. Returns the entry written, or null.
+ * Request a stop of `wl`'s live lane while it is held: `lane-stop: <lane> requested forgery-hold by forgery-check`, once per lane.
+ * A by-hand lane gets none, judged from its launch (`byHandLane`), not from the workload's mode. Returns the entry written, or null.
  */
 export function requestHoldStop(ledger: Ledger, wl: string): { laneId: string; entryId: string } | null {
 	const w = ledger.workload(wl);
-	if (!w || w.status !== "open" || w.mode !== "autonomous" || !w.holder?.startsWith("lane-") || !heldLive(w, ledger.now())) return null;
+	if (!w || w.status !== "open" || !w.holder?.startsWith("lane-") || !heldLive(w, ledger.now())) return null;
+	if (byHandLane(ledger, { id: w.id, mode: w.mode, holder: w.holder })) return null;
 	if (unansweredHits(ledger, wl).length === 0) return null;
 	const laneId = w.holder;
 	const asked = controlOf(ledger, wl).some((c) => c.prefix === "lane-stop" && c.laneId === laneId && c.createdBy === FORGERY_CHECK_BY && c.rest.startsWith(`requested ${FORGERY_HOLD_REASON} `));
@@ -207,7 +233,7 @@ export function holdStops(control: readonly ControlEntry[]): ControlEntry[] {
 
 /**
  * The tick's pass (D3): the check over every open workload and every workload closed within `windowMs`, the new hits
- * recorded, then a stop request for each held workload's live autonomous lane. Returns what it wrote.
+ * recorded, then a stop request for each held workload's live lane not launched by hand (`requestHoldStop`). Returns what it wrote.
  */
 export function forgeryPass(ledger: Ledger, windowMs: number): { hits: NewHit[]; stops: { workloadId: string; laneId: string; entryId: string }[] } {
 	const hits: NewHit[] = [];
@@ -256,12 +282,12 @@ export function allUnansweredHits(ledger: Ledger): RecordedHit[] {
 }
 
 /**
- * What a flagged row led to, from the rows that cite its id: each `launch:` attempt whose cause names it, and each
- * `train-board:` whose review names it or that boarded the flagged workload after the row.
+ * What a flagged row led to, from the rows that cite its id: each `launch:` attempt whose cause names it (`launchHistory`, read raw:
+ * a reversal hides no launch), and each `train-board:` whose review names it or that boarded the flagged workload after the row.
  */
 export function consequences(ledger: Ledger, hit: Pick<RecordedHit, "workloadId" | "rowId">): string[] {
 	const out: string[] = [];
-	for (const a of attempts(controlOf(ledger, hit.workloadId))) {
+	for (const a of launchHistory(ledger, hit.workloadId)) {
 		const ids = a.cause?.kind === "request" ? [a.cause.id] : a.cause?.kind === "resume" ? a.cause.ids : [];
 		if (ids.includes(hit.rowId)) out.push(`launched ${a.laneId} (${a.entryId})`);
 	}

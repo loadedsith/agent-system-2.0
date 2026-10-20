@@ -14,10 +14,10 @@ import { LEDGER_DB_ENV } from "../../ledger/src/locality";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import * as laneScript from "../scripts/lane";
 import { errorLines } from "../src/errors";
-import { forgeryHoldLine, forgeryPass, forgeryStakesHold, unansweredHits } from "../src/forgery-hold";
+import { consequences, forgeryHoldLine, forgeryPass, forgeryStakesHold, unansweredHits } from "../src/forgery-hold";
 import { ensureStandingWorkload } from "../src/identity";
-import { interpret } from "../src/input";
-import { controlEntries, forgeryConfirmedBody, holdersOf, launchable, pendingStop, planApprovedBody, verdictOf } from "../src/launch";
+import { apply, interpret } from "../src/input";
+import { controlEntries, forgeryConfirmedBody, holdersOf, launchable, launchRequestedBody, pendingStop, planApprovedBody, verdictOf } from "../src/launch";
 import { AUTOBOARD_WINDOW_MS, boardLanding, landingReady } from "../src/merge-train";
 import type { RankConfig } from "../src/rank-launch";
 import { FORGERY_CHECK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -418,6 +418,76 @@ describe("R11: an unanswered hit holds the workload", () => {
 		expect(pendingStop(controlEntries(es, holdersOf(es, lane, ledger.holders(wl))), lane)).toMatchObject({ reason: "forgery-hold", by: FORGERY_CHECK_BY });
 		expect(unansweredHits(ledger, wl).map((h) => h.rowId)).toEqual([row]);
 		expect(forgeryPass(ledger, AUTOBOARD_WINDOW_MS)).toEqual({ hits: [], stops: [] });
+	});
+
+	test("an unmarked mode flip decides nothing about a lane's launch: the autonomous lane flipped to user-driven gets the check's stop; Jo's by-hand lane flipped to autonomous gets none", () => {
+		const { c, ledger, path } = world();
+		const auto = ledger.openWorkload({ by: SURFACE_BY, brief: "an autonomous workload", stakes: "normal", mode: "autonomous" });
+		c.plusHours(0.01);
+		const byHand = ledger.openWorkload({ by: SURFACE_BY, brief: "Jo's own workload", stakes: "normal", mode: "user-driven" });
+		// Each lane launched as the starter launches it (`launch: <lane> cause first|interactive`), then claimed by its session.
+		const autoRun = laneScript.reserve(ledger, auto, "test", false, SHOW);
+		const handRun = laneScript.reserve(ledger, byHand, "jo", true, SHOW);
+		if (!autoRun.ok || !handRun.ok) throw new Error(`reserve refused: ${JSON.stringify([autoRun, handRun])}`);
+		for (const [wl, lane] of [[auto, autoRun.laneId], [byHand, handRun.laneId]] as const) {
+			expect(ledger.claimWorkload(wl, { by: lane, holder: lane, leaseMs: 600_000 }).won).toBe(true);
+		}
+		const surface = surfaceOf(path, c.now);
+		try {
+			surface.recordInstruction({ ...JO, workloadId: auto, body: "go on" });
+			expect(ledger.joChannelCutovers().surface).not.toBeNull();
+			c.plusHours(0.01);
+			// A script on the test's unmarked connection flips each workload's mode after the cutover (F1).
+			const toHand = ledger.flipMode(auto, { ...JO, mode: "user-driven" });
+			const toAuto = ledger.flipMode(byHand, { ...JO, mode: "autonomous" });
+			expect([ledger.workload(auto)!.mode, ledger.workload(byHand)!.mode]).toEqual(["user-driven", "autonomous"]);
+			c.plusHours(0.1);
+
+			const pass = forgeryPass(ledger, AUTOBOARD_WINDOW_MS);
+			expect(pass.hits.map((h) => [h.workloadId, h.rowId, h.rule])).toEqual([[auto, toHand, "F1"], [byHand, toAuto, "F1"]]);
+			expect(pass.stops.map((s) => [s.workloadId, s.laneId])).toEqual([[auto, autoRun.laneId]]);
+			const control = (wl: string) => {
+				const es = ledger.entries(wl);
+				return controlEntries(es, holdersOf(es, ledger.workload(wl)!.holder, ledger.holders(wl)));
+			};
+			expect(pendingStop(control(auto), autoRun.laneId)).toMatchObject({ reason: "forgery-hold", by: FORGERY_CHECK_BY });
+			expect(pendingStop(control(byHand), handRun.laneId)).toBeNull();
+			expect(forgeryPass(ledger, AUTOBOARD_WINDOW_MS)).toEqual({ hits: [], stops: [] });
+		} finally {
+			surface.close();
+		}
+	});
+
+	test("an unmarked reversal of a launch attempt hides no launch: consequences, the LOUD line and Jo's reverse receipt still name it", () => {
+		const { c, ledger, path } = world();
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "an autonomous workload", stakes: "normal", mode: "autonomous" });
+		const surface = surfaceOf(path, c.now);
+		try {
+			surface.recordInstruction({ ...JO, workloadId: wl, body: "go on" });
+			c.plusHours(0.01);
+			// A script's unmarked launch request after the cutover (F1), then the starter's real attempt citing it.
+			const req = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now()) });
+			const att = ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: `launch: lane-probe-1 cause request ${req} requested-by surface` });
+			c.plusHours(0.1);
+			const pass = forgeryPass(ledger, AUTOBOARD_WINDOW_MS);
+			expect(pass.hits.map((h) => [h.rowId, h.rule])).toEqual([[req, "F1"]]);
+			const launched = `launched lane-probe-1 (${att})`;
+			expect(consequences(ledger, { workloadId: wl, rowId: req })).toEqual([launched]);
+			c.plusHours(0.01);
+
+			// The script then writes a surface-stamped reversal of the launch attempt.
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: forgeryReversedBody(att, "in-forged") });
+			expect(controlEntries(ledger.entries(wl)).some((e) => e.id === att)).toBe(false);
+			expect(consequences(ledger, { workloadId: wl, rowId: req })).toEqual([launched]);
+			const loud = errorLines(ledger).filter((l) => l.kind === "forgery");
+			expect(loud.map((l) => [l.workloadId, l.rowId])).toEqual([[wl, req]]);
+			expect(loud[0]!.line).toContain(`it led to ${launched};`);
+			const cmd = interpret(surface, `reverse ${req}`, () => null);
+			expect(cmd).toEqual({ kind: "forgery-reverse", workloadId: wl, on: wl, rowId: req });
+			expect(apply(surface, cmd!, () => null)).toContain(`cannot be undone: ${launched}: that lane's commits, pushes and spend stay`);
+		} finally {
+			surface.close();
+		}
 	});
 });
 
