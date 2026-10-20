@@ -9,15 +9,20 @@
 // regardless of the last-N window), pending messages with their P-7c states, the last N ledger
 // entries (instructions, answers, assumptions, wake reads, slice completions and cancellations, and
 // hand-backs the orchestrator has acted on — § B7 names hand-backs as recent history, Codex S5) —
-// is the on-demand read's (LEDGER_TOOL), for one workload or all of them.
+// is the on-demand read's (LEDGER_TOOL), for one workload or all of them. While an agent channel runs on the ledger
+// handle (PLAN wl-mv8vx7wdj5nx1c D3), every render carries the `## from other agents` block after the needs-you lines:
+// the channel's notes, which are Ilex's to read and not Jo's to answer (surface/src/channel.ts `fromOtherAgents`).
 import type { InFlightWorkload, InstructionRow, Ledger, MessageRow, SliceRow, WorkloadStatusRow } from "../../ledger/src/index";
+import { channelInForce, fromOtherAgents } from "./channel";
 import { needsYouBullet } from "./delivery";
-import { type ErrorLine, errorLines, parseDue } from "./errors";
+import { type ErrorLine, errorLines, parseDue, wordsOf } from "./errors";
 import { type Identity, identityOf } from "./identity";
 import { parseSpend } from "./ceiling";
-import { ceilingOf, ceilingText } from "./input";
+import { ceilingOf, ceilingText, openPairOffer } from "./input";
 import { byHandLine, controlEntries, doneLine, holdersOf, isPlanQuestionIn, planFirst } from "./launch";
+import { pairOfferLine, shownOptions } from "./pair-suggest";
 import { Numbering } from "./numbering";
+import { currentGoals, parseAudit, rankDay, rankOpen } from "./rank";
 import { LAST_N, LEDGER_TOOL, STANDING_WORKLOAD_ID } from "./types";
 
 export interface RenderOptions {
@@ -37,6 +42,8 @@ export interface RenderOptions {
 	heading?: string;
 	/** The session's numbering (surface/src/session.ts), so a row keeps its `#n` across renders; a fresh one (1..k) when absent. */
 	numbering?: Numbering;
+	/** The Jev rank mode in force (surface/src/rank-launch.ts readRankConfig), for the rank line's label; show when absent. */
+	rankMode?: string;
 }
 
 export interface Rendered {
@@ -114,11 +121,14 @@ export function renderWorkload(ledger: Ledger, w: InFlightWorkload, lastN: numbe
 		out.push("open questions:");
 		// A multi-line body keeps its lines under the bullet, indented as errorLines indents them (PLAN wl-muq22rnjcfrrpc D8);
 		// the plan question's body starts on the line beneath its q- id, so its path sits right under the line naming it (PLAN wl-mv61a8dh4aeneo D2).
+		// A stored `pair` is not listed; a valid offer is its own line beneath the question (PLAN wl-mvb9mw00ycfjeo D4).
 		const entries = ledger.entries(workload.id);
 		const valid = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(workload.id)));
 		for (const q of openQuestions) {
 			const body = q.body.split("\n").join("\n  ");
-			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${q.options.join(" / ")}`);
+			out.push(`- ${q.id} on ${q.slice_id}:${isPlanQuestionIn(valid, q) ? `\n  ${body}` : ` ${body}`} — options: ${shownOptions(q.options).join(" / ")}`);
+			const offer = openPairOffer(ledger, q);
+			if (offer) out.push(`  ${pairOfferLine(wordsOf(ledger, workload.id, valid), q.id, workload.id, offer.signals)}`);
 		}
 	}
 	if (pendingMessages.length > 0) {
@@ -158,11 +168,41 @@ export function workloadLine(ledger: Ledger, w: InFlightWorkload, lines: readonl
 	const states = new Map<string, number>();
 	for (const s of slices) states.set(s.state, (states.get(s.state) ?? 0) + 1);
 	parts.push(`slices: ${states.size === 0 ? "none open" : [...states].map(([state, n]) => `${n} ${state}`).join(", ")}`);
-	const mine = lines.filter((l) => l.workloadId === workload.id);
+	// A channel proposal carries its target's number: the target line already lists it.
+	const mine = lines.filter((l) => l.workloadId === workload.id && l.kind !== "proposal");
 	if (mine.length > 0) parts.push(`needs you: ${mine.map((l) => (l.n === undefined ? l.kind : `#${l.n}`)).join(", ")}`);
 	if (openQuestions.length > 0) parts.push(`open questions: ${openQuestions.map((q) => q.id).join(", ")}`);
 	if (pendingMessages.length > 0) parts.push(`${pendingMessages.length} message(s) not yet acted on`);
 	return parts.join(" · ");
+}
+
+/** A rank-audit line is shown while its row is this young (D5: the newest audit, under 7 days old). */
+const AUDIT_SHOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The Jev rank lines under the needs-you block (PLAN wl-mv8k039gvogt8g D5), from `rankOpen` over stored rows only (no
+ * judge, no write): `Rank (Jev, show-only): 1 <wl> <title≤40> · 2 … · 3 …; <n> unscored; goals <set date|stale|none>;
+ * as2_rank for the table`, then the newest `rank-audit:` while under 7 days old. Empty with nothing ranked and no audit.
+ */
+export function rankLines(ledger: Ledger, now: string, mode = "show"): string[] {
+	const items = rankOpen(ledger, now);
+	const out: string[] = [];
+	if (items.length > 0) {
+		const top = items.slice(0, 3).map((i, n) => {
+			const t = i.title.replace(/\s+/g, " ");
+			return `${n + 1} ${i.workloadId} ${t.length > 40 ? `${t.slice(0, 39)}…` : t}${i.pinned ? " (pinned)" : i.score === undefined ? " (unscored)" : ""}`;
+		});
+		const goals = currentGoals(ledger, now);
+		const label = mode === "show" ? "Jev, show-only" : `Jev, launch order ${mode}`;
+		out.push(`Rank (${label}): ${top.join(" · ")}; ${items.filter((i) => i.score === undefined).length} unscored; goals ${goals.state === "set" && goals.setAt ? `set ${rankDay(goals.setAt)}` : goals.state}; as2_rank for the table`);
+	}
+	const audits = controlEntries(ledger.entries(STANDING_WORKLOAD_ID, "assumption")).filter((c) => c.prefix === "rank-audit");
+	const newest = audits.at(-1);
+	const a = newest ? parseAudit(newest.body) : null;
+	if (newest && a && Date.parse(now) - Date.parse(newest.createdAt) < AUDIT_SHOWN_MS) {
+		out.push(`Rank audit ${a.from}..${a.to}: ${a.picks} pick(s) of Jo's, ${a.scorable} scorable, Jev's #1 ${a.top1}, top 3 ${a.top3}, mean percentile ${a.meanpct ?? "unknown"}; report ${a.report}`);
+	}
+	return out;
 }
 
 /** The whole wake render. */
@@ -179,6 +219,9 @@ export function renderWake(ledger: Ledger, opts: RenderOptions = {}): Rendered {
 	out.push("## needs you");
 	if (lines.length === 0) out.push("nothing: no reserved action waiting, nothing held past the threshold, no slice failed twice, no lane died, no lane left work idle, no lane waiting on you, nothing scheduled past due");
 	for (const l of lines) out.push(needsYouBullet(l));
+	if (!opts.workloadId) out.push(...rankLines(ledger, now, opts.rankMode));
+	const channel = channelInForce(ledger);
+	if (channel) out.push("", ...fromOtherAgents(ledger, channel, now));
 	const work = inFlight.filter((w) => w.workload.id !== STANDING_WORKLOAD_ID && (!opts.workloadId || w.workload.id === opts.workloadId));
 	const compact = opts.compact ?? (opts.trigger !== undefined && !opts.workloadId);
 	out.push("");

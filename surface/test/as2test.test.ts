@@ -225,7 +225,8 @@ describe("the wrapper refuses bad argv", () => {
 
 	test("wrong arity is refused for every subcommand", () => {
 		for (const args of [["full"], ["full", "tr-a1", "x"], ["sweep", "tr-a1", "x"], ["prepare", "tr-a1"], ["prepare", "tr-a1", "a".repeat(40), "x"], ["solo", "tr-a1"],
-			["solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["cleanup", "tr-a1"], ["cleanup", "tr-a1", "tr-b", "tr-c"], ["probe", "tr-a1"], ["bogus", "tr-a1"]]) {
+			["solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["cleanup", "tr-a1"], ["cleanup", "tr-a1", "tr-b", "tr-c"], ["probe", "tr-a1"], ["bogus", "tr-a1"],
+			["base-prepare", "tr-a1"], ["base-full", "tr-a1", "x"], ["base-solo", "tr-a1"], ["base-solo", "tr-a1", "./a.test.ts", "./b.test.ts"]]) {
 			const r = raw(b, args);
 			expect({ args, exit: r.exit }).toEqual({ args, exit: WRAPPER_EXIT.refused });
 		}
@@ -250,6 +251,7 @@ describe("fencing on <stage>/current", () => {
 		setCurrent(b, "tr-other");
 		const calls: WrapperCall[] = [
 			{ sub: "prepare", runId: "tr-mine", sha }, { sub: "full", runId: "tr-mine" }, { sub: "solo", runId: "tr-mine", file: "./a.test.ts" },
+			{ sub: "base-prepare", runId: "tr-mine", sha }, { sub: "base-full", runId: "tr-mine" }, { sub: "base-solo", runId: "tr-mine", file: "./a.test.ts" },
 			{ sub: "sweep", runId: "tr-mine" }, { sub: "cleanup", runId: "tr-mine", oldRunId: "tr-old" }, { sub: "probe", runId: "tr-mine", paths: ["/tmp"] },
 		];
 		for (const c of calls) {
@@ -294,6 +296,28 @@ describe("prepare, full and solo", () => {
 		expect(s2.stdout).toStartWith("part solo-2\n");
 		expect(readFileSync(join(work, "solo-1.xml"), "utf8")).toContain('name="ok"');
 		expect(readFileSync(join(work, "solo-2.xml"), "utf8")).toContain('name="bad"');
+	});
+
+	test("PLAN wl-mv8s8srodefytc rev 17.1 D8: base-prepare clones the same bundle into runs/<id>/base once; base-full and base-solo run there and report beside the PR's", () => {
+		const b = box("base");
+		const sha = prepared(b, "tr-b1", { "a.test.ts": OK_TEST, "b_spec.ts": `import { expect, test } from "bun:test";\ntest("bad", () => { expect(1).toBe(2); });\n` });
+		const work = workOf(b, "tr-b1");
+		// nothing runs on base before base-prepare
+		expect(call(b, { sub: "base-full", runId: "tr-b1" }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(call(b, { sub: "base-prepare", runId: "tr-b1", sha }).exit).toBe(WRAPPER_EXIT.ok);
+		expect(git(join(work, "base", "repo"), "rev-parse", "HEAD")).toBe(sha);
+		expect(git(join(work, "base", "repo"), "remote")).toBe("");
+		// a second base-prepare, or one over a base dir the PR's tests planted, is refused
+		expect(call(b, { sub: "base-prepare", runId: "tr-b1", sha }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(call(b, { sub: "base-full", runId: "tr-b1" }).exit).toBe(1);
+		expect(readFileSync(join(work, "base-full.xml"), "utf8")).toContain('name="bad"');
+		expect(existsSync(join(work, "full.xml"))).toBe(false);
+		const s = call(b, { sub: "base-solo", runId: "tr-b1", file: "./b_spec.ts" });
+		expect(s.exit).toBe(1);
+		expect(s.stdout).toStartWith("part base-solo-1\n");
+		expect(readFileSync(join(work, "base-solo-1.xml"), "utf8")).toContain('name="bad"');
+		// a file base lacks is refused, never run
+		expect(call(b, { sub: "base-solo", runId: "tr-b1", file: "./c.test.ts" }).exit).toBe(WRAPPER_EXIT.refused);
 	});
 
 	test("solo ../x and a path outside runs/<id>, including through a symlink, are refused", () => {

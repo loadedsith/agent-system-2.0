@@ -177,6 +177,31 @@ export const ctxOf = (o: { hasUI?: boolean; parent?: string; cwd?: string; resum
 	};
 };
 
+/** Minimal offline Text double; ANSI controls are indivisible and only visible characters consume width. */
+export const loadTestText = async () => class TestText {
+	constructor(private readonly text: string) {}
+	invalidate(): void {}
+	render(width: number): string[] {
+		const rows: string[] = [];
+		for (const line of this.text.split("\n")) {
+			let row = "";
+			let columns = 0;
+			for (const token of line.match(/\x1b\]8;[^\x07]*(?:\x07)|\x1b\[[0-9;]*m|[^\x1b]/gu) ?? []) {
+				const size = token.startsWith("\x1b") ? 0 : Bun.stringWidth(token);
+				if (size > 0 && columns + size > width && columns > 0) {
+					rows.push(row);
+					row = "";
+					columns = 0;
+				}
+				row += token;
+				columns += size;
+			}
+			rows.push(row);
+		}
+		return rows;
+	}
+};
+
 // ---- the lane script's scratch root (surface/test/lane-script.test.ts, lane-smoke.test.ts) ----------
 
 export const LANE_SCRIPT = join(import.meta.dir, "..", "scripts", "lane.ts");
@@ -207,6 +232,10 @@ export interface FakeRecord {
 	/** On a `prompt` event: the frame's id and message. */
 	id?: string;
 	message?: string;
+	/** One per rpc command frame the fake received, in arrival order (`set_model` carries its provider and modelId). */
+	command?: string;
+	provider?: string;
+	modelId?: string;
 }
 /** One step of the fake omp's script (surface/test/fake-omp.ts header). */
 export type FakeStep =
@@ -260,7 +289,9 @@ export function tempRepo(): string {
  * A scratch root for the lane script: HOME with the profile config and a fresh ledger, the fake omp
  * on PATH ahead of the real binary, a git repo with one commit and a bare remote. The readiness
  * window and the SIGKILL grace are shortened through the runner's two test knobs; `over` adds or
- * replaces environment variables.
+ * replaces environment variables. The quota polls (`AS2_HEADROOM_POLLS`, classifier/src/headroom.ts) point at a file that
+ * does not exist, so the runner's guard is open and never reads the real quota-watch polls (PLAN wl-mv71x5rwdu7eo0 § 4); a
+ * headroom test passes its own fixture in `over`.
  */
 export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	// git rev-parse --show-toplevel reports the canonical path and the worktree is derived from it: the root is canonical too.
@@ -292,7 +323,7 @@ export function laneRoot(over: Record<string, string> = {}): LaneRoot {
 	const script = join(root, "omp-script.json");
 	const env: Record<string, string> = {
 		PATH: `${bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_LEDGER_DB: ledgerPath, FAKE_OMP_RECORD: record, FAKE_OMP_SCRIPT: script,
-		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", ...over,
+		AGENT_SYSTEM_LANE_READY_MS: "4000", AGENT_SYSTEM_LANE_END_GRACE_MS: "1500", AGENT_SYSTEM_LEASE_MS: "60000", AS2_HEADROOM_POLLS: join(root, "no-headroom-polls.jsonl"), ...over,
 	};
 	return { root, home, repo, remote, ledgerPath, record, script, env };
 }

@@ -16,7 +16,11 @@
 //                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
 //                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
 //                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
-//                                        src/omp-probe.ts), since some run inside ledger writes
+//                                        src/omp-probe.ts), since some run inside ledger writes. The quota guard
+//                                        (PLAN wl-mv71x5rwdu7eo0 § 4, classifier/src/headroom.ts) is here only: Jo's
+//                                        named model projected out spawns no omp (launch-failed: … headroom); an
+//                                        unnamed lane on an out lab is moved by set_model before its first prompt
+//                                        (lane-headroom:)
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
 //                                        omp in the TUI in the foreground (--model when Jo named one, --resume
 //                                        when recorded on that same model)
@@ -31,7 +35,8 @@
 //                                        workload's sessions folder into ctx, check the lane's session by
 //                                        id, record ctx-index: (MIGRATION.md item 43, src/ctx-index.ts)
 //   drain <wl>                           after a runner's exit, detached: start the queued launches the freed slot
-//                                        admits, one starter at a time, oldest workload first (MIGRATION.md item 71);
+//                                        admits, one starter at a time, oldest workload first (MIGRATION.md item 71),
+//                                        or in Jev rank order under `jevRank` order/parallel (src/rank-launch.ts);
 //                                        <wl> names the workload whose lane ended, for drain.log only
 //
 // Stamps: every subcommand writes as `lane-starter`, except `run`, which writes as `lane-runner`, and
@@ -40,12 +45,14 @@
 import { type Subprocess, spawn, spawnSync } from "bun";
 import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { headroom } from "../../classifier/src/headroom";
+import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
 import { fenceTargets } from "../../gates/src/fence";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
-	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type SliceRow, type Stakes, type WorkloadRow,
+	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
 import {
 	type Ceiling, CEILING_OPTIONS, type CeilingOption, ceilingQuestionBody, crossed, effectiveCeiling, scanSpend, type Spend, spendBody, wallMinutes,
@@ -53,10 +60,12 @@ import {
 import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index";
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
+import { loadTestRunnerConfig } from "../src/close-entry";
+import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
-	laneExitBody, laneDecidedBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
+	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
@@ -67,7 +76,9 @@ import {
 import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { PAIR_OPTION, type PairSignalId, pairOffer, pairOfferBody, readPairSuggestConfig } from "../src/pair-suggest";
+import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { laneDeaths } from "../src/signals";
+import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
 import { DECISION_LOG_ENV, LANE_TOOLS, LEASE_MS, LEASE_MS_ENV, ORCHESTRATOR_RECIPIENT, ROLE_ENV } from "../src/types";
 import { readCleanShell } from "../../gates/src/clean-shell";
@@ -88,9 +99,33 @@ const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
+/** The installed profile's agent dir: its config.yml carries the clean-shell switch and the tier table (classifier/extension.ts reads the same file). */
+const profileAgentDir = (): string => join(homeDir(), ".omp", "profiles", PROFILE, "agent");
+/** The installed profile's config.yml: the file preflight checks and the tracing switch is read from at each spawn. */
+const profileConfig = (): string => join(profileAgentDir(), "config.yml");
 /** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn. */
 const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
-	laneEnv(process.env, { workloadId, laneId }, readCleanShell(join(homeDir(), ".omp", "profiles", PROFILE, "agent")));
+	laneEnv(process.env, { workloadId, laneId }, readCleanShell(profileAgentDir()));
+/**
+ * PLAN wl-mv71x5rwdu7eo0 § 4 (Jo's in-mv8p5m2t005tts, in-mv8qzqym1ihmv4): the stage a quota refusal or a failed move names in
+ * `launch-failed:` and `lane-died:`, and the ids of the move's `set_model` and its confirming `get_state`.
+ */
+const HEADROOM_STAGE = "headroom";
+const SET_MODEL_ID = "headroom-set-model";
+const MOVED_STATE_ID = "headroom-state";
+
+/**
+ * A lane omp's environment, the one builder both spawn sites call (runner and `as2 lane <wl>`): `laneEnv`'s
+ * binding over `base` (with the clean-shell switch read from `configPath`'s directory), then the tracing switch
+ * read from `configPath` now (wl-mv65t5d34lts00 PLAN.md § 2, surface/src/tracing.ts): every inherited OTEL_* name
+ * dropped, then off (`OTEL_SDK_DISABLED=true`) or, when `observability.phoenix` covers the workload, its otel map
+ * with the lane's service name and resource attributes. An unreadable or malformed setting is off and never fails
+ * the launch; `notes` says why, for the caller to log.
+ */
+export function laneSpawnEnv(base: Record<string, string | undefined>, configPath: string, binding: { workloadId: string; laneId: string }): { env: Record<string, string>; notes: string[] } {
+	const r = readTracingSetting(configPath);
+	return { env: tracingEnv(laneEnv(base, binding, readCleanShell(dirname(configPath))), r.setting, { role: "lane", ...binding }), notes: r.notes };
+}
 
 class Fail extends Error {
 	constructor(readonly stage: string, message: string, readonly code: number) {
@@ -188,7 +223,7 @@ function chooseBase(repo: string): Base {
 /** Preflight (exit 2/3/4), worktree and branch (exit 5; the base is `chooseBase`'s, never refused), the scratch root, the system prompt file. Runs after the reservation. */
 function prepare(ledger: Ledger, wl: string, interactive: boolean): Prepared {
 	if (!which("omp")) throw new Fail("preflight", "no `omp` on PATH", STARTER_EXIT["no-omp"]!);
-	const config = join(homeDir(), ".omp", "profiles", PROFILE, "agent", "config.yml");
+	const config = profileConfig();
 	if (!existsSync(config)) throw new Fail("preflight", `no profile config at ${config}; run: as2 install`, STARTER_EXIT["no-profile"]!);
 	const repo = repoOf(ledger, wl);
 	if (!repo) throw new Fail("preflight", `workload ${wl} records no repository`, STARTER_EXIT["repo-or-fence"]!);
@@ -240,10 +275,15 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 		decisionLog = "";
 	}
 	const facts = factsBlock(ledger, p.repo);
+	// D10 (PLAN wl-mvbjiettjrfpxc): a lane on a repo the test runner serves hands its green, reviewed PR to the merge train.
+	const cfg = loadTestRunnerConfig(process.env);
+	const origin = cfg.ok && cfg.config.repos.length > 0 ? checkoutOwnerRepo(p.repo)?.toLowerCase() : undefined;
+	const runnerServed = cfg.ok && origin !== undefined && cfg.config.repos.some((r) => r.origin.toLowerCase() === origin);
 	const prompt = firstPrompt({
 		workload: w, laneId, repo: p.repo, worktree: p.worktree, branch: p.branch, done: doneLine(control), planFirst: planFirst(control)?.trigger ?? null,
 		decisionLog, facts, resolved, instructions: joInstructionsFor(control, instructions, laneId), machinery: canonicalPath(p.repo) === canonicalPath(REPO_ROOT), tools: LANE_TOOLS,
-		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) },
+		scratch: { root: p.scratch, capMb: scratchCapMb(process.env) }, trainTasks: ownerTasks(ledger, w.id),
+		runnerServed, trainOrFix: isTrainOrFix(entries, instructions),
 	});
 	if (ceilingLine === null) return prompt;
 	const out = prompt.split("\n");
@@ -266,13 +306,15 @@ function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: stri
 /**
  * After a reservation, a failure writes launch-failed: and the lane-died: message and releases the pre-claim. With
  * `lock` (the runner), all of it only while that lock still names this runner (`writeAsOwner`): a non-owner releases nothing.
+ * `by` is the writer: the starter's shape by default; the runner's own pre-spawn refusal (a named model projected out of
+ * quota, PLAN wl-mv71x5rwdu7eo0 § 4) writes as the runner, as `finish` does.
  */
-function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, lock: Pick<RunnerLock, "held" | "path"> | null = null): void {
+function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, lock: Pick<RunnerLock, "held" | "path"> | null = null, by: string = LANE_STARTER_BY): void {
 	try {
 		const body = (): void => {
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: launchFailedBody(laneId, f.stage, f.message) });
-			ledger.enqueue({ by: LANE_STARTER_BY, workloadId: wl, sender: LANE_STARTER_BY, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLaunchBody(laneId, f.stage, f.message) });
-			ledger.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: laneId });
+			ledger.recordEntry({ by, workloadId: wl, kind: "assumption", body: launchFailedBody(laneId, f.stage, f.message) });
+			ledger.enqueue({ by, workloadId: wl, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body: laneDiedLaunchBody(laneId, f.stage, f.message) });
+			ledger.releaseWorkload(wl, { by, holder: laneId });
 		};
 		if (lock === null) ledger.write(body);
 		else if (!writeAsOwner(ledger, lock, body)) process.stderr.write(`lane: ${lock.path} names another runner or none; the failure was not recorded and nothing was released\n`);
@@ -281,11 +323,44 @@ function failAfterReserve(ledger: Ledger, wl: string, laneId: string, f: Fail, l
 	}
 }
 
+/** A refused reservation inside the interactive pick's transaction: thrown to roll the pick snapshot back, then returned. */
+class Refused extends Error {
+	constructor(readonly result: ReserveResult) {
+		super("refused");
+	}
+}
+
+/**
+ * The reservation (decision 8) under the policy for the path. Autonomous: `decideLaunch` with Jev ranking's gate composed
+ * (`decideRanked`, PLAN wl-mv8k039gvogt8g D7; `config` is the profile's `jevRank`, read fresh here), inside
+ * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
+ * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
+ * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
+ */
+export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig()): ReserveResult {
+	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
+	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => decideRanked(ledger, rows, config) });
+	try {
+		return ledger.write(() => {
+			const r = ledger.reserveLane(wl, {
+				...input,
+				decide: (rows) => {
+					const v = decideInteractive(rows);
+					if (v.launch) writePickSnapshot(ledger, rows.now);
+					return v;
+				},
+			});
+			if (!r.ok) throw new Refused(r);
+			return r;
+		});
+	} catch (err) {
+		if (err instanceof Refused) return err.result;
+		throw err;
+	}
+}
+
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
-	const r = ledger.reserveLane(wl, {
-		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who,
-		decide: interactive ? decideInteractive : decideLaunch,
-	});
+	const r = reserve(ledger, wl, who, interactive);
 	if (r.ok) return r.laneId;
 	const code = /^cap\b/.test(r.reason) ? STARTER_EXIT.cap! : /^held\b/.test(r.reason) ? STARTER_EXIT.held! : /^closed\b/.test(r.reason) ? STARTER_EXIT.closed! : STARTER_EXIT["not-launchable"]!;
 	throw new Fail("reserve", `${wl} not launched: ${r.reason}`, code);
@@ -400,13 +475,17 @@ async function runStarter(wl: string): Promise<{ code: number; line: string }> {
 }
 
 /**
- * `drain <wl>`: sequential. Each round reads the open workloads oldest first (`inFlight`, the tick's
- * order) and runs the starter for the first one not yet tried whose predicate says launch, awaiting its
- * own exit with no timeout (`runStarter`: a killed starter could strand its committed reservation; its
- * exception path releases a failed one). Exit `cap` stops the drain; any other exit (launched, failed
- * after the reservation, refused) re-reads and goes on. Each workload is tried at most once, so the
- * drain ends after at most one attempt per open workload. Logs `start`, one `attempt` line per
- * starter, and `end` to drain.log.
+ * `drain <wl>`: sequential. Each round reads the open workloads in the order Jev ranking's mode names
+ * (`jevRank`, read fresh each round, PLAN wl-mv8k039gvogt8g D7): oldest first (`inFlight`, the tick's
+ * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, and runs the
+ * starter for the first one not yet tried whose predicate says launch, awaiting its own exit with no
+ * timeout (`runStarter`: a killed starter could strand its committed reservation; its exception path
+ * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:` or `parallel:`
+ * refusal is an attempt line like any other and the drain goes on to the next. Exit `cap` stops the
+ * drain; any other exit (launched, failed after the reservation, refused) re-reads and goes on. Each
+ * workload is tried at most once, so the drain ends after at most one attempt per open workload. Logs
+ * `start`, in `show` one `rank-shadow` line per pick (what `order` would have tried, `rankShadowLine`),
+ * one `attempt` line per starter, and `end` to drain.log.
  */
 async function cmdDrain(after: string): Promise<number> {
 	drainLine(`start ${process.pid} after ${after}`);
@@ -419,12 +498,21 @@ async function cmdDrain(after: string): Promise<number> {
 			ledger.write(() => undefined);
 			const cap = laneCap(process.env);
 			for (;;) {
-				const next = ledger.inFlight().map((w) => w.workload.id).find((id) => {
+				const config = readRankConfig();
+				const order = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, ledger.now());
+				const next = order.find((id) => {
 					if (tried.has(id)) return false;
 					const rows = ledger.launchRows(id, cap);
 					return rows !== null && verdictOf(rows).launch;
 				});
 				if (next === undefined) break;
+				if (config.mode === "show") {
+					try {
+						drainLine(rankShadowLine(ledger, process.pid, next, tried, cap, config));
+					} catch (err) {
+						drainLine(`rank-shadow ${process.pid} failed: ${String(err)}`);
+					}
+				}
 				tried.add(next);
 				const r = await runStarter(next);
 				drainLine(`attempt ${process.pid} ${next} exit ${r.code}: ${r.line}`);
@@ -523,7 +611,7 @@ export function ceilingQuestionState(
 }
 
 /** D1 at the ceiling raise: the offer, or null; a failure to compute it never blocks the raise (as the round-limit site's `roundLimitPairOffer`). */
-function ceilingPairOffer(ledger: Ledger, workloadId: string): { line: string; signals: PairSignalId[] } | null {
+function ceilingPairOffer(ledger: Ledger, workloadId: string): { signals: PairSignalId[] } | null {
 	try {
 		return pairOffer(ledger, workloadId, "ceiling", { config: readPairSuggestConfig() });
 	} catch (err) {
@@ -537,9 +625,10 @@ function ceilingPairOffer(ledger: Ledger, workloadId: string): { line: string; s
  * ledger-wide, so the workload is in the id; n = 1 + the workload's ceiling slices), the question on
  * it with the three options (the file pauses the slice), and the `spend:` entry. When the installed
  * profile's `pairSuggest` switch covers the workload and a signal fired (PLAN wl-mv67564rdkfvnk D1,
- * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also offers
- * `pair` with one last `pair:` line, and a `pair-offer:` entry records it; an offer that throws is
- * logged and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
+ * surface/src/pair-suggest.ts `pairOffer`, read before anything is written), the question also stores
+ * `pair` as its last option and a `pair-offer:` entry records it; the body is unchanged (PLAN
+ * wl-mvb9mw00ycfjeo D1: the surface shows the offer on its own line). An offer that throws is logged
+ * and the plain question raised. `ceilingQuestionState` reads an answer of `pair` as stop.
  */
 export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; ceiling: Ceiling; stakes: Stakes }): { sliceId: string; questionId: string } {
 	return ledger.write(() => {
@@ -551,10 +640,9 @@ export function raiseCeilingQuestion(ledger: Ledger, r: { workloadId: string; la
 			by: LANE_RUNNER_BY, workloadId: r.workloadId, id: `${prefix}${n}`, task: "Jo decides the ceiling overrun",
 			doneCondition: `Jo answers stop, extend or split for the ceiling ${ceilingKey(r.ceiling)}`, inputs: "ceiling",
 		});
-		const body = ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes);
 		const questionId = ledger.raiseQuestion({
 			by: LANE_RUNNER_BY, workloadId: r.workloadId, sliceId,
-			body: offer ? `${body}\n${offer.line}` : body, options: offer ? [...CEILING_OPTIONS, PAIR_OPTION] : [...CEILING_OPTIONS],
+			body: ceilingQuestionBody(r.workloadId, r.spend, r.ceiling, r.stakes), options: offer ? [...CEILING_OPTIONS, PAIR_OPTION] : [...CEILING_OPTIONS],
 		});
 		ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
 		if (offer) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: pairOfferBody(questionId, "ceiling", offer.signals) });
@@ -997,14 +1085,25 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let fatal: Fail | null = null;
 	/** Why readiness failed, when it was not a missing claim: the launch-failed: and lane-died: bodies name it. */
 	let readinessFailure: string | null = null;
-	/** The stage those two bodies name, set once beside the failure: `readiness`, or `model` for a named model OMP did not confirm (R3-1). */
+	/**
+	 * The stage those two bodies name, set once beside the failure: `readiness`, `model` for a named model OMP did not confirm
+	 * (R3-1) or a `get_state` that never answered, or `headroom` for an unnamed lane's move off an out lab that failed (PLAN
+	 * wl-mv71x5rwdu7eo0 § 4).
+	 */
 	let readinessStage = "readiness";
 	/** Jo's named model for this spawn (`laneModel`), why a recorded session was not resumed, and what `get_state` reported (MIGRATION.md item 85). */
 	let model: string | null = null;
 	let resumeSkipped: string | null = null;
 	let ranModel: string | null = null;
-	/** A named model: ready also waits for `get_state` to report exactly that `provider/id` (`stateModelCheck`). */
+	/**
+	 * Ready also waits for the first `get_state` (every lane, PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that
+	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when projected out of quota, must first be moved (`move`).
+	 */
 	let modelChecked = false;
+	/** The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests). */
+	const room = headroom();
+	/** An unnamed lane's move off an out lab: `set_model` to `to` was sent; ready waits for `get_state` to report `to` (set in `moveOff`). */
+	let move = null as { from: string; to: string; reason: string } | null;
 	/** omp's error on the first prompt that ended `error` (D3 keeps the first), for the death line. */
 	let promptError: PromptError | null = null;
 	let session: string | null = null;
@@ -1316,6 +1415,11 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			model = start.model;
 			resumeSkipped = start.skipped;
 			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
+			if (room.note !== null) process.stderr.write(`runner: ${laneId} quota guard open: ${room.note}\n`);
+			// PLAN wl-mv71x5rwdu7eo0 § 4: Jo's named model projected out of quota is refused before any omp, never replaced; the
+			// catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
+			const out = model === null ? null : room.outFor(model);
+			if (out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${out}`, STARTER_EXIT["not-launchable"]!);
 			argv = laneArgv({
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
@@ -1325,8 +1429,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
-		const env = boundEnv(wl, laneId);
+		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		for (const n of notes) process.stderr.write(`runner: ${laneId} tracing: ${n}\n`);
 		/**
 		 * The spawn and its lane-started: record are one ledger write, after the run lock is read as this runner's inside it
 		 * (`startAsOwner`; openai review r3): a lock removed before this point, with the lane dir or alone, ends the run here
@@ -1359,15 +1464,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}
 		send({ id: STATE_ID, type: "get_state" });
 
-		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. A named model
-		// also needs OMP's get_state to report exactly that provider/id (item 85). Ready means the claim, the model, the lane-ready:
+		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
+		// waits for OMP's first get_state (PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that provider/id (item 85), and an
+		// unnamed lane on a lab projected out of quota is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
 		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
-				if (claimed && (model === null || modelChecked)) {
+				if (claimed && modelChecked) {
 					clearInterval(readyPoll);
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
@@ -1384,7 +1490,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
 					if (claimed) {
-						failModel(`named ${model}, no get_state model within ${readyMinutes}`);
+						if (move !== null) failModel(`moving ${move.from} -> ${move.to} (${move.reason}): no get_state confirmed ${move.to} within ${readyMinutes}`, HEADROOM_STAGE);
+						else failModel(model !== null ? `named ${model}, no get_state model within ${readyMinutes}` : `no get_state answer within ${readyMinutes}`);
 						return;
 					}
 					clearInterval(readyPoll);
@@ -1401,15 +1508,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		}, READY_POLL_MS);
 		timers.push(readyPoll);
 		/**
-		 * A named model OMP did not confirm (item 85): the never-ready path with stage `model`, so one launch-failed: and one
+		 * A named model OMP did not confirm (item 85), a get_state that never answered, or an unnamed lane's failed move off an
+		 * out lab (stage `headroom`, PLAN wl-mv71x5rwdu7eo0 § 4): the never-ready path with that stage, so one launch-failed: and one
 		 * lane-died: name it (R3-1). The death is decided here and enqueued before the kill, whatever the holder: a stop accepted
 		 * between the kill and finish() makes the end read as intended, and finish()'s held branch would then write none. The
 		 * body is the one finish() writes for never-ready; finish() retries it, and enqueueRunnerDeath keeps it to one per lane.
 		 */
-		const failModel = (reason: string): void => {
+		const failModel = (reason: string, stage = "model"): void => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
 			clearInterval(readyPoll);
-			readinessStage = "model";
+			readinessStage = stage;
 			readinessFailure = reason;
 			outcome = "never-ready";
 			decidedDeath = laneDiedLaunchBody(laneId, readinessStage, readinessFailure);
@@ -1418,8 +1526,32 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			} catch (err) {
 				process.stderr.write(`runner: the lane-died: line could not be written: ${String(err)}\n`);
 			}
-			process.stderr.write(`runner: ${laneId} model check failed: ${reason}; killing omp\n`);
+			process.stderr.write(`runner: ${laneId} ${stage} check failed: ${reason}; killing omp\n`);
 			omp.kill("SIGKILL");
+		};
+		/**
+		 * PLAN wl-mv71x5rwdu7eo0 § 4: an unnamed lane whose first get_state model `from` is projected out (`reason`) moves, before its
+		 * first prompt, to the first entry of the installed profile's strong row (`:level` dropped) that is not out, in row order:
+		 * `set_model`, then a get_state that must report it (omp://rpc.md § Model: `{ type: "set_model", provider, modelId }`).
+		 * An unreadable tier table or a row with every entry out is never-ready at stage `headroom`.
+		 */
+		const moveOff = (from: string, reason: string): void => {
+			let row: string[];
+			try {
+				row = loadTierTable(join(profileAgentDir(), "config.yml")).strong.map(modelIdentity);
+			} catch (err) {
+				failModel(`${from} is out (${reason}); the strong row could not be read: ${oneLine(err)}`, HEADROOM_STAGE);
+				return;
+			}
+			const to = row.find((s) => room.outFor(s) === null);
+			if (to === undefined) {
+				failModel(`${from} is out (${reason}); every strong-row entry is out: ${row.map((s) => `${s} (${room.outFor(s)})`).join("; ")}`, HEADROOM_STAGE);
+				return;
+			}
+			move = { from, to, reason };
+			process.stderr.write(`runner: ${laneId} moving ${from} -> ${to}: ${reason}\n`);
+			const slash = to.indexOf("/");
+			send({ id: SET_MODEL_ID, type: "set_model", provider: to.slice(0, slash), modelId: to.slice(slash + 1) });
 		};
 		let stateSeen = false;
 
@@ -1484,7 +1616,8 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				const data = "data" in o && typeof o.data === "object" && o.data !== null ? (o.data as Frame) : null;
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
-				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it.
+				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it, and
+				// an unnamed lane's is checked against the quota signal (PLAN wl-mv71x5rwdu7eo0 § 4): not out, or no model reported, is ready.
 				if (o.type === "response" && o.id === STATE_ID && !stateSeen) {
 					stateSeen = true;
 					ranModel = stateModelOf(o);
@@ -1493,7 +1626,26 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						const check = stateModelCheck(model, o);
 						if (check.ok) modelChecked = true;
 						else failModel(check.reason);
+					} else {
+						const out = ranModel === null ? null : room.outFor(ranModel);
+						if (out === null) modelChecked = true;
+						else moveOff(ranModel!, out);
 					}
+				}
+				// The move's set_model answer: on success, ask OMP which model it now runs; a refusal fails the launch at `headroom`.
+				if (o.type === "response" && o.id === SET_MODEL_ID && move !== null && outcome === null) {
+					if (o.success === false) failModel(`set_model ${move.to} failed: ${typeof o.error === "string" ? oneLine(o.error) : "no error given"}`, HEADROOM_STAGE);
+					else send({ id: MOVED_STATE_ID, type: "get_state" });
+				}
+				// The move holds only once get_state reports the target: then lane-headroom: is recorded, ranModel names it, and ready may follow.
+				if (o.type === "response" && o.id === MOVED_STATE_ID && move !== null && !modelChecked && outcome === null) {
+					const now = stateModelOf(o);
+					if (now === move.to) {
+						record(laneHeadroomBody(laneId, move.from, move.to, move.reason));
+						ranModel = now;
+						rerecord = true;
+						modelChecked = true;
+					} else failModel(`set_model ${move.to} sent, get_state reported ${now ?? "no provider/id model"}`, HEADROOM_STAGE);
 				}
 				if (session === null && sessionFile !== null) {
 					session = sessionFile;
@@ -1556,9 +1708,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		for (const t of timers) clearTimeout(t);
 		if (child === null) {
 			// Before the spawn: a launch failure (decision 9), in the starter's shape; finalization has nothing to reap. A lost
-			// run lock writes nothing: the lane id may be another runner's now.
+			// run lock writes nothing: the lane id may be another runner's now. The runner's own quota refusal of Jo's named model
+			// (PLAN wl-mv71x5rwdu7eo0 § 4) is written as the runner.
 			finished = true;
-			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock);
+			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock, f.stage === HEADROOM_STAGE ? LANE_RUNNER_BY : LANE_STARTER_BY);
 			return f.code;
 		}
 		child.kill("SIGKILL");
@@ -1600,8 +1753,9 @@ async function cmdInteractive(wl: string): Promise<number> {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
 		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
-		const env = boundEnv(wl, laneId);
+		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
 		// Interactive lanes are not metered (DESIGN-workload-ceiling.md § 2, "Not covered"): no ceiling line.

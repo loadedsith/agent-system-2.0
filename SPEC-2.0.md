@@ -511,6 +511,25 @@ Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md
 review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
 "approved" was undefined.
 
+**Amended 2026-10-19 — the merge train lands a normal lane's PR** (`migration/items/merge-train-auto-board.md`;
+jo-issues #132; Jo, ledger input `in-mvbjiylsgdtqf4`: "it is of the utmost importance to me that agents can
+merge autonomsly"; built in wl-mvbjiettjrfpxc, plan revision 6). This amends the normal row above and the
+completion rule of `DESIGN-lane-launcher.md` decision 11 (on this repository a lane never merges: Jo
+integrates). An autonomous normal-stakes lane on a repository the test runner serves
+(`testRunner.repos`), a merge train or train fix lane excepted, never asks Jo to integrate. A
+cross-lab review slice must pass before the PR is done. Once the PR is green at its head with that
+review passed, the lane records `done-because:` and releases, the surface closes the workload, and
+the merge train boards and lands the PR; a done line's "merged on main" is met by that hand-off. The
+train tick boards a PR only when its workload is closed, was autonomous at normal stakes, carries a
+holder `done-because:` newer than the tick's `train-autoboard: on` cutover row, has its newest
+full-suite run green at the PR's head (a head ahead of it only by `.ai/decision-log/` commits
+counts), and has its cross-lab review passed. A PR that fails a test gets a `train-board-skip:`
+ledger row, no line to Jo, and Jo's `train <N>` still lands it. For these PRs the normal row's "told
+in one line after the merge" no longer holds: Jo hears only of a production-stakes merge, a
+conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
+tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
+above unchanged; production auto-boarding is a non-goal.
+
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
 or kimi. if those are unavailable due to spend reasons or login issues i should be alerted and
@@ -631,6 +650,41 @@ astra. Kimi and Anthropic entries keep the deep row.
 - **End.** When the review-cost framework workload lands, or Jo says otherwise, the `openai` entry
   of `REVIEW_ROW_FROM` is deleted and deep reviews take the deep row again.
 
+**Amended 2026-10-12 — three-lab review panels** (MIGRATION.md item 111; Jo, opening the work:
+*"okay, i would like you to have all the capabilities to perform any cross lab review that exists,
+how do we get that for you?"*; plan approved by Jo in in-mv5p8baa8fykn4; built in
+wl-mv5m7qvgkxhpj4). A lane runs every `skills/cross-model-review` mode (triad, quorum and its
+refutation stage, refute, doubt-driven) as a **panel**: one judge hand per lab, each pinned to its
+lab, then one synthesis hand (`classifier/src/panel.ts`; the lane steps are in the skill's
+*From an as2 lane* section).
+- **A separate, explicit dispatch.** A panel runs only from a `task` item carrying `panel: <run>`
+  (then `panel-synth: <run>`) on a judge slice. No review dispatch becomes a panel, and no panel
+  stands in for a review this section requires.
+- **The builder's lab is in it.** A panel's members are all three labs, the builders' labs
+  included; the lab rule above does not exclude a panel member, and the panel synthesis prefers a
+  lab that built nothing and names a builder lab in its report when it has to use one.
+- **Panel hands are reviews.** Every panel hand plans on `reviewRow`, as the gpt-6-sol amendment
+  above says, so a panel's OpenAI leg runs on the review row's OpenAI entry, gpt-6.1-sol since the
+  *Amended 2026-10-14* entry below.
+- **Never a review round, never the plan review.** Panel members write no `review-round:` entry
+  and a panel group is not counted by the review round limit; panels are bounded separately, at
+  most that limit's number of panels per slice, and `stop-reviews` stops them too. `panel:` and
+  `panel-synth:` are refused on the plan slice, so a panel never counts as the plan review (§ B6,
+  *Amended 2026-10-01 — plan review by another lab*).
+- **Ordinary builder exclusion unchanged.** Every review this section requires still runs off the
+  builders' labs, with the park, fan-out and read-only rules above; a panel member's settle feeds
+  the builder count exactly as a review hand's does.
+- **A missing leg is never substituted.** A lab with no usable leg is recorded missing or
+  excluded with its reason and named in the report; no other lab is spawned in its place, and a
+  full panel means a new panel, never a single replacement leg.
+
+**Amended 2026-10-14 — OpenAI reviews on gpt-6.1-sol** (Jo, ledger input `in-mv8qzqym1ihmv4`;
+built in wl-mv71x5rwdu7eo0). The strong row's OpenAI entry in `profile/config.yml` is now
+`openai-codex/gpt-6.1-sol`, replacing `openai-codex/gpt-6-sol`. Through `REVIEW_ROW_FROM` every
+OpenAI review, on deep and on strong, runs gpt-6.1-sol, and so does an OpenAI lane's strong build.
+Cross-lab review and the same-lab fallback are unchanged; no other row changes, so gpt-6.1-sol sits
+in one tier. A lane Jo named on a model keeps that model.
+
 ### B5 · Jo steering a lane, and Jo coding manually (P-8, P-13, P-17)
 
 **Ruled 2026-09-23.** Jo: *"yes to your reccos"* to *"what happens if i decide i want to steer or
@@ -650,6 +704,26 @@ code manually at some point?"*
   recreates the shared-checkout collision the 1.x charter already recorded once
   (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
   diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
+
+**Amended 2026-10-19 — inbound agent channel** (`migration/items/agent-channel.md`; Jo, answering
+q-mv8wcymfkx3y0w: *"notes"*, ledger input `in-mv8yzvhuwz9jwg`; plan
+`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8vx7wdj5nx1c/PLAN.md` rev 6; built in
+wl-mv8vx7wdj5nx1c). Other agents reach the orchestrator through one inbound channel, never
+through Jo's steering path. Each sender is configured in `profile/config.yml` under
+`channel.senders[]` with an `id`, a `transport` and an `authority`; the authority belongs to the
+sender, not to anything a message says. Phase 1 has one sender, `{ id: plumb, transport:
+omp-mailbox, authority: notes }`, and `notes` (notes and proposals) is the only authority built.
+A message is never authored as Jo: it is a `messages` row on `wl-orchestrator` with sender
+`plumb`, created_by `channel:plumb` and the body prefix `channel-note from plumb:`, and the
+channel writes no instruction, answer, stakes or mode flip, or ceiling change. The orchestrator
+reads it as information from that sender, and replies with `orchestrator_reply` or closes it
+with `orchestrator_channel_done`. A line that names a waiting needs-you row and a word that
+answers it is a proposal: it renders as `#n plumb proposes <word> <target>` and carries the
+target's own number, never one of its own, and only Jo's typed `n <word>` (or another word that
+fits the row) applies, as Jo's ordinary row. Flip and ceiling words from a sender answer no
+numbered row, so they stay notes. A sender's `from` is self-claimed, so a spoof costs a
+misattributed note, never an action. Grant words wait for a phase with sender proof; phase 2
+(Juno, remote, notes only) starts only after Jo's go is recorded as an instruction.
 
 ### B6 · Spec-and-plan option is offered inside the lane (P-12)
 
@@ -695,7 +769,8 @@ judge still runs under "no plan", so the size is what it would have been. A "no 
 open does not lift a standing plan-first.
 A question on the plan slice that offers `approve` carries the plan, in this order and nothing
 else: the absolute path of the plan file; one `- <slice id>: <what it does>` line per proposed
-slice (at least one); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
+slice (at least one); the `prompt-only:` lines (*Amended 2026-10-14 — requirements name their
+enforcer*, below); 1 to 3 `tradeoff:` lines; one `review: <verdict>, <model>, <absolute path of
 the verdict file>` line. Both paths must be existing files and every line is at most 160
 characters; `lane_raise_question` refuses any other body and names the shape. Jo's needs-you line
 shows that question whole, one indented line per body line; every other question keeps the
@@ -706,6 +781,41 @@ question only if it was marked when raised: `lane_raise_question` writes the con
 `plan-question: <question id>`, as the holding lane, when it raises an approve question on the plan
 slice while `plan: first` stands, and Jo's approve writes `plan: approved` only on a marked
 question. A question raised before its slice held the plan role never approves the plan.
+
+**Amended 2026-10-14 — requirements name their enforcer** (`migration/items/plan-requirements-name-their-enforcer.md`;
+Jo, ledger input in-mv8vw0sx5g4d8g: *"Each plan requirement names its enforcer (test, gate row, hook,
+code path) or says prompt-only and why; the plan check refuses a plan missing that, and the plan
+question lists prompt-only items for Jo. Jo 10-12: nothing matters without machinery."*; built in
+wl-mv8vwb04cy18n4; the plan-question gate of § B14.3, *Amended 2026-10-14 — machinery first for all
+work*). When `lane_raise_question` raises the plan question it reads the plan file the question's
+first line names (UTF-8, `\r\n` read as `\n`). The file holds exactly one line that is exactly
+`## Requirements`; the section runs from it to the next line opening with `# ` or `## `, or to the
+end of the file, and every non-blank line in it is one of two requirement lines:
+`- R<n>: <requirement> => <enforcer>[; <enforcer>]…` or
+`- R<n>: <requirement> => prompt-only: <why no code can enforce it>`. The line splits at its last
+` => `, so the requirement text may hold arrows. `R<n>` is unique in the section. An enforcer is a
+lower-case kind, `test`, `gate`, `hook` or `code`, exactly one space, then a locator that starts with
+no whitespace, saying where (`gate row 6`, `code surface/src/launch.ts planQuestionProblem`);
+enforcers are separated by `; `, so a locator holds no `;`, and the same enforcer twice is refused
+while one kind may name two places. `prompt-only: ` (colon, one space) opens the whole enforcer part,
+never mixed with an enforcer, and its reason, which may hold `; `, has at least two words. The read
+is bounded: a plan file over 262144 bytes (`PLAN_FILE_MAX_BYTES`) is refused, and a path that is not
+a regular file when opened is unreadable. At least one requirement line; prose, a `###` heading, a fence, a table or a
+sub-bullet inside the section is refused as unparseable, since a requirement the check cannot
+parse names no enforcer. The question body gains one line kind, after the slice lines and before
+the `tradeoff:` lines: `prompt-only: <R id>: <the requirement, and why no code reaches it>`, one
+per prompt-only requirement, the ids exactly the file's (a missing, extra or repeated id is named),
+or exactly `prompt-only: none` when the file has none; the 160-character limit applies, and only the
+id is checked. The needs-you line already shows the plan question whole, so these lines reach Jo
+with no render change. The structural checks above run first, unchanged; then every offending
+requirement is named in one refusal, then the id match, and the refusal carries the question shape
+and the requirement grammar (`PLAN_REQUIREMENTS_SHAPE` in `surface/src/launch.ts`, also rendered
+into a plan-first lane's first prompt and the tool's description). The check runs only at raise
+time: questions raised before the change are not re-checked, and Jo's `approve` on them works as
+before; a plan-first lane started before the merge keeps the old check for its session. Not
+checked: that a locator exists (a test the plan will write does not exist yet) or that it really
+enforces its requirement; Jo judges that from the plan, the cross-lab plan review reads it, and the
+code review checks it in the diff.
 
 ### B7 · Wake: the ledger rendered, never a hand's prose (P-17)
 
@@ -943,6 +1053,30 @@ as the primary vehicle (needs a write-back webhook to keep the ledger true; avai
 for phone/teammate acceptance); shadow-mode install (violates "never applies"; possible
 post-acceptance stage). **P-16 closed.**
 
+**Amended 2026-10-14 — machinery first for all work** (`migration/items/plan-requirements-name-their-enforcer.md`; Jo, input
+in-mv61a9s52y4g00: *"anything as2 has to do is done by code that renders, gates, refuses or tests
+it, and a prose instruction to a model is the fallback only where code cannot reach"*; the scope is
+Jo's instructions in-mv61vrgz48tpts and in-mv61vrk3ca8q2o, as first written for PR #111; built in
+wl-mv8vwb04cy18n4). Machinery first governs all work done on or with as2 or any other agent, LLM or
+AI software, not only P-16 proposals: as2's own lanes, hands, gates, surface and classifier; Plumb,
+Tinker and the other seats; skills, tier files, prompts and briefs; and any LLM or AI feature in a
+product repo. For that work, anything the system has to do is done by code that renders, gates,
+refuses or tests it; an instruction to a model is the last rung. The ladder in item 2 (deny-rule →
+ask-rule → prompt hook → pre-tool hook → post-tool hook → prose last) widens to all of it: a test,
+a gate, a hook or code before prose, and prose is chosen only with a stated reason. The rule is
+normative for all such work; the gate built for it is narrower. It fires only on a plan question
+offering `approve` (§ B6, *Amended 2026-10-14 — requirements name their enforcer*): each requirement
+in the plan file names its enforcer or says `prompt-only:` and why, and the question lists the
+prompt-only items for Jo. A workload without a plan gets no enforcer check, and no slice added
+through `lane_add_slice` is checked. PR #111's slice-tag gate (an enforcement tag on every plan
+slice line and every `lane_add_slice` task, `migration/items/plan-slices-name-their-enforcement.md`,
+never merged), including the `lane_add_slice` check of Jo's in-mv61vrgxu5iuio, was superseded, not
+adopted: a category tag on a slice names no enforcer a reviewer can open, its vocabulary
+(`render`, `gate`, `refusal`, `test`, `prose`) would have been a second grammar on one question, and
+its `tiers/lane.md` growth broke that file's size bound. Not enforced by code: whether a named
+enforcer is real and covers its requirement, or whether a prompt-only reason is a good one; Jo
+judges that on the plan and reviewers on the diff.
+
 ### B15 · Output types and receipt verification (new requirement P-23)
 
 **Ruled 2026-09-24.** Jo: *"i agree with your reccomendation. verification is important - i am
@@ -1020,7 +1154,11 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    failure, tees to a fixed log path; the ledger row that handed it over records the log path;
    the script's exit writes a row (exit code, log path). **The lane listens**, not the hand: the
    hand that wrote the script may be closed when Jo runs it; the lane is bound to the workload
-   for its life (P-2, P-5). A non-zero exit is one of B3's error lines.
+   for its life (P-2, P-5). A non-zero exit is one of B3's error lines. One named exception
+   (amended 2026-10-17, `migration/items/pair-offer-own-line.md`, the exception MIGRATION.md
+   item 52 asked for): the orchestrator may give Jo the by-hand `as2 lane wl-…` line that
+   continues a user-driven workload, bare, in plain text or inline code, never inside a shell
+   fence. It names the lane Jo starts in his own terminal; there is no script to log.
 3. **Mechanical, not prose — the OMP settings and the gate.** *Ask before acting*: a lane runs
    under `tools.approvalMode: write` with per-tool `tools.approval` overrides
    (`omp://approval-mode.md:14-30`) in the profile template (B8 machinery). *Ask as a
@@ -1035,7 +1173,10 @@ a logger attached"*; then, on the mechanical form: *"yes to the improvement"*. R
    since OMP does not retract streamed text (amended 2026-10-07, MIGRATION.md item 37). One
    marker shows per prompt: a later hold in the same prompt (a refused rewrite) shows "…" in
    each text block instead, and still blocks with its full reason and original; the marker
-   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08).
+   shows again after Jo's typed input or a reply that passes row 1 (amended 2026-10-08). The
+   item 2 exception passes the gate: on the orchestrator, row 1 lets the bare `as2 lane wl-…`
+   line through in prose and in inline code and still refuses it inside a shell fence (amended
+   2026-10-17, `migration/items/pair-offer-own-line.md`, MIGRATION.md item 52).
 4. Session C's C2 pass (communication rules) opens with P-24 as its governing requirement; the
    1.x prose rules in `~/.claude/CLAUDE.md` § *How to communicate with Jo* and § *Commands you
    hand to Jo to run* are re-homed (P-18) as the text behind the gate, not as the enforcement.

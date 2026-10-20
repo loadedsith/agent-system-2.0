@@ -39,8 +39,10 @@ classifier/src/build-row.ts	module	-
 classifier/src/classify.ts	module	-
 classifier/src/fingerprint.ts	module	-
 classifier/src/hand-session.ts	module	-
+classifier/src/headroom.ts	module	-
 classifier/src/lab.ts	module	-
 classifier/src/ledger-port.ts	module	-
+classifier/src/panel.ts	module	-
 classifier/src/review-stop.ts	module	-
 classifier/src/rounds.ts	module	-
 classifier/src/route.ts	module	-
@@ -63,12 +65,16 @@ classifier/test/fixtures/ledger-replay/golden.txt	test	-
 classifier/test/fixtures/ledger-replay/live-2026-10-11T22-42-01.718Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/manifest.json	test	-
 classifier/test/hand-session.test.ts	test	-
+classifier/test/headroom.test.ts	test	-
 classifier/test/helpers.ts	test	-
 classifier/test/kimi-rule.test.ts	test	-
 classifier/test/lab.test.ts	test	-
 classifier/test/lane-lab.test.ts	test	-
 classifier/test/ledger-replay.test.ts	test	-
+classifier/test/panel-dispatch.test.ts	test	-
+classifier/test/panel.test.ts	test	-
 classifier/test/review-defects.test.ts	test	-
+classifier/test/profile-rows.test.ts	test	-
 classifier/test/replay.test.ts	test	-
 classifier/test/review-round1.test.ts	test	-
 classifier/test/review-round2.test.ts	test	-
@@ -206,6 +212,28 @@ skills/code-review-and-quality/references/security-checklist.md	skill-asset	-
 skills/cross-model-review/SKILL.md	skill	-
 skills/cross-model-review/references/doubt-driven-development.md	skill-asset	-
 skills/cross-model-review/references/orchestration-patterns.md	skill-asset	-
+skills/cross-model-review/references/panel/panel.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/doubt.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/doubt.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum-refute.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum-refute.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/quorum.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/refute.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/refute.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/synth-common.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad-verify.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad-verify.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad.leg.md	skill-asset	-
+skills/cross-model-review/references/panel/prompts/triad.synth.md	skill-asset	-
+skills/cross-model-review/references/panel/schema/doubt.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/quorum-refute.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/quorum.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/refute.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/synth.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/triad-verify.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/schema/triad.leg.schema.json	skill-asset	-
+skills/cross-model-review/references/panel/scripts/panel.ts	skill-asset	-
 skills/cross-model-review/references/quorum/prompts/ground.md	skill-asset	-
 skills/cross-model-review/references/quorum/prompts/plan.md	skill-asset	-
 skills/cross-model-review/references/quorum/prompts/plan.schema.json	skill-asset	-
@@ -223,6 +251,7 @@ skills/cross-model-review/references/triad/prompts/refute.schema.json	skill-asse
 skills/cross-model-review/references/triad/scripts/herdr-legs.sh	skill-asset	-
 skills/cross-model-review/references/triad/scripts/triad-fanout.sh	skill-asset	-
 skills/cross-model-review/references/triad/triad.md	skill-asset	-
+skills/cross-model-review/test/panel.test.ts	test	-
 skills/ctx/SKILL.md	skill	-
 skills/debugging-and-error-recovery/SKILL.md	skill	-
 skills/deprecation-and-migration/SKILL.md	skill	-
@@ -1075,6 +1104,7 @@ surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
 surface/test/ctx-index.test.ts	test	-
 surface/src/close-entry.ts	module	-
@@ -1095,6 +1125,20 @@ surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/src/merge-train.ts	module	-
+surface/src/merge-train-resolve.ts	module	-
+surface/src/merge-train-stack.ts	module	-
+surface/scripts/merge-train.ts	module	-
+surface/test/merge-train-resolve.test.ts	test	-
+surface/test/train-word.test.ts	test	-
+surface/test/merge-train-stack.test.ts	test	-
+surface/test/train-return.test.ts	test	-
+surface/test/train-board.test.ts	test	-
+surface/scripts/train-tick.ts	module	-
+surface/test/train-tick.test.ts	test	-
+surface/test/train-world.ts	test	-
+surface/test/train-escalation.test.ts	test	-
+install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
 surface/test/as2test.test.ts	test	-
@@ -1191,9 +1235,92 @@ surface/test/pair-suggest-ceiling.test.ts	test	-
 surface/test/pair-suggest-forgery.test.ts	test	-
 surface/test/pair-suggest-module.test.ts	test	-
 surface/test/pair-suggest-switch.test.ts	test	-
+surface/test/pair-offer-visible.test.ts	test	-
 # Base-prompt voice and contract (migration/items/base-prompt-voice-contract.md): bin/as2 renders the
 # orchestrator's --append-system-prompt file with this script, so every turn sends the same system prompt.
 surface/scripts/orchestrator-prompt.ts	module	-
 surface/test/base-prompt.test.ts	test	-
 # Test runner self-refresh (migration/items/test-runner-self-refresh.md): row 6 pins for the refresh helper's sudo forms.
 gates/test/as2test-refresh-pins.test.ts	test	-
+# Openable links (migration/items/openable-links.md): render-only linking and the local herdr action.
+gates/src/links.ts	module	-
+gates/extensions/open-links.ts	extension	-
+gates/test/links.test.ts	test	-
+gates/test/open-links.test.ts	test	-
+surface/src/linked-api.ts	module	-
+surface/test/linked-api.test.ts	test	-
+install/herdr-file-links/herdr-plugin.toml	install	-
+install/herdr-file-links/open-file.sh	install	-
+ledger/test/file-links-install.test.ts	test	-
+# Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
+surface/src/rank.ts	module	-
+surface/src/rank-audit.ts	module	-
+surface/src/rank-launch.ts	module	-
+surface/extensions/rank.ts	module	-
+surface/scripts/rank.ts	module	-
+surface/scripts/rank-mode.ts	module	-
+surface/test/rank.test.ts	test	-
+surface/test/rank-tool.test.ts	test	-
+surface/test/rank-audit.test.ts	test	-
+surface/test/rank-launch.test.ts	test	-
+# Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
+# on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
+install/com.agent-system-2.phoenix.plist	install	-
+install/phoenix-agent.sh	install	-
+install/phoenix-run.sh	install	-
+install/phoenix-serve.py	install	-
+install/phoenix-footprint.py	install	-
+surface/src/tracing.ts	module	-
+surface/scripts/tracing.ts	module	-
+surface/test/tracing.test.ts	test	-
+surface/test/phoenix-run.test.ts	test	-
+# Agent channel, phase 1 (migration/items/agent-channel.md): Plumb sends Ilex notes and proposals through
+# the OMP seat mailbox; never authored as Jo. Loaded by surface/index.ts for the orchestrator only.
+surface/src/channel.ts	module	-
+surface/extensions/agent-channel.ts	module	-
+surface/test/channel.test.ts	test	-
+surface/test/channel-reply.test.ts	test	-
+# Jo's plugins (wl-mv8r90k9nci4qo, 2026-10-14): i-have-audhd and ask-graham vendored from
+# jo-wolff-plugins at the pin in plugins/VENDOR.md, upstream *.test.mjs left out. All used in place:
+# profile/config.yml loads plugins/index.ts (orchestrator only) and lists each plugins/<p>/skills dir.
+plugins/VENDOR.md	doc	-
+plugins/index.ts	extension	-
+plugins/ask-graham/.claude-plugin/plugin.json	data	-
+plugins/ask-graham/.omp-plugin/plugin.json	data	-
+plugins/ask-graham/hooks/ask-graham-hook.mjs	module	-
+plugins/ask-graham/hooks/hooks.json	data	-
+plugins/ask-graham/omp/ask-graham-omp.ts	extension	-
+plugins/ask-graham/package.json	data	-
+plugins/ask-graham/README.md	doc	-
+plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
+plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
+plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
+plugins/i-have-audhd/checks/closing-ask-last.mjs	module	-
+plugins/i-have-audhd/checks/lines.mjs	module	-
+plugins/i-have-audhd/checks/name-the-artifact.mjs	module	-
+plugins/i-have-audhd/checks/needs-you-first.mjs	module	-
+plugins/i-have-audhd/checks/plural-back-reference.mjs	module	-
+plugins/i-have-audhd/example.i-have-audhd.json	data	-
+plugins/i-have-audhd/hooks/hooks.json	data	-
+plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
+plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
+plugins/i-have-audhd/judge/ask.mjs	module	-
+plugins/i-have-audhd/lib/config.mjs	module	-
+plugins/i-have-audhd/lib/state.mjs	module	-
+plugins/i-have-audhd/omp/i-have-audhd-omp.ts	extension	-
+plugins/i-have-audhd/omp/REGISTRATION.md	doc	-
+plugins/i-have-audhd/package.json	data	-
+plugins/i-have-audhd/README.md	doc	-
+plugins/i-have-audhd/skills/i-have-audhd/SKILL.md	skill	-
+plugins/i-have-audhd/skills/i-have-audhd/reference.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/comparison.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/rationale.md	skill-asset	-
+plugins/i-have-audhd/skills/i-have-audhd/references/sources.md	skill-asset	-
+plugins/i-have-audhd/tools/upgrade-from-communication-rules.mjs	module	-
+plugins/i-have-audhd/triggers/bad-news-lexicon.mjs	module	-
+plugins/i-have-audhd/triggers/batch-heading.mjs	module	-
+plugins/i-have-audhd/triggers/conclusion-first.mjs	module	-
+plugins/i-have-audhd/triggers/todo-unfinished.mjs	module	-
+plugins/test/loader.test.ts	test	-

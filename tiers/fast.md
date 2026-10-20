@@ -13,6 +13,8 @@ here, and classifier/test/review-round1.test.ts checks that list against the rou
 You are a **fast** hand, the tier on the quickest, cheapest model row. Most slices here are **locate** work. A throwaway workload's stakes cap also sends every other kind of slice here (SPEC-2.0.md § B4), so the kind of your task is whatever its brief asks for. Do the task your brief states, to its
 done-condition; your tier sets your model, never the scope of your task.
 
+Write raw absolute receipts and URLs; render machinery makes Jo-facing links, while stored documents and ledger rows stay raw (`contract/output-types.md`, "The receipt rule").
+
 ## Your brief
 
 Your brief has six fields (SPEC-2.0.md § B9): workload, task, done-condition, inputs, stakes,
@@ -46,3 +48,5 @@ Read the kind off your task, then follow the matching line.
   edit a scratch clone with the write tool only on a non-protected branch. The root has an advisory cap
   (`AGENT_SYSTEM_SCRATCH_CAP_MB`, default 2048). Anything a later lane needs goes in the plan directory.
 - Your harness is OMP 18.8.6; its slash commands, settings and which of them apply to you are in ~/.omp/profiles/<profile>/agent/OMP-HARNESS.md, where `<profile>` is `$OMP_PROFILE` in your bash env (`agent-system-2` by default) — read it when a harness question comes up.
+- Any order of workloads, PRs or next steps you give or act on comes from `as2_rank`, never your own
+  judgment; Jo's "X first", unpins and goals are the orchestrator's to record.

@@ -41,9 +41,15 @@ export const DECISION_LOG_DIR = ".ai/decision-log/";
 /** Overrides the runs root (§ 2.3 step 1); tests set it to a tmp dir. Never in the untrusted child's env. */
 export const RUNS_ROOT_ENV = "AGENT_SYSTEM_TEST_RUNS";
 
-export type TestVerdict = "green" | "red" | "stale" | "error" | "superseded";
-export const TEST_VERDICTS: readonly TestVerdict[] = ["green", "red", "stale", "error", "superseded"];
-/** The verdicts a `test-run-failed:` message carries: never green, never superseded (a superseded run settles nothing). */
+/**
+ * `red-main` (PLAN wl-mv8s8srodefytc rev 17.1 D8): every failing test of every part also fails in base's run of the same
+ * part (origin/main at the sha the trusted phase fetched), so the PR adds no failure; it settles like `green`.
+ */
+export type TestVerdict = "green" | "red-main" | "red" | "stale" | "error" | "superseded";
+export const TEST_VERDICTS: readonly TestVerdict[] = ["green", "red-main", "red", "stale", "error", "superseded"];
+/** The verdicts that complete the full-suite slice and post `as2/full-suite` success: a green, and a red-main (D8). */
+export const SETTLING_VERDICTS: readonly TestVerdict[] = ["green", "red-main"];
+/** The verdicts a `test-run-failed:` message carries: never green, red-main or superseded (a superseded run settles nothing). */
 export type FailedVerdict = "red" | "stale" | "error";
 
 /** Thrown by a formatter or builder handed a value its body cannot carry; a caller bug, never a run outcome. */
@@ -214,6 +220,21 @@ export interface Failure {
 	/** The whole first non-empty line of its error. */
 	firstError: string;
 }
+/**
+ * One part compared with base's run of the same part (D8): the part (`full` or the solo `./<path>`), the names failing on the
+ * PR, the names failing on base (null when base's part errored, as a solo file base lacks does), and base's error.
+ */
+export interface BasePart {
+	part: string;
+	failing: string[];
+	baseFailing: string[] | null;
+	baseError: string | null;
+}
+/** The base comparison of a run whose parts failed (D8): base's sha and each failing part, in part order. */
+export interface BaseCompare {
+	sha: string;
+	parts: BasePart[];
+}
 export interface TestRun {
 	runId: string;
 	verdict: TestVerdict;
@@ -232,6 +253,8 @@ export interface TestRun {
 	runDir: string | null;
 	/** The preflight's summary (§ 3.1), null when it never ran. */
 	preflight: string | null;
+	/** The base comparison (D8), present only on a run whose failing parts were rerun on base. */
+	baseCompare?: BaseCompare;
 }
 
 const nat = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
@@ -258,6 +281,20 @@ function failureOf(v: unknown): Failure | null {
 	if (typeof f.part !== "string" || typeof f.name !== "string" || typeof f.firstError !== "string") return null;
 	return { part: f.part, name: f.name, firstError: f.firstError };
 }
+const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
+function baseCompareOf(v: unknown): BaseCompare | null {
+	if (v === null || typeof v !== "object") return null;
+	const b = v as Record<string, unknown>;
+	if (!isSha(b.sha) || !Array.isArray(b.parts)) return null;
+	const parts: BasePart[] = [];
+	for (const p of b.parts as unknown[]) {
+		if (p === null || typeof p !== "object") return null;
+		const x = p as Record<string, unknown>;
+		if (typeof x.part !== "string" || !strings(x.failing) || !(x.baseFailing === null || strings(x.baseFailing)) || !strOrNull(x.baseError)) return null;
+		parts.push({ part: x.part, failing: [...x.failing], baseFailing: x.baseFailing === null ? null : [...x.baseFailing], baseError: x.baseError });
+	}
+	return { sha: b.sha, parts };
+}
 
 /** The canonical TestRun built from untrusted fields, or null: the one shape both the formatter and the parser accept. */
 function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr: unknown }, v: Record<string, unknown>): TestRun | null {
@@ -271,28 +308,33 @@ function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr
 	const solo = v.solo.map(soloOf);
 	const failures = v.failures.map(failureOf);
 	if (solo.some((s) => s === null) || failures.some((f) => f === null)) return null;
+	// A red-main always carries the comparison it rests on; any other verdict may carry one (a red that was compared).
+	const baseCompare = v.baseCompare === undefined || v.baseCompare === null ? null : baseCompareOf(v.baseCompare);
+	if (v.baseCompare !== undefined && v.baseCompare !== null && baseCompare === null) return null;
+	if (head.verdict === "red-main" && baseCompare === null) return null;
 	return {
 		runId: head.runId, verdict: head.verdict as TestVerdict, sha: head.sha, pr: head.pr, reason: v.reason, headAtEnd: v.headAtEnd,
 		base: v.base, mergeBase: v.mergeBase, full, solo: solo as SoloCounts[], failures: failures as Failure[], runDir: v.runDir, preflight: v.preflight,
+		...(baseCompare === null ? {} : { baseCompare }),
 	};
 }
 
 /**
  * `test-run: <run id> <verdict> sha=<sha> pr=<N> {json}` (§ 2.3 step 6). The json repeats sha and pr
  * and carries reason, headAtEnd, base, mergeBase, full, solo, failures (every one), runDir and
- * preflight, on one line. The same object goes to `result.json`.
+ * preflight, plus baseCompare when the run has one (D8), on one line. The same object goes to `result.json`.
  */
 export function testRunBody(run: TestRun): string {
 	const c = canonicalRun(run, run as unknown as Record<string, unknown>);
 	need(c !== null, `test-run ${run.runId} does not have the shape its body carries`);
 	const json = JSON.stringify({
 		sha: c!.sha, pr: c!.pr, reason: c!.reason, headAtEnd: c!.headAtEnd, base: c!.base, mergeBase: c!.mergeBase, full: c!.full, solo: c!.solo,
-		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight,
+		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight, ...(c!.baseCompare ? { baseCompare: c!.baseCompare } : {}),
 	});
 	return `${TEST_RUN_PREFIX} ${c!.runId} ${c!.verdict} sha=${c!.sha} pr=${c!.pr} ${json}`;
 }
 
-const RUN_RE = /^test-run: (tr-[a-z0-9]+) (green|red|stale|error|superseded) sha=([0-9a-f]{40}) pr=([1-9]\d*) (\{.*\})$/;
+const RUN_RE = /^test-run: (tr-[a-z0-9]+) (green|red-main|red|stale|error|superseded) sha=([0-9a-f]{40}) pr=([1-9]\d*) (\{.*\})$/;
 
 export function parseTestRun(body: string): TestRun | null {
 	const m = RUN_RE.exec(body.trim());
@@ -354,9 +396,9 @@ export function parseTestRunFailed(body: string): TestRunFailed | null {
 	return { workloadId: m[1]!, slice: m[2]!, verdict: m[3] as FailedVerdict, sha: m[4]!, failing, first: m[6] ?? null };
 }
 
-/** The signal for a finished run that is not green, or null for green and superseded. */
+/** The signal for a finished run that is not green, or null for green, red-main and superseded. */
 export function testRunFailedOf(workloadId: string, slice: string, run: TestRun): TestRunFailed | null {
-	if (run.verdict === "green" || run.verdict === "superseded") return null;
+	if (run.verdict === "green" || run.verdict === "red-main" || run.verdict === "superseded") return null;
 	const counted = (run.full?.fail ?? 0) + run.solo.reduce((n, s) => n + s.fail, 0);
 	return { workloadId, slice, verdict: run.verdict, sha: run.sha, failing: Math.max(counted, run.failures.length), first: run.failures[0]?.name ?? null };
 }
@@ -930,6 +972,11 @@ export interface RunFacts {
 	owner: boolean;
 	/** The slice's state read in the write transaction; null when it is gone. */
 	sliceState: SliceState | null;
+	/**
+	 * Base's runs of the failing parts (D8), keyed by part (`full` or the solo `./<path>`), at `sha` (origin/main as the trusted
+	 * phase fetched it); null when no part was rerun on base (`baseParts` named none, or the run stopped first).
+	 */
+	baseRuns: { sha: string; parts: Readonly<Record<string, PartResult>> } | null;
 }
 export interface RunDecision {
 	/** What the entry records: `superseded` for a run that lost ownership. */
@@ -937,15 +984,59 @@ export interface RunDecision {
 	/** What the run found, ownership aside. */
 	outcome: Exclude<TestVerdict, "superseded">;
 	reason: string | null;
-	/** Complete the slice: an owned green on a slice still open. */
+	/** Complete the slice: an owned green or red-main on a slice still open. */
 	settle: boolean;
+}
+
+/**
+ * The parts the runner reruns on base (D8), in part order: each part with a failing test, when every part reported cleanly (no
+ * part `error`, and every part without a failing test exited 0); else none, since such a run is `red` or `error` whatever base says.
+ */
+export function baseParts(f: Pick<RunFacts, "full" | "solo">): string[] {
+	if (f.full === null) return [];
+	const parts: { label: string; p: PartResult }[] = [{ label: "full", p: f.full }, ...f.solo.map((s) => ({ label: s.file, p: s }))];
+	if (parts.some(({ p }) => p.error !== null || (p.fail === 0 && p.exit !== 0))) return [];
+	return parts.filter(({ p }) => p.fail > 0).map(({ label }) => label);
+}
+
+/** Each failing part beside base's run of it (D8), or null when the run has no base runs. A part base never ran counts as base's error. */
+export function baseCompareFor(f: Pick<RunFacts, "full" | "solo" | "baseRuns">): BaseCompare | null {
+	if (f.baseRuns === null) return null;
+	const runs = f.baseRuns.parts;
+	const failing: { label: string; p: PartResult }[] = [...(f.full ? [{ label: "full", p: f.full }] : []), ...f.solo.map((s) => ({ label: s.file, p: s }))];
+	const parts = failing.filter(({ p }) => p.fail > 0).map(({ label, p }): BasePart => {
+		const base = Object.hasOwn(runs, label) ? runs[label]! : null;
+		const baseError = base === null ? "not run on base" : base.error;
+		return { part: label, failing: p.failures.map((x) => x.name), baseFailing: baseError === null ? base!.failures.map((x) => x.name) : null, baseError };
+	});
+	return { sha: f.baseRuns.sha, parts };
+}
+
+/**
+ * Main red (D8): every failing test of every compared part also fails in base's run of that part; a base error is never main red.
+ * Failures compare as a multiset: a failure identity (`file > describe > name`, not unique when two cases share a name) that
+ * fails more often on the head than on base is a failure base lacks, so the part is `red`.
+ */
+export function mainRed(c: BaseCompare): boolean {
+	const covered = (failing: readonly string[], base: readonly string[]): boolean => {
+		const left = new Map<string, number>();
+		for (const n of base) left.set(n, (left.get(n) ?? 0) + 1);
+		for (const n of failing) {
+			const k = left.get(n) ?? 0;
+			if (k === 0) return false;
+			left.set(n, k - 1);
+		}
+		return true;
+	};
+	return c.parts.length > 0 && c.parts.every((p) => p.baseFailing !== null && covered(p.failing, p.baseFailing));
 }
 
 /**
  * The verdict (§ 2.3 step 6, § 2.4) and whether to settle (§ 2.2 step 5, § 2.3 step 7), in this order:
  * a fetched head that is not the requested sha is `stale` before any test; a run-level failure is
  * `error`; a head that moved by the end is `stale` whatever the counts; any failing test in any
- * part is `red` (a solo failure with the suite green included); a part that errored is `error`;
+ * part is `red` (a solo failure with the suite green included), or `red-main` when base's runs of the failing parts
+ * (`baseRuns`) fail every one of them too (`mainRed`, D8); a part that errored is `error`;
  * otherwise `green`. A run that does not own its request records `superseded` and settles nothing.
  */
 export function decideRun(f: RunFacts): RunDecision {
@@ -961,7 +1052,11 @@ export function decideRun(f: RunFacts): RunDecision {
 			return { outcome: "stale", reason: `the PR head moved to ${sha7(f.headAtEnd)} during the run of ${sha7(f.requestedSha)}` };
 		}
 		const parts = [f.full, ...f.solo];
-		if (parts.some((p) => p.fail > 0)) return { outcome: "red", reason: null };
+		if (parts.some((p) => p.fail > 0)) {
+			const compare = baseParts(f).length > 0 ? baseCompareFor(f) : null;
+			if (compare !== null && mainRed(compare)) return { outcome: "red-main", reason: `every failing test also fails on base ${sha7(compare.sha)}` };
+			return { outcome: "red", reason: null };
+		}
 		const broken = [{ p: f.full, label: "full" }, ...f.solo.map((s) => ({ p: s, label: s.file }))].find(({ p }) => p.error !== null || p.exit !== 0);
 		if (broken) return { outcome: "error", reason: `${broken.label}: ${broken.p.error ?? `exit ${broken.p.exit}`}` };
 		return { outcome: "green", reason: null };
@@ -969,7 +1064,7 @@ export function decideRun(f: RunFacts): RunDecision {
 	if (!f.owner) {
 		return { verdict: "superseded", outcome: outcome.outcome, reason: `lost ownership of the request; the run found ${outcome.outcome}${outcome.reason ? ` (${outcome.reason})` : ""}`, settle: false };
 	}
-	return { verdict: outcome.outcome, outcome: outcome.outcome, reason: outcome.reason, settle: outcome.outcome === "green" && f.sliceState === "open" };
+	return { verdict: outcome.outcome, outcome: outcome.outcome, reason: outcome.reason, settle: SETTLING_VERDICTS.includes(outcome.outcome) && f.sliceState === "open" };
 }
 
 /** Every failing test across the parts, untruncated, in part order. */
@@ -985,25 +1080,30 @@ export function buildTestRun(
 	request: TestRequested, facts: RunFacts, decision: RunDecision,
 	extra: { base: string | null; mergeBase: string | null; runDir: string | null; preflight: string | null },
 ): TestRun {
+	const baseCompare = baseCompareFor(facts);
 	return {
 		runId: request.runId, verdict: decision.verdict, sha: request.sha, pr: request.pr, reason: decision.reason, headAtEnd: facts.headAtEnd,
 		base: extra.base, mergeBase: extra.mergeBase,
 		full: facts.full ? { pass: facts.full.pass, fail: facts.full.fail, skip: facts.full.skip, exit: facts.full.exit, ms: facts.full.ms, error: facts.full.error } : null,
 		solo: facts.solo.map((s) => ({ file: s.file, pass: s.pass, fail: s.fail, skip: s.skip, exit: s.exit, ms: s.ms, error: s.error })),
 		failures: failuresOf(facts.full, facts.solo), runDir: extra.runDir, preflight: extra.preflight,
+		...(baseCompare === null ? {} : { baseCompare }),
 	};
 }
 
-/** The orchestrator hears a finished run that is neither green nor superseded when no lane holds the workload under a live lease (§ 2.3 step 8). */
+/** The orchestrator hears a finished run that is neither green, red-main nor superseded when no lane holds the workload under a live lease (§ 2.3 step 8). */
 export function notifiesOrchestrator(verdict: TestVerdict, heldLive: boolean): boolean {
-	return verdict !== "green" && verdict !== "superseded" && !heldLive;
+	return !SETTLING_VERDICTS.includes(verdict) && verdict !== "superseded" && !heldLive;
 }
 
-/** The artifact a settled slice carries (§ 2.3 step 7). */
+/** The artifact a settled slice carries (§ 2.3 step 7); a red-main names base's sha and every compared part (D8). */
 export function settleArtifact(run: TestRun): string {
-	need(run.verdict === "green" && run.full !== null, `test-run ${run.runId} is not a green with a full part`);
+	need(SETTLING_VERDICTS.includes(run.verdict) && run.full !== null, `test-run ${run.runId} is not a green or red-main with a full part`);
 	const alone = run.solo.length === 0 ? "none" : run.solo.map((s) => `${s.file} ${s.pass}/${s.fail}`).join(", ");
-	return `test-run ${run.runId}: green at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}; ${run.runDir ?? "no run dir"}`;
+	const main = run.verdict === "red-main" && run.baseCompare
+		? `; every failure also fails on base ${run.baseCompare.sha} (${run.baseCompare.parts.map((p) => `${p.part} ${p.failing.length}`).join(", ")})`
+		: "";
+	return `test-run ${run.runId}: ${run.verdict} at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}${main}; ${run.runDir ?? "no run dir"}`;
 }
 
 // ---- retention -------------------------------------------------------------------------------------
@@ -1076,25 +1176,74 @@ export interface ClosePr {
 	 * its non-green result while it was the newest request on that slice; else null. Only a merged PR at that run's sha passes on it.
 	 */
 	waivedRun: string | null;
+	/**
+	 * The question Jo answered `skip` on for this PR on a merge train (PLAN wl-mv8s8srodefytc § 1; surface/src/merge-train.ts
+	 * `trainSkippedOf`): its id when the workload carries a valid `train:` entry and Jo's `skip`, written by the surface,
+	 * answers a question on one of the train's slices of this PR; else null. Such a PR is treated like a closed one.
+	 */
+	trainSkipped: string | null;
+	/**
+	 * The PR is on a merge train (PLAN wl-mv8s8srodefytc rev 17.1 D8; surface/src/close-entry.ts `trainPrsOn`): a valid `train:`
+	 * entry on a workload of this repository, open or closed, lists it. A `red-main` result passes close only on such a PR, merged, at its merged head.
+	 */
+	onTrain: boolean;
+	/** A MERGED PR's merge commit (gh `mergeCommit.oid`, read in the same call as its head); null for any other state. */
+	mergeCommit: string | null;
+	/**
+	 * For a MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a green its merged head does not keep, a red,
+	 * error or stale run Jo did not waive at that head, or a red-main off a train or not at its merged head): the newest
+	 * test-runner green, on any workload of this repository, whose sha S is on the freshly fetched `origin/<default>` and either is
+	 * the merged head (or the head descends from S through decision-log-only commits, `how: "head"`) or contains the merge commit
+	 * (`how: "merge"`) (PLAN wl-mvfjen3q5mqi2o D2; surface/src/close-entry.ts `gatherCloseFacts`); else null. S is an integration
+	 * snapshot of the main line that contains the merge, not a claim that it still runs every line the PR added.
+	 */
+	cover: { runId: string; sha: string; workloadId: string; how: "head" | "merge" } | null;
+	/** Jo's `waive-pr` instruction naming this PR (PLAN wl-mvfjen3q5mqi2o D3; surface/src/launch.ts `waivedPrs`), or null. It passes only a MERGED PR nothing covers. */
+	waivedByJo: string | null;
 }
 export interface CloseFacts {
 	/** Why git or gh could not answer, or null. Any failure refuses (fails closed). */
 	failure: string | null;
 	/** `wl/<wl>`. */
 	branch: string;
+	/** Origin's default branch, short (`main`): the main line a covering green must be on. */
+	defaultBranch: string;
 	/** The local branch tip close will publish, pinned as C, and every file changed between merge-base(origin/main, C) and C. */
 	candidate: { sha: string; changed: readonly string[] };
-	/** The PR set: every PR from the branch, from a `push-dest:` branch, or named by a `test-requested:`, in any state. */
+	/**
+	 * The PR set: every PR from the branch in any state; every PR from a holder's `push-dest:` branch whose head contains a sha
+	 * the workload pushed there (PLAN wl-mvfjen3q5mqi2o D1); and every PR a `test-requested:` names.
+	 */
 	prs: readonly ClosePr[];
 }
 export type CloseDecision = { close: true; why: string } | { close: false; reason: string };
 
 /**
+ * Whether a MERGED PR's own results fail the close check, so it needs D2's cover or D3's waiver (PLAN wl-mvfjen3q5mqi2o): no
+ * result; a green its merged head does not keep; a red, error, stale or superseded run Jo's run-based `waive` does not pass at
+ * that head; or a red-main off a train or not at its merged head. False for any other state and for a PR Jo skipped on a train.
+ * It mirrors `closeFreshness`'s rules for a merged PR, which pass these PRs on `cover` or `waivedByJo` only after their own rules.
+ */
+export function mergedNeedsCover(pr: Pick<ClosePr, "state" | "result" | "headSha" | "headCompare" | "waivedRun" | "trainSkipped" | "onTrain">): boolean {
+	if (pr.state !== "MERGED" || pr.trainSkipped) return false;
+	const r = pr.result;
+	if (r === null) return true;
+	if (r.verdict === "green") return pr.headSha !== r.sha && decisionLogFault(pr.headCompare) !== null;
+	if (r.verdict === "red-main") return !pr.onTrain || pr.headSha !== r.sha;
+	return pr.waivedRun !== r.runId || pr.headSha !== r.sha;
+}
+
+/**
  * The close check (§ 2.4 item 4). Every open or merged PR in the set needs an authoritative green at
  * S, with its head at S or descended from it through commits that each touch only the decision log;
- * a merged PR whose authoritative non-green run Jo waived (`waivedRun`) passes when that run's sha is
- * its final head, and an open PR never passes on a waiver. A candidate with a code delta needs such a
- * green on a PR from the branch that covers C the same way (a waiver covers nothing). The one
+ * its final head, and an open PR never passes on a waiver. A `red-main` result (D8) passes only a merged train PR
+ * (`onTrain`) at exactly its merged head, and then counts as that PR's green. A PR Jo skipped on a merge train (`trainSkipped`)
+ * is treated like a closed one and named in the why. A MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a
+ * green its merged head does not keep, a red, error or stale run not waived at that head, a red-main off a train) passes on a
+ * covering test-runner green on the main line (`cover`, PLAN wl-mvfjen3q5mqi2o D2), else on Jo's `waive-pr` (`waivedByJo`,
+ * D3); with neither, a PR with no result or an unkept green is refused naming its merge commit and both ways through (D4), and
+ * any other keeps its refusal with the same two ways appended. An open PR never passes on either. A candidate with a code
+ * delta needs such a green on a PR from the branch that covers C the same way (a waiver or a cover covers nothing). The one
  * exemption is an empty PR set with no code delta. Anything git or gh could not answer refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
@@ -1106,22 +1255,79 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			: { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 	}
 	const waived: string[] = [];
+	const skipped: string[] = [];
+	const covers: string[] = [];
+	const waivedByJo: string[] = [];
+	const mainRedMerged = new Set<number>();
+	// D2 then D3, for a MERGED PR its own results do not pass: true when it passes, and named in the why.
+	const passesMerged = (pr: ClosePr): boolean => {
+		if (pr.state !== "MERGED") return false;
+		const c = pr.cover;
+		if (c !== null) {
+			const holds = c.how === "merge" ? `which contains merge commit ${pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit)}` : "at its merged head";
+			covers.push(`PR #${pr.number} merged; covered by test-run ${c.runId} green at ${sha7(c.sha)} (${c.workloadId}), ${holds}`);
+			return true;
+		}
+		if (pr.waivedByJo !== null) {
+			waivedByJo.push(`#${pr.number} (${pr.waivedByJo})`);
+			return true;
+		}
+		return false;
+	};
+	// D4: the two ways through for a merged PR nothing covers, a covering green on <default> that contains its merge commit or Jo's waive-pr.
+	const waysThrough = (pr: ClosePr): string => {
+		const m = pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit);
+		const d = f.defaultBranch;
+		return `once a green run's commit that contains ${m} is on ${d} (for example, the next green PR that merges ${d} in, once it has merged), or on Jo's \`waive-pr ${f.branch.replace(/^wl\//, "")} ${pr.number}\``;
+	};
+	const uncovered = (pr: ClosePr): CloseDecision => ({
+		close: false,
+		reason: `PR #${pr.number} merged at ${sha7(pr.headSha)} (merge commit ${pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit)}) and no test-runner green on ${f.defaultBranch} holds it: it passes ${waysThrough(pr)}`,
+	});
+	// A merged PR's refusal from its own run, kept, with D4's two ways appended.
+	const refusedMerged = (pr: ClosePr, reason: string): CloseDecision => ({ close: false, reason: `${reason}; it also passes ${waysThrough(pr)}` });
 	for (const pr of f.prs) {
 		if (pr.state === "CLOSED") continue;
+		if (pr.trainSkipped) {
+			skipped.push(`#${pr.number} (${pr.trainSkipped})`);
+			continue;
+		}
 		const r = pr.result;
-		if (r === null) return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
+		if (r === null) {
+			if (passesMerged(pr)) continue;
+			if (pr.state === "MERGED") return uncovered(pr);
+			return { close: false, reason: `PR #${pr.number} has no test-run result: call lane_full_test` };
+		}
+		if (r.verdict === "red-main") {
+			const newest = `PR #${pr.number}'s newest test-run ${r.runId} is red-main`;
+			const refused = pr.state !== "MERGED" || !pr.onTrain
+				? `${newest}: it passes only a train PR the train merged at that head`
+				: pr.headSha !== r.sha ? `${newest} at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` : null;
+			if (refused === null) {
+				mainRedMerged.add(pr.number);
+				continue;
+			}
+			if (pr.state !== "MERGED") return { close: false, reason: refused };
+			if (passesMerged(pr)) continue;
+			return refusedMerged(pr, refused);
+		}
 		if (r.verdict !== "green") {
 			const newest = `PR #${pr.number}'s newest test-run ${r.runId} is ${r.verdict}`;
 			if (pr.state === "OPEN") return { close: false, reason: `${newest}: fix it and call lane_full_test (a waiver passes only a merged PR)` };
-			if (pr.waivedRun !== r.runId) {
-				return { close: false, reason: `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result` };
+			const refused = pr.waivedRun !== r.runId
+				? `${newest}: a merged PR passes only on Jo's \`waive\` answering a question that offers waive on the run's slice, asked after the result`
+				: pr.headSha !== r.sha ? `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` : null;
+			if (refused === null) {
+				waived.push(`#${pr.number} (${r.runId})`);
+				continue;
 			}
-			if (pr.headSha !== r.sha) return { close: false, reason: `${newest} and waived, but at ${sha7(r.sha)}, not the merged head ${sha7(pr.headSha)}` };
-			waived.push(`#${pr.number} (${r.runId})`);
-			continue;
+			if (passesMerged(pr)) continue;
+			return refusedMerged(pr, refused);
 		}
 		const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
 		if (fault !== null) {
+			if (passesMerged(pr)) continue;
+			if (pr.state === "MERGED") return uncovered(pr);
 			return { close: false, reason: `PR #${pr.number}'s head ${sha7(pr.headSha)} is not the green ${sha7(r.sha)}: ${fault}; call lane_full_test` };
 		}
 	}
@@ -1129,15 +1335,20 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 		const own = f.prs.filter((p) => p.headRefName === f.branch);
 		if (own.length === 0) return { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 		const covered = own.some(
-			(p) => p.state !== "CLOSED" && p.result?.verdict === "green" && (f.candidate.sha === p.result.sha || decisionLogOnly(p.candidateCompare)),
+			(p) => p.state !== "CLOSED" && (p.result?.verdict === "green" || mainRedMerged.has(p.number)) && (f.candidate.sha === p.result!.sha || decisionLogOnly(p.candidateCompare)),
 		);
 		if (!covered) {
 			if (own.every((p) => p.state === "CLOSED")) return { close: false, reason: `PR #${own.at(-1)!.number} is closed; reopen it, or reset the branch` };
 			return { close: false, reason: `local ${f.branch} has untested commit ${sha7(f.candidate.sha)}` };
 		}
 	}
-	const head = waived.length === 0 ? "every PR in the set is green at its head" : `every PR in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
-	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}` };
+	const every = covers.length + waivedByJo.length === 0 ? "every PR" : "every other PR";
+	const head = waived.length === 0 ? `${every} in the set is green at its head` : `${every} in the set is green at its head or merged with a waived run (${waived.join(", ")})`;
+	const cover = covers.length === 0 ? "" : `; ${covers.join("; ")}`;
+	const jo = waivedByJo.length === 0 ? "" : `; waived by Jo: ${waivedByJo.join(", ")}`;
+	const mainRed = mainRedMerged.size === 0 ? "" : `; merged by the train on main red: ${[...mainRedMerged].map((n) => `#${n}`).join(", ")}`;
+	const skip = skipped.length === 0 ? "" : `; skipped by Jo on the train: ${skipped.join(", ")}`;
+	return { close: true, why: `${head}${delta.length > 0 ? ` and covers ${sha7(f.candidate.sha)}` : ""}${cover}${jo}${mainRed}${skip}` };
 }
 
 // ---- the untrusted child: env, git shim, gitconfig (§ 3) -------------------------------------------
@@ -1241,10 +1452,15 @@ export function stageDirOf(runId: string, root: string = AS2TEST_ROOT): string {
 	return join(root, "stage", runId);
 }
 
+/**
+ * One wrapper call. `base-prepare`, `base-full` and `base-solo` (PLAN wl-mv8s8srodefytc rev 17.1 D8) are `prepare`, `full` and
+ * `solo` on base: a second clone of the same bundle under `runs/<run id>/base`, detached at base's sha (the bundle's
+ * `as2-trusted-main`), run with the same argv and env, its reports `base-full.*` and `base-solo-<i>.*` beside the PR's.
+ */
 export type WrapperCall =
-	| { sub: "prepare"; runId: string; sha: string }
-	| { sub: "full"; runId: string }
-	| { sub: "solo"; runId: string; file: string }
+	| { sub: "prepare" | "base-prepare"; runId: string; sha: string }
+	| { sub: "full" | "base-full"; runId: string }
+	| { sub: "solo" | "base-solo"; runId: string; file: string }
 	| { sub: "sweep"; runId: string }
 	| { sub: "cleanup"; runId: string; oldRunId: string }
 	| { sub: "probe"; runId: string; paths: readonly string[] };
@@ -1255,12 +1471,15 @@ export function wrapperArgv(call: WrapperCall, exec: string = AS2TEST_EXEC): str
 	const head = ["sudo", "-n", "-u", AS2TEST_USER, exec, call.sub, call.runId];
 	switch (call.sub) {
 		case "prepare":
+		case "base-prepare":
 			need(isSha(call.sha), `${call.sha} is not a full sha`);
 			return [...head, call.sha];
 		case "full":
+		case "base-full":
 		case "sweep":
 			return head;
 		case "solo":
+		case "base-solo":
 			need(call.file.startsWith("./") && !call.file.slice(2).split("/").some((s) => s === ".." || s === "") && isBunTestFile(call.file), `${call.file} is not a ./<path> test file inside the clone`);
 			return [...head, call.file];
 		case "cleanup":
