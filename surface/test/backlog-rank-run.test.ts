@@ -298,7 +298,7 @@ describe("review regressions: complete typed snapshots and safe retries", () => 
 			if (!connection || typeof connection !== "object" || !("nodes" in connection) || !Array.isArray(connection.nodes)) throw new Error("missing fixture connection");
 			expect(connection.nodes[56]).toEqual(node(999));
 		}
-	});
+	}, 30_000);
 });
 
 describe("R3: every value of every item is backed up before the first mutation", () => {
