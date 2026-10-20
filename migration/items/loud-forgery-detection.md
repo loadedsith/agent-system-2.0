@@ -1,0 +1,50 @@
+---
+title: Loud forgery detection: a Jo-authority row no Jo channel wrote raises an alarm and holds its workload
+status: building
+workload: wl-mvfxw3c4zqfzls
+pr: none
+---
+**Built on branch `wl/wl-mvfxw3c4zqfzls`, PR pending.** Workload `wl-mvfxw3c4zqfzls` (production stakes, plan revision 6 at `~/agent-scratch/agent-system-2.0/wl-mvfxw3c4zqfzls/PLAN.md`, approved by Jo). Jo's ruling (`in-mvfxvdxyywhds0`): detection, not prevention, at accident grade. A check flags a Jo-authority row that no Jo channel wrote, and a lane that resolves its own question. A hit alarms loudly and holds the workload until Jo confirms or reverses the row. Jo's typed answers in a by-hand lane must pass.
+
+**Depends on PR #261** (the Jo-only boundary, `migration/items/jo-only-boundary.md`). This PR stacks on it and merges after it. It adds AUTHORITY rows in `ledger/src/authority.ts` and changes none of #261's trigger rules.
+
+**Jo channels.** A Jo channel is a non-agent process that declares itself one in code (never by env) with `declareJoChannel` (`ledger/src/jo-channel.ts`). There are two:
+
+- the surface: the orchestrator's surface session declares `{ kind: "surface" }` when it becomes active (`surface/src/session.ts`). Every row Jo's words write through the surface is marked.
+- the launcher: `as2 lane <wl>` in Jo's terminal (`cmdInteractive`, `surface/scripts/lane.ts`) declares `{ kind: "launcher", workload }` before it opens the ledger. It marks only that workload's rows. This covers the by-hand typed answer the launcher writes (kind answer or withdrawal, author `jo`, channel `direct`, stamp `lane-starter`, a question id) and the surface-stamped rows written with it. The relay that writes that answer is wl-mvb9mw00ycfjeo's PR; either PR can merge first, because the declaration covers every connection the process opens.
+
+After the declaration, every connection the process opens gets TEMP triggers that write a mark into `provenance` for each Jo-authority row it inserts: every `instructions` row authored `jo`, and every `entries` row stamped `orchestrator-surface` that opens with a jo-only control prefix. The mark is `lane_instance = 'jo-channel'`, `detail` `surface` or `launcher`, `tbl` and `row_id` the marked row, `at` the row's own `created_at`. No schema change. `declareJoChannel` throws in an agent context on a live ledger. An agent connection there also gets one more trigger: it may not insert a `jo-channel` provenance row.
+
+**What is flagged** (`checkForgery`, `surface/src/forgery.ts`):
+
+- F1, unmarked: a Jo row stamped `orchestrator-surface` (an author-jo instruction, or a jo-only control entry) with no mark on its own row id. This catches the orchestrator model's own bash or script writing as the surface.
+- F2, wrong channel: an author-jo `lane-starter` row that is not the by-hand answer shape, or has no `launcher` mark; an author-jo surface-stamped row on channel `direct`; an author-jo row stamped by anything else, except a lane's own row-11 instruction.
+- F3, a lane resolves its own question: a question resolved by an instruction stamped with a lane id (`lane-<stem>-<n>`), or by an answer not authored `jo`.
+- F4, machinery resolves a question: a withdrawal not authored `jo`. The runner withdrawing its own ceiling question (`lane-runner`) is not flagged.
+- F5, wrong writer: a jo-only control entry whose stamp may not write that prefix. Until now `controlEntries` dropped such a row silently.
+
+F1 and F2's mark tests start at a cutover: the earliest `surface` mark and the earliest `launcher` mark in the whole ledger (`Ledger.joChannelCutovers()`). Rows before a kind's first mark are never flagged for lacking that mark, so the deploy does not flood. F3, F4 and F5 need no mark and apply to every row.
+
+**Where it runs.** The train tick runs a pass first, every 300 s, over every open workload and every workload closed within the autoboard window. The launch reserve (`cmdLaunch`, `cmdInteractive`) runs the check before a lane starts. `bun surface/scripts/merge-train.ts stakes --hold-ok` runs it read-only before a train merge. A hit is recorded once per row id, ever: `forgery: hit <row id> <rule>` on the workload, stamped `forgery-check`, or `forgery: hit <wl> <row id> <rule>` on the standing workload when the workload is closed. Nothing is checked at write time.
+
+**The alarm.** A pass or a refused launch with new hits raises one macOS notification (sound Glass) and one spoken line, `as2 forgery alert. <n> rows on <workloads>` (`surface/src/notify.ts`). A flood is one alarm. Each unanswered hit also gets a LOUD needs-you line naming the row, the rule, what it led to (`launch:` attempts and `train-board:` rows that cite it) and the two words. The line stays until Jo answers. Nothing is pushed into a by-hand lane's terminal.
+
+**The hold.** While a workload has a hit Jo has not answered:
+
+- no autonomous launch (`launchable` returns `forgery-hold`), and the tick asks its live autonomous lane to stop (`lane-stop: … requested forgery-hold by forgery-check`).
+- no train boarding or landing (`boardLanding`, `landingReady`), and `stakes --hold-ok` answers `hold: forgery <row id> <rule> on <wl>` for the PR's workload and the train's own.
+- no close (`orchestrator_close_workload`).
+- `as2 lane <wl>` by hand is not refused. It prints the hold line at start.
+
+**Jo's words** (`surface/src/forgery-words.ts`, at the surface):
+
+- `confirm <row id>`: the row was Jo's. Writes `forgery-confirmed: <row id> by <in-…>`. The row is never flagged again. When the last hit is confirmed and the hold had stopped an autonomous lane, it also writes `launch-requested:` so the lane comes back.
+- `reverse <row id>`: the row was not Jo's. Writes `forgery-reversed: <row id> by <in-…>`. Every decision read then skips the row: control entries, `repo:`, `Ledger.instructions`, `parkLane`'s resolving read, and `invariants.ts`'s `reservedView` (as of its time in `--as-of` replay). A reversed answer or `replan` withdrawal is re-asked on the same slice while the slice is open or paused. A reversed mode flip is flipped back.
+- Reverse cannot undo: a cancelled slice (a deferred cancel still fires when the slice's other open question resolves, through the persistent trigger `questions_resolution_settles_slice`, which needs a schema version to change; a LOUD line says so and Jo re-cuts the slice), an answer whose slice is already done or cancelled, anything outside the ledger the row led to (a launch, a lane's commits, a push, spend, a merge), and anything on a closed workload. The receipt names each.
+- Either word on a row no hit names, or on a hit already answered, is refused.
+
+**Hazards after merge.** An orchestrator started later from a checkout without this change writes unmarked rows; after the surface cutover each one is an F1 hit (confirm clears each). A by-hand answer from a launcher started before this merged, after the launcher cutover, is an F2 hit.
+
+**Not covered (shelved).** Machinery stamps written by a model (`escalation`, `lane-runner`, `notice:`, audit G5) and repo scripts that reach them (G7), except where F5 catches a jo-only prefix. A deliberate forger who calls `declareJoChannel` on purpose, drops TEMP triggers, or brings its own SQLite.
+
+Tests: `ledger/test/jo-channel.test.ts`, `surface/test/forgery-check.test.ts`, `surface/test/forgery-tick.test.ts`, `surface/test/forgery-hold.test.ts`, `surface/test/forgery-words.test.ts`, `classifier/test/forgery-readers.test.ts`.
