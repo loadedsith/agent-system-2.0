@@ -15,3 +15,19 @@ What changed:
 - Gates. pair_write, pair_edit and pair_run pass the same P-11 rows, fence and clean-shell check as write, edit and bash (gates/src/pair-call.ts, plugins/paired-as2.ts). Authorization is by tool call id and argument fingerprint, so arguments rewritten after the gate are refused at execute. A pair_run of a declared artifact records its real outcome; a run that executed and then stopped pairing records a failure.
 
 Deployment: this reaches Ilex and new lanes only after /Users/jowolff/code/agent-system-2.0 is on main and `as2 install` has re-run; running sessions keep their old adapter registrations until restarted.
+
+## Train-return fence fixture repair
+
+The returned task `tt-mvhbgiv1a05xc0` includes five-second metadata-test timeouts.
+`gates/test/fence.test.ts` now snapshots paths and file digests in process rather than
+launching `shasum` and `cut` for every file. Assertions and timeouts are unchanged.
+The snapshot still records directories, hashes file-symlink targets and does not
+traverse directory symlinks.
+
+A standalone scratch-fixture comparison matched the former snapshot output, detected
+file mutations/additions and preserved symlink behavior. Three local comparisons on
+40 regular files took 425–458 ms for the shell pipeline and 1.05–1.22 ms in process.
+Those measurements establish fixture overhead reduction, not a full-suite timeout fix.
+The local complete fence file could not exercise nested Seatbelt controls: child
+`sandbox-exec` calls exited 71 with `sandbox_apply: Operation not permitted`.
+Full acceptance requires the external runner at the repaired PR head.
