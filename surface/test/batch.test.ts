@@ -14,7 +14,7 @@ import orchestratorSurface from "../index";
 import { onFire } from "../src/batch";
 import { ceilingNoticeBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { laneExitBody } from "../src/launch";
+import { laneExitBody, SCRATCH_SWEEP_BY } from "../src/launch";
 import { sendNotice } from "../src/notice";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { surfaceSession } from "../src/session";
@@ -22,7 +22,10 @@ import { laneDiedShutdownBody } from "../src/signals";
 import {
 	type Failure, makeRunId, notifiesOrchestrator, securityRedBody, securityRedOf, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf,
 } from "../src/test-run";
-import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
+import { ensureStandingWorkload, standingSlice } from "../src/identity";
+import { ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { SCRATCH_ENTRY } from "../../gates/src/scratch";
+import { askJo, nowBody } from "../../gates/src/rulings";
 import { clock, ctxOf, fakePi, notices, type Sent, tempLedger, timers, tmp, workloadWithSlice } from "./helpers";
 
 const NEEDS = "## needs you (new since your last turn)";
@@ -132,6 +135,99 @@ describe("onFire: the kinds that go out on their own poll", () => {
 		expect(fire("idle", stopped)).toBe(true);
 		expect(fire("idle", parked)).toBe(false);
 		expect(fire("test-run", red)).toBe(true);
+	});
+});
+
+describe("NOW (PLAN wl-mvg1vs0rhnu3gg § 1.0–1.3): a marked question, a NOW_RESERVED request and the scratch disk are on fire", () => {
+	/** The `errorLines` line of `kind` about `rowId`, which must exist. */
+	const lineOf = (l: Ledger, kind: string, rowId: string) => {
+		const line = errorLines(l).find((x) => x.kind === kind && x.rowId === rowId);
+		expect(line).toBeDefined();
+		return line!;
+	};
+	/** Row 6's `reserved-request` body for an action and the call it refused (gates/src/rows/r06-reserved.ts reservedRequestBody). */
+	const request = (l: Ledger, wl: string, sl: string, action: string, call: string) =>
+		l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "reserved-request", body: `${action}: ${call} (P-11 row 6 refused tool call c1)` });
+
+	test("a lane question askJo raised with now is tagged NOW (<category>) with state now and on fire; a plain question is neither", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl } = workloadWithSlice(l);
+		const hot = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "The token leaks into logs: rotate now?", options: ["rotate", "hold"], now: "security" }, { asker: "lane" });
+		const cold = ask(l, wl, sl, "Which header token?");
+		if (!("raised" in hot)) throw new Error("not raised");
+		const now = lineOf(l, "question", hot.raised);
+		expect(now.state).toBe("now");
+		expect(now.line.startsWith(`NOW (security): lane on ${wl} is waiting on you (${hot.raised}, slice ${sl}): The token leaks into logs: rotate now?`)).toBe(true);
+		expect(onFire(l, now)).toBe(true);
+		const plain = lineOf(l, "question", cold);
+		expect(plain.state).toBeUndefined();
+		expect(plain.line.startsWith(`lane on ${wl} is waiting on you (${cold}`)).toBe(true);
+		expect(onFire(l, plain)).toBe(false);
+	});
+
+	test("the orchestrator's own question askJo raised with now is tagged and on fire", () => {
+		const { ledger: l } = tempLedger();
+		ensureStandingWorkload(l);
+		const slice = standingSlice(l)!;
+		const hot = askJo(l, { by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, sliceId: slice.id, body: "The disk under the ledger is failing: stop every lane?", options: ["stop", "wait"], now: "incident" }, { asker: "orchestrator", about: null });
+		if (!("raised" in hot)) throw new Error("not raised");
+		const line = lineOf(l, "question", hot.raised);
+		expect(line.state).toBe("now");
+		expect(line.line.startsWith(`NOW (incident): the orchestrator asked you (${hot.raised}): The disk under the ledger is failing`)).toBe(true);
+		expect(onFire(l, line)).toBe(true);
+	});
+
+	test("a lane-written now: look-alike tags nothing and is not on fire, beside ESCALATION_BY's mark on the same workload, which does", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		const q = ask(l, wl, sl, "Merge it?");
+		l.recordEntry({ by: "lane-a", workloadId: wl, sliceId: sl, kind: "assumption", body: nowBody(q, "security") });
+		const forged = lineOf(l, "question", q);
+		expect(forged.state).toBeUndefined();
+		expect(forged.line).not.toContain("NOW");
+		expect(onFire(l, forged)).toBe(false);
+		const real = askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "This drops the guard on row 9: go ahead?", options: ["go", "stop"], now: "guard" }, { asker: "lane" });
+		if (!("raised" in real)) throw new Error("not raised");
+		const marked = lineOf(l, "question", real.raised);
+		expect(marked.state).toBe("now");
+		expect(marked.line.startsWith(`NOW (guard): lane on ${wl} is waiting on you (${real.raised}`)).toBe(true);
+		expect(onFire(l, marked)).toBe(true);
+		// the forged mark still counts for nothing once a valid one is on the workload
+		expect(lineOf(l, "question", q).state).toBeUndefined();
+	});
+
+	test("a waiting reserved request whose rule is in NOW_RESERVED is tagged and on fire; a blind one and rm are not", () => {
+		const { ledger: l } = tempLedger();
+		const { wl, sl } = workloadWithSlice(l);
+		const admin = request(l, wl, sl, "gh pr merge --admin bypasses branch protection", "gh pr merge 5 --admin");
+		const force = request(l, wl, sl, "force-push", "git push --force origin topic");
+		const deploy = request(l, wl, sl, "deploy (fly)", "fly deploy");
+		const blind = request(l, wl, sl, "bun with a subcommand or target not known until it runs", "bun $X");
+		const rm = request(l, wl, sl, "rm -rf (recursive force-delete)", "rm -rf build");
+		for (const [en, category] of [[admin, "guard"], [force, "irreversible"], [deploy, "irreversible"]] as const) {
+			const line = lineOf(l, "reserved", en);
+			expect(line.state).toBe("now");
+			expect(line.line.startsWith(`NOW (${category}): reserved action waiting on you (${wl}): `)).toBe(true);
+			expect(onFire(l, line)).toBe(true);
+		}
+		for (const en of [blind, rm]) {
+			const line = lineOf(l, "reserved", en);
+			expect(line.state).toBeUndefined();
+			expect(line.line.startsWith(`reserved action waiting on you (${wl}): `)).toBe(true);
+			expect(onFire(l, line)).toBe(false);
+		}
+	});
+
+	test("the sweep's scratch-disk line is on fire; a lane's over-cap line is not", () => {
+		const { ledger: l } = tempLedger();
+		ensureStandingWorkload(l);
+		const disk = l.recordEntry({ by: SCRATCH_SWEEP_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${SCRATCH_ENTRY.disk} 12000.5 MiB under /h passes 10240 MiB (AGENT_SYSTEM_SCRATCH_TOTAL_MB); report /r.md` });
+		expect(onFire(l, lineOf(l, "scratch", disk))).toBe(true);
+		const { wl } = workloadWithSlice(l);
+		expect(l.claimWorkload(wl, { by: "lane-a", holder: "lane-a", leaseMs: 3_600_000 }).won).toBe(true);
+		const over = l.recordEntry({ by: "lane-a", workloadId: wl, kind: "assumption", body: `${SCRATCH_ENTRY.overCap} 3000.0 MiB over the 2048 MiB cap at /h/s/${wl}` });
+		expect(onFire(l, lineOf(l, "scratch", over))).toBe(false);
 	});
 });
 

@@ -9,7 +9,9 @@
 //    on its workload whose body is exactly `approve <id>` / `deny <id>` — Jo's word at the surface
 //    (surface-input.ts; a clarification that merely mentions the id is not a decision, Codex S1) —
 //    no `reserved-withdrawn:` by a holder, its raising lane still holds the workload, and no later
-//    request repeats it (MIGRATION.md item 31). A repeat names the earliest call it repeats.
+//    request repeats it (MIGRATION.md item 31). A repeat names the earliest call it repeats. One whose
+//    action is a NOW_RESERVED rule (gates/src/rows/r06-reserved.ts `nowReserved`, PLAN wl-mvg1vs0rhnu3gg
+//    § 1.2, § 1.3) is tagged `NOW (guard): ` or `NOW (irreversible): ` and has state `now`.
 // 2. held past § A3: the oldest `held` message per open workload that is addressed to a lane (a
 //    message to the orchestrator is consumed by the surface at read, so it is never "held with no
 //    live lane"), older than HOLD_HOURS; or an open workload — sliced or not (§ A3: "the workload
@@ -25,7 +27,10 @@
 //    `prompt-wait:` (a leaked blocking prompt, § B3 item 5 first trigger). A question is cut at 120
 //    characters, except the plan question (`isPlanQuestionIn`, PLAN wl-muq22rnjcfrrpc D8): it shows
 //    whole, its body starting on the line beneath the q- id (the plan path directly beneath the line
-//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces.
+//    naming the question, PLAN wl-mv61a8dh4aeneo D2) and every body line indented two spaces. A question
+//    a valid `now: <q-…> <category>` control entry names (gates/src/rulings.ts `nowMarks`: ESCALATION_BY's
+//    alone, so a look-alike by a lane tags nothing; PLAN wl-mvg1vs0rhnu3gg § 1.0) is tagged
+//    `NOW (<category>): ` and has state `now`, on the orchestrator's own asks too.
 // 6. a lane that ended leaving work idle (MIGRATION.md item 68): an open workload (the standing one
 //    excepted) with open slices, no holder, no open question and no waiting reserved request, whose
 //    newest lane lifecycle entry is a `lane-exit:` with an intended outcome (`isIntendedOutcome`): the
@@ -77,6 +82,8 @@
 import { type EntryRow, type InFlightWorkload, type Ledger, type MessageRow, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import { CHANNEL_REFUSED_SHOWN_HOURS, channelInForce, channelProposals, channelRefusals } from "./channel";
 import { SCRATCH_ENTRY } from "../../gates/src/scratch";
+import { type NowCategory, nowMarks } from "../../gates/src/rulings";
+import { nowReserved } from "../../gates/src/rows/r06-reserved";
 import { openPairOffer } from "./input";
 import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit } from "./launch";
 import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
@@ -450,7 +457,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const requests = reservedStates(ledger, wl);
 		for (const r of requests) {
 			if (r.state.kind !== "waiting") continue;
-			reserved.push({ kind: "reserved", workloadId: wl, rowId: r.id, line: `reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\`` });
+			// § 1.2, § 1.3: a guard bypass or an irreversible or shared-state rule (gates/src/rows/r06-reserved.ts NOW_RESERVED) is NOW.
+			const hot = nowReserved(r.body);
+			reserved.push({
+				kind: "reserved", workloadId: wl, rowId: r.id, ...(hot ? { state: "now" } : {}),
+				line: `${hot ? `NOW (${hot.category}): ` : ""}reserved action waiting on you (${label}): ${short(r.body)}${repeatNote(r, requests)} — \`approve ${r.id}\` or \`deny ${r.id}\``,
+			});
 		}
 		const oldest = pendingMessages.find((m) => m.state === "held" && m.recipient !== ORCHESTRATOR_RECIPIENT);
 		if (oldest && hoursElapsed(oldest.created_at, now) >= holdHours) {
@@ -483,9 +495,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 		const taken = wl !== STANDING_WORKLOAD_ID && workload.mode === "user-driven" && !laneLive ? takenPair(ledger.entries(wl, "assumption")) : null;
 		if (taken) idle.push({ kind: "pair", workloadId: wl, rowId: taken.questionId, state: "taken", line: pairTakenLine(wordsOf(ledger, wl), taken.questionId, wl) });
 		let control: ControlEntry[] = [];
+		/** § 1.0: the NOW category of each open question a valid `now:` control entry (ESCALATION_BY's alone) names. */
+		let marks = new Map<string, NowCategory>();
 		if (openQuestions.length > 0) {
 			const entries = ledger.entries(wl);
 			control = controlEntries(entries, holdersOf(entries, workload.holder, ledger.holders(wl)));
+			marks = nowMarks(entries);
 		} else if (!taken && wl !== STANDING_WORKLOAD_ID && workload.open_slices > 0 && !workload.holder && !requests.some((r) => r.state.kind === "waiting")) {
 			// Item 68: no holder, no question, no reserved request — only an intended lane-exit: as the newest
 			// lifecycle entry says the lane ended on purpose and left the work to nobody. A lapsed holder is
@@ -496,10 +511,12 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			if (ended && !trainRouted(windows, ended.createdAt) && !isTrain()) idle.push({ kind: "idle", workloadId: wl, rowId: ended.id, line: `lane ${ended.laneId} on ${label} ended (${ended.outcome}) with ${workload.open_slices} open slice(s) and no question; ${next}` });
 		}
 		for (const q of openQuestions) {
+			const hot = marks.get(q.id);
+			const nowTag = hot ? `NOW (${hot}): ` : "";
 			if (wl === STANDING_WORKLOAD_ID) {
 				// The orchestrator's own ask to Jo (MIGRATION.md item 105), its subject workload from the surface's subject entry.
 				const about = questionSubject(ledger, q.id);
-				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, line: `the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
+				questions.push({ kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(hot ? { state: "now" } : {}), line: `${nowTag}the orchestrator asked you (${q.id}${about ? `, about ${about}` : ""}): ${short(q.body, 120)} — answer with one word: ${q.options.join(" / ")} (or \`withdraw\`)` });
 				continue;
 			}
 			// D4: a valid pair offer is its own line, right before its question's; the question lists its options less `pair` (D2).
@@ -509,9 +526,10 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			// D9's re-send: level 2 or 3 of the train tick's ladder makes the line LOUD, each level a new state.
 			const loud = trainAlertLevel(control, q.id);
 			const step = loud >= 2 ? TRAIN_ALERT_LADDER.find((s) => s.level === loud) : undefined;
-			const tag = step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : "";
+			const tag = `${nowTag}${step ? `LOUD${step.labels.includes("critical") ? ", critical" : ""} (unacknowledged ${step.afterMs / 3_600_000} h): ` : ""}`;
 			const asker = q.created_by === MERGE_TRAIN_BY ? `merge train ${label} needs you` : `lane on ${label} is waiting on you`;
-			const state = step ? `loud-${loud}` : null;
+			// A NOW question is on fire from its first poll (batch.ts onFire), so its state stays `now` whatever the ladder's level.
+			const state = hot ? "now" : step ? `loud-${loud}` : null;
 			questions.push({
 				kind: "question", workloadId: wl, rowId: q.id, options: q.options, ...(state ? { state } : {}),
 				line: `${tag}${asker} (${q.id}, slice ${q.slice_id}):${body} — answer with one word: ${shownOptions(q.options).join(" / ")} (or \`withdraw\`)`,
