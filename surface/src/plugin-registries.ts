@@ -10,14 +10,19 @@
 //      it in; a user entry counts otherwise.
 //   2. An OMP user registry entry list for an id replaces every Claude entry for that id (any scope).
 //   3. The project OMP registry found by OMP's walk from the cwd replaces both for the ids it lists.
-// The OMP user registries read are the default profile's `<home>/<configDir>/plugins/installed_plugins.json` and the
-// active profile's `<home>/<configDir>/profiles/<profile>/plugins/installed_plugins.json` when that file exists
-// (pi-utils@18.8.6 src/dirs.ts `getPluginsDir`, `getProfileConfigRoot`); each is resolved on its own, as an OMP
-// session in that profile would. XDG redirection (Linux only in `DirResolver`) is not followed.
+// Each OMP session checked is resolved as OMP 18.8.6 resolves its own (`ompSession`): the default profile's, and the
+// active profile's when one is set, each with its user registry at `getPluginsDir()` (pi-utils@18.8.6 src/dirs.ts):
+// `<data root>/plugins/installed_plugins.json`, where the data root is `$XDG_DATA_HOME/omp` (default profile) or
+// `$XDG_DATA_HOME/omp/profiles/<name>` (named profile) when that directory exists on Linux or macOS and the agent dir
+// is the profile's own (`DirResolver`), else the legacy `<home>/<configDir>[/profiles/<name>]`. The env each session's
+// resolver reads is the caller's plus the dotenv files OMP loads before it rebuilds the resolver (pi-utils@18.8.6
+// src/env.ts, then `refreshDirsFromEnv` and cli.ts `setProfile`); the session's cwd stands for OMP's process cwd.
+// Bun's own autoload of `.env.local` / `.env.<NODE_ENV>` is not followed.
 //
 // HOME, env and cwd are parameters, so tests run on fixture homes; the module reads files and writes nothing.
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { parseEnv } from "node:util";
 
 export interface RegistryInputs {
 	home: string;
@@ -59,6 +64,8 @@ interface Root {
 }
 
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const WINDOWS_RESERVED_BASENAME_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/i;
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Claude's config dir: `CLAUDE_CONFIG_DIR` (trimmed, resolved) or `<home>/.claude` (src/config/claude-paths.ts `resolveClaudePaths`). */
 export function claudeConfigDir(home: string, env: RegistryInputs["env"]): string {
@@ -66,32 +73,84 @@ export function claudeConfigDir(home: string, env: RegistryInputs["env"]): strin
 	return override ? resolve(override) : join(home, ".claude");
 }
 
-/** The active OMP profile, or undefined for the default (pi-utils@18.8.6 src/dirs.ts `resolveProfileEnv`); an invalid name counts as none. */
-export function activeProfile(env: RegistryInputs["env"]): string | undefined {
-	const name = (env.OMP_PROFILE !== undefined ? env.OMP_PROFILE : env.PI_PROFILE)?.trim();
-	if (!name || name === "default" || name.endsWith(".") || !PROFILE_NAME_RE.test(name)) return undefined;
+/** A profile name, or undefined for the default (pi-utils@18.8.6 src/dirs.ts `normalizeProfileName`); an invalid name counts as none. */
+function profileName(value: string | undefined): string | undefined {
+	const name = value?.trim();
+	if (!name || name === "default" || name.endsWith(".") || !PROFILE_NAME_RE.test(name) || WINDOWS_RESERVED_BASENAME_RE.test(name)) return undefined;
 	return name;
 }
 
-/** The OMP user registries to check: the default profile's, then the active profile's when that file exists. */
-export function ompUserRegistries(home: string, env: RegistryInputs["env"]): { path: string; profile: string | undefined }[] {
-	// OMP's config dir name: `PI_CONFIG_DIR` or `.omp` (pi-utils@18.8.6 src/dirs.ts `getConfigDirName`).
+/** The active OMP profile, or undefined for the default (pi-utils@18.8.6 src/dirs.ts `resolveProfileEnv`). */
+export function activeProfile(env: RegistryInputs["env"]): string | undefined {
+	return profileName(env.OMP_PROFILE !== undefined ? env.OMP_PROFILE : env.PI_PROFILE);
+}
+
+/** `<home>/<configDir>[/profiles/<profile>]`, configDir `PI_CONFIG_DIR` or `.omp` (pi-utils@18.8.6 src/dirs.ts `getProfileConfigRoot`). */
+function profileRoot(home: string, env: RegistryInputs["env"], profile: string | undefined): string {
 	const root = join(home, env.PI_CONFIG_DIR || ".omp");
-	const out: { path: string; profile: string | undefined }[] = [{ path: join(root, "plugins", "installed_plugins.json"), profile: undefined }];
-	const profile = activeProfile(env);
-	if (profile) {
-		const path = join(root, "profiles", profile, "plugins", "installed_plugins.json");
-		if (isFile(path)) out.push({ path, profile });
+	return profile ? join(root, "profiles", profile) : root;
+}
+
+/** pi-utils@18.8.6 src/env.ts `parseEnvFile`: shell-identifier keys with NUL-free values, `OMP_X` copied to `PI_X`; {} when unreadable. */
+function parseEnvFile(path: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	try {
+		for (const [key, value] of Object.entries(parseEnv(readFileSync(path, "utf8")))) {
+			if (value !== undefined && ENV_NAME_RE.test(key) && !value.includes("\0")) out[key] = value;
+		}
+	} catch {
+		// missing or unreadable: no keys
 	}
+	for (const key of Object.keys(out)) if (key.startsWith("OMP_")) out[`PI_${key.slice(4)}`] = out[key]!;
 	return out;
 }
 
-function isFile(path: string): boolean {
-	try {
-		return statSync(path).isFile();
-	} catch {
-		return false;
+/** One OMP session the check models: its profile, the env its directory resolver reads, and its user registry. */
+export interface OmpSession {
+	profile: string | undefined;
+	env: RegistryInputs["env"];
+	registry: string;
+}
+
+/**
+ * The OMP session `OMP_PROFILE=<profile or default> omp` started in `cwd` would be, as pi-utils@18.8.6 src/dirs.ts,
+ * src/env.ts and pi-coding-agent cli.ts `runCli` build it:
+ *   1. Module load: a default-profile session keeps `PI_CODING_AGENT_DIR` as its agent-dir override unless it is the
+ *      agent dir `PI_PROFILE`'s profile derives (`resolvePreProfileAgentDir`); a named profile takes none.
+ *   2. env.ts fills each unset key from `<cwd>/.env`, `<agent dir>/.env`, `<config root>/.env`, `<home>/.env`, in
+ *      that order, the agent dir and config root being the module-load ones.
+ *   3. `setProfile` rebuilds the resolver from the filled env: the config root from its `PI_CONFIG_DIR`, the XDG data
+ *      root from its `XDG_DATA_HOME` (`DirResolver`), consulted only when the agent dir is the profile's own.
+ */
+export function ompSession(inputs: RegistryInputs, profile: string | undefined): OmpSession {
+	const { home, cwd } = inputs;
+	const launch: RegistryInputs["env"] = { ...inputs.env, OMP_PROFILE: profile ?? "default" };
+	const piProfile = profileName(launch.PI_PROFILE);
+	const derived = piProfile !== undefined && launch.PI_CODING_AGENT_DIR === join(profileRoot(home, launch, piProfile), "agent");
+	const agentOverride = profile || derived ? undefined : launch.PI_CODING_AGENT_DIR;
+	const loadRoot = profileRoot(home, launch, profile);
+	const loadAgentDir = agentOverride ? resolve(agentOverride) : join(loadRoot, "agent");
+
+	const env: RegistryInputs["env"] = { ...launch };
+	for (const file of [join(cwd, ".env"), join(loadAgentDir, ".env"), join(loadRoot, ".env"), join(home, ".env")]) {
+		for (const [key, value] of Object.entries(parseEnvFile(file))) if (!env[key]) env[key] = value;
 	}
+
+	const root = profileRoot(home, env, profile);
+	const ownAgentDir = !agentOverride || resolve(agentOverride) === join(root, "agent");
+	let dataRoot = root;
+	if ((process.platform === "linux" || process.platform === "darwin") && ownAgentDir && env.XDG_DATA_HOME) {
+		const appRoot = join(env.XDG_DATA_HOME, "omp");
+		const xdgRoot = profile ? join(appRoot, "profiles", profile) : appRoot;
+		if (exists(xdgRoot)) dataRoot = xdgRoot;
+	}
+	return { profile, env, registry: join(dataRoot, "plugins", "installed_plugins.json") };
+}
+
+/** The OMP sessions to check: the default profile's, then the active profile's when one is set. */
+export function ompSessions(inputs: RegistryInputs): OmpSession[] {
+	const profile = activeProfile(inputs.env);
+	return profile ? [ompSession(inputs, undefined), ompSession(inputs, profile)] : [ompSession(inputs, undefined)];
 }
 
 function isDir(path: string): boolean {
@@ -162,13 +221,13 @@ function readRegistry(path: string): Record<string, unknown> | null {
 /**
  * src/discovery/helpers.ts `resolveActiveProjectRegistryPath`, with HOME a parameter: the nearest ancestor of cwd
  * (stopping before home) holding a `<configDir>` directory, else the nearest holding `.git`, as
- * `<dir>/<configDir>/plugins/installed_plugins.json`; null when neither is found. `userRoots` are the config roots
- * `isUserConfigRoot` excludes (home's and each OMP user registry's).
+ * `<dir>/<configDir>/plugins/installed_plugins.json`; null when neither is found. `isUserConfigRoot` excludes home's
+ * config root and `userRoot`, the session's user registry root (`dirname(getPluginsDir())`).
  */
-export function projectRegistryPath(cwd: string, home: string, env: RegistryInputs["env"], userRoots: readonly string[]): string | null {
+export function projectRegistryPath(cwd: string, home: string, env: RegistryInputs["env"], userRoot: string): string | null {
 	const name = env.PI_CONFIG_DIR || ".omp";
 	const homeDir = normalize(home);
-	const excluded = new Set([normalize(join(home, name)), ...userRoots.map(normalize)]);
+	const excluded = new Set([normalize(join(home, name)), normalize(userRoot)]);
 	const isUserConfigRoot = (dir: string) => excluded.has(normalize(join(dir, name)));
 	for (const marker of [name, ".git"]) {
 		let dir = resolve(cwd);
@@ -214,19 +273,17 @@ function entriesOf(id: string, value: unknown): Entry[] | null {
 
 const versionOf = (entry: Entry): string => (typeof entry.version === "string" && entry.version ? entry.version : "unknown");
 
-/** The disagreements an OMP session in `cwd` would carry, for every OMP user registry checked. Throws MalformedRegistryError. */
+/** The disagreements an OMP session in `cwd` would carry, for every OMP session checked (`ompSessions`). Throws MalformedRegistryError. */
 export function findDisagreements(inputs: RegistryInputs): Disagreement[] {
-	const { home, env, cwd } = inputs;
-	const users = ompUserRegistries(home, env);
-	const userRoots = users.map((u) => dirname(dirname(u.path)));
-	const claudeDir = claudeConfigDir(home, env);
-	const claudePath = join(claudeDir, "plugins", "installed_plugins.json");
-	const claudePlugins = readRegistry(claudePath);
-	const projectFound = projectRegistryPath(cwd, home, env, userRoots);
+	const { home, cwd } = inputs;
 	const out: Disagreement[] = [];
 	const seen = new Set<string>();
-	for (const user of users) {
-		const projectPath = projectFound && normalize(projectFound) !== normalize(user.path) ? projectFound : null;
+	for (const session of ompSessions(inputs)) {
+		const claudeDir = claudeConfigDir(home, session.env);
+		const claudePath = join(claudeDir, "plugins", "installed_plugins.json");
+		const claudePlugins = readRegistry(claudePath);
+		const projectFound = projectRegistryPath(cwd, home, session.env, dirname(dirname(session.registry)));
+		const projectPath = projectFound && normalize(projectFound) !== normalize(session.registry) ? projectFound : null;
 		const projectRoot = projectPath ? dirname(dirname(dirname(projectPath))) : cwd;
 		const activeProject = canonical(projectRoot);
 		const canonicalCwd = canonical(cwd);
@@ -253,7 +310,7 @@ export function findDisagreements(inputs: RegistryInputs): Disagreement[] {
 
 		// 2. The OMP user registry replaces Claude's entries for every id it lists.
 		let roots: Root[] = [...claude];
-		for (const [id, value] of Object.entries(readRegistry(user.path) ?? {})) {
+		for (const [id, value] of Object.entries(readRegistry(session.registry) ?? {})) {
 			const entries = entriesOf(id, value);
 			if (!entries) continue;
 			roots = roots.filter((r) => r.id !== id);
@@ -261,7 +318,7 @@ export function findDisagreements(inputs: RegistryInputs): Disagreement[] {
 				if (typeof entry.installPath !== "string" || !entry.installPath) continue;
 				if (entry.enabled === false) continue;
 				if (roots.some((r) => r.id === id && r.installPath === entry.installPath)) continue;
-				roots.push({ id, version: versionOf(entry), installPath: entry.installPath, registry: user.path, origin: "omp" });
+				roots.push({ id, version: versionOf(entry), installPath: entry.installPath, registry: session.registry, origin: "omp" });
 			}
 		}
 
@@ -287,7 +344,7 @@ export function findDisagreements(inputs: RegistryInputs): Disagreement[] {
 			if (omp.origin !== "omp") continue;
 			for (const c of claude) {
 				if (c.id !== omp.id || c.version === omp.version) continue;
-				const key = JSON.stringify([omp.id, omp.version, omp.registry, c.version]);
+				const key = JSON.stringify([omp.id, omp.version, omp.registry, c.version, claudePath]);
 				if (seen.has(key)) continue;
 				seen.add(key);
 				out.push({ id: omp.id, ompVersion: omp.version, ompPath: omp.registry, claudeVersion: c.version, claudePath });
@@ -297,18 +354,37 @@ export function findDisagreements(inputs: RegistryInputs): Disagreement[] {
 	return out;
 }
 
+/** One shell word for `arg`: as is when it holds only characters no POSIX shell treats specially, else single-quoted, each `'` written `'\''`. */
+function shellQuote(arg: string): string {
+	return /^[A-Za-z0-9@%+=:,./_-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
 /**
- * The two fix commands for one disagreement. OMP's marketplace install takes no version: `name@marketplace` installs
- * the catalog's current version, and `--force` is needed over an existing install (pi-coding-agent@18.8.6
- * src/cli/classify-install-target.ts `classifyInstallTarget` reads a trailing `@<version>` as an npm spec;
- * src/extensibility/plugins/marketplace/manager.ts `#validateInstall` refuses an installed id without force). The
- * profile is named so the command writes the registry that disagrees; `default` selects the default profile
- * (pi-utils@18.8.6 src/dirs.ts `normalizeProfileName`).
+ * The commands that settle one disagreement, every argument shell-quoted. The match commands reinstall one side from
+ * its marketplace, which takes no version: OMP's `name@marketplace` installs the catalog's current version, and
+ * `--force` is needed over an existing install (pi-coding-agent@18.8.6 src/cli/classify-install-target.ts
+ * `classifyInstallTarget` reads a trailing `@<version>` as an npm spec; src/extensibility/plugins/marketplace/manager.ts
+ * `#validateInstall` refuses an installed id without force), so either can land on a version other than the one shown.
+ * The disable commands are deterministic: `omp plugin disable --scope <scope>` writes `enabled: false` on every entry
+ * of the id in that scope's registry (src/cli/plugin-cli.ts `handleSetEnabled`, manager.ts `setPluginEnabled`), and
+ * `claude plugin disable` writes `enabledPlugins: { <id>: false }` to Claude's settings for the scope it detects (seen
+ * on Claude Code 2026-10-20; it refuses with "already disabled" when no setting enables the id). `findDisagreements`,
+ * like OMP, skips a disabled entry, so either, once it succeeds, leaves the id without a pair to compare. The profile
+ * is named so the command writes the registry that disagrees; `default` selects the default profile (pi-utils@18.8.6
+ * src/dirs.ts `normalizeProfileName`).
  */
-export function fixCommands(d: Disagreement, inputs: RegistryInputs): { omp: string; claude: string } {
-	const users = ompUserRegistries(inputs.home, inputs.env);
-	const user = users.find((u) => u.path === d.ompPath);
-	if (user) return { omp: `OMP_PROFILE=${user.profile ?? "default"} omp plugin install --force ${d.id}`, claude: `claude plugin update ${d.id}` };
-	const projectDir = dirname(dirname(dirname(d.ompPath)));
-	return { omp: `(cd ${projectDir} && omp plugin install --force --scope project ${d.id})`, claude: `(cd ${projectDir} && claude plugin update ${d.id})` };
+export function fixCommands(d: Disagreement, inputs: RegistryInputs): { omp: string; claude: string; ompDisable: string; claudeDisable: string } {
+	const id = shellQuote(d.id);
+	const session = ompSessions(inputs).find((s) => s.registry === d.ompPath);
+	if (session) {
+		const omp = `OMP_PROFILE=${shellQuote(session.profile ?? "default")} omp plugin`;
+		return { omp: `${omp} install --force ${id}`, claude: `claude plugin update ${id}`, ompDisable: `${omp} disable --scope user ${id}`, claudeDisable: `claude plugin disable ${id}` };
+	}
+	const cd = `cd ${shellQuote(dirname(dirname(dirname(d.ompPath))))} &&`;
+	return {
+		omp: `(${cd} omp plugin install --force --scope project ${id})`,
+		claude: `(${cd} claude plugin update ${id})`,
+		ompDisable: `(${cd} omp plugin disable --scope project ${id})`,
+		claudeDisable: `(${cd} claude plugin disable ${id})`,
+	};
 }

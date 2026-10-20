@@ -3,9 +3,9 @@
 // OMP session started in <dir> (default: this process's cwd) takes a plugin from an OMP registry at a version other
 // than an active Claude Code entry's (surface/src/plugin-registries.ts `findDisagreements`). HOME and the env are this
 // process's. Exit 0 and print nothing when they agree. Exit 1 on any disagreement: one line per plugin with both
-// versions and both registry paths, then the two fix commands, on stderr. Exit 2 when a registry file holds text OMP
-// would not read, naming it. bin/as2 runs it before every orchestrator start (`as2`, `as2 --print`) and as
-// `as2 plugins`; a lane launch does not.
+// versions and both registry paths, then per plugin the two match commands and the two disable commands, on stderr.
+// Exit 2 when a registry file holds text OMP would not read, naming it. bin/as2 runs it before every orchestrator start
+// (`as2`, `as2 --print`) and as `as2 plugins`; a lane launch does not.
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { findDisagreements, fixCommands, MalformedRegistryError, type RegistryInputs } from "../src/plugin-registries";
@@ -34,10 +34,13 @@ export function main(argv: readonly string[], env: Record<string, string | undef
 	for (const d of found) {
 		const fix = fixCommands(d, inputs);
 		err(`fix ${d.id}, one of:\n`);
-		err(`  match Claude: ${fix.omp}\n`);
-		err(`  match OMP:    ${fix.claude}\n`);
+		err(`  match Claude:      ${fix.omp}\n`);
+		err(`  match OMP:         ${fix.claude}\n`);
+		err(`  disable in OMP:    ${fix.ompDisable}\n`);
+		err(`  disable in Claude: ${fix.claudeDisable}\n`);
 	}
-	err("(omp plugin install takes no version: it installs the marketplace's current one, as claude plugin update does; check the version each reports)\n");
+	err("(the match commands take no version: omp plugin install and claude plugin update install the marketplace's current one, which can still differ; check the version each reports.\n");
+	err(" The disable commands are deterministic: a disabled plugin counts as absent here, as it does in OMP, so either one, once it succeeds, makes the two registries on that plugin's line agree. Claude refuses its disable with \"already disabled\" when its settings never enabled the plugin; Claude Code is not loading it then, but OMP still reads Claude's entry, so use the OMP one. Disabling in OMP stops OMP loading the plugin from that registry. Then run as2 again.)\n");
 	return 1;
 }
 

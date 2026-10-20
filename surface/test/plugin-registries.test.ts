@@ -142,7 +142,23 @@ describe("findDisagreements: OMP's precedence for the cwd", () => {
 		expect(check(g)).toEqual([]);
 	});
 
-	test("the active profile's registry is checked when it exists; CLAUDE_CONFIG_DIR moves Claude's registry", () => {
+	test("a disabled plugin counts as absent: OMP's disable (every entry enabled: false) in the user or the project registry → []", () => {
+		// `omp plugin disable` writes enabled: false on every entry of the id (pi-coding-agent@18.8.6
+		// src/extensibility/plugins/marketplace/manager.ts `setPluginEnabled`); OMP then drops Claude's entries for the id
+		// and loads none. Claude's side (enabledPlugins false, or enabled: false on its entry) is the tests above.
+		const f = fixture("omp-disabled");
+		put(f.claude, registry([at("1.0.0")]));
+		put(f.omp, registry([at("2.0.0", { enabled: false })]));
+		expect(check(f)).toEqual([]);
+
+		const g = fixture("project-disabled");
+		put(g.claude, registry([at("1.0.0")]));
+		put(g.omp, registry([at("1.0.0")]));
+		put(g.project, registry([at("3.0.0", { scope: "project", enabled: false })]));
+		expect(check(g)).toEqual([]);
+	});
+
+	test("the active profile's registry is checked beside the default's; CLAUDE_CONFIG_DIR moves Claude's registry", () => {
 		const f = fixture("profile");
 		put(f.claude, registry([at("1.0.0")]));
 		put(f.omp, registry([at("1.0.0")]));
@@ -156,6 +172,56 @@ describe("findDisagreements: OMP's precedence for the cwd", () => {
 		expect(check(f, { CLAUDE_CONFIG_DIR: claudeDir })).toEqual([
 			{ id: ID, ompVersion: "1.0.0", ompPath: f.omp, claudeVersion: "0.9.0", claudePath: join(claudeDir, "plugins", "installed_plugins.json") },
 		]);
+	});
+});
+
+describe("OMP's XDG data root (pi-utils@18.8.6 src/dirs.ts DirResolver, getPluginsDir)", () => {
+	/** `$XDG_DATA_HOME/omp[/profiles/<name>]/plugins/installed_plugins.json`, with XDG_DATA_HOME `<home>/xdg`. */
+	const xdgRegistry = (f: Fixture, profile?: string) => join(f.home, "xdg", "omp", ...(profile ? ["profiles", profile] : []), "plugins", "installed_plugins.json");
+	const xdg = (f: Fixture) => ({ XDG_DATA_HOME: join(f.home, "xdg") });
+
+	test("default profile: an existing $XDG_DATA_HOME/omp holds the registry OMP reads, not ~/.omp's", () => {
+		const f = fixture("xdg-default");
+		put(f.claude, registry([at("1.0.0")]));
+		put(f.omp, registry([at("1.0.0")]));
+		put(xdgRegistry(f), registry([at("2.0.0")]));
+		expect(check(f, xdg(f))).toEqual([{ id: ID, ompVersion: "2.0.0", ompPath: xdgRegistry(f), claudeVersion: "1.0.0", claudePath: f.claude }]);
+	});
+
+	test("named profile: an existing $XDG_DATA_HOME/omp/profiles/<name> holds that profile's registry", () => {
+		const f = fixture("xdg-profile");
+		put(f.claude, registry([at("1.0.0")]));
+		put(xdgRegistry(f, "as2"), registry([at("2.0.0")]));
+		expect(check(f, { ...xdg(f), OMP_PROFILE: "as2" })).toEqual([{ id: ID, ompVersion: "2.0.0", ompPath: xdgRegistry(f, "as2"), claudeVersion: "1.0.0", claudePath: f.claude }]);
+		expect(check(f, xdg(f))).toEqual([]);
+	});
+
+	test("the legacy paths where OMP falls back: no XDG app root, no XDG profile dir, or an agent dir not the profile's own", () => {
+		const f = fixture("xdg-fallback");
+		put(f.claude, registry([at("1.0.0")]));
+		put(f.omp, registry([at("2.0.0")]));
+		const legacy = [{ id: ID, ompVersion: "2.0.0", ompPath: f.omp, claudeVersion: "1.0.0", claudePath: f.claude }];
+		expect(check(f, xdg(f))).toEqual(legacy);
+
+		// The base XDG root exists: the default profile moves to it (no registry there), a named profile without its
+		// own XDG dir stays on ~/.omp/profiles/<name>.
+		mkdirSync(join(f.home, "xdg", "omp"), { recursive: true });
+		put(f.profile("as2"), registry([at("3.0.0")]));
+		expect(check(f, { ...xdg(f), OMP_PROFILE: "as2" })).toEqual([{ id: ID, ompVersion: "3.0.0", ompPath: f.profile("as2"), claudeVersion: "1.0.0", claudePath: f.claude }]);
+
+		// PI_CODING_AGENT_DIR away from ~/.omp/agent keeps the default profile off XDG.
+		expect(check(f, { ...xdg(f), PI_CODING_AGENT_DIR: join(f.home, "agent-elsewhere") })).toEqual(legacy);
+		// One the parent's profile derived (PI_PROFILE's own agent dir) does not.
+		expect(check(f, { ...xdg(f), PI_PROFILE: "as2", OMP_PROFILE: "default", PI_CODING_AGENT_DIR: join(f.home, ".omp", "profiles", "as2", "agent") })).toEqual([]);
+	});
+
+	test("XDG_DATA_HOME from a dotenv file OMP loads (~/.env) moves the registry too; the env's own value wins", () => {
+		const f = fixture("xdg-dotenv");
+		put(f.claude, registry([at("1.0.0")]));
+		put(xdgRegistry(f), registry([at("2.0.0")]));
+		put(join(f.home, ".env"), `XDG_DATA_HOME=${join(f.home, "xdg")}\n`);
+		expect(check(f)).toEqual([{ id: ID, ompVersion: "2.0.0", ompPath: xdgRegistry(f), claudeVersion: "1.0.0", claudePath: f.claude }]);
+		expect(check(f, { XDG_DATA_HOME: join(f.home, "no-xdg") })).toEqual([]);
 	});
 });
 
@@ -175,7 +241,7 @@ describe("the CLI: check [--cwd <dir>]", () => {
 		expect(run(f)).toEqual({ code: 0, err: "" });
 	});
 
-	test("a disagreement: exit 1, one line with both versions and paths, then the two fix commands", () => {
+	test("a disagreement: exit 1, one line with both versions and paths, then the match and disable commands", () => {
 		const f = fixture("cli-mismatch");
 		put(f.claude, registry([at("1.0.0")]));
 		put(f.omp, registry([at("2.0.0")]));
@@ -183,12 +249,68 @@ describe("the CLI: check [--cwd <dir>]", () => {
 		expect(r.code).toBe(1);
 		const lines = r.err.trimEnd().split("\n");
 		expect(lines[1]).toBe(`  ${ID}: OMP 2.0.0 (${f.omp}) vs Claude 1.0.0 (${f.claude})`);
-		expect(lines).toContain(`  match Claude: OMP_PROFILE=default omp plugin install --force ${ID}`);
-		expect(lines).toContain(`  match OMP:    claude plugin update ${ID}`);
+		expect(lines).toContain(`  match Claude:      OMP_PROFILE=default omp plugin install --force ${ID}`);
+		expect(lines).toContain(`  match OMP:         claude plugin update ${ID}`);
+		expect(lines).toContain(`  disable in OMP:    OMP_PROFILE=default omp plugin disable --scope user ${ID}`);
+		expect(lines).toContain(`  disable in Claude: claude plugin disable ${ID}`);
+		expect(r.err).toContain("either one, once it succeeds, makes the two registries on that plugin's line agree");
 
 		put(f.project, registry([at("3.0.0", { scope: "project" })]));
 		const p = run(f).err.split("\n");
-		expect(p).toContain(`  match Claude: (cd ${f.proj} && omp plugin install --force --scope project ${ID})`);
+		expect(p).toContain(`  match Claude:      (cd ${f.proj} && omp plugin install --force --scope project ${ID})`);
+		expect(p).toContain(`  disable in OMP:    (cd ${f.proj} && omp plugin disable --scope project ${ID})`);
+	});
+
+	test("an XDG profile registry's commands name that profile", () => {
+		const f = fixture("cli-xdg");
+		put(f.claude, registry([at("1.0.0")]));
+		put(join(f.home, "xdg", "omp", "profiles", "as2", "plugins", "installed_plugins.json"), registry([at("2.0.0")]));
+		const r = run(f, { XDG_DATA_HOME: join(f.home, "xdg"), OMP_PROFILE: "as2" });
+		expect(r.code).toBe(1);
+		expect(r.err.split("\n")).toContain(`  disable in OMP:    OMP_PROFILE=as2 omp plugin disable --scope user ${ID}`);
+	});
+
+	test("every command is shell-quoted: a project path with a space and an apostrophe, an id with shell syntax, each round-trips through sh", () => {
+		const home = realpathSync(tmp("plugins-quote"));
+		roots.push(home);
+		const proj = join(home, "Jo's proj");
+		mkdirSync(join(proj, ".git"), { recursive: true });
+		const id = "it's $HOME `x`@market";
+		put(join(home, ".claude", "plugins", "installed_plugins.json"), registry([at("1.0.0")], id));
+		put(join(home, ".omp", "plugins", "installed_plugins.json"), registry([at("2.0.0")], id));
+		const projectRegistry = join(proj, ".omp", "plugins", "installed_plugins.json");
+		put(projectRegistry, registry([at("3.0.0", { scope: "project" })], id));
+
+		/** The printed commands by label, each run by sh with omp and claude as functions printing $PWD, the name, OMP_PROFILE (omp) and argv. */
+		const runCommands = () => {
+			let err = "";
+			expect(main(["check", "--cwd", proj], { HOME: home }, (s) => (err += s))).toBe(1);
+			const out: Record<string, string[]> = {};
+			for (const line of err.split("\n")) {
+				const m = /^ {2}(match Claude|match OMP|disable in OMP|disable in Claude): +(.*)$/.exec(line);
+				if (!m) continue;
+				const shim = `omp() { printf '%s\\n' "$PWD" omp "\${OMP_PROFILE-}" "$@"; }; claude() { printf '%s\\n' "$PWD" claude "$@"; }; `;
+				const r = Bun.spawnSync(["sh", "-c", shim + m[2]!], { cwd: home, env: { PATH: process.env.PATH ?? "" }, stdout: "pipe", stderr: "pipe" });
+				expect({ command: m[2], code: r.exitCode, err: r.stderr.toString() }).toEqual({ command: m[2], code: 0, err: "" });
+				out[m[1]!] = r.stdout.toString().replace(/\n$/, "").split("\n");
+			}
+			return out;
+		};
+
+		expect(runCommands()).toEqual({
+			"match Claude": [proj, "omp", "", "plugin", "install", "--force", "--scope", "project", id],
+			"match OMP": [proj, "claude", "plugin", "update", id],
+			"disable in OMP": [proj, "omp", "", "plugin", "disable", "--scope", "project", id],
+			"disable in Claude": [proj, "claude", "plugin", "disable", id],
+		});
+
+		rmSync(projectRegistry);
+		expect(runCommands()).toEqual({
+			"match Claude": [home, "omp", "default", "plugin", "install", "--force", id],
+			"match OMP": [home, "claude", "plugin", "update", id],
+			"disable in OMP": [home, "omp", "default", "plugin", "disable", "--scope", "user", id],
+			"disable in Claude": [home, "claude", "plugin", "disable", id],
+		});
 	});
 
 	test("malformed JSON: exit 2 naming the file", () => {
