@@ -28,11 +28,11 @@
  *      model (`ctx.model`) at that spawn (`buildRow`, classifier/src/build-row.ts; Jo's inputs
  *      in-mv7hm58386f2o0 and in-mv7hmuk0u600e8): no current model, a model with no lab, or no entry
  *      of its lab refuses, and an unusable lane-lab entry never widens the row to another lab. A
- *      review plans on `reviewRow` and the cross-lab rule instead. An entry whose lab the quota
- *      watcher's polls project out of quota before its reset (`headroom`, classifier/src/headroom.ts;
- *      PLAN wl-mv71x5rwdu7eo0 § 3, Jo's input in-mv8p5m2t005tts) is one more unusable entry: a build
- *      whose lane-lab entries are all out is refused, a review loses them (and parks when no other
- *      lab is left), and the spawn writes one `headroom-skip:` entry per entry skipped that way.
+ *      review plans on `reviewRow` and the cross-lab rule instead. Headroom skips quota-out entries
+ *      and writes one `headroom-skip:` per skip. A week-pace-only source can be retained against a
+ *      faster-burning available configured budget (PLAN wl-mv958y95fk07wg, Policy B), with its
+ *      explanation in the routing note. Build comparators use the tier row, reviews `reviewRow`;
+ *      neither counterfactual budget comparison nor retention changes the legal spawn row or pins.
  *   3. The hand's own session: this factory's instance there sees every assistant `message_end`
  *      (awaited, and drained by the session's `waitForIdle` before the hand's result exists:
  *      session/agent-session.ts #processAgentEvent, #emitSessionEvent, waitForIdle) and records the
@@ -549,26 +549,19 @@ function reviewRowNotes(table: TierTable, tier: Tier, pin: Lab | null): string[]
 }
 
 /**
- * DESIGN-2.0.md P-11 row 15 / SPEC-2.0.md § B11: the row's entries OMP's final selection will keep —
- * in the registry, on an enabled provider, credentialed session-free and (given a spawn key) for it,
- * on a provider that has not refused on the workload (`refused`, `refusedProviders`) — in row order,
- * and why each other entry was skipped. `room`: the quota headroom read once for this call (PLAN
- * wl-mv71x5rwdu7eo0 § 3, in-mv8p5m2t005tts): an otherwise usable entry it projects out is skipped as
- * `projected out: <reason>` and listed in `projected` (selector → reason). Null: no headroom check
- * (Jo's Kimi-out rule reads refusals only, PLAN wl-mv5xay6bjp0268 § 2.1).
+ * Registry/provider/refusal and session-free/spawn-key credentials only, in configured row order.
+ * Kept separate from quota so a predicted-out budget can still be a counterfactual comparator.
  */
-async function usableRow(
+async function availableRow(
 	row: readonly string[],
 	registry: ModelAvailability,
 	disabled: ReadonlySet<string>,
 	refused: ReadonlyMap<string, Refusal>,
 	spawnKey: string | null,
-	room: Headroom | null = null,
 ) {
 	const available = registry.getAvailable();
 	const usable: string[] = [];
 	const why: Record<string, string> = {};
-	const projected: Record<string, string> = {};
 	for (const selector of row) {
 		const model = available.find(m => `${m.provider}/${m.id}` === modelIdentity(selector));
 		const refusal = model ? refused.get(model.provider) : undefined;
@@ -577,13 +570,43 @@ async function usableRow(
 		else if (refusal) why[selector] = `its provider refused on ${refusal.token} (status ${refusal.status})`;
 		else if (!(await registry.getApiKey(model))) why[selector] = "no credentials";
 		else if (spawnKey && !(await registry.getApiKey(model, spawnKey))) why[selector] = `no credentials for spawn ${spawnKey}`;
+		else usable.push(selector);
+	}
+	return { usable, why };
+}
+
+/**
+ * Legal spawn entries, with quota decisions against available configured budget alternatives.
+ * Selectors absent from `budgets` fail closed; its other selectors never gain spawn authority. Core owns lab
+ * filtering, ordering and comparison policy. Null room preserves credential/refusal-only Kimi checks.
+ */
+async function usableRow(
+	row: readonly string[],
+	registry: ModelAvailability,
+	disabled: ReadonlySet<string>,
+	refused: ReadonlyMap<string, Refusal>,
+	spawnKey: string | null,
+	room: Headroom | null = null,
+	budgets: readonly string[] = row,
+) {
+	const available = await availableRow(budgets, registry, disabled, refused, spawnKey);
+	const usable: string[] = [];
+	const why: Record<string, string> = {};
+	const projected: Record<string, string> = {};
+	const retained: Record<string, string> = {};
+	for (const selector of row) {
+		if (!budgets.includes(selector)) why[selector] = "not in the configured budget row";
+		else if (available.why[selector]) why[selector] = available.why[selector]!;
 		else {
-			const out = room?.outFor(selector) ?? null;
-			if (out === null) usable.push(selector);
-			else why[selector] = `projected out: ${(projected[selector] = out)}`;
+			const decision = room?.decisionFor(selector, available.usable);
+			if (decision?.out) why[selector] = `projected out: ${(projected[selector] = decision.out)}`;
+			else {
+				usable.push(selector);
+				if (decision?.retained) retained[selector] = decision.retained;
+			}
 		}
 	}
-	return { usable, why, projected, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
+	return { usable, why, projected, retained, skipped: Object.entries(why).map(([selector, reason]) => `${selector} (${reason})`) };
 }
 
 /** `headroom-skip: <selector> token <dt> <reason>`: hand `dt`'s spawn skipped `selector` for quota headroom (PLAN wl-mv71x5rwdu7eo0 § 3). */
@@ -2641,7 +2664,8 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
 				const row = build ? build.row : reviewRow(table, tier);
 				const room = headroom({ now: clock() });
-				const { usable, why, skipped, projected: out } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room);
+				const { usable, why, skipped, projected: out, retained } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row);
+				const retainedNotes = (models: readonly string[]) => models.flatMap(selector => retained[selector] ? [retained[selector]!] : []);
 				const pin = found?.lab ?? null;
 				projected = Object.entries(out).filter(([selector]) => pin === null || labOf(selector) === pin);
 				if (found?.panel) {
@@ -2705,7 +2729,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						recordSpawn(found, usable, null, null);
 						hands.push({ ...found, root, spawnKey, tier, models: usable, row: build.row.map(modelIdentity), cwd: ctx.cwd, before: null });
 					}
-					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, [...(found?.note ? [found.note] : []), lane]) };
+					return { model: usable, note: routingNote(found?.routing ?? null, tier, usable, skipped, [...(found?.note ? [found.note] : []), lane, ...retainedNotes(usable)]) };
 				}
 				// Only a classified review reaches here, and a classified spawn has a session file (above).
 				if (!found || !root) throw new Error(`review spawn ${spawnKey ?? "(no spawn key)"} has no classification or no lane session file`);
@@ -2734,7 +2758,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 						before = { error: message(error) }; // withheld at settle: fail closed
 					}
 					hands.push({ ...found, root, spawnKey, tier, models: pin.models, row: pin.allow, cwd: ctx.cwd, before });
-					return { model: pin.models, note: routingNote(found.routing, tier, pin.models, skipped, found.note ? [found.note] : []) };
+					return { model: pin.models, note: routingNote(found.routing, tier, pin.models, skipped, [...(found.note ? [found.note] : []), ...retainedNotes(pin.models)]) };
 				}
 
 				// D4: a review runs only on labs outside the builders, recomputed now; a fan-out member only
@@ -2804,6 +2828,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 							: []),
 						...(review.note ? [review.note] : []),
 						...reviewRowNotes(table, tier, review.lab),
+						...retainedNotes(plan.models),
 					];
 					return { model: plan.models, note: routingNote(review.routing, tier, plan.models, skipped, notes) };
 				}

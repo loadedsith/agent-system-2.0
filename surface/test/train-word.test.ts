@@ -297,6 +297,8 @@ exit 1
 	const PROTECTED = rules(true, ["as2/full-suite"]);
 	/** Ruleset 1 as `gh api repos/<repo>/rulesets/1` returns it to an account that can never bypass it. */
 	const NEVER = { 1: { id: 1, enforcement: "active", current_user_can_bypass: "never" } };
+	/** One CLI run: a fresh Bun process each time, so a test making five or more runs takes the 30 s timeout, not bun's 5 s
+	 * default (R9's twelve took 3 s alone and 5.45 s under the full suite, tr-0mvg482h33pjjhy). */
 	function run(ledgerPath: string, views: StakesView[], args: string[], mainRules?: unknown, rulesets: Record<number, unknown> = NEVER) {
 		const root = tmp("train-stakes");
 		mkdirSync(join(root, "bin"));
@@ -342,7 +344,7 @@ exit 1
 			expect(r.out.startsWith(unverified)).toBe(true);
 		}
 		expect(run(w.path, views, ["stakes", "--repo", REPO, "--pr", "101"]).out).toContain("HTTP 404");
-	});
+	}, 30_000);
 
 	test("D2 bypass: a qualifying rule counts only when the merging account can never bypass its ruleset, and only with no integration_id", () => {
 		const w = stakesWorld();
@@ -366,7 +368,7 @@ exit 1
 		// a ruleset the account can never bypass makes main protected even beside one it can bypass
 		const two = [...rules(true, ["as2/full-suite"]), { ...rules(true, ["as2/full-suite"])[0]!, ruleset_id: 2 }];
 		expect(stakes(two, { 1: { current_user_can_bypass: "always" }, 2: { current_user_can_bypass: "never" } }).out).toBe("normal\n");
-	});
+	}, 30_000);
 
 	test("exit 2 on a usage error or a gh failure", () => {
 		const w = stakesWorld();
@@ -397,7 +399,7 @@ exit 1
 		const prod = run(w.path, views, ["stakes", "--hold-ok", "--repo", REPO, "--pr", "102"]);
 		expect([prod.code, prod.out]).toEqual([0, `production: ${w.prod}'s stakes are production\n`]);
 		expect(run(w.path, [], ["stakes", "--hold-ok", "--repo", REPO, "--pr", "999"]).code).toBe(2);
-	});
+	}, 30_000);
 
 	test("list: the train's members in membership order, `<n> jo` or `<n> board`, read-only, no gh; exit 2 for no such workload", () => {
 		const w = stakesWorld();
