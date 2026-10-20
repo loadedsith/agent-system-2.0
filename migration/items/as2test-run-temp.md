@@ -28,4 +28,4 @@ The existing root-owned refresh helper installs only origin/main. After merge, n
 
 ## Rollback
 
-Revert this change and let the existing refresh helper install the reverted origin/main. An explicit operator deployment script also preserves the previous installed wrapper, bundle and SOURCE and can restore them. Rolling back restores the temp-leak risk; it does not recreate Jo's already-deleted legacy extraction directories. No live session history or open-workload scratch is deleted by this migration.
+Revert this change and let the existing refresh helper install the reverted origin/main. An explicit operator deployment script also preserves the previous installed wrapper, bundle and SOURCE and can restore them under the helper's `refresh.d/lock`, with the required 0755 installed modes. That snapshot undo is temporary: the next runner preflight reapplies main on input drift; a lasting rollback requires reverting main. Rolling back restores the temp-leak risk; it does not recreate Jo's already-deleted legacy extraction directories. No live session history or open-workload scratch is deleted by this migration.
