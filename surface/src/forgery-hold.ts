@@ -7,7 +7,9 @@
 //   <row id> by <in-…>` (surface/src/input.ts), follow the same placement and are matched by row id wherever they sit.
 //   An answer counts only when it is Jo's (ledger/src/jo-channel.ts `joForgeryAnswer`): surface-stamped, carrying a `surface`
 //   jo-channel mark on its own row id (in the provenance of the workload it sits on, the standing one included), and naming
-//   another row. An unmarked answer, however it got there and whatever answers it in turn, lifts no hold.
+//   another row. An unmarked answer, however it got there and whatever answers it in turn, lifts no hold. No reversal voids the
+//   check's own rows, its hit records and its stop request (surface/src/launch.ts `controlEntries`), so a forged
+//   `forgery-reversed:` naming a hit entry hides nothing.
 // - A workload is held while it has a recorded hit with neither answer (`unansweredHits`), or, for the read-only
 //   checks that run before a pass has recorded anything (`merge-train.ts stakes --hold-ok`, the launch reserve), a
 //   fresh hit of the check itself (`holdState`). A hit Jo reversed after the workload closed (`forgery-reversed:` on the

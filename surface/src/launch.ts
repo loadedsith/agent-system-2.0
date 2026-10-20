@@ -175,7 +175,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * (FORGERY_CHECK_BY: the train tick's pass, the launcher's reserve), and so is its `lane-stop: <lane> requested forgery-hold by
  * forgery-check` (`validWriter`); Jo's answers `forgery-confirmed: <row id> by <in-…>` and `forgery-reversed: <row id> by <in-…>`
  * are the surface's, and so is a reversal's compensating mode flip's `mode-compensation: <flip id> reverses <row id>`
- * (surface/src/forgery-words.ts). `controlEntries` drops every entry a surface `forgery-reversed:` of the same workload names.
+ * (surface/src/forgery-words.ts). `controlEntries` drops every entry a surface `forgery-reversed:` of the same workload names,
+ * except the forgery check's own (FORGERY_CHECK_BY): a reversal never voids a hit record or the hold's stop request.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -297,13 +298,16 @@ export function holdersOf(entries: readonly EntryRow[], current: string | null, 
  * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface —
  * is dropped here, so no reader sees it. So is an entry Jo reversed: one an effective surface `forgery-reversed:`
  * among `entries` names (PLAN wl-mvfxw3c4zqfzls D5; ledger/src/jo-channel.ts `reversedRowIds`). A reversal a later
- * effective reversal names voids nothing and is itself dropped, so the entry it named comes back.
+ * effective reversal names voids nothing and is itself dropped, so the entry it named comes back. A reversal never voids
+ * an entry the forgery check wrote (FORGERY_CHECK_BY: its `forgery: hit …` records and its forgery-hold `lane-stop:`
+ * request): Jo's `reverse` answers a flagged row, which is never the check's own, so only a forged reversal names one, and
+ * hiding the hit would lift the hold that contains the forgery (surface/src/forgery-hold.ts and every reader built here).
  */
 export function controlEntries(entries: readonly EntryRow[], holders: readonly string[] = []): ControlEntry[] {
 	const out: ControlEntry[] = [];
 	const reversed = reversedRowIds(entries);
 	for (const e of entries) {
-		if (e.kind !== "assumption" || reversed.has(e.id)) continue;
+		if (e.kind !== "assumption" || (reversed.has(e.id) && e.created_by !== FORGERY_CHECK_BY)) continue;
 		const m = PREFIXED.exec(e.body.trim());
 		if (!m || !(CONTROL_PREFIXES as readonly string[]).includes(m[1]!)) continue;
 		const prefix = m[1] as ControlPrefix;

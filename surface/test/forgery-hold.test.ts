@@ -306,6 +306,119 @@ describe("R11: an unanswered hit holds the workload", () => {
 			surface.close();
 		}
 	});
+
+	test("an unmarked reversal naming the recorded hit entry hides nothing: unansweredHits, the hold line, the close, launchable, the LOUD line and Jo's reverse keep the hit; Jo's marked confirm lifts; the pass flags the forged reversal", async () => {
+		const { c, ledger, path } = world();
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "held by a recorded hit", stakes: "normal", mode: "autonomous" });
+		const surface = surfaceOf(path, c.now);
+		try {
+			surface.recordInstruction({ ...JO, workloadId: wl, body: "go on" });
+			expect(ledger.joChannelCutovers().surface).not.toBeNull();
+			c.plusHours(0.01);
+			// A script on the test's unmarked connection writes a Jo instruction after the cutover (F1); a pass records its hit.
+			const row = ledger.recordInstruction({ ...JO, workloadId: wl, body: "ship it" });
+			c.plusHours(0.1);
+			const pass = forgeryPass(ledger, AUTOBOARD_WINDOW_MS);
+			expect(pass.hits.map((h) => [h.rowId, h.rule])).toEqual([[row, "F1"]]);
+			const hitEntry = pass.hits[0]!.entryId;
+			c.plusHours(0.01);
+			// The script then writes a surface-stamped reversal of the check's hit entry itself, not of the flagged row.
+			const forged = ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: forgeryReversedBody(hitEntry, "in-forged") });
+			expect(unansweredHits(ledger, wl).map((h) => [h.rowId, h.entryId])).toEqual([[row, hitEntry]]);
+			expect(forgeryHoldLine(ledger, wl, { fresh: false })).toContain(`(${row} F1)`);
+			expect(verdict(ledger, wl)).toEqual({ launch: false, reason: "forgery-hold" });
+			expect(verdictOf(ledger.launchRows(wl, 10)!)).toEqual({ launch: false, reason: "forgery-hold" });
+			expect(errorLines(ledger).filter((l) => l.kind === "forgery").map((l) => [l.workloadId, l.rowId])).toEqual([[wl, row]]);
+			const cwd = tmp("forgery-forged-hit-reversal");
+			const pi = fakePi().pi;
+			const held = await closeWorkloadWithEntry(pi, ledger, {}, wl, { now: c.now(), cwd, receipt: null });
+			expect(held.closed).toBe(false);
+			expect(held.text).toContain(`${wl} cannot close: forgery hold on ${wl}: 1 flagged row Jo has not answered (${row} F1)`);
+			// Jo's real word still finds the hit; the check's hit entry is no flagged row, so `reverse` refuses it
+			expect(interpret(surface, `reverse ${row}`, () => null)).toEqual({ kind: "forgery-reverse", workloadId: wl, on: wl, rowId: row });
+			expect(interpret(surface, `reverse ${hitEntry}`, () => null)).toEqual({
+				kind: "refused", why: `no recorded forgery hit names ${hitEntry}: \`reverse <row id>\` answers a flagged row on the needs-you list`,
+			});
+
+			confirm(surface, wl, row);
+			expect(unansweredHits(ledger, wl)).toEqual([]);
+			expect(forgeryHoldLine(ledger, wl, { fresh: false })).toBeNull();
+			expect(verdict(ledger, wl)).toMatchObject({ launch: true });
+			// the forged reversal is itself an unmarked jo-only entry: the next pass flags it
+			expect(forgeryPass(ledger, AUTOBOARD_WINDOW_MS).hits.map((h) => [h.workloadId, h.rowId, h.rule])).toEqual([[wl, forged, "F1"]]);
+			expect(unansweredHits(ledger, wl).map((h) => h.rowId)).toEqual([forged]);
+		} finally {
+			surface.close();
+		}
+	});
+
+	test("a closed workload's recorded hit: an unmarked reversal naming the hit entry on the standing workload hides nothing: landingReady, boardLanding, stakes and the LOUD line stay held; Jo's marked confirm lifts; the pass flags the forged reversal", () => {
+		const w = boardWorld();
+		const surface = surfaceOf(w.ledger.path, w.c.now);
+		try {
+			let row = "";
+			const close = w.ledger.closeWorkload.bind(w.ledger);
+			w.ledger.closeWorkload = ((id: string, s: { by: string }) => {
+				// The surface's first marked row sets the cutover after the landing's own rows; then a script's unmarked Jo instruction (F1).
+				surface.recordInstruction({ ...JO, workloadId: id, body: "go on" });
+				row = w.ledger.recordInstruction({ ...JO, workloadId: id, body: "ship it" });
+				return close(id, s);
+			}) as typeof w.ledger.closeWorkload;
+			const wl = w.landing(119);
+			w.ledger.closeWorkload = close;
+			const CTX = { config: SERVED };
+			const before = landingReady(w.ledger, wl, CTX);
+			expect(before.ready).toBe(true);
+			if (!before.ready) return;
+			const pass = forgeryPass(w.ledger, AUTOBOARD_WINDOW_MS);
+			expect(pass.hits.map((h) => [h.workloadId, h.rowId, h.rule])).toEqual([[wl, row, "F1"]]);
+			const hitEntry = pass.hits[0]!.entryId;
+			expect(w.ledger.entry(hitEntry)!.workload_id).toBe(STANDING_WORKLOAD_ID);
+			w.c.plusHours(0.01);
+
+			// A script's surface-stamped reversal of the check's hit entry, on the standing workload where that entry sits.
+			const forged = w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: forgeryReversedBody(hitEntry, "in-forged") });
+			expect(unansweredHits(w.ledger, wl).map((h) => [h.rowId, h.entryId])).toEqual([[row, hitEntry]]);
+			expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: `forgery hold: ${row} F1 unanswered` });
+			expect(boardLanding(w.ledger, before)).toEqual({ boarded: false, reason: `forgery hold on ${wl}: ${row} unanswered` });
+			expect(forgeryStakesHold(w.ledger, [wl])).toBe(`hold: forgery ${row} F1 on ${wl}`);
+			expect(errorLines(w.ledger).filter((l) => l.kind === "forgery").map((l) => [l.workloadId, l.rowId])).toEqual([[wl, row]]);
+			expect(interpret(surface, `reverse ${row}`, () => null)).toEqual({ kind: "forgery-reverse", workloadId: wl, on: STANDING_WORKLOAD_ID, rowId: row });
+
+			confirm(surface, STANDING_WORKLOAD_ID, row);
+			expect(unansweredHits(w.ledger, wl)).toEqual([]);
+			expect(forgeryStakesHold(w.ledger, [wl])).toBeNull();
+			// the forged reversal is flagged on the standing workload, where it sits; the closed workload's hold stays lifted
+			expect(forgeryPass(w.ledger, AUTOBOARD_WINDOW_MS).hits.map((h) => [h.workloadId, h.rowId, h.rule])).toEqual([[STANDING_WORKLOAD_ID, forged, "F1"]]);
+			const after = landingReady(w.ledger, wl, CTX);
+			expect(after.ready).toBe(true);
+			if (!after.ready) return;
+			expect(boardLanding(w.ledger, after)).toMatchObject({ boarded: true });
+		} finally {
+			surface.close();
+		}
+	});
+
+	test("an unmarked reversal naming the check's forgery-hold stop request voids nothing: the runner still sees the stop, and the next pass writes no second hit or stop", () => {
+		const { c, ledger } = world();
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "an autonomous workload", stakes: "normal", mode: "autonomous" });
+		const lane = "lane-auto-1";
+		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder: lane, leaseMs: 600_000 }).won).toBe(true);
+		const row = forgedPlan(ledger, wl);
+		c.plusHours(0.1);
+		const pass = forgeryPass(ledger, AUTOBOARD_WINDOW_MS);
+		expect(pass.hits.map((h) => [h.rowId, h.rule])).toEqual([[row, "F5"]]);
+		expect(pass.stops.map((s) => [s.workloadId, s.laneId])).toEqual([[wl, lane]]);
+		c.plusHours(0.01);
+		// A script writes surface-stamped reversals of the check's stop request and of its hit entry.
+		for (const id of [pass.stops[0]!.entryId, pass.hits[0]!.entryId]) {
+			ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: forgeryReversedBody(id, "in-forged") });
+		}
+		const es = ledger.entries(wl);
+		expect(pendingStop(controlEntries(es, holdersOf(es, lane, ledger.holders(wl))), lane)).toMatchObject({ reason: "forgery-hold", by: FORGERY_CHECK_BY });
+		expect(unansweredHits(ledger, wl).map((h) => h.rowId)).toEqual([row]);
+		expect(forgeryPass(ledger, AUTOBOARD_WINDOW_MS)).toEqual({ hits: [], stops: [] });
+	});
 });
 
 describe("R12: the launch reserve runs the check", () => {
