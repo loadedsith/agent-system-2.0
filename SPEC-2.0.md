@@ -266,6 +266,50 @@ now ruled). Enforcement is P-11's: each item is a tool call a gate must recognis
 evasions — browser writes are not tool calls, shell inside `eval` reaches the gate as one opaque
 string — are build requirements on the gate, not list items.
 
+**Amended 2026-10-20 — routine deploys, escalated only on a named risk condition**
+(`migration/items/routine-deploy-risk-conditions.md`; Jo, ledger inputs `in-mvgor1imswhbsw` (the opening brief: routine
+deploys run without Jo, and a deploy escalates only on a written, research-cited condition) and `in-mvgpe7k1np4xkw`
+(*"doesn't mean it has to"*: a lane may deploy but need not after every merge; order across repos matters; build on
+escalation phase 2); plan `~/agent-scratch/agent-system-2.0/wl-mvgorfqqbuyyo0/PLAN.md` rev 9; built in
+wl-mvgorfqqbuyyo0). Deploy
+stays reserved, with one exception: a `workflow_dispatch` run of a Jo-accepted workflow, issued by a lane (not a hand,
+the orchestrator or a train lane), whose bash command equals one declared target's command byte for byte. Every deploy
+CLI, `infrastructure change`, `publishes a package`, `gh release`, every secret rule and any `gh workflow run` that
+matches no target stay reserved with their refusal text unchanged. Jo accepts the profile's `deploy:` section with the
+word `deploy-policy <sha12>`; only the newest `deploy-policy:` row counts, and `deploy-policy off` or any other hash
+means no target is routine. A lane may deploy, but it never must: no merge, close, settle or tick deploys anything, and
+a lane deploys only when its workload calls for it. Every fact is a `gh api` read, a ledger read, the clock or the
+gate's own HTTPS GET; a declared command is never run. The code (`gates/src/deploy-risk.ts`) decides one of four
+outcomes, and every condition that holds is named:
+
+- **Hold**: a plain refusal, no reserved request, nothing reaches Jo, never overridden by an approval. `O1` the
+  predecessor target in `deploy.order` has merged work not yet deployed (cross-repo order: deploy the predecessor first);
+  `U1` a deploy of the target has no settle row (run `as2 deploy settle <dp-…>`); `U2` (on `gh pr merge`) a deploy of
+  the repo is unsettled; `U3` a merge of the repo started or finished while the facts were read (re-evaluate).
+- **Escalate**: a reserved request `deploy (<target>, escalated: <ids>) …` that is NOW under escalation phase 2. `E0` the
+  policy is not authenticated, has a bad shape, the workflow blob moved, a fact could not be read, or the compare is
+  capped; `E1` the workload's stakes are production; `E2` a required check is missing, not green, or any check at the
+  commit failed; `E3` the default branch moved while facts were read, an open PR has auto-merge, or a merge queue is on;
+  `E4` migration or data-shape files changed; `E5` auth, payment, secret, infra or pipeline files changed; `E6` no
+  known-good release to return to (first deploy, no rollback text, or no successful run of the previous commit); `E7` a
+  workflow run of a declared target that is not byte-equal to its command; `E8` the target's newest settle failed with
+  no later ok; `E9` the change is over the high line count; `E10` the target's health probe fails before the deploy;
+  `E11` an as2 merge of the repo is unresolved; `M1` a `gh pr merge` on a repo whose push to the default branch deploys.
+- **Defer**: `D1` now is outside the deploy window; a reserved request `off-hours deploy (<target>) …` that waits for
+  Jo's window instead of pinging.
+- **Warn**, never blocks, rides the `deploy:` row and the notice: `W1` a direct dependency's major version changed;
+  `W2` a required check passed only on a re-run, or an optional one was skipped; `W3` the change is over the low line
+  count; `W4` the change touches many top-level directories.
+
+**Approval binding.** The request records each condition as its id plus the facts that made it hold, in sorted form,
+with their sha256. Jo's `approve` admits that exact command once, at that commit, within 24 hours, only when every
+condition holding at admission is one the request named and no hold applies; a second call, a moved branch, a withdrawn
+request or a new instance (another stalled PR, a new failing check, another matched path) needs a new approval. A
+merge-triggered repo's approved merge is admitted once and only with `--match-head-commit` equal to the recorded head.
+After a dispatch the lane runs `gh run watch` and `as2 deploy settle <dp-…>`, which binds the run, checks the shipped
+commit and the health probe, writes `deploy-settled:` and sends one notice; a lane cannot release or hand off with a
+deploy unsettled. The research behind each condition, with its source and passage, is in `docs/deploy-risk.md`.
+
 **Amended 2026-10-08 — no process from eval** (MIGRATION.md item 58; Jo: *"standing rule: deny
 any reserved request that launches a command from eval or a subprocess, without asking me, and tell
 the lane to use bash"*; to Ilex's "refuse outright?": *"yes, open it"*; built in
