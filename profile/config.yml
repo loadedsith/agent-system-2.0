@@ -288,6 +288,11 @@ testRunner:
   soloCapMin: 10
   reportCapMb: 50
   queueMaxMin: 60
+  # Workers for the PR's full part (workload wl-mvg2kzuvwngdmo): over 1, test-exec runs it as
+  # `bun test --parallel=<n>` (an integer of 1 or more; absent means 1). Base reruns (`base-full`)
+  # stay serial whatever this says. surface/scripts/test-run-waits.ts reads each run's `full workers`
+  # line and wait back per day. Reversal: `fullWorkers: 1`.
+  fullWorkers: 6
 
 # ── Tracing switch (wl-mv65t5d34lts00 PLAN.md §§ 2, 8; surface/src/tracing.ts) ──
 # Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): all (the
