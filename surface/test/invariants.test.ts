@@ -16,6 +16,7 @@ import { askJo } from "../../gates/src/rulings";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
+import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { reservedStates } from "../src/errors";
 import { BACKUP_GAP_MS, check, gitIn, type Git, type Input, jsonLines, newestWrite, orchestratorsFromPs, parseArgs, type Probe, type PsDeps, renderTable, type Report, reservedView, reviewsLine, type Run } from "../scripts/invariants";
 import { AS_OF, buildFixture, LANE_RUNNER } from "./fixtures/invariants/build";
@@ -111,6 +112,30 @@ describe("the ledger invariants over the fixture (as-of, one lane alive)", () =>
 		for (const i of ["checkout-behind-main", "process-older-than-head", "ff-lull"]) expect(skipsOf(r, i)).toEqual([expect.stringContaining("replay (--as-of)")]);
 		expect(renderTable(r)).toContain("[checkout-behind-main] skipped: replay");
 		expect(renderTable(r)).toContain("6 finding(s): dead-lane=1 silent-lane=0 orphan-hand=1"); // + stale-reserved, stuck-question, provider-refusal-loop, silent-orchestrator
+	});
+});
+
+describe("silent-orchestrator and the train tick's rows (PLAN wl-mvbjiettjrfpxc D10)", () => {
+	/** Whether silent-orchestrator fires over a copy of the fixture with one more wl-orchestrator row by `by`, 10 min before as-of. */
+	const silentWith = (by: string, body: string) => {
+		const path = join(tmp("silent"), "ledger.db");
+		copyFileSync(fixture.path, path);
+		const at = new Date(Date.parse(AS_OF) - 10 * 60_000).toISOString();
+		const l = Ledger.open(path, { backup: false, backupOnOpen: false, clock: () => at });
+		l.recordEntry({ by, workloadId: "wl-orchestrator", kind: "assumption", body });
+		l.close();
+		const copy = new Database(path, { readonly: true });
+		try {
+			return run({ db: copy }).findings.some((x) => x.invariant === "silent-orchestrator");
+		} finally {
+			copy.close();
+		}
+	};
+
+	test("R12: the merge train's rows on wl-orchestrator do not hide a silent orchestrator; the orchestrator's own row does", () => {
+		expect(silentWith(MERGE_TRAIN_BY, "train-board-skip: workload wl-a1 pr 7 head none stakes production")).toBe(true);
+		expect(silentWith(MERGE_TRAIN_BY, "train-notice: protection thewolff/product gap no rule")).toBe(true);
+		expect(silentWith(SURFACE_BY, "decision: Jo asked for the plan")).toBe(false);
 	});
 });
 
