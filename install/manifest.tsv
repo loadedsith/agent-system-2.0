@@ -1274,6 +1274,11 @@ surface/src/tracing.ts	module	-
 surface/scripts/tracing.ts	module	-
 surface/test/tracing.test.ts	test	-
 surface/test/phoenix-run.test.ts	test	-
+# Plugin-registry check (wl-mv8k0fby51uakg PLAN D7, jo-issues#51): bin/as2 refuses to start the orchestrator when an OMP
+# registry's effective plugin version differs from an active Claude Code entry's; `as2 plugins` runs it alone.
+surface/src/plugin-registries.ts	module	-
+surface/scripts/plugin-registries.ts	module	-
+surface/test/plugin-registries.test.ts	test	-
 # Agent channel, phase 1 (migration/items/agent-channel.md): Plumb sends Ilex notes and proposals through
 # the OMP seat mailbox; never authored as Jo. Loaded by surface/index.ts for the orchestrator only.
 surface/src/channel.ts	module	-
