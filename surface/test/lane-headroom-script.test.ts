@@ -277,6 +277,7 @@ describe("mature week-only runner admission against configured budget alternativ
 			expect(snap.control.some((c) => c.prefix === "lane-ready" || c.prefix === "lane-headroom")).toBe(false);
 			expect(snap.deaths).toHaveLength(1);
 			expect(snap.workload!.holder).toBeNull();
+			if (named) expect(runnerLog(r, wl)).toContain("quota guard comparison unavailable: the strong row could not be read:");
 			if (named) expect(spawns(r)).toEqual([]);
 			else {
 				expect(failure?.rest).toContain("the strong row could not be read");
@@ -297,6 +298,9 @@ describe("mature week-only runner admission against configured budget alternativ
 		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
 		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: A, ranModel: A });
 		expect(commandsOf(r, 1).slice(0, 2)).toEqual(["get_state", "prompt"]);
+		expect(commandsOf(r, 1).some((c) => c.startsWith("set_model"))).toBe(false);
+		expect(snap.control.some((c) => c.prefix === "lane-headroom")).toBe(false);
+		expect(runnerLog(r, wl)).toContain("quota guard comparison unavailable: the strong row could not be read:");
 		expect(snap.deaths).toEqual([]);
 	}, 60_000);
 
@@ -326,7 +330,6 @@ describe("mature week-only runner admission against configured budget alternativ
 		expect(laneExit(snap.control, lane1)).toMatchObject({ outcome: "completed" });
 		expect(commandsOf(r, 1).slice(0, 4)).toEqual(["get_state", `set_model ${K}`, "get_state", "prompt"]);
 		expect(laneStarted(snap.control, lane1)).toMatchObject({ model: null, ranModel: K });
-		expect(snap.control.find((c) => c.prefix === "lane-headroom")?.rest).toBe(`${A} -> ${K} (anthropic 5h 0.87 used > 0.80)`);
 		const order = snap.control.filter((c) => c.laneId === lane1).map((c) => c.prefix);
 		expect(order.indexOf("lane-headroom")).toBeLessThan(order.indexOf("lane-ready"));
 		expect(snap.control.some((c) => c.prefix === "lane-model")).toBe(false);

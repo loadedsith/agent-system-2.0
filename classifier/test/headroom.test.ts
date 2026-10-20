@@ -81,6 +81,59 @@ describe("projected at reset, by the window's pace", () => {
 		});
 	}
 
+	for (const windowId of ["7d", "1w"]) {
+		for (const elapsed of [59, 60, 2015, 2016]) {
+			for (const used of [1, 1.01]) {
+				test(`${windowId} actual exhaustion at ${used} refuses at ${elapsed}min without a comparison exception`, () => {
+					const source = lim("openai-codex", windowId, used, WEEK_MIN - elapsed);
+					const h = comparison([{ ...source, usedFraction: 0.99 }, claude(0.04)], [source, claude(0.87)]);
+					expectRefused(h);
+					expect(h.decisionFor(SOL).out).toContain(`openai-codex ${windowId}`);
+					if (elapsed === 2016) expect(h.decisionFor(SOL).out).toContain("projected");
+				});
+			}
+		}
+		for (const elapsed of [59, 60, 2015]) {
+			test(`${windowId} .999 remains ordinarily admitted before warm-up at ${elapsed}min`, () => {
+				const source = lim("openai-codex", windowId, 0.999, WEEK_MIN - elapsed);
+				const h = comparison([{ ...source, usedFraction: 0.99 }, claude(0.04)], [source, claude(0.87)]);
+				expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null });
+				expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null });
+			});
+		}
+	}
+
+	test("actual week exhaustion preserves the first existing ordinary refusal regardless of limit order", () => {
+		const exhausted = lim("openai-codex", "7d", 1, WEEK_MIN - 59);
+		const hard = lim("openai-codex", "5h", 0.87, 290);
+		const paced = lim("openai-codex", "2d", 0.6, 1440);
+		const ordinary = at([poll(0, [hard, paced])]).decisionFor(SOL);
+		for (const limits of [[exhausted, hard, paced], [hard, exhausted, paced], [hard, paced, exhausted]]) {
+			const h = comparison([claude(0.04)], [...limits, claude(0.87)]);
+			expect(h.decisionFor(SOL)).toEqual(ordinary);
+			expectRefused(h);
+		}
+		const h = comparison([week(0.20), claude(0.04)], [exhausted, week(0.21), claude(0.87)]);
+		expect(h.decisionFor(SOL)).toEqual(at([poll(0, [week(0.21)])]).decisionFor(SOL));
+		expectRefused(h);
+	});
+
+	test("exhaustion leaves unknown, no-reset, expired and old-format week compatibility paths unchanged", () => {
+		for (const used of [1, 1.01]) {
+			const limits = [
+				lim("openai-codex", "monthly", used, 60),
+				lim("openai-codex", "2d", used, 2880 - 59),
+				...["7d", "1w"].flatMap(windowId => [null, NOW, NOW - 1].map(resetsAt => ({
+					...lim("openai-codex", windowId, used, 60), resetsAt,
+				}))),
+			];
+			const h = comparison([claude(0.04)], [...limits, claude(0.87)]);
+			expect(h.decisionFor(SOL)).toEqual({ out: null, retained: null });
+			expect(h.decisionFor(SOL, [OPUS])).toEqual({ out: null, retained: null });
+			expect(at([oldPoll(0, { "openai-codex/7d/chat": used, "openai-codex/1w/chat": used })]).decisionFor(SOL)).toEqual({ out: null, retained: null });
+		}
+	});
+
 	test("5h warm-up remains inclusive at 60min, not 59min", () => {
 		expect(at([poll(0, [lim("anthropic", "5h", 0.21, 241)])]).decisionFor(OPUS).out).toBeNull();
 		for (const resetIn of [240, 239]) {

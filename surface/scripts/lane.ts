@@ -1107,7 +1107,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let strongRow: string[] = [];
 	let strongRowFailure: string | null = null;
 	try {
-		strongRow = loadTierTable(join(profileAgentDir(), "config.yml")).strong.map(modelIdentity);
+		strongRow = loadTierTable(profileConfig()).strong.map(modelIdentity);
 	} catch (err) {
 		strongRowFailure = oneLine(err);
 	}
@@ -1428,6 +1428,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			// Budget comparison can retain Jo's named source, never substitute it. An out decision still fails before any omp,
 			// and the catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
 			if (model !== null) {
+				if (strongRowFailure !== null) process.stderr.write(`runner: ${laneId} quota guard comparison unavailable: the strong row could not be read: ${strongRowFailure}\n`);
 				const decision = room.decisionFor(model, strongRow);
 				if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
 				if (decision.out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${decision.out}`, STARTER_EXIT["not-launchable"]!);

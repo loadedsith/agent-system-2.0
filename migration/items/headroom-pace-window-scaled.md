@@ -2,7 +2,7 @@
 title: Window-scaled headroom pace and budget protection
 status: building
 workload: wl-mv958y95fk07wg
-pr: null
+pr: none
 ---
 
 ## Scope and delivery boundary
@@ -20,9 +20,9 @@ The replacement starts projection at the inclusive threshold `max(60 minutes, wi
 - A five-hour window still starts projection at 60 minutes.
 - A seven-day window, including the equivalent `1w` form, starts at 2016 minutes: **33h36m**. A 6% reading at 60 or 61 minutes no longer triggers weekly projection.
 - Once warm-up is reached, the existing `used / elapsed × window length` projection still refuses at projected usage `>= 1.0` unless the narrowly defined budget comparison below retains the source.
-- The strict five-hour `used > 0.80` ceiling applies even during warm-up. Hard source limits and actual exhaustion are never waived by the comparison exception.
+- The strict five-hour `used > 0.80` ceiling applies even during warm-up. A known seven-day window (`7d` or `1w`) with a future reset and actual usage `>= 1.0` also refuses before warm-up; an existing ordinary refusal keeps its first reason and wording. Hard source limits and actual exhaustion are never waived by the comparison exception.
 
-Twenty percent is an approved policy choice, not a claim of statistical confidence. Existing tier/provider binding, stale or missing poll fail-open behavior and unknown/reset/expired/old-format handling remain in place. In particular, missing comparison evidence does not turn an ordinary base refusal into admission.
+Twenty percent is an approved policy choice, not a claim of statistical confidence. Existing tier/provider binding, stale or missing poll fail-open behavior and unknown/reset/expired/old-format handling remain in place. The pre-warm-up exhaustion rule does not extend to unknown-length windows, other window lengths, absent reset timestamps or passed resets. In particular, missing comparison evidence does not turn an ordinary base refusal into admission.
 
 ## Recent evidence and comparator order
 
@@ -58,7 +58,7 @@ Budget comparison is **not spawn authorization**:
 - Same-lab builds keep their legal lane-lab row; budget comparators come from the configured tier row without widening legal spawn choices.
 - Reviews and panels retain their builder exclusions, pins, grants and independent-review restrictions. Their configured budget alternatives do not authorize a forbidden review leg.
 - A named lane remains exactly on its named source model; retention never calls `set_model` to substitute a different model. Unnamed lanes can likewise retain the original source rather than displace work onto a faster-burning budget.
-- Lanes use the installed strong row as ordered counterfactual budgets, not a claim that each comparator is a verified runnable fallback. If that row cannot be read, no exception is available; ordinary source admission still works and an out source keeps its refusal.
+- Lanes use the installed strong row as ordered counterfactual budgets, not a claim that each comparator is a verified runnable fallback. If that row cannot be read, no exception is available; a named lane explains the missing comparison through stderr, ordinary source admission still works and an out source keeps its refusal.
 - Actual unnamed-lane moves retain the existing strong-row order and confirmed `set_model` / `get_state` sequence. **Destination checks use base-only `decisionFor(candidate)`**, without comparators. A quota-out benchmark or a destination that could itself earn a retention exception is not thereby admitted as a move destination.
 
 ## Observed proof and pending delivery

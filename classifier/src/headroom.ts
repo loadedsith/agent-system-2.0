@@ -14,8 +14,8 @@
  *   binding-meter rate, in quota points/hour, not token-equivalent capacity. Hard/exhausted limits never relax.
  * - A limit binds a selector when the provider matches and its tier is null or the model id contains the tier
  *   (`fable` binds `anthropic/claude-fable-*` only; Fable's meter never takes Opus out).
- * - Out: a binding limit with a pace projection ≥ 1.0, or a binding 5h limit with `u > FIVE_HOUR_CEILING`.
- *   A limit whose `resetsAt` has already passed has reset and binds nothing.
+ * - Out: a binding limit with a pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
+ *   exhausted known week with a future reset even before warm-up. A passed reset binds nothing.
  * - Old poll lines (no `limits`) read their `rows` keys as limits with no reset time, so only the 5h rule applies.
  *   A third key segment is a tier unless it is a meter name in `METERS` (`openai-codex/7d/chat` is the shared meter).
  *   An unknown third segment read as a tier binds only models whose id contains it, so a misread fails open.
@@ -206,14 +206,22 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 		note: null,
 		decisionFor(selector: string, comparators: readonly string[] = []): HeadroomDecision {
 			let out: string | null = null;
+			let exhausted: Limit | null = null;
 			let weekPaceOnly = true;
 			for (const l of bindingLimits(newest, selector)) {
 				if (l.resetsAt !== null && l.resetsAt <= now) continue;
-				if (l.used >= 1) weekPaceOnly = false;
+				if (l.used >= 1) {
+					weekPaceOnly = false;
+					if (l.resetsAt !== null && windowMs(l.windowId) === WEEK_MS) exhausted ??= l;
+				}
 				const refusal = refusalOf(l);
 				if (!refusal) continue;
 				out ??= refusal.reason;
 				if (!refusal.weekPaceOnly) weekPaceOnly = false;
+			}
+			// Exhaustion closes only the week warm-up gap; keep the first existing ordinary refusal and its wording.
+			if (out === null && exhausted !== null) {
+				out = `${exhausted.provider} ${exhausted.windowId}${exhausted.tier ? ` ${exhausted.tier}` : ""} ${pct(exhausted.used)} used, quota exhausted`;
 			}
 			const base = { out, retained: null };
 			if (out === null || !weekPaceOnly || !older) return base;

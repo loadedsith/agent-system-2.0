@@ -577,8 +577,8 @@ async function availableRow(
 
 /**
  * Legal spawn entries, with quota decisions against available configured budget alternatives.
- * `budgets` covers `row` but never authorizes its other selectors to spawn. Core owns lab filtering,
- * ordering and comparison policy. Null room preserves credential/refusal-only Kimi checks.
+ * Selectors absent from `budgets` fail closed; its other selectors never gain spawn authority. Core owns lab
+ * filtering, ordering and comparison policy. Null room preserves credential/refusal-only Kimi checks.
  */
 async function usableRow(
 	row: readonly string[],
@@ -595,7 +595,8 @@ async function usableRow(
 	const projected: Record<string, string> = {};
 	const retained: Record<string, string> = {};
 	for (const selector of row) {
-		if (available.why[selector]) why[selector] = available.why[selector]!;
+		if (!budgets.includes(selector)) why[selector] = "not in the configured budget row";
+		else if (available.why[selector]) why[selector] = available.why[selector]!;
 		else {
 			const decision = room?.decisionFor(selector, available.usable);
 			if (decision?.out) why[selector] = `projected out: ${(projected[selector] = decision.out)}`;
