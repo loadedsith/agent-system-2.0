@@ -586,6 +586,44 @@ export function sendCeilingNotice(
 	});
 }
 
+/** One meter poll's outcome: the step, and whether its ceiling stop's `lane-stop: <lane> accepted ceiling` is already on the ledger. */
+export interface MeterPoll extends MeterResult {
+	accepted: boolean;
+}
+
+/**
+ * One meter poll on the ledger, in one transaction: the ceiling in force read now (the workload's control entries, its
+ * instructions and its stakes), the step over `spend`, the notice or the stop's `spend:` entry, and on a stop the
+ * `lane-stop: <lane> accepted ceiling`. A raise (surface/src/input.ts `raiseCeiling`, also one transaction) therefore
+ * lands either before it, and the lane goes on under the new value, or after it, and sees the accepted stop and requests
+ * the relaunch; never between a stop decided on the old value and its acceptance. When the writes fail after a stop was
+ * decided, the stop still stands (`accepted` false: the caller accepts it on its own) and the state is unchanged;
+ * any other failure throws.
+ */
+export function meterPoll(ledger: Ledger, r: { workloadId: string; laneId: string; spend: Spend; state: MeterState }): MeterPoll {
+	let decided = null as MeterResult | null;
+	try {
+		const step = ledger.write(() => {
+			decided = null;
+			const w = ledger.workload(r.workloadId);
+			if (!w) throw new Error(`no workload ${r.workloadId}`);
+			const es = ledger.entries(r.workloadId);
+			const ceiling = effectiveCeiling(controlEntries(es, holdersOf(es, w.holder)), ledger.instructions(r.workloadId), w.stakes);
+			const s = meterStep(r.state, { ceiling, spend: r.spend, sent: ceilingNoticesSent(ledger, r.workloadId, ceiling) });
+			decided = s;
+			if (s.notice !== null) sendCeilingNotice(ledger, { workloadId: r.workloadId, laneId: r.laneId, level: s.notice, spend: r.spend, ceiling, stakes: w.stakes });
+			else if (s.stop) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: spendBody(r.laneId, r.spend) });
+			if (s.stop) ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: r.workloadId, kind: "assumption", body: laneStopAcceptedBody(r.laneId, "ceiling") });
+			return s;
+		});
+		return { ...step, accepted: step.stop };
+	} catch (err) {
+		if (decided === null || !decided.stop) throw err;
+		process.stderr.write(`runner: the ceiling stop's writes failed: ${String(err)}\n`);
+		return { ...decided, state: r.state, accepted: false };
+	}
+}
+
 /** What `recordDecision` wrote, step by step (the tests read it; the runner only logs failures). */
 export interface DecisionRecord {
 	death: "written" | "present" | "failed" | "none";
@@ -1096,24 +1134,23 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
 	/**
-	 * One meter poll: the 80 % notice once per ceiling value; at 100 % the stop notice once per ceiling value and the stop
-	 * through the stop path (acceptance `ceiling`, outcome stop, no lane-died:). A failure is logged, never fatal; a stop the
-	 * step called for is taken even when its writes failed. Returns whether it stopped the lane.
+	 * One meter poll (`meterPoll`): the 80 % notice once per ceiling value; at 100 % the stop notice once per ceiling value
+	 * and the stop through the stop path (acceptance `ceiling`, outcome stop, no lane-died:), the ceiling read and the
+	 * acceptance in one transaction. `control` is the poll's snapshot, for the wall only. A failure is logged, never fatal; a
+	 * stop the step called for is taken even when its writes failed. Returns whether it stopped the lane.
 	 */
-	const meter = (stakes: Stakes, control: readonly ControlEntry[]): boolean => {
+	const meter = (control: readonly ControlEntry[]): boolean => {
 		let stopping = false;
+		let accepted = false;
 		try {
-			const spend = measure(control);
-			const ceiling = effectiveCeiling(control, ledger.instructions(wl), stakes);
-			const step = meterStep(meterState, { ceiling, spend, sent: ceilingNoticesSent(ledger, wl, ceiling) });
-			stopping = step.stop;
-			if (step.notice !== null) sendCeilingNotice(ledger, { workloadId: wl, laneId, level: step.notice, spend, ceiling, stakes });
-			else if (step.stop) record(spendBody(laneId, spend));
-			meterState = step.state;
+			const polled = meterPoll(ledger, { workloadId: wl, laneId, spend: measure(control), state: meterState });
+			stopping = polled.stop;
+			accepted = polled.accepted;
+			meterState = polled.state;
 		} catch (err) {
 			process.stderr.write(`runner: the ceiling meter failed: ${String(err)}\n`);
 		}
-		if (stopping) stop("ceiling", "ceiling");
+		if (stopping) stop("ceiling", "ceiling", accepted);
 		return stopping;
 	};
 
@@ -1194,13 +1231,16 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	/**
 	 * A stop, from the ledger or a signal: acceptance persisted first, then abort and end (decision 14). A stop after the
 	 * runner decided the outcome (and enqueued its death) is accepted and recorded, and the decided outcome stands (D3).
+	 * `accepted`: the acceptance is already on the ledger (the meter's ceiling stop, `meterPoll`).
 	 */
-	const stop = (ref: string, reason: string): void => {
+	const stop = (ref: string, reason: string, accepted = false): void => {
 		if (outcome === "stop" || finished) return;
-		try {
-			record(laneStopAcceptedBody(laneId, ref));
-		} catch (err) {
-			process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
+		if (!accepted) {
+			try {
+				record(laneStopAcceptedBody(laneId, ref));
+			} catch (err) {
+				process.stderr.write(`runner: the stop acceptance could not be written: ${String(err)}\n`);
+			}
 		}
 		if (outcome === null) {
 			outcome = "stop";
@@ -1386,7 +1426,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					const { workload: latest, control } = controlNow();
 					const stakes = latest?.stakes ?? w.stakes;
 					// A relaunch already at or past the ceiling stops here, before lane-ready: and before the first prompt spends a model turn past it.
-					if (meter(stakes, control)) {
+					if (meter(control)) {
 						ready = true;
 						return;
 					}
@@ -1474,7 +1514,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 					send({ id: "abort", type: "abort" });
 					conclude("deadline", laneDiedDeadlineBody(laneId, maxTime, inFlightNow()));
 				}
-				if (ready && outcome === null) meter(cur?.stakes ?? w.stakes, control);
+				if (ready && outcome === null) meter(control);
 				// D6: held for the lane's hands, and (PLAN wl-mv5i3lulwwbbi8 D8) the workload's live test runs; once none is left,
 				// omp's own word on settled (get_state) comes first.
 				if (holding && outcome === null) {

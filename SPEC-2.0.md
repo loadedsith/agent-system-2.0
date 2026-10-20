@@ -500,8 +500,9 @@ When an active ruling covers the question, no question row is written and nothin
 `ruling-applied: <ruling> kind <k> slice <sl> answer <a>`, and the lane and orchestrator tools return the ruling and
 its action instead of a question id. Every other question, of kind `other` (round limit, merge train, plan, safety) or
 outside a ruling's scope, is raised as before. A ruling is added only by a code change from Jo's words, and Jo's
-`end-ruling <id>` ends one at once. The invariant report's `ruling-miss` lists a question raised since 2026-10-19
-that an active ruling would have decided, the runtime check for a raise path that bypasses `askJo`. **Notices:**
+`end-ruling <id>` ends one at once. The invariant report's `ruling-miss` lists a question raised since the ledger's
+first `ruling-applied:` entry (the check's activation) that an active ruling would have decided, the runtime check for
+a raise path that bypasses `askJo`. **Notices:**
 something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a plan that started on its own,
 § B6 and § B11 *Amended 2026-10-19*) is a `notice:` message to the orchestrator written by trusted tool code
 (`sendNotice`, `surface/src/notice.ts`), never a `questions` row. It shows after every other needs-you line as

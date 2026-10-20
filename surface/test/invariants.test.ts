@@ -12,6 +12,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
+import { askJo } from "../../gates/src/rulings";
 import { backupNamespace, copyProblem, Ledger } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
 import { laneExitBody } from "../src/launch";
@@ -574,24 +575,32 @@ describe("output and the CLI", () => {
 });
 
 describe("ruling-miss (PLAN wl-mvfkv7llkp7nk0 § 1, R5)", () => {
-	test("a question an active ruling covers, raised past askJo after the rulings were built, is a finding; one no ruling covers, or raised before, is not", () => {
-		let now = "2026-10-18T12:00:00.000Z";
+	test("activation is the ledger's first ruling-applied: entry: a covered question raised past askJo before it is not a finding, one raised after it is; a question no ruling covers never is", () => {
+		let now = "2026-10-20T09:00:00.000Z";
 		const path = join(mkdtempSync(join(tmpdir(), "inv-ruling-")), "ledger.db");
 		const ledger = Ledger.open(path, { create: true, backup: false, backupOnOpen: false, clock: () => now });
 		const wl = ledger.openWorkload({ by: "surface", brief: "Fix", stakes: "normal", mode: "autonomous" });
 		const sl = () => ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
-		const before = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Open the docs workload now?", options: ["open", "later"] });
+		const covered = { body: "Open the docs workload now?", options: ["open", "later"] };
+		const before = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), ...covered });
+		now = "2026-10-20T10:00:00.000Z";
+		// The rulings check goes live: askJo decides a covered question and writes the ledger's first ruling-applied: entry.
+		expect(askJo(ledger, { by: "lane-b", workloadId: wl, sliceId: sl(), ...covered }, { asker: "lane", now: Date.parse(now) })).toHaveProperty("decided");
 		now = "2026-10-20T12:00:00.000Z";
-		const missed = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Open the docs workload now?", options: ["open", "later"] });
+		const missed = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), ...covered });
 		ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl(), body: "Ship it?", options: ["ship", "hold"] });
 		ledger.close();
 		const db = new Database(path, { readonly: true });
 		const noProbe: Probe<never> = { skipped: "not run" };
-		const r = check({ db, asOf: "2026-10-20T12:05:00.000Z", replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 } });
-		const misses = r.findings.filter((f) => f.invariant === "ruling-miss");
-		expect(misses.map((f) => [f.key, f.workload])).toEqual([[`ruling-miss:${missed}`, wl]]);
-		expect(misses[0]!.text).toContain("flow-repair");
-		expect(misses.some((f) => f.key.endsWith(before))).toBe(false);
+		const misses = (asOf: string) =>
+			check({ db, asOf, replay: true, liveLanes: { found: new Set<string>() }, lanesDirOf: () => "/nonexistent", repo: "/nonexistent", git: null, orchestrators: () => noProbe, backups: { dir: "/nonexistent", gapMs: 30 * 60 * 60_000 } })
+				.findings.filter((f) => f.invariant === "ruling-miss");
+		const after = misses("2026-10-20T12:05:00.000Z");
+		expect(after.map((f) => [f.key, f.workload])).toEqual([[`ruling-miss:${missed}`, wl]]);
+		expect(after[0]!.text).toContain("flow-repair");
+		expect(after.some((f) => f.key.endsWith(before))).toBe(false);
+		// Replayed before the activation entry landed, nothing is selected, though `before` was open and covered then.
+		expect(misses("2026-10-20T09:30:00.000Z")).toEqual([]);
 		db.close();
 	});
 });

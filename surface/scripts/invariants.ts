@@ -35,7 +35,7 @@
 // | no-independent-lab | the classifier's own `builderLabs` (classifier/src/lab.ts) excludes all three labs; review tokens held by a live spawning lane are passed as `liveReviews`, as the classifier does | `no-independent-lab:<wl>` |
 // | stale-reserved | a `reserved-request` entry older than 30 min that `reservedStates` (surface/src/errors.ts) still finds `waiting`: no `approve <id>` / `deny <id>` instruction, no `reserved-withdrawn: <id>`, its raising lane still holds the workload (a `lane-stopped` request is closed, not stale), and no later request repeats it | `stale-reserved:<entry>` |
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
-// | ruling-miss | a question open as of as-of, raised at or after `RULING_MISS_SINCE` (when gates/src/rulings.ts was built), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject | `ruling-miss:<q>` |
+// | ruling-miss | a question open as of as-of, raised at or after the ledger's first `ruling-applied:` entry landed by as-of (the activation receipt: only `askJo`, gates/src/rulings.ts, writes one; with none, nothing is selected), that an active standing ruling would have decided (`checkRulings` replayed as of its raise: its asker read from its writer — the orchestrator surface on the standing workload with its `question-about:` subject, the merge train, the classifier for a question its `review-park:` / `review-limit:` entry names, else the lane — with the workload's builders, stakes and train flag then, and Jo's `end-ruling` words by then): a raise path that bypassed `askJo`. A question whose every option is a `provider/model` id is never one: its row does not carry the declared subject | `ruling-miss:<q>` |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
 // | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive | `silent-orchestrator:<last entry id>` |
@@ -166,16 +166,17 @@ const QUESTION_SQL = `SELECT q.id, q.workload_id, q.created_at, q.body FROM ques
   WHERE q.created_at <= :cutoff
     AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
   ORDER BY q.created_at`;
-/** ruling-miss: questions raised at or after :since and open as of :asOf, with their workload's stakes. */
+/**
+ * ruling-miss: questions open as of :asOf and raised at or after the rulings check went live, with their workload's stakes.
+ * The ledger's activation receipt is its first `ruling-applied:` entry landed by :asOf (only `askJo`, gates/src/rulings.ts,
+ * writes one; a lane cannot, surface/extensions/lane-tools.ts): questions raised before it went to Jo by design, and with
+ * none there is nothing to compare against, so nothing is selected.
+ */
 const RULING_MISS_SQL = `SELECT q.id, q.workload_id, q.body, q.options, q.created_by, q.created_at, w.stakes FROM questions q JOIN workloads w ON w.id = q.workload_id
-  WHERE q.created_at >= :since AND q.created_at <= :asOf
+  WHERE q.created_at <= :asOf
+    AND q.created_at >= (SELECT min(a.created_at) FROM entries a WHERE a.body LIKE 'ruling-applied: %' AND a.created_at <= :asOf)
     AND (q.state = 'open' OR (SELECT i.created_at FROM instructions i WHERE i.id = q.resolved_by) > :asOf)
   ORDER BY q.created_at`;
-/**
- * The day the standing-rulings check (gates/src/rulings.ts, PLAN wl-mvfkv7llkp7nk0 § 1) was built: questions raised before it
- * went to Jo by design. One raised after it by a process still running older code is reported too; a ruling covers it all the same.
- */
-export const RULING_MISS_SINCE = "2026-10-19T00:00:00.000Z";
 const NEAR_SQL = `SELECT body FROM entries WHERE workload_id = :wl AND created_at BETWEEN :from AND :to
   UNION ALL SELECT body FROM messages WHERE workload_id = :wl AND created_at BETWEEN :from AND :to`;
 const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
@@ -473,7 +474,6 @@ export function check(input: Input): Report {
 
 	// ---- 5b. ruling-miss (gates/src/rulings.ts checkRulings, replayed as of each raise) ----------
 	const misses = run<{ id: string; workload_id: string; body: string; options: string; created_by: string; created_at: string; stakes: Stakes }>(RULING_MISS_SQL, {
-		":since": RULING_MISS_SINCE,
 		":asOf": asOf,
 	});
 	for (const q of misses.rows) {

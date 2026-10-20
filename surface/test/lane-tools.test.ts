@@ -19,7 +19,7 @@ import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/in
 import orchestratorSurface from "../index";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
 import { renderWake } from "../src/render";
-import { planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
+import { planAutoStartRound, planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import {
 	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst, planFirstBody, doneBody,
@@ -1373,4 +1373,54 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 		expect(apply(ledger, interpret(ledger, "approve")!)).toContain("plan approved");
 		expect(await call("lane_add_slice", { task: "change it", doneCondition: "d", inputs: "i", kind: "change-small" })).toMatch(/^Added slice/);
 	});
+
+	/** One review loop on the plan slice that ended on a pass: its one round `dg-pass` of `members` (each a `seedReview`), then the classifier's `review-loop-end:`. */
+	const passWith = (ledger: Ledger, wl: string, planId: string, members: { ran?: string[]; grant?: string }[]) => {
+		for (const m of members) seedReview(ledger, wl, planId, { round: 1, group: "dg-pass", ...m });
+		ledger.recordEntry({ by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption", body: reviewLoopEndBody(planId, "pass") });
+		tick();
+	};
+	// Each seed writes an otherwise-eligible round; `veto` adds the one thing a single guard of planAutoStartRound refuses.
+	const vetoes: [string, (ledger: Ledger, wl: string, planId: string, veto: boolean) => void][] = [
+		["a review hand-spawn on the plan slice after the passing loop-end, with no routing", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{}]);
+			if (veto) {
+				// Its row is on the builder's own lab: an unsettled hand counts its row as builders (builderLabs item 3), and this adds none.
+				ledger.recordEntry({
+					by: "lane-t-1", workloadId: wl, sliceId: planId, kind: "assumption",
+					body: handSpawnBody({ token: "dt-late", root: "/tmp/lane-t-1", spawnKey: planId, review: true, group: "dg-late", row: [LANE_MODEL] }),
+				});
+			}
+		}],
+		["a review routing on the plan slice after the passing loop-end, with no hand-spawn", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{}]);
+			if (veto) {
+				ledger.recordRouting({
+					by: "lane-t-1", workloadId: wl, sliceId: planId, spawnKey: planId, sessionRoot: "/tmp/lane-t-1", agentId: `${planId}-late`,
+					kind: "judge", confidence: 0.9, probabilities: { judge: 0.9 }, classifiedTier: "strong", tier: "strong",
+					models: [OTHER_LAB], judgeModel: "typesafe/jev-1.13.0", outcome: "ran", ranModels: [OTHER_LAB],
+				});
+			}
+		}],
+		["a member spawned on Jo's same-lab grant (his `same-lab` answer to the park question), though it answered on another lab", (ledger, wl, planId, veto) => {
+			const grant = jo(ledger, parkQuestion(ledger, wl, planId), "same-lab");
+			passWith(ledger, wl, planId, [veto ? { grant } : {}]);
+		}],
+		["a genuine same-lab passing round: its one member answered on the builder's lab", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{ ran: [veto ? LANE_MODEL : OTHER_LAB] }]);
+		}],
+		["a mixed-member passing round: one member on another lab, the other on the builder's lab", (ledger, wl, planId, veto) => {
+			passWith(ledger, wl, planId, [{ ran: [OTHER_LAB] }, { ran: [veto ? LANE_MODEL : OTHER_LAB] }]);
+		}],
+	];
+	for (const [name, seed] of vetoes) {
+		test(`R8: ${name} vetoes auto-start on its own; the same round without it starts`, async () => {
+			for (const veto of [false, true]) {
+				const { ledger, wl, planId } = await planFixture();
+				endFlowRepair(ledger);
+				seed(ledger, wl, planId, veto);
+				expect({ veto, round: planAutoStartRound(ledger, wl, planId, Date.now()) }).toEqual({ veto, round: veto ? null : "dg-pass" });
+			}
+		});
+	}
 });

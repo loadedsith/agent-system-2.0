@@ -6,12 +6,13 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { LANE_RUNNER_BY, type Ledger, type Stakes } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, type Stakes } from "../../ledger/src/index";
 import { type Ceiling, ceilingKey, effectiveCeiling, parseCeilingNotice, parseSpend, scanSpend, type Spend, wallMinutes } from "../src/ceiling";
 import { controlEntries, laneExitBody, laneStartedBody } from "../src/launch";
+import { apply, interpret } from "../src/input";
 import { sendNotice } from "../src/notice";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
-import { ceilingNoticesSent, type MeterState, meterStep, sendCeilingNotice } from "../scripts/lane";
+import { ceilingNoticesSent, type MeterState, meterPoll, meterStep, sendCeilingNotice } from "../scripts/lane";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
 const NORMAL: Ceiling = { usd: 50, wallMin: 360 };
@@ -188,5 +189,75 @@ describe("a relaunch on the same ceiling (§ 2 items 3, 4)", () => {
 		// and at 100 % the relaunched runner stops with the stop notice, which the ledger did not hold
 		expect(step(fresh, NORMAL, { ...run2, usd: 50 }, ceilingNoticesSent(ledger, wl, NORMAL))).toMatchObject({ level: 100, notice: 100, stop: true });
 		expect(ledger.questions(wl)).toEqual([]);
+	});
+});
+
+describe("a raise racing the 100 % stop (meterPoll)", () => {
+	/** An autonomous normal workload at $50 / 6h, lane-t-1 launched on it and holding it under a live lease. */
+	function held(l: Ledger) {
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Move the header offset into a token", stakes: "normal", mode: "autonomous" });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: "ceiling: usd 50 wall 360 source stakes normal" });
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: "launch: lane-t-1 cause first requested-by test" });
+		expect(l.claimWorkload(wl, { by: LANE_STARTER_BY, holder: "lane-t-1", leaseMs: 60_000 }).won).toBe(true);
+		return wl;
+	}
+	/** `ledger` with `raise` run once, at the first transaction the caller opens: the moment between the runner's poll snapshot and its first write. */
+	function raisingAtFirstWrite(ledger: Ledger, raise: () => void): Ledger {
+		let fired = false;
+		return new Proxy(ledger, {
+			get(target, key) {
+				const v = Reflect.get(target, key, target);
+				if (key === "write") {
+					return <T>(fn: () => T): T => {
+						if (!fired) {
+							fired = true;
+							raise();
+						}
+						return target.write(fn);
+					};
+				}
+				return typeof v === "function" ? v.bind(target) : v;
+			},
+		});
+	}
+	const atCeiling: Spend = { usd: 50.2, tokens: 1000, wallMin: 40 };
+	const control = (l: Ledger, wl: string) => controlEntries(l.entries(wl));
+	const stops = (l: Ledger, wl: string) => control(l, wl).filter((c) => c.prefix === "lane-stop").map((c) => c.body);
+	const requests = (l: Ledger, wl: string) => control(l, wl).filter((c) => c.prefix === "launch-requested");
+
+	test("a raise landing after the poll measured 100 % of the old value and before its write: the runner reads the new value and goes on, nothing stops, no relaunch is needed", () => {
+		const { ledger } = tempLedger();
+		const wl = held(ledger);
+		let receipt = "";
+		const polled = meterPoll(raisingAtFirstWrite(ledger, () => {
+			receipt = apply(ledger, interpret(ledger, `extend ${wl}`)!);
+		}), { workloadId: wl, laneId: "lane-t-1", spend: atCeiling, state: fresh });
+		expect(receipt).toContain("lane-t-1 still holds it and goes on under it");
+		expect(polled).toMatchObject({ stop: false, accepted: false, notice: null });
+		expect(stops(ledger, wl)).toEqual([]);
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([]);
+		expect(requests(ledger, wl)).toEqual([]);
+	});
+
+	test("a raise landing after the poll's write sees the accepted ceiling stop and requests the relaunch", () => {
+		const { ledger } = tempLedger();
+		const wl = held(ledger);
+		const polled = meterPoll(ledger, { workloadId: wl, laneId: "lane-t-1", spend: atCeiling, state: fresh });
+		expect(polled).toMatchObject({ stop: true, accepted: true, notice: 100 });
+		expect(stops(ledger, wl)).toEqual(["lane-stop: lane-t-1 accepted ceiling"]);
+		expect(apply(ledger, interpret(ledger, `extend ${wl}`)!)).toContain("lane-t-1 is stopping at the ceiling, so a relaunch is requested");
+		expect(requests(ledger, wl)).toHaveLength(1);
+	});
+
+	test("a stop whose writes fail still stands, unaccepted, and leaves nothing half-written", () => {
+		const { ledger, path } = tempLedger();
+		const wl = held(ledger);
+		const db = new Database(path);
+		db.exec("CREATE TRIGGER fail_stop BEFORE INSERT ON entries WHEN NEW.body LIKE 'lane-stop:%' BEGIN SELECT RAISE(ABORT, 'injected stop failure'); END;");
+		db.close();
+		const polled = meterPoll(ledger, { workloadId: wl, laneId: "lane-t-1", spend: atCeiling, state: fresh });
+		expect(polled).toMatchObject({ stop: true, accepted: false, notice: 100, state: fresh });
+		expect(ceilingNoticesSent(ledger, wl, NORMAL)).toEqual([]);
+		expect(control(ledger, wl).filter((c) => c.prefix === "spend")).toEqual([]);
 	});
 });

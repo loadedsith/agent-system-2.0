@@ -1074,7 +1074,9 @@ function ceilingInstructionBody(c: Ceiling): string {
  * stopping or gone), the workload is autonomous, the lane's last `spend:` is under `next` in both halves, and no
  * unconsumed request already waits; so that lane relaunches once its lease is gone. Otherwise nothing is requested: a
  * live holder not stopped at the ceiling reads the new value at its next poll and goes on, and a request written with
- * no lane stopped at the ceiling would outlive the raise and relaunch a finished workload. Returns the receipt tail,
+ * no lane stopped at the ceiling would outlive the raise and relaunch a finished workload. The runner reads the ceiling
+ * and accepts its ceiling stop in one transaction (surface/scripts/lane.ts `meterPoll`) and this check runs in the
+ * caller's, so a raise either lands first and the lane goes on, or sees the accepted stop here. Returns the receipt tail,
  * naming which case it was.
  */
 function raiseCeiling(ledger: Ledger, wl: string, next: Ceiling, source: string, instructionId: string, why: string): string {
