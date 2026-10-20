@@ -263,7 +263,7 @@ describe("profile: the testRunner block", () => {
 	test("the checkout's profile/config.yml serves agent-system-2.0 with bun test and the plan's caps", () => {
 		const doc = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8"));
 		const c = testRunnerConfig(doc);
-		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60 } });
+		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 6 } });
 		if (!c.ok) throw new Error(c.error);
 		const config = c.config;
 		for (const url of ["https://github.com/thewolff/agent-system-2.0.git", "git@github.com:thewolff/agent-system-2.0.git", "ssh://git@github.com/TheWolff/agent-system-2.0", "thewolff/agent-system-2.0"]) {
@@ -280,6 +280,24 @@ describe("profile: the testRunner block", () => {
 			expect(testRunnerConfig(bad).ok).toBe(false);
 		}
 		expect(ownerRepoOf("https://gitlab.com/o/r.git")).toBeNull();
+	});
+	test("fullWorkers: an integer of 1 or more, 1 when absent; 0, 2.5, \"6\", negatives and non-numbers are refused", () => {
+		const repos = [{ origin: "o/r", command: "bun test" }];
+		const parsed = (v: unknown) => testRunnerConfig({ testRunner: { repos, fullWorkers: v } });
+		expect(TEST_RUNNER_DEFAULTS.fullWorkers).toBe(1);
+		const absent = testRunnerConfig({ testRunner: { repos } });
+		expect(absent.ok && absent.config.fullWorkers).toBe(1);
+		for (const n of [1, 6, 32]) {
+			const c = parsed(n);
+			expect(c.ok && c.config.fullWorkers).toBe(n);
+		}
+		for (const bad of [0, 2.5, "6", -1, -6, null, true, Number.NaN, Number.POSITIVE_INFINITY, [6]]) {
+			expect({ bad, c: parsed(bad) }).toEqual({ bad, c: { ok: false, error: "testRunner.fullWorkers is not an integer of 1 or more" } });
+		}
+		// The yml form: the parse reads it as the profile is read.
+		const yml = testRunnerConfig(Bun.YAML.parse("testRunner:\n  fullWorkers: 4\n"));
+		expect(yml.ok && yml.config.fullWorkers).toBe(4);
+		expect(testRunnerConfig(Bun.YAML.parse('testRunner:\n  fullWorkers: "4"\n')).ok).toBe(false);
 	});
 	test("the runs root: the override, else test-runs beside the resolved ledger; run, work and stage dirs", () => {
 		expect(runsRoot({ HOME: "/h", AGENT_SYSTEM_TEST_RUNS: "/tmp/runs" })).toBe("/tmp/runs");

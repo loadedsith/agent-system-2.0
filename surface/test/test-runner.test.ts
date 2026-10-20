@@ -219,7 +219,7 @@ interface World {
 	ago: <T>(ms: number, fn: () => T) => T;
 }
 
-function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number } = {}): World {
+function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number } = {}): World {
 	const root = realpathSync(tmp("trun"));
 	roots.push(root);
 	const gid = statSync(root).gid;
@@ -286,7 +286,8 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 
 	const cap = o.capMin ?? 2;
 	const config = join(root, "config.yml");
-	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n`);
+	const workers = o.fullWorkers === undefined ? "" : `  fullWorkers: ${o.fullWorkers}\n`;
+	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n${workers}`);
 
 	const env: Record<string, string> = {
 		PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "en_US.UTF-8", USER: process.env.USER ?? "jo",
@@ -785,6 +786,26 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		]);
 		expect(run.verdict).toBe("green");
 	});
+
+	test("fullWorkers (wl-mvg2kzuvwngdmo): the trusted phase writes it into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
+		for (const [workers, n] of [[3, 3], [undefined, 1]] as const) {
+			const w = world({ fullWorkers: workers });
+			const { wl, slice } = workload(w);
+			const runId = request(w, wl, slice, PR.green, fx.head.green);
+			await spawnRun(w, runId).exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("green");
+			expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
+			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n });
+			const lines = runnerLog(w, runId).split("\n");
+			const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
+			const workersLine = at(/ full workers \d+$/);
+			expect(lines.filter((l) => / full workers /.test(l))).toHaveLength(1);
+			expect(lines[workersLine]).toMatch(new RegExp(`^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z full workers ${n}$`));
+			expect(at(/ took the lock$/)).toBeLessThan(workersLine);
+			expect(at(new RegExp(` full ${runId} → exit `))).toBeGreaterThan(workersLine);
+		}
+	}, 120_000);
 
 	test("red keeps the slice open with every failing name and its whole first error line (25 of them), and messages the orchestrator when no lane holds the workload", async () => {
 		const w = world();

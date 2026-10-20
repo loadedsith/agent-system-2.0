@@ -24,6 +24,11 @@
 //       wl-mv8s8srodefytc rev 17.1 D2, D8), and the lock released. No `pending` is posted: a missing status already blocks a
 //       protected merge. A failed status post is logged and never changes the verdict.
 //
+//       Parallel files (workload wl-mvg2kzuvwngdmo): the trusted phase writes the profile's `testRunner.fullWorkers` into
+//       caps.json beside the caps, and the run logs `<ts> full workers <n>` right before the PR full part; test-exec runs that
+//       part with `bun test --parallel=<n>` when n is over 1. Base reruns (`base-full`) stay serial whatever n is.
+//       surface/scripts/test-run-waits.ts reads the waits, the `full workers` lines and the results back per day.
+//
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
 // Test-only knobs (the fence's tests set them; Jo's environment never does, and none crosses the
@@ -902,7 +907,7 @@ class Runner {
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
 		const caps = join(this.stage, "caps.json");
-		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin })}\n`, { mode: 0o640 });
+		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers })}\n`, { mode: 0o640 });
 		chmodSync(caps, 0o640);
 		chmodSync(this.stage, 0o750);
 		this.log(`trusted phase: ${q.sha} on base ${this.f.base}, merge-base ${this.f.mergeBase}; changed test files: ${changed.join(" ") || "none"}`);
@@ -1026,6 +1031,7 @@ class Runner {
 		const changed = await this.trusted();
 		if (changed === null) return;
 		await this.prepare();
+		this.log(`full workers ${this.config.fullWorkers}`);
 		this.f.full = await this.part({ sub: "full" });
 		await this.sweep("full");
 		for (const file of changed) {
