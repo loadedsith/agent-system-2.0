@@ -1123,6 +1123,8 @@ surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
+surface/scripts/test-run-waits.ts	module	-
+surface/test/test-run-waits.test.ts	test	-
 surface/src/merge-train.ts	module	-
 surface/src/merge-train-resolve.ts	module	-
 surface/src/merge-train-stack.ts	module	-
