@@ -20,11 +20,13 @@ The verdict vocabulary, defined in the guide's § Verdict key and roles:
 
 Graham's paired-mode note: see profile/OMP-HARNESS.md § Pairing and workspace directories.
 
-Re-verifying on an OMP upgrade. `ledger/test/omp-harness.test.ts` checks that the guide's `verified-omp: X.Y.Z` header line has the same major.minor as `VERIFIED_HOST` in `gates/src/host.ts`. It also checks that the card is at most 8000 bytes, starts with its marker line and names the guide by its `{repo}` path. A patch upgrade passes that test unnoticed. On any OMP upgrade:
+**The runtime guide, snapshot headers and the plugin-registry refusal (2026-10-20, jo-issues#55).** A research audit of the guide found it covered what each command, flag and setting is, but not how OMP behaves while it runs. `profile/OMP-RUNTIME.md` closes that gap: one section for each of the audit's 22 subsystems (profile scoping, plugin registries, extension load order and the fail-closed `tool_call` event, message delivery, compaction and the stop-hook skip, session leases, the rpc protocol the lane runner uses, MCP sources and OAuth, credentials, logs, OTEL, tool approval, what a hand inherits, and the rest), each with OMP source receipts and a verdict for Ilex, a lane, a hand and a seat. The installer links it beside the guide, and the card and the four hand tier files name both files. The same pass corrected five guide rows (`--resume`, `OMP_PROFILE`, the extension list, `/mcp`, `/reload-plugins`), added the launch flags no launcher passes (`--no-extensions`, `--no-skills`, `--approval-mode` and the rest), and corrected `plugins/VENDOR.md` clash C11 and its `profile/config.yml` comment: OMP's plugin registry is per profile, so the as2 profile loads no marketplace plugin. The guides and the card now open with `snapshot of OMP <x.y.z>, <date>; drift will occur` in place of the old `verified-omp` line. The card also teaches the start refusal from jo-issues#51: `as2` refuses to start while the default-profile OMP plugin registry and Claude's disagree on a plugin's version, prints two fix commands, and `as2 plugins` rechecks.
+
+Re-verifying on an OMP upgrade. `ledger/test/omp-harness.test.ts` checks that line 1 of the guide, the runtime guide and the card is the snapshot line, with a version equal to `MEASURED_HOST` in `gates/src/shell-start.ts`; that the runtime guide has a `## ` section for each of the audit's 22 subsystems, each with a source receipt or a pointer to a guide section; and that the card is at most 8000 bytes, carries its marker on line 2 and names both guides by their `{repo}` paths. On any OMP upgrade:
 
 1. Rerun the three count commands at the top of the guide.
-2. Re-check each changed command, flag and setting row against the new OMP source, and update the anchors and verdicts.
-3. Bump the `verified-omp` line and the card's `verified-omp:` sentence.
+2. Re-check each changed command, flag and setting row, and each runtime section, against the new OMP source, and update the anchors and verdicts.
+3. Bump the snapshot line in all three files.
 4. Re-run `bash install/install.sh`.
 
-A minor upgrade also bumps `VERIFIED_HOST` after `gates/test/host.test.ts` passes on the new host, and the guide test then fails until the guide is bumped too.
+A version bump of `MEASURED_HOST` fails the snapshot test until the three files are re-verified and bumped too. A minor upgrade also bumps `VERIFIED_HOST` after `gates/test/host.test.ts` passes on the new host.

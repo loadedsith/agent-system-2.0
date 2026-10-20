@@ -1,14 +1,18 @@
+snapshot of OMP 18.8.6, 2026-10-20; drift will occur
 # OMP harness card (agent-system 2.0)
 
-verified-omp: 18.8.6. The full guide is `{repo}/profile/OMP-HARNESS.md`: all 85 built-in slash commands, the profile's dynamic commands, the launch flags and all 541 settings, each with its OMP source anchor and an Ilex / lane / seat verdict. Read it on demand when a harness question comes up; do not @-import it. Re-verify the guide and this card on any OMP upgrade (the test guards only major.minor).
+The full guides are `{repo}/profile/OMP-HARNESS.md` (all 85 built-in slash commands, the profile's dynamic commands, the launch flags and all 541 settings, each with its OMP source anchor and an Ilex / lane / seat verdict) and `{repo}/profile/OMP-RUNTIME.md` (how OMP behaves at run time: profiles, plugin registries, extension order and events, message delivery, compaction, leases, rpc, MCP, approval, what a hand inherits). Read them on demand; do not @-import them. On any OMP upgrade re-verify both guides and this card, then bump the three snapshot lines.
 
 ## Rules
 
+- For any OMP or harness question, read the two guides or the OMP source (`omp://` docs, the installed `@oh-my-pi/pi-coding-agent/src`) before answering; never answer from memory.
 - A lane runs `omp --mode rpc --no-ui`. TUI-only slash commands do not exist there: rpc runs only the 45 built-ins with a text handler, and any other `/x` text in a lane goes to the model as plain text.
-- No agent types a slash command. OMP dispatches them only from user prompt text, never from model output. Ilex suggests one to Jo; a lane uses none (its runner sends only `prompt`, `abort`, `get_state`).
+- No agent types a slash command. OMP dispatches them only from user prompt text, never from model output. Ilex suggests one to Jo; a lane uses none.
+- The lane runner cannot steer: it sends only `prompt`, `abort`, `get_state` and `set_model`, so a running lane takes new input only at its next prompt.
 - Machinery-owned settings change only in `profile/config.yml` plus a re-install, never with `/settings`: `install/install.sh` section 5 rewrites the profile's config.yml on every install, so a `/settings` edit is lost.
 - Settings writes through `cfg://<id>` (and `cfg://<id>/save`) work only in the top-level TUI session, so only Ilex, and only with Jo's approval. Lanes and hands cannot change a setting.
-- Hands do not get this card (OMP strips `AGENTS.md` from subagents: `pi-coding-agent@18.8.6 src/task/structured-subagent.ts` `buildExecutorOptions`); their tier file names the guide.
+- Hands lose every file named `AGENTS.md`: this card and any project `AGENTS.md` (OMP strips them from subagents: `pi-coding-agent@18.8.6 src/task/structured-subagent.ts` `buildExecutorOptions`). Put what a hand needs in its brief; its tier file names the guides.
+- `as2` refuses to start while the default-profile OMP plugin registry and Claude's disagree on a plugin's version. Run one of the two fix commands it prints, then `as2 plugins` to recheck.
 - Skills: the 22 in `{repo}/skills` are the only source. Load one with `read skill://<name>` when its trigger fires.
 - Workspace dirs (`--add-dir`, `/add-dir`, `workspace.additionalDirectories`) only add system-prompt roots; they never gate file access. A dir that was never added can still be read and written unless a write policy blocks it (plan mode, the paired-coding gate, a fence), and that policy treats added dirs the same.
 - `/add-dir` after start works in the TUI, ACP and between rpc turns. It is refused while a turn streams and for a `/collab` guest ("host-only"); `omp -p` never runs it. Graham's paired-mode note and the per-mode table are in the guide § Pairing and workspace directories.
@@ -28,7 +32,7 @@ verified-omp: 18.8.6. The full guide is `{repo}/profile/OMP-HARNESS.md`: all 85 
 | `/login` | use: once per profile per provider |
 | `/settings`, `/setup` | machinery-owned: keys live in `profile/config.yml`; `setupVersion: 2` skips the wizard |
 | `/extended-context` | machinery-owned: `extendedContext: true` in config.yml |
-| `/mcp` | machinery-owned: the server set is `profile/mcp.json` (`ctx`); Jo may `list` or `reconnect` |
+| `/mcp` | machinery-owned: the server set is `profile/mcp.json` (`ctx`) plus any project MCP file in the cwd; Jo may `list` or `reconnect` |
 
 Every other built-in is `Jo only` or `not for as2` for Ilex (plan, goal, vibe, loop, collab, wt and others: see the guide).
 
@@ -43,7 +47,7 @@ Ilex: `OMP_PROFILE=<profile> omp --cwd <repo> --append-system-prompt <prompt>` (
 | `setupVersion` | machinery-owned: `2` |
 | `symbolPreset`, `composer.shape`, `theme.dark`, `theme.light`, `hideThinkingBlock`, `display.hideToolActivity`, `display.showTokenUsage`, `display.showTurnTime`, `display.shimmer`, `tui.resizeScrollback`, `tui.hyperlinks` | machinery-owned: Jo's look, display only (inert in a lane) |
 | `compaction.thresholdPercent`, `compaction.methodOrder`, `compaction.modelThresholds`, `extendedContext` | machinery-owned: `25`; shake first; `moonshot/kimi-k2.*` at 180000; `true` |
-| `extensions` | machinery-owned: surface, gates, classifier, in that order |
+| `extensions` | machinery-owned: surface, gates, classifier, plugins, in that order, after the ambient `agent/extensions/*` |
 | `skills.enabled`, `skills.customDirectories`, `skills.includeSkills`, the seven `skills.enable*` provider keys | machinery-owned: `{repo}/skills` only, 22 names allowlisted, other providers off |
 | `modelRoles`, `retry.fallbackChains` | machinery-owned: judge `typesafe/jev-1.13.0`, empty judge chain |
 | `task.agentModelOverrides` | machinery-owned: the tier → model table |

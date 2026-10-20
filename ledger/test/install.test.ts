@@ -10,8 +10,8 @@
 // ledger path, and writes nothing else; and it fails closed (review r2, openai #3): only exit 113
 // with "Could not find service" counts as absent, and a missing launchctl, any other print failure
 // or a failed bootout exits 1 with the plist kept. The OMP harness card profile/AGENTS.md is rendered
-// into the profile with {repo} filled in and the guide profile/OMP-HARNESS.md is linked there
-// (wl-mv8k0fby51uakg); any other profile/*.md row is still refused.
+// into the profile with {repo} filled in, and the guide profile/OMP-HARNESS.md and its runtime companion
+// profile/OMP-RUNTIME.md are linked there (wl-mv8k0fby51uakg); any other profile/*.md row is still refused.
 import { beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -316,19 +316,22 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 	});
 });
 
-describe("install: the OMP harness card is rendered and the guide linked into the profile (wl-mv8k0fby51uakg)", () => {
-	test("AGENTS.md carries the checkout's absolute path; OMP-HARNESS.md is a link into the checkout; another profile/*.md is refused", () => {
+describe("install: the OMP harness card is rendered and both guides linked into the profile (wl-mv8k0fby51uakg)", () => {
+	test("AGENTS.md carries the checkout's absolute path; OMP-HARNESS.md and OMP-RUNTIME.md are links into the checkout; another profile/*.md is refused", () => {
 		const r = install("harness");
 		expect(r.out).toContain("install complete");
 		expect(r.exitCode).toBe(0);
 		const agent = join(r.home, ".omp", "profiles", "agent-system-2", "agent");
 		const card = readFileSync(join(agent, "AGENTS.md"), "utf8");
-		expect(card.split("\n")[0]).toBe("# OMP harness card (agent-system 2.0)");
+		expect(card.split("\n")[1]).toBe("# OMP harness card (agent-system 2.0)");
 		expect(card).toContain(`${copy}/profile/OMP-HARNESS.md`);
+		expect(card).toContain(`${copy}/profile/OMP-RUNTIME.md`);
 		expect(card).not.toContain("{repo}");
-		const guide = join(agent, "OMP-HARNESS.md");
-		expect(lstatSync(guide).isSymbolicLink()).toBe(true);
-		expect(realpathSync(guide)).toBe(realpathSync(join(copy, "profile", "OMP-HARNESS.md")));
+		for (const name of ["OMP-HARNESS.md", "OMP-RUNTIME.md"]) {
+			const linked = join(agent, name);
+			expect(lstatSync(linked).isSymbolicLink()).toBe(true);
+			expect(realpathSync(linked)).toBe(realpathSync(join(copy, "profile", name)));
+		}
 
 		const other = "profile/OTHER.md";
 		writeFileSync(join(copy, other), "# not a profile file\n");
@@ -336,7 +339,7 @@ describe("install: the OMP harness card is rendered and the guide linked into th
 		const refused = install("harness-other-md");
 		rmSync(join(copy, other));
 		writeFileSync(manifest, original);
-		expect(refused.out).toContain(`kind profile is only profile/config.yml, profile/models.yml, profile/mcp.json, profile/AGENTS.md and profile/OMP-HARNESS.md; got ${other}`);
+		expect(refused.out).toContain(`kind profile is only profile/config.yml, profile/models.yml, profile/mcp.json, profile/AGENTS.md, profile/OMP-HARNESS.md and profile/OMP-RUNTIME.md; got ${other}`);
 		expect(refused.exitCode).toBe(2);
 		expect(existsSync(refused.db)).toBe(false);
 	});

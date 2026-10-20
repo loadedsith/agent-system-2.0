@@ -29,7 +29,8 @@ install/com.agent-system-2.ledger-backup.plist	ledger-backup-agent	{launch_agent
 # the profile names the extension entry points by repo path. `profile` rows are the template the
 # profile rendering is owned by M6 (MIGRATION.md; corrected 2026-09-29 from "M8"); models.yml must land beside config.yml.
 # The OMP harness card profile/AGENTS.md is rendered with {repo} filled in beside config.yml, and the guide
-# profile/OMP-HARNESS.md is linked there (wl-mv8k0fby51uakg); exactly one row each, like config.yml, models.yml, mcp.json.
+# profile/OMP-HARNESS.md and its runtime companion profile/OMP-RUNTIME.md are linked there (wl-mv8k0fby51uakg);
+# exactly one row each, like config.yml, models.yml, mcp.json.
 classifier/calibration.json	data	-
 classifier/extension.ts	extension	-
 classifier/kind-question.json	data	-
@@ -169,6 +170,7 @@ gates/test/r18-typed-wrapper.test.ts	test	-
 gates/test/r18-typed-wrapper-exec.test.ts	test	-
 profile/AGENTS.md	profile	{profile}/agent/AGENTS.md
 profile/OMP-HARNESS.md	profile	{profile}/agent/OMP-HARNESS.md
+profile/OMP-RUNTIME.md	profile	{profile}/agent/OMP-RUNTIME.md
 gates/src/shell-start.ts	module	-
 gates/test/shell-start.test.ts	test	-
 gates/test/shell-start-bash.test.ts	test	-

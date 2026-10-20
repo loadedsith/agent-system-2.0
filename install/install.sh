@@ -10,7 +10,8 @@
 # $HOME/.omp/profiles/<profile>/agent/config.yml, place the `profile` row profile/models.yml beside
 # it, render the `profile` row profile/AGENTS.md (the OMP harness card, which OMP loads into every
 # top-level session of the profile as user context) with {repo} filled into the same directory, link
-# the `profile` row profile/OMP-HARNESS.md (the full harness guide) there, and link every `tier` row
+# the `profile` rows profile/OMP-HARNESS.md (the full harness guide) and profile/OMP-RUNTIME.md (its
+# runtime companion) there, and link every `tier` row
 # into $HOME/.omp/profiles/<profile>/agent/agents/. `skill` rows
 # (skills/<name>/SKILL.md or plugins/<p>/skills/<n>/SKILL.md) and `skill-asset` rows are used in place through the profile's
 # skills.customDirectories; the render is refused when its skills.includeSkills is not exactly
@@ -283,6 +284,7 @@ models_rows=""
 mcp_rows=""
 card_rows=""
 guide_rows=""
+runtime_rows=""
 tier_rows=""
 launcher_rows=""
 skill_names=""
@@ -318,7 +320,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 				profile/mcp.json) mcp_rows="$mcp_rows$path"$'\n' ;;
 				profile/AGENTS.md) card_rows="$card_rows$path"$'\n' ;;
 				profile/OMP-HARNESS.md) guide_rows="$guide_rows$path"$'\n' ;;
-				*) fail "manifest line $line_no: kind profile is only profile/config.yml, profile/models.yml, profile/mcp.json, profile/AGENTS.md and profile/OMP-HARNESS.md; got $path" 2 ;;
+				profile/OMP-RUNTIME.md) runtime_rows="$runtime_rows$path"$'\n' ;;
+				*) fail "manifest line $line_no: kind profile is only profile/config.yml, profile/models.yml, profile/mcp.json, profile/AGENTS.md, profile/OMP-HARNESS.md and profile/OMP-RUNTIME.md; got $path" 2 ;;
 			esac ;;
 		tier)
 			[ "$dest" = "{profile}/agent/agents/${path##*/}" ] || fail "manifest line $line_no: tier destination must be {profile}/agent/agents/${path##*/}" 2
@@ -357,7 +360,7 @@ done <"$MANIFEST"
 [ "$header_seen" -eq 1 ] || fail "manifest has no header row" 2
 # The ledger kinds are run, not just listed, so each must name exactly one file; the schema row
 # must name the one file the module applies, so a misclassified or missing row cannot pass.
-for kind_rows in "ledger-schema:$schema_rows" "ledger-init:$init_rows" "ledger-backup:$backup_rows" "ledger-backup-agent:$agent_rows" "profile config.yml:$config_rows" "profile models.yml:$models_rows" "profile mcp.json:$mcp_rows" "profile AGENTS.md:$card_rows" "profile OMP-HARNESS.md:$guide_rows"; do
+for kind_rows in "ledger-schema:$schema_rows" "ledger-init:$init_rows" "ledger-backup:$backup_rows" "ledger-backup-agent:$agent_rows" "profile config.yml:$config_rows" "profile models.yml:$models_rows" "profile mcp.json:$mcp_rows" "profile AGENTS.md:$card_rows" "profile OMP-HARNESS.md:$guide_rows" "profile OMP-RUNTIME.md:$runtime_rows"; do
 	kind="${kind_rows%%:*}"
 	list="${kind_rows#*:}"
 	count="$(printf '%s' "$list" | grep -c . || true)"
@@ -374,6 +377,7 @@ MODELS_ROW="${models_rows%$'\n'}"
 MCP_ROW="${mcp_rows%$'\n'}"
 CARD_ROW="${card_rows%$'\n'}"
 GUIDE_ROW="${guide_rows%$'\n'}"
+RUNTIME_ROW="${runtime_rows%$'\n'}"
 [ -n "$tier_rows" ] || fail "manifest has no tier rows; the profile needs its tiers/<name>.md agents" 2
 [ -n "$skill_names" ] || fail "manifest has no skill rows; the profile's includeSkills would allow nothing" 2
 step "manifest ok: $rows rows (schema $SCHEMA_ROW, $(printf '%s' "$tier_rows" | grep -c .) tiers, $(printf '%s' "$skill_names" | grep -c .) skills)"
@@ -558,6 +562,8 @@ mv -f "$PROFILE_DIR/AGENTS.md.tmp.$$" "$PROFILE_DIR/AGENTS.md"
 step "profile written: config.yml (rendered from $CONFIG_ROW), models.yml (from $MODELS_ROW), mcp.json (from $MCP_ROW), AGENTS.md (rendered from $CARD_ROW)"
 ln -sfn "$REPO/$GUIDE_ROW" "$PROFILE_DIR/${GUIDE_ROW##*/}"
 step "guide linked: $PROFILE_DIR/${GUIDE_ROW##*/} -> $REPO/$GUIDE_ROW"
+ln -sfn "$REPO/$RUNTIME_ROW" "$PROFILE_DIR/${RUNTIME_ROW##*/}"
+step "runtime guide linked: $PROFILE_DIR/${RUNTIME_ROW##*/} -> $REPO/$RUNTIME_ROW"
 while IFS= read -r tier; do
 	[ -n "$tier" ] || continue
 	ln -sfn "$REPO/$tier" "$PROFILE_DIR/agents/${tier##*/}"
