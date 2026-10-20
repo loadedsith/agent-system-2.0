@@ -223,6 +223,48 @@ describe("OMP's XDG data root (pi-utils@18.8.6 src/dirs.ts DirResolver, getPlugi
 		expect(check(f)).toEqual([{ id: ID, ompVersion: "2.0.0", ompPath: xdgRegistry(f), claudeVersion: "1.0.0", claudePath: f.claude }]);
 		expect(check(f, { XDG_DATA_HOME: join(f.home, "no-xdg") })).toEqual([]);
 	});
+
+	test("PI_CODING_AGENT_DIR from a dotenv file OMP loads keeps the default profile off XDG: refreshDirsFromEnv recomputes the override", () => {
+		// pi-utils@18.8.6 src/env.ts fills the env, then `refreshDirsFromEnv` takes the agent-dir override from the
+		// filled PI_CODING_AGENT_DIR; an agent dir not the profile's own leaves the data root at the legacy config root.
+		const f = fixture("xdg-dotenv-agent-dir");
+		put(f.claude, registry([at("1.0.0")]));
+		put(f.omp, registry([at("2.0.0")]));
+		put(xdgRegistry(f), registry([at("3.0.0")]));
+		expect(check(f, xdg(f))).toEqual([{ id: ID, ompVersion: "3.0.0", ompPath: xdgRegistry(f), claudeVersion: "1.0.0", claudePath: f.claude }]);
+
+		const legacy = [{ id: ID, ompVersion: "2.0.0", ompPath: f.omp, claudeVersion: "1.0.0", claudePath: f.claude }];
+		const line = `PI_CODING_AGENT_DIR=${join(f.home, "agent-elsewhere")}\n`;
+		for (const dotenv of [join(f.home, ".omp", "agent", ".env"), join(f.home, ".omp", ".env"), join(f.home, ".env"), join(f.proj, ".env")]) {
+			put(dotenv, line);
+			expect({ dotenv, found: check(f, xdg(f)) }).toEqual({ dotenv, found: legacy });
+			rmSync(dotenv);
+		}
+		// The default agent dir named in a dotenv file is the profile's own: XDG stays.
+		put(join(f.home, ".env"), `PI_CODING_AGENT_DIR=${join(f.home, ".omp", "agent")}\n`);
+		expect(check(f, xdg(f))).toEqual([{ id: ID, ompVersion: "3.0.0", ompPath: xdgRegistry(f), claudeVersion: "1.0.0", claudePath: f.claude }]);
+	});
+
+	test("competing dotenv values: the first of project, agent dir, config root, home holding the key wins, as in OMP", () => {
+		// pi-utils@18.8.6 src/env.ts: `for (const file of [projectEnv, agentEnv, piEnv, homeEnv])`, each filling unset keys.
+		const f = fixture("xdg-dotenv-order");
+		put(f.claude, registry([at("1.0.0")]));
+		const files = [
+			["project", join(f.proj, ".env")],
+			["agent", join(f.home, ".omp", "agent", ".env")],
+			["root", join(f.home, ".omp", ".env")],
+			["home", join(f.home, ".env")],
+		] as const;
+		const registryOf = (name: string) => join(f.home, `xdg-${name}`, "omp", "plugins", "installed_plugins.json");
+		files.forEach(([name, file], i) => {
+			put(file, `XDG_DATA_HOME=${join(f.home, `xdg-${name}`)}\n`);
+			put(registryOf(name), registry([at(`${i + 2}.0.0`)]));
+		});
+		for (const [i, [name, file]] of files.entries()) {
+			expect({ name, found: check(f) }).toEqual({ name, found: [{ id: ID, ompVersion: `${i + 2}.0.0`, ompPath: registryOf(name), claudeVersion: "1.0.0", claudePath: f.claude }] });
+			rmSync(file);
+		}
+	});
 });
 
 describe("the CLI: check [--cwd <dir>]", () => {
@@ -253,12 +295,32 @@ describe("the CLI: check [--cwd <dir>]", () => {
 		expect(lines).toContain(`  match OMP:         claude plugin update ${ID}`);
 		expect(lines).toContain(`  disable in OMP:    OMP_PROFILE=default omp plugin disable --scope user ${ID}`);
 		expect(lines).toContain(`  disable in Claude: claude plugin disable ${ID}`);
-		expect(r.err).toContain("either one, once it succeeds, makes the two registries on that plugin's line agree");
+		expect(r.err).toContain("Claude's, once it succeeds, leaves the plugin no active Claude entry to disagree with");
 
 		put(f.project, registry([at("3.0.0", { scope: "project" })]));
 		const p = run(f).err.split("\n");
 		expect(p).toContain(`  match Claude:      (cd ${f.proj} && omp plugin install --force --scope project ${ID})`);
 		expect(p).toContain(`  disable in OMP:    (cd ${f.proj} && omp plugin disable --scope project ${ID})`);
+	});
+
+	test("an OMP disable can expose a lower OMP entry that disagrees too: Claude 1, OMP user 2, OMP project 3", () => {
+		// The project's entry shadows the user's (pi-coding-agent@18.8.6 src/discovery/helpers.ts); once `omp plugin
+		// disable --scope project` writes enabled: false on it, the user registry's entry counts and disagrees on its own.
+		const f = fixture("cli-expose-lower");
+		put(f.claude, registry([at("1.0.0")]));
+		put(f.omp, registry([at("2.0.0")]));
+		put(f.project, registry([at("3.0.0", { scope: "project" })]));
+		const first = run(f);
+		expect(first.code).toBe(1);
+		expect(first.err.split("\n")[1]).toBe(`  ${ID}: OMP 3.0.0 (${f.project}) vs Claude 1.0.0 (${f.claude})`);
+		expect(first.err).toContain("a lower OMP entry for the same plugin (the user registry's, under a project one) then counts, and can disagree with Claude in its own right");
+
+		put(f.project, registry([at("3.0.0", { scope: "project", enabled: false })]));
+		const second = run(f);
+		expect(second.code).toBe(1);
+		const lines = second.err.split("\n");
+		expect(lines[1]).toBe(`  ${ID}: OMP 2.0.0 (${f.omp}) vs Claude 1.0.0 (${f.claude})`);
+		expect(lines).toContain(`  disable in OMP:    OMP_PROFILE=default omp plugin disable --scope user ${ID}`);
 	});
 
 	test("an XDG profile registry's commands name that profile", () => {

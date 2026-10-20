@@ -14,10 +14,12 @@
 // active profile's when one is set, each with its user registry at `getPluginsDir()` (pi-utils@18.8.6 src/dirs.ts):
 // `<data root>/plugins/installed_plugins.json`, where the data root is `$XDG_DATA_HOME/omp` (default profile) or
 // `$XDG_DATA_HOME/omp/profiles/<name>` (named profile) when that directory exists on Linux or macOS and the agent dir
-// is the profile's own (`DirResolver`), else the legacy `<home>/<configDir>[/profiles/<name>]`. The env each session's
-// resolver reads is the caller's plus the dotenv files OMP loads before it rebuilds the resolver (pi-utils@18.8.6
-// src/env.ts, then `refreshDirsFromEnv` and cli.ts `setProfile`); the session's cwd stands for OMP's process cwd.
-// Bun's own autoload of `.env.local` / `.env.<NODE_ENV>` is not followed.
+// is the profile's own (`DirResolver`), else the legacy `<home>/<configDir>[/profiles/<name>]`. That resolver is the one
+// OMP rebuilds after its dotenv load, in OMP's order (`ompSession`): cli.ts `runCli` calls `setProfile` before
+// importing pi-utils@18.8.6 src/env.ts; env.ts fills unset keys from the dotenv files that resolver's agent dir and
+// config root name, then `refreshDirsFromEnv` recomputes the agent-dir override, config root and XDG root from the
+// filled env. The session's cwd stands for OMP's process cwd. Bun's own autoload of `.env.local` / `.env.<NODE_ENV>`
+// is not followed.
 //
 // HOME, env and cwd are parameters, so tests run on fixture homes; the module reads files and writes nothing.
 import { readFileSync, realpathSync, statSync } from "node:fs";
@@ -113,33 +115,70 @@ export interface OmpSession {
 }
 
 /**
- * The OMP session `OMP_PROFILE=<profile or default> omp` started in `cwd` would be, as pi-utils@18.8.6 src/dirs.ts,
- * src/env.ts and pi-coding-agent cli.ts `runCli` build it:
- *   1. Module load: a default-profile session keeps `PI_CODING_AGENT_DIR` as its agent-dir override unless it is the
- *      agent dir `PI_PROFILE`'s profile derives (`resolvePreProfileAgentDir`); a named profile takes none.
+ * The agent-dir override a default-profile resolver takes from `env` (pi-utils@18.8.6 src/dirs.ts
+ * `resolvePreProfileAgentDir` with `isProfileDerivedAgentDir`): `PI_CODING_AGENT_DIR`, unless it is the agent dir
+ * `PI_PROFILE`'s profile derives under env's config dir.
+ */
+function agentDirOverride(home: string, env: RegistryInputs["env"]): string | undefined {
+	const piProfile = profileName(env.PI_PROFILE);
+	const value = env.PI_CODING_AGENT_DIR;
+	return piProfile !== undefined && value === join(profileRoot(home, env, piProfile), "agent") ? undefined : value;
+}
+
+/** The paths a pi-utils@18.8.6 src/dirs.ts `DirResolver` holds that the check reads. */
+interface Dirs {
+	configRoot: string;
+	agentDir: string;
+	/** The agent dir is the profile's own `<config root>/agent`: only then does the resolver consult XDG. */
+	isOwnAgentDir: boolean;
+}
+
+/** pi-utils@18.8.6 src/dirs.ts `DirResolver` under `env`; a named profile takes no override. */
+function dirResolver(inputs: RegistryInputs, env: RegistryInputs["env"], profile: string | undefined, override: string | undefined): Dirs {
+	const configRoot = profileRoot(inputs.home, env, profile);
+	const ownAgentDir = join(configRoot, "agent");
+	const agentOverride = profile ? undefined : override;
+	const agentDir = agentOverride ? resolve(inputs.cwd, agentOverride) : ownAgentDir;
+	return { configRoot, agentDir, isOwnAgentDir: agentDir === ownAgentDir };
+}
+
+/**
+ * The OMP session `OMP_PROFILE=<profile or default> omp` started in `cwd` would be, as pi-coding-agent@18.8.6 cli.ts
+ * `runCli`, pi-utils@18.8.6 src/dirs.ts and src/env.ts build it, in this order:
+ *   1. `setProfile` runs before env.ts is imported. A named profile sets `OMP_PROFILE`, `PI_PROFILE` and
+ *      `PI_CODING_AGENT_DIR` to its own, and its resolver takes no override. The default profile deletes
+ *      `OMP_PROFILE` and `PI_PROFILE`, and keeps `PI_CODING_AGENT_DIR` only when it is not the agent dir `PI_PROFILE`'s
+ *      profile derives (the module-load snapshot), its resolver taking that value as its override.
  *   2. env.ts fills each unset key from `<cwd>/.env`, `<agent dir>/.env`, `<config root>/.env`, `<home>/.env`, in
- *      that order, the agent dir and config root being the module-load ones.
- *   3. `setProfile` rebuilds the resolver from the filled env: the config root from its `PI_CONFIG_DIR`, the XDG data
- *      root from its `XDG_DATA_HOME` (`DirResolver`), consulted only when the agent dir is the profile's own.
+ *      that order, the agent dir and config root being step 1's.
+ *   3. `refreshDirsFromEnv` rebuilds the resolver from the filled env: the default profile's override recomputed from
+ *      the filled `PI_CODING_AGENT_DIR` and `PI_PROFILE`, the config root from `PI_CONFIG_DIR`, the XDG data root
+ *      from `XDG_DATA_HOME`, consulted only when the agent dir is the profile's own.
+ * `getPluginsDir()` is then `<data root>/plugins`.
  */
 export function ompSession(inputs: RegistryInputs, profile: string | undefined): OmpSession {
 	const { home, cwd } = inputs;
 	const launch: RegistryInputs["env"] = { ...inputs.env, OMP_PROFILE: profile ?? "default" };
-	const piProfile = profileName(launch.PI_PROFILE);
-	const derived = piProfile !== undefined && launch.PI_CODING_AGENT_DIR === join(profileRoot(home, launch, piProfile), "agent");
-	const agentOverride = profile || derived ? undefined : launch.PI_CODING_AGENT_DIR;
-	const loadRoot = profileRoot(home, launch, profile);
-	const loadAgentDir = agentOverride ? resolve(agentOverride) : join(loadRoot, "agent");
 
 	const env: RegistryInputs["env"] = { ...launch };
-	for (const file of [join(cwd, ".env"), join(loadAgentDir, ".env"), join(loadRoot, ".env"), join(home, ".env")]) {
+	const preProfile = profile ? undefined : agentDirOverride(home, launch);
+	const load = dirResolver(inputs, launch, profile, preProfile);
+	if (profile) {
+		Object.assign(env, { OMP_PROFILE: profile, PI_PROFILE: profile, PI_CODING_AGENT_DIR: load.agentDir });
+	} else {
+		delete env.OMP_PROFILE;
+		delete env.PI_PROFILE;
+		if (preProfile === undefined) delete env.PI_CODING_AGENT_DIR;
+		else env.PI_CODING_AGENT_DIR = preProfile;
+	}
+
+	for (const file of [join(cwd, ".env"), join(load.agentDir, ".env"), join(load.configRoot, ".env"), join(home, ".env")]) {
 		for (const [key, value] of Object.entries(parseEnvFile(file))) if (!env[key]) env[key] = value;
 	}
 
-	const root = profileRoot(home, env, profile);
-	const ownAgentDir = !agentOverride || resolve(agentOverride) === join(root, "agent");
-	let dataRoot = root;
-	if ((process.platform === "linux" || process.platform === "darwin") && ownAgentDir && env.XDG_DATA_HOME) {
+	const dirs = dirResolver(inputs, env, profile, profile ? undefined : agentDirOverride(home, env));
+	let dataRoot = dirs.configRoot;
+	if ((process.platform === "linux" || process.platform === "darwin") && dirs.isOwnAgentDir && env.XDG_DATA_HOME) {
 		const appRoot = join(env.XDG_DATA_HOME, "omp");
 		const xdgRoot = profile ? join(appRoot, "profiles", profile) : appRoot;
 		if (exists(xdgRoot)) dataRoot = xdgRoot;
@@ -369,9 +408,11 @@ function shellQuote(arg: string): string {
  * of the id in that scope's registry (src/cli/plugin-cli.ts `handleSetEnabled`, manager.ts `setPluginEnabled`), and
  * `claude plugin disable` writes `enabledPlugins: { <id>: false }` to Claude's settings for the scope it detects (seen
  * on Claude Code 2026-10-20; it refuses with "already disabled" when no setting enables the id). `findDisagreements`,
- * like OMP, skips a disabled entry, so either, once it succeeds, leaves the id without a pair to compare. The profile
- * is named so the command writes the registry that disagrees; `default` selects the default profile (pi-utils@18.8.6
- * src/dirs.ts `normalizeProfileName`).
+ * like OMP, skips a disabled entry, so Claude's, once it succeeds, leaves the id no Claude entry to compare. OMP's
+ * removes only that registry's entry: a lower-precedence OMP entry for the id (the user registry's, under a project
+ * one) then counts, as in src/discovery/helpers.ts, and can disagree in its own right. The profile is named so the
+ * command writes the registry that disagrees; `default` selects the default profile (pi-utils@18.8.6 src/dirs.ts
+ * `normalizeProfileName`).
  */
 export function fixCommands(d: Disagreement, inputs: RegistryInputs): { omp: string; claude: string; ompDisable: string; claudeDisable: string } {
 	const id = shellQuote(d.id);

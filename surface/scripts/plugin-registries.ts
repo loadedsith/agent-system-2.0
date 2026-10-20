@@ -40,7 +40,7 @@ export function main(argv: readonly string[], env: Record<string, string | undef
 		err(`  disable in Claude: ${fix.claudeDisable}\n`);
 	}
 	err("(the match commands take no version: omp plugin install and claude plugin update install the marketplace's current one, which can still differ; check the version each reports.\n");
-	err(" The disable commands are deterministic: a disabled plugin counts as absent here, as it does in OMP, so either one, once it succeeds, makes the two registries on that plugin's line agree. Claude refuses its disable with \"already disabled\" when its settings never enabled the plugin; Claude Code is not loading it then, but OMP still reads Claude's entry, so use the OMP one. Disabling in OMP stops OMP loading the plugin from that registry. Then run as2 again.)\n");
+	err(" The disable commands are deterministic: a disabled plugin counts as absent here, as it does in OMP. Claude's, once it succeeds, leaves the plugin no active Claude entry to disagree with; it refuses with \"already disabled\" when Claude's settings never enabled the plugin, and Claude Code is not loading it then, but OMP still reads Claude's entry, so use the OMP one. OMP's stops OMP loading the plugin from that registry and removes only that registry's entry: a lower OMP entry for the same plugin (the user registry's, under a project one) then counts, and can disagree with Claude in its own right. After either, run as2 again: it runs this check again.)\n");
 	return 1;
 }
 
