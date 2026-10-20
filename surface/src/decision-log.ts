@@ -281,7 +281,8 @@ export function renderClose(ledger: Ledger, workloadId: string, dir: string, ide
 		"SELECT id, task, state, artifact, done_condition FROM slices WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
 	const questions = ledger.db.query<{ id: string; slice_id: string; body: string; state: string; options: string }, [string]>(
 		"SELECT id, slice_id, body, state, options FROM questions WHERE workload_id = ? ORDER BY created_at, id").all(workloadId);
-	const instructions = ledger.instructions(workloadId);
+	// The record keeps every row, a reversed one included (PLAN wl-mvfxw3c4zqfzls D5); the reversal entry says why.
+	const instructions = ledger.instructions(workloadId, { withReversed: true });
 	const entries = ledger.entries(workloadId);
 	const held = ledger.db.query<{ id: string; body: string; state: string }, [string]>(
 		"SELECT id, body, state FROM messages WHERE workload_id = ? AND state <> 'acted-on' ORDER BY created_at, id").all(workloadId);

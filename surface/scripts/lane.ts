@@ -51,6 +51,7 @@ import { fenceTargets } from "../../gates/src/fence";
 import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
+import { declareJoChannel } from "../../ledger/src/jo-channel";
 import {
 	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type SliceRow, type Stakes, type WorkloadRow,
 } from "../../ledger/src/index";
@@ -1738,6 +1739,9 @@ async function terminate(child: Pick<Subprocess, "kill" | "exited" | "exitCode" 
 }
 
 async function cmdInteractive(wl: string): Promise<number> {
+	// The by-hand launcher in Jo's terminal is a Jo channel (PLAN wl-mvfxw3c4zqfzls D1), declared before any connection:
+	// every connection this process opens, a relay's included, marks the Jo-authority rows it writes on `wl`.
+	declareJoChannel({ kind: "launcher", workload: wl });
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w) throw new Fail("interactive", `no workload ${wl}`, STARTER_EXIT.unknown!);

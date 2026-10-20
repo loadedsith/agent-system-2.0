@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { agentContext, installBoundary } from "./authority";
+import { joChannel, markRefusalSql, markTriggerSql, REVERSAL_ENTRIES_SQL, reversedRowIds } from "./jo-channel";
 import { assertLocalPath, assertNotLiveLedgerUnderTest, defaultLedgerPath, inLiveRoot, LiveLedgerUnderTestError } from "./locality";
 
 export {
@@ -489,8 +490,15 @@ export class Ledger {
 			if (!opts.readonly) retryBusy(retries, () => ensureWal(db));
 			// The Jo-only boundary, layer 1 (PLAN wl-mv654hoqwpfhmo § 6.3 item 1): an agent's connection to a live
 			// ledger, or one opened with `authority: "enforce"`, refuses surface-stamped rows, Jo-authored rows outside
-			// row 11's shape under this process's own lane id, and every answer (authority.ts installBoundary).
-			if (!opts.readonly && agentContext() && (opts.authority === "enforce" || liveOrUnknown(target))) installBoundary(db);
+			// row 11's shape under this process's own lane id, and every answer (authority.ts installBoundary), and
+			// writes no Jo-channel mark (jo-channel.ts markRefusalSql). A declared Jo channel is no agent: it is refused
+			// there. Elsewhere a declared process marks the Jo-authority rows it writes (PLAN wl-mvfxw3c4zqfzls D1).
+			const channel = opts.readonly ? null : joChannel();
+			if (!opts.readonly && agentContext() && (opts.authority === "enforce" || liveOrUnknown(target))) {
+				if (channel) throw new Error(`${target}: this process is a declared Jo channel (ledger/src/jo-channel.ts) and an agent context on a ledger the Jo-only boundary guards; refused`);
+				installBoundary(db);
+				db.exec(markRefusalSql());
+			} else if (channel) db.exec(markTriggerSql(channel));
 		} catch (e) {
 			db.close();
 			throw e;
@@ -638,7 +646,8 @@ export class Ledger {
 	/**
 	 * The park decision (decision 14), in one transaction with the question read: when a question
 	 * this lane raised is open, or resolved (answer or replan withdrawal) by an instruction no
-	 * `launch:` attempt names, write `lane-parked: <laneId> questions <ids> session <path>`.
+	 * `launch:` attempt names and no `forgery-reversed:` voids (PLAN wl-mvfxw3c4zqfzls D5: a reversed
+	 * answer is no pending resume), write `lane-parked: <laneId> questions <ids> session <path>`.
 	 */
 	parkLane(workloadId: string, input: Stamp & { laneId: string; session: string }): ParkResult {
 		return this.write(() => {
@@ -648,6 +657,7 @@ export class Ledger {
 				"SELECT body FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ? AND body GLOB ?",
 			).all(workloadId, LANE_STARTER_BY, LAUNCH_ATTEMPT_GLOB);
 			const consumed = new Set(attempts.flatMap((a) => a.body.split(/\s+/)));
+			const reversed = this.reversedIds(workloadId);
 			const pending: string[] = [];
 			let open = 0;
 			for (const q of questions) {
@@ -656,7 +666,7 @@ export class Ledger {
 					pending.push(q.id);
 					continue;
 				}
-				if (q.resolved_by === null || consumed.has(q.resolved_by)) continue;
+				if (q.resolved_by === null || consumed.has(q.resolved_by) || reversed.has(q.resolved_by)) continue;
 				const resolution = this.db.query<InstructionRow, [string]>("SELECT * FROM instructions WHERE id = ?").get(q.resolved_by);
 				if (resolution && (resolution.kind === "answer" || resolution.disposition === "replan")) pending.push(q.id);
 			}
@@ -795,9 +805,22 @@ export class Ledger {
 		return this.write(() => this.insertInstruction({ ...input, kind: "instruction" }));
 	}
 
-	instructions(workloadId: string): InstructionRow[] {
-		return this.db.query<InstructionRow, [string]>(
+	/**
+	 * The workload's instructions, oldest first, leaving out every row a surface `forgery-reversed:` entry of the
+	 * workload names (PLAN wl-mvfxw3c4zqfzls D5): the read every decision reader takes. `withReversed` keeps them, for
+	 * the reads that need the raw rows (the forgery check, the decision log, row 11's dedup).
+	 */
+	instructions(workloadId: string, opts: { withReversed?: boolean } = {}): InstructionRow[] {
+		const rows = this.db.query<InstructionRow, [string]>(
 			"SELECT * FROM instructions WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId);
+		if (opts.withReversed) return rows;
+		const reversed = this.reversedIds(workloadId);
+		return reversed.size === 0 ? rows : rows.filter((r) => !reversed.has(r.id));
+	}
+
+	/** The row ids the workload's surface `forgery-reversed:` entries void (jo-channel.ts reversedRowIds). */
+	private reversedIds(workloadId: string): Set<string> {
+		return reversedRowIds(this.db.query<Pick<EntryRow, "kind" | "body" | "created_by" | "created_at">, [string]>(REVERSAL_ENTRIES_SQL).all(workloadId));
 	}
 
 	private insertInstruction(input: Stamp & {
@@ -1041,6 +1064,16 @@ export class Ledger {
 	provenance(workloadId: string): ProvenanceRow[] {
 		return this.db.query<ProvenanceRow, [string]>(
 			"SELECT * FROM provenance WHERE workload_id = ? ORDER BY seq").all(workloadId);
+	}
+
+	/**
+	 * The global Jo-channel cutovers (PLAN wl-mvfxw3c4zqfzls D2): the earliest `surface` and `launcher` mark in the
+	 * ledger (jo-channel.ts), null before a kind's first mark. Ledger-wide, never one workload's.
+	 */
+	joChannelCutovers(): { surface: string | null; launcher: string | null } {
+		const rows = this.db.query<{ detail: string; at: string }, []>(
+			"SELECT detail, MIN(at) AS at FROM provenance WHERE lane_instance = 'jo-channel' AND detail IN ('surface', 'launcher') GROUP BY detail").all();
+		return { surface: rows.find((r) => r.detail === "surface")?.at ?? null, launcher: rows.find((r) => r.detail === "launcher")?.at ?? null };
 	}
 
 	/**
