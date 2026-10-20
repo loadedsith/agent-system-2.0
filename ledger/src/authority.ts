@@ -1,7 +1,8 @@
 // The Jo-only boundary, accident grade (PLAN wl-mv654hoqwpfhmo § 6, migration/items/jo-only-boundary.md).
 //
-// One table of the rows only Jo (through the surface) may write, with the reader that trusts each; the one
-// predicate every reader of Jo's authority uses; which processes are agents; and the per-connection TEMP
+// One table of the rows only Jo (through the surface) may write, with the reader that trusts each; the
+// predicate readers of Jo's authority are to use (`joAuthority`: no non-test reader calls it yet, G4 in
+// migration/items/jo-only-boundary.md); which processes are agents; and the per-connection TEMP
 // triggers `Ledger.open` installs on an agent's connection to a live ledger (layer 1). The gate's half
 // (layer 2: eval and bash may not import the ledger module, open the ledger raw or touch the names below) is
 // gates/src/rows/r10-raw-ledger.ts and gates/src/eval-code.ts.
@@ -101,7 +102,8 @@ export const BOUNDARY = "Jo-only boundary";
 const sql = (s: string) => `'${s.replaceAll("'", "''")}'`;
 const SURFACE = sql(SURFACE_BY);
 const STAMP_REFUSED = sql(`${BOUNDARY}: an agent process may not write a row stamped ${SURFACE_BY}; only the surface writes it, for Jo (ledger/src/authority.ts)`);
-const JO_REFUSED = sql(`${BOUNDARY}: an agent process may write author jo only as row 11's direct channel (kind instruction, channel direct, no question, its own stamp)`);
+const JO_REFUSED = sql(`${BOUNDARY}: an agent process may write author jo only as row 11's direct channel (kind instruction, channel direct, no question, stamped with its own AGENT_SYSTEM_LANE_ID)`);
+const ANSWER_REFUSED = sql(`${BOUNDARY}: an agent process may not answer a question, whatever the author; only the surface answers, for Jo (ledger/src/authority.ts)`);
 
 /** Tables the triggers guard, and whether a row carries `changed_by` (updated rows) or only `created_by` (append-only). */
 const GUARDED: readonly [table: string, updatable: boolean][] = [
@@ -114,12 +116,21 @@ const GUARDED: readonly [table: string, updatable: boolean][] = [
 ];
 
 /**
- * The boundary's triggers: TEMP, so they live on this connection only and write nothing to the file (no
- * `sqlite_master` row, no schema_version change), on `main.<table>` so they bind to the file's tables
+ * The boundary's triggers for a connection whose process carries `laneId` (AGENT_SYSTEM_LANE_ID, or none):
+ * TEMP, so they live on this connection only and write nothing to the file (no `sqlite_master` row, no
+ * schema_version change), on `main.<table>` so they bind to the file's tables
  * (https://sqlite.org/lang_createtrigger.html § 7). There is no way to turn them off on the connection
  * short of dropping them by name in raw SQL, which the gate refuses an agent.
+ * - Row 11's exemption (author jo, kind instruction, channel direct, no question) holds only for a row
+ *   stamped with this connection's own lane id, built in as a literal (G3, scratch auth-forgery AUDIT.md
+ *   § (e)): row 11 writes with the lane's id (gates/src/rows/r11-jo-instruction.ts, `by: input.laneId`, the
+ *   session's AGENT_SYSTEM_LANE_ID), and `joInstructionsFor` delivers any other stamp to the next lane as
+ *   Jo's words. With no lane id (a hand's own process, another agent context) the shape is refused.
+ * - An `answer` row is refused whatever its author (G2): an agent never answers a question, so a lane cannot
+ *   un-gate its own (`resolutions` reads any answer). A withdrawal stays allowed: the runner withdraws its
+ *   ceiling questions as `lane-runner` (surface/scripts/lane.ts withdrawCeilingQuestions).
  */
-function triggerSql(): string {
+function triggerSql(laneId: string | undefined): string {
 	const out: string[] = [];
 	const trigger = (name: string, event: string, table: string, when: string, message: string) =>
 		out.push(`CREATE TEMP TRIGGER IF NOT EXISTS jo_only_${name} BEFORE ${event} ON main.${table} WHEN ${when} BEGIN SELECT RAISE(ABORT, ${message}); END;`);
@@ -127,15 +138,19 @@ function triggerSql(): string {
 		trigger(`${t}_insert_stamp`, "INSERT", t, `NEW.created_by = ${SURFACE}`, STAMP_REFUSED);
 		trigger(`${t}_update_stamp`, "UPDATE", t, updatable ? `NEW.changed_by = ${SURFACE}` : `NEW.created_by = ${SURFACE}`, STAMP_REFUSED);
 	}
-	const notRow11 = "NEW.author = 'jo' AND NOT (NEW.kind = 'instruction' AND NEW.channel = 'direct' AND NEW.question_id IS NULL)";
+	const ownStamp = laneId ? `NEW.created_by = ${sql(laneId)}` : "0";
+	const notRow11 = `NEW.author = 'jo' AND NOT (NEW.kind = 'instruction' AND NEW.channel = 'direct' AND NEW.question_id IS NULL AND ${ownStamp})`;
 	trigger("instructions_insert_jo", "INSERT", "instructions", notRow11, JO_REFUSED);
 	trigger("instructions_update_jo", "UPDATE", "instructions", notRow11, JO_REFUSED);
+	trigger("instructions_insert_answer", "INSERT", "instructions", "NEW.kind = 'answer'", ANSWER_REFUSED);
+	trigger("instructions_update_answer", "UPDATE", "instructions", "NEW.kind = 'answer'", ANSWER_REFUSED);
 	return out.join("\n");
 }
 
-const TRIGGERS = triggerSql();
-
-/** Install the boundary's triggers on `db` (an agent's connection to a live ledger). Idempotent. */
-export function installBoundary(db: Database): void {
-	db.exec(TRIGGERS);
+/**
+ * Install the boundary's triggers on `db` (an agent's connection to a live ledger), keyed on the lane id `env`
+ * carries at open. Idempotent per connection: a second call adds nothing (`IF NOT EXISTS`, by name).
+ */
+export function installBoundary(db: Database, env: Record<string, string | undefined> = process.env): void {
+	db.exec(triggerSql(env.AGENT_SYSTEM_LANE_ID || undefined));
 }

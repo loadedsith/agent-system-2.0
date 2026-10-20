@@ -488,7 +488,8 @@ export class Ledger {
 			if (v !== SCHEMA_VERSION) throw new LedgerSchemaVersionError(target, v);
 			if (!opts.readonly) retryBusy(retries, () => ensureWal(db));
 			// The Jo-only boundary, layer 1 (PLAN wl-mv654hoqwpfhmo § 6.3 item 1): an agent's connection to a live
-			// ledger, or one opened with `authority: "enforce"`, refuses surface-stamped and Jo-authored rows.
+			// ledger, or one opened with `authority: "enforce"`, refuses surface-stamped rows, Jo-authored rows outside
+			// row 11's shape under this process's own lane id, and every answer (authority.ts installBoundary).
 			if (!opts.readonly && agentContext() && (opts.authority === "enforce" || liveOrUnknown(target))) installBoundary(db);
 		} catch (e) {
 			db.close();

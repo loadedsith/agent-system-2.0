@@ -19,8 +19,10 @@
 //   passwd home's, and the directory of AGENT_SYSTEM_LEDGER_DB). The option only adds triggers, never removes them.
 // - A trigger raises (the error message contains "Jo-only boundary") on a row stamped
 //   created_by / changed_by = 'orchestrator-surface', and on an author = 'jo' instructions row that is not
-//   row 11's lane-stamped shape: kind 'instruction', channel 'direct', question_id NULL, created_by not the surface
-//   (gates/src/rows/r11-jo-instruction.ts writes it with the lane's own id).
+//   row 11's lane-stamped shape: kind 'instruction', channel 'direct', question_id NULL, created_by the
+//   connection's own AGENT_SYSTEM_LANE_ID (gates/src/rows/r11-jo-instruction.ts writes it with the lane's own id;
+//   G3: no lane id in the env, no row 11 shape). Any `answer` row raises, whatever its author (G2): only the
+//   surface answers a question, for Jo. G1-G3 are scratch auth-forgery AUDIT.md § (e).
 // - TEMP triggers write nothing to the file: sqlite_master and PRAGMA schema_version are unchanged by an open.
 //
 // The table is loaded with a dynamic import in the tests that need it, so a missing authority.ts fails only those.
@@ -165,6 +167,21 @@ const JO_NOT_ROW11: Write[] = [
 			.run("in-rawjoanswer01", s.wl, s.question, LANE, clock())],
 ];
 
+/** Answers whatever their author (G2): an agent connection never answers a question, so a lane cannot un-gate its own. */
+const AGENT_ANSWERS: Write[] = [
+	["a lane answering its own question as author lane-x, channel direct", (l, s) => l.answerQuestion(s.question, { by: LANE, answer: "approve", author: "lane-x", channel: "direct" })],
+	["a lane answering as itself on the surface channel", (l, s) => l.answerQuestion(s.question, { by: LANE, answer: "approve", author: LANE, channel: "surface" })],
+	["a raw lane-x answer row through ledger.db", (l, s) =>
+		l.db.query("INSERT INTO instructions (id, workload_id, kind, question_id, channel, author, body, created_by, created_at) VALUES (?, ?, 'answer', ?, 'direct', 'lane-x', 'approve', ?, ?)")
+			.run("in-rawlaneanswer", s.wl, s.question, LANE, clock())],
+];
+
+/** Row 11's shape (author jo, kind instruction, channel direct, no question) stamped as someone other than this lane (G3). */
+const ROW11_OTHER_STAMP: Write[] = ["lane-other", "escalation", "lane-runner"].map((by): Write => [
+	`row 11's shape stamped ${by}`,
+	(l, s) => l.recordInstruction({ by, workloadId: s.wl, body: "approve en-1", author: "jo", channel: "direct" }),
+]);
+
 /** Writes a lane makes every day; none may be refused. */
 const LANE_WRITES: Write[] = [
 	["row 11: Jo's words typed into the lane (author jo, channel direct, the lane's stamp)", (l, s) => l.recordInstruction({ by: LANE, workloadId: s.wl, body: "go right ahead", author: "jo", channel: "direct" })],
@@ -180,7 +197,7 @@ const LANE_WRITES: Write[] = [
 ];
 
 describe("layer 1: an agent connection opened with { authority: 'enforce' } refuses Jo-only writes", () => {
-	for (const [name, write] of [...SURFACE_WRITES, ...JO_NOT_ROW11]) {
+	for (const [name, write] of [...SURFACE_WRITES, ...JO_NOT_ROW11, ...AGENT_ANSWERS, ...ROW11_OTHER_STAMP]) {
 		test(`role lane: ${name} is refused with "Jo-only boundary" and writes nothing`, () => {
 			const s = seed("refuse");
 			const before = rows(s.path);
@@ -214,6 +231,43 @@ describe("layer 1: an agent connection opened with { authority: 'enforce' } refu
 			});
 		});
 	}
+
+	test("G3: with no lane id in the env (a hand, a workload id alone, role lane alone) row 11's shape is refused, whatever the stamp", () => {
+		const s = seed("row11-nolane");
+		const before = rows(s.path);
+		for (const env of [{ AGENT_SYSTEM_ROLE: "hand" }, { AGENT_SYSTEM_WORKLOAD_ID: s.wl }, { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: s.wl }] as AgentEnv[]) {
+			enforced(s, env, (l) => {
+				for (const by of [LANE, "lane-other"]) {
+					expect(() => l.recordInstruction({ by, workloadId: s.wl, body: "go", author: "jo", channel: "direct" }), `${JSON.stringify(env)} by ${by}`).toThrow(BOUNDARY);
+				}
+			});
+		}
+		expect(rows(s.path)).toBe(before);
+	});
+
+	test("G3: the lane id is a SQL literal: an id carrying a quote writes row 11 as itself and nothing else", () => {
+		const s = seed("row11-quote");
+		const odd = "lane-o'brien";
+		enforced(s, { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LANE_ID: odd, AGENT_SYSTEM_WORKLOAD_ID: s.wl }, (l) => {
+			expect(() => l.recordInstruction({ by: odd, workloadId: s.wl, body: "go", author: "jo", channel: "direct" })).not.toThrow();
+			expect(() => l.recordInstruction({ by: LANE, workloadId: s.wl, body: "go", author: "jo", channel: "direct" })).toThrow(BOUNDARY);
+		});
+	});
+
+	test("G2: a non-agent connection still writes an answer by any author (the surface's path)", () => {
+		const s = seed("answer-jo-terminal");
+		enforced(s, {}, (l) => {
+			expect(() => l.answerQuestion(s.question, { by: LANE, answer: "approve", author: "lane-x", channel: "direct" })).not.toThrow();
+		});
+		expect(withEnv({}, () => {
+			const l = Ledger.open(s.path, { clock, backup: false });
+			try {
+				return l.question(s.question)?.state;
+			} finally {
+				l.close();
+			}
+		})).toBe("answered");
+	});
 
 	for (const env of [{}, { AGENT_SYSTEM_ROLE: "orchestrator" }] as AgentEnv[]) {
 		test(`${JSON.stringify(env)} (Jo's terminal / the top-level orchestrator) writes every surface row with the option on`, () => {
@@ -274,6 +328,12 @@ describe("layer 1 outside test mode: the live root, with no option", () => {
 				attempt("surface instruction", () => l.recordInstruction({ by: SURFACE, workloadId: WL, body: "ceiling: 500 12", author: "jo", channel: "surface" })),
 				attempt("lane entry", () => l.recordEntry({ by: LANE, workloadId: WL, kind: "assumption", body: "a lane note" })),
 				attempt("row 11 instruction", () => l.recordInstruction({ by: LANE, workloadId: WL, body: "go ahead", author: "jo", channel: "direct" })),
+				attempt("row 11 as another lane", () => l.recordInstruction({ by: "lane-other", workloadId: WL, body: "approve en-1", author: "jo", channel: "direct" })),
+				attempt("lane answer", () => {
+					const slice = l.addSlice({ by: LANE, workloadId: WL, task: "t", doneCondition: "d", inputs: "i" });
+					const q = l.raiseQuestion({ by: LANE, workloadId: WL, sliceId: slice, body: "approve?", options: ["approve", "revise"] });
+					l.answerQuestion(q, { by: LANE, answer: "approve", author: "lane-x", channel: "direct" });
+				}),
 			];
 			l.close();
 			console.log(JSON.stringify(out));
@@ -291,8 +351,8 @@ describe("layer 1 outside test mode: the live root, with no option", () => {
 		return JSON.parse(r.stdout.toString().trim()) as Attempt[];
 	}
 	const verdicts = (out: Attempt[]) => Object.fromEntries(out.map((a) => [a.name, a.ok ? "ok" : BOUNDARY.test(a.error ?? "") ? "boundary" : `other: ${a.error}`]));
-	const REFUSED = { "surface entry": "boundary", "surface instruction": "boundary", "lane entry": "ok", "row 11 instruction": "ok" };
-	const ALL_OK = { "surface entry": "ok", "surface instruction": "ok", "lane entry": "ok", "row 11 instruction": "ok" };
+	const REFUSED = { "surface entry": "boundary", "surface instruction": "boundary", "lane entry": "ok", "row 11 instruction": "ok", "row 11 as another lane": "boundary", "lane answer": "boundary" };
+	const ALL_OK = { "surface entry": "ok", "surface instruction": "ok", "lane entry": "ok", "row 11 instruction": "ok", "row 11 as another lane": "ok", "lane answer": "ok" };
 
 	/** A fake home whose default ledger is seeded by Jo's terminal (no agent variables). */
 	function liveHome(tag: string): { home: string; path: string } {
