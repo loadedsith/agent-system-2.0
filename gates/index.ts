@@ -21,6 +21,7 @@
 //   row allowed, its revision never reaches a row (row 18 reads the typed command), and its
 //   tool_result cleanup runs after rows 3 and 8 read the original command.
 import openLinks from "./extensions/open-links";
+import ompDocsStaleRow from "./extensions/omp-docs-stale";
 import { linkedApi } from "./src/links";
 import askPolicyRow from "./extensions/r14-ask-policy";
 import briefFieldsRow from "./extensions/r05-brief-fields";
@@ -152,6 +153,10 @@ export default function p11Gates(
 	turnShapeRow(pi, env);
 	joInstructionRow(pi, env);
 	registerFence(pi, env, fenceSettings, startCheck, cleanShell);
-	// The notice reads the host; a test handing in its own reader has no host to read.
-	if (fenceSettings === hostFenceSettings) hostVersionNotice(pi);
+	// The notices read the host; a test handing in its own reader has no host to read. The stale-docs
+	// row registers its `context` handler from session_start, so it runs after the fence's history view.
+	if (fenceSettings === hostFenceSettings) {
+		hostVersionNotice(pi);
+		ompDocsStaleRow(pi);
+	}
 }

@@ -1254,6 +1254,10 @@ surface/test/linked-api.test.ts	test	-
 install/herdr-file-links/herdr-plugin.toml	install	-
 install/herdr-file-links/open-file.sh	install	-
 ledger/test/file-links-install.test.ts	test	-
+# Stale OMP docs (wl-mv8k0fby51uakg, PLAN D8): the OMP-doc rule and snapshot parser, the gates row that notices a stale doc, its test.
+gates/src/omp-docs.ts	module	-
+gates/extensions/omp-docs-stale.ts	extension	-
+gates/test/omp-docs-stale.test.ts	test	-
 # Jev ranking, show-only first (migration/items/jev-ranking.md): the ranking, the as2_rank tool, the audit, the launch gate, the CLIs.
 surface/src/rank.ts	module	-
 surface/src/rank-audit.ts	module	-
