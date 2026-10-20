@@ -890,7 +890,9 @@ describe("Round limit (D9), wired", () => {
 
 	test("a passing round ends the loop with no question, and the next review starts a fresh loop with the full allowance", async () => {
 		const w = world();
-		const h = lane(w);
+		// This exercises loop accounting; read-only reviews above cover real git fingerprints.
+		// Avoid twelve synchronous snapshots (sixty git processes) across the six rounds here.
+		const h = lane(w, { fingerprint: () => "unchanged" });
 		h.laneMessage(OPUS);
 		await reviewRound(h, w, "rev-1", blocking("a"));
 		await reviewRound(h, w, "rev-2", blocking("b"));

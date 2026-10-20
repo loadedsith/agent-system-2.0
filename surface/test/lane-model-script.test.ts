@@ -5,7 +5,7 @@
 // that never got one), and omp's prompt error in the death line. The pure rows are in
 // lane-model.test.ts; these spawn processes, so they run in the full suite outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { builderLabs } from "../../classifier/src/lab";
 import { LANE_RUNNER_BY, Ledger } from "../../ledger/src/index";
@@ -252,6 +252,29 @@ describe("T4: a named model OMP does not report fails the launch before any prom
 });
 
 describe("T5c: lane-ready: only just before the first prompt", () => {
+	test("preparation does not consume the child's claim/model readiness window", async () => {
+		const r = makeRoot();
+		const { wl } = openWorkload(r, X);
+		const realGit = Bun.which("git");
+		if (realGit === null) throw new Error("git is required by the lane fixture");
+		const shim = join(r.root, "bin", "git");
+		// Only the runner's prepare is delayed, not the starter. Its 4s consumes the old
+		// readiness clock before omp exists; the delayed model reply then misses the first poll.
+		writeFileSync(shim, `#!/bin/sh
+if [ -n "$AGENT_SYSTEM_LANE_ID" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
+  sleep 4
+fi
+exec ${JSON.stringify(realGit)} "$@"
+`);
+		chmodSync(shim, 0o755);
+		launch(r, wl, { steps: DONE, stateDelayMs: 1500 });
+		const lane1 = laneIdOf(wl, 1);
+		expect(await settledExit(r, wl, lane1)).toMatchObject({ outcome: "completed" });
+		expect(readyLines(r, wl, lane1)).toHaveLength(1);
+		expect(eventsOf(r, spawnRecord(r, 1).pid)).toEqual(["prompt", "eof"]);
+		expect(laneSnapshot(r, wl).deaths).toEqual([]);
+	}, 60_000);
+
 	test("an at-ceiling relaunch stops before lane-ready: and before any prompt; builderLabs names it neither builder nor unknown", async () => {
 		const r = makeRoot();
 		const { wl } = openWorkload(r, X);

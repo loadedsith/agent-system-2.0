@@ -26,3 +26,18 @@ Not changed: the review round limit and its `extend` / `accept` / `stop` questio
 The train tick needs no reinstall: it runs `surface/scripts/train-tick.ts` from the checkout on each pass. No schema change and no ledger rewrite. `notice:`, `ruling-applied:`, `plan: approved auto`, `plan: halted` and `train-hold:` rows are new and inert under the old code. A ceiling question left open from before the deploy is not settled by anything new: answer it with `cancel-slice sl-ceiling-…` (withdraws it and cancels its slice) or `withdraw q-…` (withdraws it and replans the slice).
 
 **Reversal.** Revert the PR on main, fast-forward, re-run the install, restart `as2` and relaunch the lanes. Rows already written stay in the ledger. The old reader drops a `plan: approved` from any writer but the surface (`validWriter`, `surface/src/launch.ts`), so a workload auto-started before the revert reads as plan-first and unapproved again: its lane may add no change slice until Jo approves its next plan question. A ceiling over 80 % may raise the old ceiling question at the lane's next poll.
+
+## PR 267 train repair
+
+The runner's claim/model readiness window and runtime deadline start at the child spawn,
+not before repository/profile preparation. Preparation may block on git before OMP exists;
+it must not consume the child's readiness allowance. Ceiling thresholds and the pre-prompt
+ceiling check are unchanged. `surface/test/lane-model-script.test.ts`, under
+`T5c: lane-ready: only just before the first prompt`, covers delayed preparation followed by
+a delayed model reply and retains the at-ceiling relaunch's no-readiness/no-prompt checks.
+
+The classifier's six-round review-loop reset scenario in `classifier/test/crosslab.test.ts`
+uses the existing fingerprint injection to isolate loop accounting from repeated git scans.
+It retains every round and behavioral assertion; the read-only review and fingerprint tests
+still exercise real git. Neither repair increases a test or readiness timeout.
+
