@@ -8,11 +8,15 @@
 // transcript's own copy.
 import type { Ledger } from "../../ledger/src/index";
 import { ensureStandingWorkload } from "../../surface/src/identity";
-import { checkReserved, deploymentCandidate, judgeDeploy, recordDeployResult, type DeployPending, type MergeView, reservedAction, reservedRequestBody } from "../src/rows/r06-reserved";
-import { type GatesAPI, gateSession } from "../src/session";
+import { checkReserved, deploymentCandidate, judgeDeploy, recordDeployResult, type DeployPending, type DeployToolCall, type MergeView, reservedAction, reservedRequestBody } from "../src/rows/r06-reserved";
+import { type Ctx, type GatesAPI, gateSession } from "../src/session";
 import type { DeployFacts } from "../src/deploy-risk";
 
-export default function reservedRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env, facts?: (ledger: Ledger) => DeployFacts, mergeView?: MergeView): void {
+export interface ReservedOptions { deferAdmission?: boolean; timeoutMs?: number }
+
+// With the aggregate extension, only the read-only reserved pass runs here; its admission handler
+// is registered after the fence. Standalone row profiles have no later aggregate gates.
+export default function reservedRow(pi: GatesAPI, env: Record<string, string | undefined> = process.env, facts?: (ledger: Ledger) => DeployFacts, mergeView?: MergeView, options: ReservedOptions = {}): () => void {
 	const pending = new Map<string, DeployPending>();
 	pi.on("tool_result", (event, ctx) => {
 		const admitted = event.toolCallId ? pending.get(event.toolCallId) : undefined;
@@ -28,14 +32,14 @@ export default function reservedRow(pi: GatesAPI, env: Record<string, string | u
 			pending.delete(event.toolCallId!);
 		}
 	});
-	pi.on("tool_call", async (event, ctx) => {
+	const handler = async (event: DeployToolCall, ctx: Ctx) => {
 		const s = gateSession(ctx, env);
 		const call = { ...event, input: s.originalInput(event) };
 		const callCtx = { role: s.role, cwd: ctx.cwd, env, mode: s.mode?.mode };
 		if (deploymentCandidate(call, callCtx)) {
 			try {
 				const ledger = s.ledger();
-				const judged = await judgeDeploy(call, callCtx, { ledger, workloadId: s.workloadId ?? ensureStandingWorkload(ledger), laneId: s.laneId, facts: facts?.(ledger), mergeView });
+				const judged = await judgeDeploy(call, callCtx, { ledger, workloadId: s.workloadId ?? ensureStandingWorkload(ledger), laneId: s.laneId, facts: facts?.(ledger), mergeView, timeoutMs: options.timeoutMs });
 				if (judged) {
 					const otherAction = reservedAction(judged.refusal);
 					if (otherAction) ledger.recordEntry({ workloadId: s.workloadId ?? ensureStandingWorkload(ledger), sliceId: s.workloadId ? s.currentSlice() : null, by: s.laneId, kind: "reserved-request", body: reservedRequestBody(call, otherAction, event.toolCallId) });
@@ -49,7 +53,7 @@ export default function reservedRow(pi: GatesAPI, env: Record<string, string | u
 		const refusal = checkReserved(call, callCtx);
 		const action = reservedAction(refusal);
 		if (action) {
-			const body = reservedRequestBody(event, action, event.toolCallId);
+			const body = reservedRequestBody(call, action, event.toolCallId);
 			try {
 				const ledger = s.ledger();
 				const workloadId = s.workloadId ?? ensureStandingWorkload(ledger);
@@ -60,5 +64,15 @@ export default function reservedRow(pi: GatesAPI, env: Record<string, string | u
 			}
 		}
 		return refusal ?? undefined;
-	});
+	};
+	if (!options.deferAdmission) {
+		pi.on("tool_call", handler);
+		return () => {};
+	}
+	const candidate = (event: DeployToolCall, ctx: Ctx) => {
+		const s = gateSession(ctx, env);
+		return deploymentCandidate({ ...event, input: s.originalInput(event) }, { role: s.role, cwd: ctx.cwd, env, mode: s.mode?.mode });
+	};
+	pi.on("tool_call", (event, ctx) => candidate(event, ctx) ? undefined : handler(event, ctx));
+	return () => pi.on("tool_call", (event, ctx) => candidate(event, ctx) ? handler(event, ctx) : undefined);
 }

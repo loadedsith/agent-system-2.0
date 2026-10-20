@@ -60,6 +60,22 @@ describe("deploy settle (R4 R8 R25 R27)", () => {
 		const x = fixture();
 		x.set({ candidates: [{ id: 123, event: "workflow_dispatch", created_at: x.time.now() }, { id: 999, event: "push", created_at: x.time.now() }, { id: 888, event: "workflow_dispatch", created_at: "2026-10-19T18:02:01.000Z" }] });
 		expect((await settleDeploy(x.ledger, "dp-test", { facts: x.facts })).code).toBe(0);
+		const list = x.calls.find((c) => c.kind === "rest" && c.path.includes("/runs?"));
+		expect(list?.kind === "rest" && list.paginate).toBe(true);
+		expect(list?.kind === "rest" && decodeURIComponent(list.path)).toContain("created=2026-10-19T18:00:00.000Z..2026-10-19T18:02:00.000Z");
+	});
+	test("filtered fallback still requires complete pagination and checks every candidate's window", async () => {
+		for (const complete of [false, true]) {
+			const x = fixture();
+			const original = x.facts.gh;
+			x.facts.gh = async (req) => req.kind === "rest" && req.path.includes("/runs?")
+				? { ok: true, json: [{ total_count: 2, workflow_runs: [{ id: 123, event: "workflow_dispatch", created_at: x.time.now() }] }, ...(complete ? [{ total_count: 2, workflow_runs: [{ id: 999, event: "workflow_dispatch", created_at: "2026-10-19T18:02:01.000Z" }] }] : [])] }
+				: original(req);
+			const result = await settleDeploy(x.ledger, "dp-test", { facts: x.facts });
+			expect(result.code).toBe(complete ? 0 : 1);
+			expect(x.settles()).toHaveLength(complete ? 1 : 0);
+			if (!complete) expect(result.line).toContain("incomplete workflow_runs pagination");
+		}
 	});
 	test("nonzero dispatch exit alone never settles; no run waits until 600s then fails not-dispatched", async () => {
 		const x = fixture();

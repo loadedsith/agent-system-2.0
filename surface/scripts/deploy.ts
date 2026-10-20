@@ -76,9 +76,11 @@ export async function settleDeploy(ledger: Ledger, id: string, options: SettleOp
 		const own = ledgerFacts(ledger).rows("deploy-run").map((r) => parseDeployRunRow(r.body)).findLast((r) => r?.id === id && r.runId !== undefined);
 		let runId = own?.runId;
 		if (!runId) {
-			const json = await request(`repos/${target.repo}/actions/workflows/${target.file}/runs?event=workflow_dispatch&per_page=100`, true);
 			const start = Date.parse(row.createdAt);
 			if (!Number.isFinite(start)) throw new Error("unreadable deploy timestamp");
+			const end = start + 120_000;
+			const created = encodeURIComponent(`${new Date(start).toISOString()}..${new Date(end).toISOString()}`);
+			const json = await request(`repos/${target.repo}/actions/workflows/${target.file}/runs?event=workflow_dispatch&created=${created}&per_page=100`, true);
 			const candidates = new Set<string>();
 			for (const item of pageItems(json, "workflow_runs")) {
 				if (!object(item)) throw new Error("unreadable workflow run");

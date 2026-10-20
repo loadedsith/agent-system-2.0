@@ -57,7 +57,9 @@ The thresholds (400 and 1500 lines, 5 directories) and the window hours are GUES
 
 ## Predicates
 
-H is the default-branch head at evaluation. B is the H of the target's newest `deploy-settled: … ok` row. Order of outcomes: hold, then escalate, then defer, then routine; every condition that holds is named. If the policy is not authenticated, evaluation stops at E0 and reads no other fact. No condition runs a declared shell command: every fact is a `gh api` read, a ledger read, the clock or the gate's own HTTPS GET.
+H is the default-branch head at evaluation. B is the H of the target's newest `deploy-settled: … ok` row. Order of outcomes: hold, then escalate, then defer, then routine; every condition that holds is named. First identify a declared target of a parsed policy: absent, unreadable or malformed policy, an unknown workflow/repo, or an unresolved repo leaves the original workflow reserved request unchanged (R5 precedes R6; never routine). For an identifiable declared target, unauthenticated policy is E0 and reads no other fact. No condition runs a declared shell command: every fact is a `gh api` read, a ledger read, the clock or the gate's own HTTPS GET.
+
+Admission runs only after every rejecting gate, including the OS fence, and reads the original command rather than its fence wrapper. All read-only preparation shares one 20 s total deadline below the host's 30 s handler timeout, including merge selector/origin resolution; expiry is a plain E0 refusal with no admission, approval consumption or late ledger writes. Per-gh and health timeouts do not extend this total. Admission checks the deadline again under the ledger lock and before commit.
 
 ### Hold
 
@@ -76,19 +78,19 @@ A reserved request `deploy (<target>, escalated: <ids>) …`, NOW under escalati
 
 | id | Outcome | Sources | Predicate |
 |---|---|---|---|
-| E0 | escalate | none (fail-closed rule) | the policy is not authenticated, fails to parse, or declares a shape the routine rule rejects; the workflow blob at H ≠ `workflowBlob`; a fact below cannot be read (gh non-zero, 20 s timeout, missing JSON field, incomplete pagination); or the `B…H` compare is capped (300 or more files, or fewer commits listed than its total), so E4, E5 and E9 cannot see every file |
+| E0 | escalate | none (fail-closed rule) | an identifiable declared target's policy is not authenticated; the workflow blob at H ≠ `workflowBlob`; a fact below cannot be read (gh non-zero, timeout, missing JSON field, incomplete pagination); or the `B…H` compare is capped (300 or more files, or fewer commits listed than its total), so E4, E5 and E9 cannot see every file. No parsed target retains the original reservation instead; total deadline expiry is a plain E0 refusal without rows |
 | E1 | escalate | as2 policy (SPEC § B4) | the workload's stakes are `production` |
 | E2 | escalate | S9, S13, S17 | a `requiredChecks` entry (`{name, app}`: check-run name and `app.slug`) has no check-run at H, or its latest attempt is not completed with `success`; or any check-run or commit status at H is `failure`, `cancelled`, `timed_out`, `action_required`, `stale` or not completed. Every page is read |
 | E3 | escalate | S3 | the default-branch head read again at the end of evaluation differs from H; or an open PR of the repo has auto-merge enabled; or the default branch uses a merge queue |
 | E4 | escalate | S5, S7, S11, S14 | the `B…H` compare touches a migration or data-shape glob (defaults `**/migrations/**`, `**/migrate/**`, `**/*.sql`, `**/schema.prisma`, `**/alembic/**`, `supabase/**`, `db/schema.*`, `**/*.proto`, `**/*.graphql`, `**/schema.json`; the target adds more) |
 | E5 | escalate | S2, S9, S10, S11, S12 | the `B…H` compare touches a sensitive glob (auth `**/auth/**`, `**/*auth*.*`; payment `**/payment*/**`, `**/billing/**`, `**/*stripe*`; secret `**/.env*`, `**/secret*`; infra and pipeline `.github/workflows/**`, `**/Dockerfile*`, `**/*.tf`, `k8s/**`, `helm/**`, `charts/**`, `infra/**`, `deploy/**`, `scripts/deploy*`, `fly.toml`, `vercel.json`, `netlify.toml`, `wrangler.toml`, `app.yaml`; the target adds more). The auth, payment and secret globs are GUESS(inference): no source ranks them |
 | E6 | escalate | S7, S14, S2 | no B (first deploy); or the target declares no `rollback` text; or no completed successful run of the workflow at head_sha B exists: the release to return to was never built |
-| E7 | escalate | none (misuse guard) | a `gh workflow run` of a declared target's file and repo that is not byte-equal to the declared command (an extra `-f`, another `--ref`, a pipe, a prefix). Named so Jo sees why it was not routine |
+| E7 | escalate | none (misuse guard) | a `gh workflow run` of a declared target's file and explicitly resolved repo that is not byte-equal to the declared command (an extra `-f`, another `--ref`, a pipe, a prefix). A basename without a repo never guesses a target: it keeps the original reservation |
 | E8 | escalate | S6 | the target's newest settle is `failed` with no later `ok` |
 | E9 | escalate | S8, S4, S2 | the `B…H` compare's additions plus deletions exceed `deploy.lines.escalate` (default 1500) |
 | E10 | escalate | S6 | the target's `health` probe, run by the gate before the deploy, fails: an HTTPS GET of the declared URL (no shell, 10 s timeout, redirects not followed) returns a status other than the declared one |
 | E11 | escalate | none (mechanism) | a `merge-inflight:` row of the target's repo is unresolved: no `merge-done:`, and its PR is not merged with a merge commit H contains. No age limit, and a closed PR does not resolve it. The request names the PR and token |
-| M1 | escalate | Jo (in-mvgpe7k1np4xkw), inferred | the call is `gh pr merge` on a repo in the merge-triggered list (its push to the default branch deploys): the code constant `["ContextPress/crawler"]` plus the policy's `mergeTriggered` when the policy is authenticated |
+| M1 | escalate | Jo (in-mvgpe7k1np4xkw), inferred | the call is `gh pr merge` on a repo in the merge-triggered list (its push to the default branch deploys): the code constant `["ContextPress/crawler"]` plus the policy's `mergeTriggered` when the policy is authenticated. An ineligible session gets `role-not-admissible`, not an approvable request; approval cannot make a hand, orchestrator, train or nonholder admissible |
 
 ### Defer
 
@@ -105,13 +107,19 @@ Never blocks. Warnings ride the `deploy:` row and the settle notice.
 | id | Outcome | Sources | Predicate |
 |---|---|---|---|
 | W1 | warn | S16 | a `package.json` direct dependency's major version changed in `B…H` |
-| W2 | warn | S9, S13, S17 | a required check passed only on a re-run (`run_attempt` > 1), or a check that is not required concluded `skipped` or `neutral` |
+| W2 | warn | S9, S13, S17 | the latest required check-run succeeds but an earlier run with the same name and app slug did not succeed (re-run inference, not a `run_attempt` field), or a check that is not required concluded `skipped` or `neutral` |
 | W3 | warn | S8, S4, S2 | additions plus deletions in `B…H` exceed `deploy.lines.warn` (default 400) |
 | W4 | warn | S8 | `B…H` touches more than `deploy.dirs.warn` (default 5) top-level directories |
 
 ## Always reserved
 
 Every deploy CLI in row 6's table (vercel, netlify, fly, doctl apps, wrangler, firebase, serverless/cdk/eb, gcloud, helm, kubectl, git push heroku/dokku), `infrastructure change (apply/up)`, `publishes a package` (S18), `gh release …`, every secret rule, a `gh workflow run` whose file and repo match no target, and every deploy-family call from a hand, the orchestrator or a train lane.
+
+## Installed policy and settlement
+
+Reinstall carries the installed `deploy:` section, including custom targets and order, and verifies that its canonical hash stays identical while other template sections remain unchanged. An invalid/unreadable installed section refuses reinstall rather than losing targets. Fresh profiles still ship `targets: []`. Carry never writes acceptance: only the newest surface `deploy-policy:` row counts, so `off` and a newer differing hash remain authoritative.
+
+Settlement's fallback query filters workflow_dispatch runs to the deploy row's creation time through 120 s later. Every page must still be complete, and the local event/time-window checks remain mandatory; filtering is not proof of a matching run.
 
 ## Not covered
 

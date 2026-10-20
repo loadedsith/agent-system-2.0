@@ -1,14 +1,18 @@
 // PLAN rev9 row6 integration: real Ledger transactions and injected external facts, driven through the OMP adapter.
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
+import { chmodSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Ledger, Stakes } from "../../ledger/src/index";
 import { DEPLOY_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 import reservedRow from "../extensions/r06-reserved";
+import p11Gates from "../index";
+import { CERTIFIED } from "./helpers";
 import { type DeployFacts, type GhResult, evaluateShippedDeploy, formatDeployMergeRow, formatDeployRow, formatDeployRunRow, formatDeploySettledRow, formatMergeInflightRow, formatMergeDoneRow, ledgerFacts, parseDeployMergeRow, parseDeployRow, parseDeployRunRow, parseDeploySettledRow, parseMergeInflightRow, parseMergeDoneRow, policyHash, targetHistory } from "../src/deploy-risk";
 import { nowReserved } from "../src/rows/r06-reserved";
 import type { Ctx, GatesAPI } from "../src/session";
 import { gateSession } from "../src/session";
 import type { Role } from "../src/types";
-import { git, repoWithOrigin, tempLedger } from "./helpers";
+import { git, repoWithOrigin, tempLedger, tmp } from "./helpers";
 
 const ROOT = new URL("../../", import.meta.url).pathname;
 const H = "a".repeat(40), B = "b".repeat(40), BLOB = "c".repeat(40), OTHER = "d".repeat(40);
@@ -18,9 +22,9 @@ const LANE = "lane-row6";
 const TUESDAY = "2026-10-20T17:00:00.000Z";
 const ok = (json: unknown): GhResult => ({ ok: true, json });
 type Handler = (event: unknown, ctx: Ctx) => unknown;
-type GateReply = { block: true; reason: string } | undefined;
+type GateReply = { block?: true; reason?: string; input?: Record<string, unknown> } | undefined;
 
-function fixture(options: { stakes?: Stakes; role?: Role; auth?: boolean; history?: boolean; ledger?: Ledger; path?: string; workloadId?: string; lane?: string } = {}) {
+function fixture(options: { stakes?: Stakes; role?: Role; auth?: boolean; history?: boolean; ledger?: Ledger; path?: string; workloadId?: string; lane?: string; fullGates?: boolean; fenceRefusal?: boolean; fenceEnabled?: boolean; timeoutMs?: number; defaultMergeView?: boolean } = {}) {
 	const clock = { value: TUESDAY };
 	const fresh = options.ledger ? { ledger: options.ledger, path: options.path! } : tempLedger(() => clock.value);
 	const { ledger, path } = fresh;
@@ -62,20 +66,28 @@ function fixture(options: { stakes?: Stakes; role?: Role; auth?: boolean; histor
 	};
 	const handlers = new Map<string, Handler[]>();
 	const notices: string[] = [];
-	const api = { on: (name: string, h: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), h]), appendEntry: () => {} };
+	const api = { on: (name: string, h: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), h]), appendEntry: () => {}, getActiveTools: () => ["bash"], getAllTools: () => [{ name: "bash" }], setActiveTools: async () => {}, registerTool: () => {}, zod: { object: () => ({}), string: () => ({ describe: () => ({}), optional: () => ({ describe: () => ({}) }) }) } };
 	const env = { AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_ROLE: options.role ?? "lane", AGENT_SYSTEM_WORKLOAD_ID: workloadId, AGENT_SYSTEM_LANE_ID: lane, PATH: process.env.PATH };
 	const ctx: Ctx = { hasUI: options.role !== "hand", cwd: ROOT, sessionManager: { getHeader: () => options.role === "hand" ? { parentSession: "parent" } : {}, getEntries: () => [] }, ui: { notify: (m) => notices.push(m) } };
 	// Use the same real Ledger connection and deterministic clock for gate writes and Jo's decisions.
 	gateSession(ctx, env).ledger = () => ledger;
 	const views: { selector: string | null; repo: string }[] = [];
-	const viewState = { answer: undefined as GhResult | undefined };
-	reservedRow(api as unknown as GatesAPI, env, () => facts, async (selector, repo) => {
+	const viewState = { answer: undefined as GhResult | undefined, wait: undefined as (() => Promise<void>) | undefined, budget: 0 };
+	const mergeView = async (selector: string | null, repo: string, _cwd: string, _env: Record<string, string | undefined>, timeoutMs: number) => {
 		views.push({ selector, repo });
+		viewState.budget = timeoutMs;
+		await viewState.wait?.();
 		return viewState.answer ?? ok({ number: 7, headRefOid: H, url: `https://github.com/${repo}/pull/7` });
-	});
+	};
+	if (options.fullGates) {
+		p11Gates(api as unknown as GatesAPI, env, async () => {
+			if (options.fenceRefusal) throw new Error("review regression fence refusal");
+			return { enabled: options.fenceEnabled ?? false, autoBackground: true };
+		}, CERTIFIED, undefined, { facts: () => facts, mergeView, timeoutMs: options.timeoutMs });
+	} else reservedRow(api as unknown as GatesAPI, env, () => facts, options.defaultMergeView ? undefined : mergeView, { timeoutMs: options.timeoutMs });
 	let counter = 0;
 	const event = (command = COMMAND, input: Record<string, unknown> = {}) => ({ toolName: "bash", toolCallId: `tc-${++counter}`, input: { command, ...input } });
-	const emit = async (name: string, e: unknown) => { let result: unknown; for (const h of handlers.get(name) ?? []) result = await h(e, ctx); return result as GateReply; };
+	const emit = async (name: string, e: unknown) => { let result: unknown; for (const h of handlers.get(name) ?? []) { const next = await h(e, ctx); if (next) result = next; if ((next as GateReply)?.block) break; } return result as GateReply; };
 	const call = async (command = COMMAND, input: Record<string, unknown> = {}) => { const e = event(command, input); return { event: e, result: await emit("tool_call", e) }; };
 	const requests = () => ledger.entries(workloadId, "reserved-request");
 	const deployments = () => ledgerFacts(ledger).rows("deploy").filter((r) => parseDeployRow(r.body)?.id !== "dp-base");
@@ -192,6 +204,86 @@ describe("routine, escalation, deferral and holds", () => {
 		const r = await w.call();
 		expect(r.result.reason).toContain("O1");
 		expect(w.requests()).toHaveLength(0);
+	});
+});
+
+describe("review regressions: final admission, finite total evaluation and legacy reservations", () => {
+	test("a later real fence refusal leaves approved deploy and merge admissions untouched", async () => {
+		const w = fixture({ stakes: "production" });
+		await w.call();
+		w.decide(w.requests()[0]!.id);
+		const blocked = fixture({ ledger: w.ledger, path: w.path, workloadId: w.workloadId, fullGates: true, fenceRefusal: true });
+		expect((await blocked.call()).result?.reason).toContain("review regression fence refusal");
+		expect(blocked.deployments()).toHaveLength(0);
+		expect((await blocked.call(`gh pr merge 7 -R ${REPO} --squash`)).result?.reason).toContain("review regression fence refusal");
+		expect(ledgerFacts(w.ledger).rows("merge-inflight")).toHaveLength(0);
+		expect(ledgerFacts(w.ledger).rows("deploy-merge")).toHaveLength(0);
+		expect((await w.call()).result).toBeUndefined();
+	});
+	test("admission through all gates reads the original input and preserves the fence wrapper (no command executed)", async () => {
+		const w = fixture({ fullGates: true, fenceEnabled: true });
+		const admitted = await w.call();
+		expect(admitted.result?.block).not.toBe(true);
+		expect(admitted.result?.input?.command).toContain("sandbox-exec");
+		expect(w.deployments()).toHaveLength(1);
+	});
+	for (const merge of [false, true]) test(`overall deadline refuses ${merge ? "merge resolution" : "deploy facts"} with no late rows or consumption`, async () => {
+		const w = fixture({ timeoutMs: 20, stakes: "production" });
+		await w.call();
+		w.decide(w.requests()[0]!.id);
+		let release!: () => void;
+		let reached!: () => void;
+		const ready = new Promise<void>((resolve) => { reached = resolve; });
+		const late = new Promise<void>((resolve) => { release = resolve; });
+		const original = w.facts.gh;
+		w.facts.gh = async (req) => { reached(); await late; return original(req); };
+		if (merge) w.viewState.wait = async () => { reached(); await late; };
+		jest.useFakeTimers();
+		try {
+			let result: { result: GateReply } | undefined;
+			const pending = w.call(merge ? `gh pr merge feature/deploy -R ${CRAWLER} --squash --match-head-commit ${H}` : COMMAND).then((r) => { result = r; });
+			await ready;
+			jest.advanceTimersByTime(21);
+			// Drain promise continuations, not platform time; the external fact remains unresolved.
+			for (let i = 0; i < 30; i++) await Promise.resolve();
+			expect(result?.result?.reason).toContain("E0");
+			expect(result?.result?.reason).toContain("deadline");
+			if (merge) expect(w.viewState.budget).toBeLessThanOrEqual(20);
+			const count = w.ledger.entries(w.workloadId).length;
+			release();
+			await pending;
+			for (let i = 0; i < 100; i++) await Promise.resolve();
+			expect(w.ledger.entries(w.workloadId)).toHaveLength(count);
+			expect(w.deployments()).toHaveLength(0);
+			expect(ledgerFacts(w.ledger).rows("merge-inflight")).toHaveLength(0);
+			expect(ledgerFacts(w.ledger).rows("deploy-merge")).toHaveLength(0);
+		} finally { release(); jest.useRealTimers(); }
+	});
+	test("the real synchronous merge resolver is killed within the remaining total budget", async () => {
+		const w = fixture({ timeoutMs: 30, defaultMergeView: true });
+		const bin = tmp("deploy-merge-deadline");
+		const fake = join(bin, "gh");
+		// Real subprocess timeout/kill is the boundary under test; fake JS timers cannot kill it.
+		writeFileSync(fake, "#!/bin/sh\nexec /bin/sleep 5\n");
+		chmodSync(fake, 0o755);
+		w.env.PATH = `${bin}:/usr/bin:/bin`;
+		const started = performance.now();
+		expect((await w.call(`gh pr merge feature/deploy -R ${REPO} --squash`)).result?.reason).toContain("E0");
+		expect(performance.now() - started).toBeLessThan(2000);
+		expect(w.requests()).toHaveLength(0);
+		expect(ledgerFacts(w.ledger).rows("merge-inflight")).toHaveLength(0);
+	});
+	for (const text of [null, "other: 1\n", "deploy: [unclosed"]) test(`no parsed target retains original workflow reservation: ${text}`, async () => {
+		const w = fixture();
+		w.config.text = text;
+		expect((await w.call()).result?.block).toBe(true);
+		expect(w.requests()[0]!.body).toStartWith("gh workflow run triggers a workflow (deploy path):");
+		expect(w.reads).toHaveLength(0);
+	});
+	test("a workflow basename without a resolved repo does not bind another repo's target", async () => {
+		const w = fixture();
+		await w.call("gh workflow run cicd.yml --ref main", { cwd: "/nonexistent-deploy-origin" });
+		expect(w.requests()[0]!.body).toStartWith("gh workflow run triggers a workflow (deploy path):");
 	});
 });
 
@@ -356,16 +448,25 @@ describe("merge interlock and merge-triggered deploys", () => {
 		expect((await w.call(command)).result.block).toBe(true);
 		expect(w.deployments()).toHaveLength(0);
 	});
-	for (const defect of ["no-pin", "unknown-head", "moved-head", "train", "hand"]) test(`R22 M1 cannot approve ${defect}`, async () => {
-		const w = fixture({ auth: false, history: false, role: defect === "hand" ? "hand" : "lane" });
+	for (const defect of ["no-pin", "unknown-head", "moved-head"]) test(`R22 M1 cannot approve ${defect}`, async () => {
+		const w = fixture({ auth: false, history: false });
 		w.config.text = null;
-		if (defect === "train") w.entry("train: 1", LANE);
 		if (defect === "unknown-head") w.answers.delete(`repos/${CRAWLER}/pulls/7`);
 		const command = merge(CRAWLER, defect === "no-pin" ? "" : ` --match-head-commit ${H}`);
 		await w.call(command);
 		w.decide(w.requests()[0]!.id);
 		if (defect === "moved-head") w.answers.set(`repos/${CRAWLER}/pulls/7`, ok({ head: { sha: OTHER } }));
 		expect((await w.call(command)).result.block).toBe(true);
+		expect(ledgerFacts(w.ledger).rows("deploy-merge")).toHaveLength(0);
+	});
+	for (const role of ["hand", "orchestrator", "train", "train-fix", "nonholder"]) test(`M1 ${role} refusal says role-not-admissible; approval cannot help`, async () => {
+		const w = fixture({ role: role === "hand" || role === "orchestrator" ? role : "lane" });
+		if (role === "train" || role === "train-fix") w.entry(`${role}: 1`, LANE);
+		if (role === "nonholder") w.ledger.releaseWorkload(w.workloadId, { by: LANE, holder: LANE });
+		const r = await w.call(merge(CRAWLER, ` --match-head-commit ${H}`));
+		expect(r.result?.reason).toContain("role-not-admissible");
+		expect(r.result?.reason).toContain("approval cannot admit");
+		expect(w.requests()).toHaveLength(0);
 		expect(ledgerFacts(w.ledger).rows("deploy-merge")).toHaveLength(0);
 	});
 

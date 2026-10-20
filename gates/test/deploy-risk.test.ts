@@ -557,11 +557,11 @@ describe("E0: unreadable facts, timeouts, incomplete pages, a capped compare, a 
 		expect(await e0(branch)).toEqual([["default branch is not --ref"]]);
 	});
 
-	test("an authenticated policy whose shape is rejected", async () => {
+	test("a malformed declaration has no parsed target and retains the original reservation", async () => {
 		const bad = section({ targets: [webTarget({ command: `${WEB_CMD} ; true` })] });
 		const w = world({ section: bad });
-		const v = await w.verdict();
-		expect([v.outcome, v.authenticated, v.conditions]).toEqual(["escalate", true, [{ id: "E0", facts: ["policy shape"] }]]);
+		expect(await evaluateDeploy({ command: WEB_CMD, cwd: ROOT, env: {}, workloadId: w.workloadId }, w.facts)).toEqual({ kind: "not-target" });
+		expect(w.ghCalls).toEqual([]);
 	});
 
 	test("the default gh reader: a timeout, a 404, every page slurped", async () => {
@@ -592,12 +592,11 @@ describe("R15 and R16: authentication first; only the newest deploy-policy row c
 		expect(w.ledgerCalls).toEqual(["rows deploy-policy"]);
 	});
 
-	test("R6: an absent, unreadable or unparsable policy is E0 with nothing more read", async () => {
+	test("R5 precedes R6: absent, unreadable or unparsable policy retains legacy reservation", async () => {
 		for (const text of [null, "deploy: [unclosed", "other: 1\n"]) {
 			const w = world();
 			w.config.text = text;
-			const v = await w.verdict();
-			expect([v.outcome, ids(v), v.target]).toEqual(["escalate", ["E0"], null]);
+			expect(await evaluateDeploy({ command: WEB_CMD, cwd: ROOT, env: {}, workloadId: w.workloadId }, w.facts)).toEqual({ kind: "not-target" });
 			expect(w.ghCalls).toEqual([]);
 			expect(w.httpsCalls).toEqual([]);
 		}

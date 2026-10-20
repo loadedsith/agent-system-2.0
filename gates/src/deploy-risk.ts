@@ -696,8 +696,8 @@ function differingWords(call: BashCall, target: DeployTarget): string[] {
 
 /**
  * Which declared target a bash call is (§ 2.1): `exact` when its raw command, trimmed, equals the target's command byte
- * for byte and the tool input carries no env; `near` (E7) when some `gh workflow run` in it names a target's file and its
- * repo (or no repo at all) without being exact; null when it names no target.
+ * for byte and the tool input carries no env; `near` (E7) when some `gh workflow run` in it names a target's file and
+ * repo without being exact. An unresolved repo retains the original workflow reservation, never a guessed target.
  */
 export function matchCall(call: BashCall, policy: DeployPolicy): CallMatch {
 	const trimmed = call.command.trim();
@@ -730,7 +730,7 @@ export function matchCall(call: BashCall, policy: DeployPolicy): CallMatch {
 		repo ??= envRepo;
 		if (file === null) continue;
 		const base = file.split("/").at(-1)!;
-		const target = policy.targets.find((t) => t.file === base && (repo === null || sameRepo(t.repo, repo)));
+		const target = repo === null ? undefined : policy.targets.find((t) => t.file === base && sameRepo(t.repo, repo));
 		if (target) return { kind: "near", target, differing: differingWords(call, target) };
 	}
 	return null;
@@ -931,15 +931,14 @@ export interface DeployCall extends BashCall {
 }
 
 /**
- * Evaluate a deploy call (§ 2.3, § 2.4). Policy authentication comes first; when it fails the verdict is E0 and no
- * other fact is read (R15). A call that names no target of a parsed policy is `not-target` (row 6's own rules decide
- * it); with no parsed policy nothing can say a call is not a target, so the caller hands in only calls it already reads
- * as a workflow run. Otherwise every predicate is evaluated and every condition that holds is named.
+ * Evaluate a deploy call (§ 2.3, § 2.4). First identify a target of a parsed policy; no parsed target leaves the
+ * original workflow reservation in charge (R5 takes precedence over R6). For an identifiable target, failed policy
+ * authentication is E0 with no other fact read (R15). Otherwise every predicate names every condition that holds.
  */
 export async function evaluateDeploy(call: DeployCall, facts: DeployFacts, shipped?: { sha: string; deployId: string }): Promise<DeployEvaluation> {
 	const auth = policyAuth(facts);
 	const match = auth.policy === null ? null : matchCall(call, auth.policy);
-	if (auth.policy !== null && match === null) return { kind: "not-target" };
+	if (match === null) return { kind: "not-target" };
 	const t = new Tally();
 	const empty = { target: match?.target.name ?? null, repo: match?.target.repo ?? null, authenticated: auth.authenticated, head: null, base: null, mark: null, checks: 0 };
 	if (!auth.authenticated || auth.policy === null || match === null) {

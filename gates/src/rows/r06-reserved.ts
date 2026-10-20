@@ -1428,10 +1428,52 @@ export function checkReserved(call: ToolCall, ctx: CallContext, dispatch = false
 
 /** Machinery-owned admission state, keyed by the host's tool call id until tool_result. */
 export interface DeployPending { workloadId: string; deployId?: string; mergeToken?: string }
-export type MergeView = (selector: string | null, repo: string, cwd: string, env: Record<string, string | undefined>) => Promise<GhResult>;
-export interface DeployBinding { ledger: Ledger; workloadId: string | null; laneId: string; facts?: DeployFacts; mergeView?: MergeView }
+export type MergeView = (selector: string | null, repo: string, cwd: string, env: Record<string, string | undefined>, timeoutMs: number) => Promise<GhResult>;
+export interface DeployBinding { ledger: Ledger; workloadId: string | null; laneId: string; facts?: DeployFacts; mergeView?: MergeView; timeoutMs?: number }
 export interface DeployJudgment { refusal: Refusal; pending?: DeployPending }
 export interface DeployToolCall extends ToolCall { toolCallId?: string }
+interface ResolvedMergeCall { repo: string; pr: number; headGuard: string | null }
+
+/** One finite budget for all read-only preparation, below OMP's 30s handler timeout.
+ * Only pure reads are raced. The continuation containing ledger writes is never raced or detached.
+ * Expiry also closes the fact adapters, so a late external result cannot start further reads.
+ */
+class EvaluationDeadline {
+	readonly end: number;
+	expired = false;
+	constructor(timeoutMs = 20_000) { this.end = Date.now() + Math.max(1, Math.min(20_000, timeoutMs)); }
+	remaining(): number {
+		const left = this.end - Date.now();
+		if (this.expired || left <= 0) throw new Error("E0 total deploy evaluation deadline exceeded; no action admitted");
+		return left;
+	}
+	async read<T>(fn: () => Promise<T>): Promise<T> {
+		const left = this.remaining();
+		let timer: Timer | undefined;
+		try {
+			const value = await Promise.race([fn(), new Promise<never>((_, reject) => { timer = setTimeout(() => { this.expired = true; reject(new Error("E0 total deploy evaluation deadline exceeded; no action admitted")); }, left); })]);
+			this.remaining();
+			return value;
+		} finally { clearTimeout(timer); }
+	}
+	facts(source: DeployFacts): DeployFacts {
+		return { ...source,
+			gh: (req) => { this.remaining(); return source.gh(req); },
+			httpsGet: (url) => { this.remaining(); return source.httpsGet(url); },
+		};
+	}
+	/** Never wait out SQLite's default 5s busy timeout/retries at the end of the host budget.
+	 * Recheck inside the lock and before commit: expiry rolls back all admission/consumption rows.
+	 */
+	write<T>(ledger: Ledger, fn: () => T): T {
+		this.remaining();
+		const previous = ledger.db.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()!.timeout;
+		ledger.db.exec("PRAGMA busy_timeout = 0");
+		try {
+			return ledger.write(() => { this.remaining(); const value = fn(); this.remaining(); return value; });
+		} finally { ledger.db.exec(`PRAGMA busy_timeout = ${previous}`); }
+	}
+}
 
 export function deploymentCandidate(call: ToolCall, ctx: CallContext): boolean {
 	if (call.toolName !== "bash") return false;
@@ -1478,15 +1520,15 @@ function approvedRequest(ledger: Ledger, binding: DeployBinding, command: string
 }
 
 /** Read-only branch/current-branch resolution; supported JSON fields: https://cli.github.com/manual/gh_pr_view. */
-const defaultMergeView: MergeView = async (selector, repo, cwd, env) => {
-	const r = spawnSync("gh", ["pr", "view", ...(selector ? [selector] : []), "-R", repo, "--json", "number,headRefOid,url"], { cwd, env: { ...env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1" }, encoding: "utf8", timeout: 20_000 });
+const defaultMergeView: MergeView = async (selector, repo, cwd, env, timeoutMs) => {
+	const r = spawnSync("gh", ["pr", "view", ...(selector ? [selector] : []), "-R", repo, "--json", "number,headRefOid,url"], { cwd, env: { ...env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1" }, encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" });
 	if (r.error || r.status !== 0) return { ok: false, error: r.error?.message ?? `gh pr view exited ${r.status}`, notFound: false };
 	try { return { ok: true, json: JSON.parse(r.stdout) }; }
 	catch { return { ok: false, error: "gh pr view printed no JSON", notFound: false }; }
 };
 
 /** Resolve literal numeric/URL selectors directly, branch and omitted selectors through GitHub's read-only view. */
-async function mergeCalls(call: ToolCall, ctx: CallContext, view: MergeView): Promise<{ repo: string; pr: number; headGuard: string | null }[] | string> {
+async function mergeCalls(call: ToolCall, ctx: CallContext, view: MergeView, deadline: EvaluationDeadline): Promise<ResolvedMergeCall[] | string> {
 	const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
 	const x = expandShell(bashCommand(call.input), cwd, ctx.env, call.input.env);
 	const out: { repo: string; pr: number; headGuard: string | null }[] = [];
@@ -1525,7 +1567,7 @@ async function mergeCalls(call: ToolCall, ctx: CallContext, view: MergeView): Pr
 			selector = url[2]!;
 		}
 		if (!repo) {
-			const r = spawnSync("git", ["remote", "get-url", "origin"], { cwd: e.dir, encoding: "utf8", timeout: 20_000, env: ctx.env });
+			const r = spawnSync("git", ["remote", "get-url", "origin"], { cwd: e.dir, encoding: "utf8", timeout: deadline.remaining(), killSignal: "SIGKILL", env: ctx.env });
 			const remote = r.status === 0 ? /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\s*$/.exec(r.stdout.trim()) : null;
 			repo = remote?.[1] ?? null;
 		}
@@ -1537,7 +1579,7 @@ async function mergeCalls(call: ToolCall, ctx: CallContext, view: MergeView): Pr
 				const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(w.text);
 				if (m) env[m[1]!] = m[2]!;
 			}
-			const r = await view(selector, repo, e.dir, env);
+			const r = await view(selector, repo, e.dir, env, deadline.remaining());
 			if (!r.ok || !r.json || typeof r.json !== "object") return "merge PR could not be resolved with gh pr view";
 			const json = r.json;
 			if (!("number" in json) || !Number.isSafeInteger(json.number) || Number(json.number) < 1 || !("headRefOid" in json) || typeof json.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(json.headRefOid) || !("url" in json) || typeof json.url !== "string") return "merge PR view returned incomplete facts";
@@ -1560,16 +1602,19 @@ export async function judgeDeploy(call: DeployToolCall, ctx: CallContext, bindin
 	const action = reservedAction(original);
 	if (original && action !== WORKFLOW_WHY) return null;
 	const command = bashCommand(call.input).trim();
-	const merges = await mergeCalls(call, ctx, binding.mergeView ?? defaultMergeView);
+	const deadline = new EvaluationDeadline(binding.timeoutMs);
 	const plain = (reason: string): DeployJudgment => ({ refusal: { block: true, reason: `P-11 row 6 hold: ${reason}` } });
+	let merges: ResolvedMergeCall[] | string;
+	try { merges = await deadline.read(() => mergeCalls(call, ctx, binding.mergeView ?? defaultMergeView, deadline)); }
+	catch (err) { return plain(String(err)); }
 	if (typeof merges === "string") return plain(`${merges}; use gh pr merge <number> -R <owner/repo> in its own bash call`);
 	if (!merges.length && action !== WORKFLOW_WHY) return null;
 	const { ledger, workloadId, laneId } = binding;
-	const facts = binding.facts ?? defaultFacts(ledger, ctx.env);
+	const facts = deadline.facts(binding.facts ?? defaultFacts(ledger, ctx.env));
 	const eligible = ctx.role === "lane" && workloadId !== null && ledger.workload(workloadId)?.holder === laneId && !ledger.entries(workloadId).some((e) => /^(?:train|train-fix):/.test(e.body));
 	const request = (body: string): DeployJudgment => {
 		if (!workloadId) return plain("deploy admission needs a holding lane");
-		ledger.recordEntry({ workloadId, by: laneId, kind: "reserved-request", body });
+		deadline.write(ledger, () => ledger.recordEntry({ workloadId, by: laneId, kind: "reserved-request", body }));
 		return { refusal: { block: true, reason: `P-11 row 6 reserved request: ${body}` } };
 	};
 	try {
@@ -1579,11 +1624,11 @@ export async function judgeDeploy(call: DeployToolCall, ctx: CallContext, bindin
 			if (merges.length !== 1) return plain("run one gh pr merge per bash call");
 			const merge = merges[0]!;
 			const auth = policyAuth(facts);
-			const v = await evaluateMerge(merge, facts);
+			const v = await deadline.read(() => evaluateMerge(merge, facts));
 			if (v.outcome === "hold") return plain(`U2 settle the unsettled deploy first: ${canonicalJson(v.conditions)}`);
-			if (v.outcome === "escalate" && !eligible) return request(deployRequestBody(call, merge.repo, v.head, v.conditions));
+			if (v.outcome === "escalate" && !eligible) return plain("M1 role-not-admissible: only the current holding non-train lane can request and consume deploy admission; approval cannot admit this session");
 			const targetRepo = auth.policy?.targets.some((t) => t.repo.toLowerCase() === merge.repo.toLowerCase()) ?? false;
-			return ledger.write(() => {
+			return deadline.write(ledger, () => {
 				// U2 is repeated with live ledger facts under the admission lock, even for non-lanes.
 				const current = ledgerFacts(ledger);
 				const liveAuth = policyAuth(facts);
@@ -1615,10 +1660,10 @@ export async function judgeDeploy(call: DeployToolCall, ctx: CallContext, bindin
 		const other = checkReserved(call, ctx, true);
 		if (other) return { refusal: other };
 		const auth = policyAuth(facts);
-		const v = await evaluateDeploy({ command, toolEnv: call.input.env, cwd: typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd, env: ctx.env, workloadId: workloadId! }, facts);
+		const v = await deadline.read(() => evaluateDeploy({ command, toolEnv: call.input.env, cwd: typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd, env: ctx.env, workloadId: workloadId! }, facts));
 		if (v.kind === "not-target") return null;
 		if (v.outcome === "hold") return plain(`${v.ids.join(",")} ${canonicalJson(v.conditions)}; deploy predecessors first or as2 deploy settle <dp-id>, then retry`);
-		return ledger.write(() => {
+		return deadline.write(ledger, () => {
 			if (ledger.workload(workloadId!)?.holder !== laneId) return plain("only the current holding lane can deploy");
 			const current = ledgerFacts(ledger);
 			if (v.target) {
