@@ -6,22 +6,23 @@
 //
 // No text grants authority (astra review B2): a comment naming `ledger/src/index` or a trailing
 // argument shaped like `ledger/scripts/x.ts` authorises nothing. The one exemption is running a
-// script that canonically resolves inside this repository's `ledger/scripts/`, as the script bun
-// or node executes, with no inline code.
+// script that canonically resolves inside this repository's `ledger/scripts/`, as the one program bun
+// or node executes, with no inline code and no preloaded module.
 //
 // The row is the Jo-only boundary's layer 2 (PLAN wl-mv654hoqwpfhmo § 6.3 item 2, ledger/src/authority.ts),
 // for every role: eval and inline code may not load the ledger module at all, a database opened from code may
 // not name a `ledger.db` or sit under `.agent-system-2/`, and no call may set, unset or override the
 // agent-context tags or the names that move the live roots. Every refusal names the boundary.
-// G1 (scratch auth-forgery AUDIT.md § (e)): a script bun or node runs is read at gate time and judged by the
-// same rules (scriptCrossing), and a module loaded by a specifier computed at run time is refused in eval,
-// inline code and scripts (eval-code.ts computedModuleLoad).
+// G1 (scratch auth-forgery AUDIT.md § (e)), with its review round 1: a script an interpreter runs (bun, node,
+// tsx, ts-node, bunx/npx on those, python, perl, ruby, deno) and the modules its options preload are read at gate
+// time and judged by the same rules (scriptCrossing), and a module loaded by a specifier computed at run time is
+// refused in eval, inline code and scripts outside every git repository (eval-code.ts computedModuleLoad).
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import { BOUNDARY, boundaryEnvName } from "../../../ledger/src/authority";
 import { canonicalPath, DEFAULT_LEDGER_RELATIVE, defaultLedgerPath, LEDGER_DB_ENV } from "../../../ledger/src/locality";
 import { boundaryEnvWrite, type CodeFacts, callArgs, codeFacts, computedMember, computedModuleLoad, dbConstructorEscape, evalProcessStart, ledgerModuleImport, SPAWN_API, WRITE_API } from "../eval-code";
-import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, type Expansion, expandShell, gitCall, gitTraceFiles, interpreterEnv, READ_ONLY_HEADS, writeDestinations } from "../exec";
+import { bashCommand, type CodeFamily, codeInterpreterEnv, type Exec, type Expansion, expandShell, gitCall, gitTraceFiles, interpreterArgs, interpreterEnv, interpreterFamily, READ_ONLY_HEADS, writeDestinations } from "../exec";
 import type { Fragment, Word } from "../shell-parse";
 import { writeTargets } from "../targets";
 import type { CallContext, Refusal, ToolCall } from "../types";
@@ -238,17 +239,6 @@ function writeNamesLedger(w: Word, e: Exec, paths: LedgerPaths): boolean {
 	});
 }
 
-/** The word naming the script bun or node executes (`bun x.ts`, `bun run x.ts`, `node x.js`); null with inline code, an option (`--preload`, `-r` load other code first) or none. */
-function scriptWord(e: Exec): Word | null {
-	const name = basename(e.argv[0]!.text);
-	if (name !== "bun" && name !== "node") return null;
-	let args = e.argv.slice(1);
-	if (name === "bun" && args[0]?.text === "run") args = args.slice(1);
-	const w = args[0];
-	if (!w || w.opaque || w.expanded || w.text.startsWith("-")) return null;
-	return w;
-}
-
 /**
  * `sqlite3` dot-commands a ledger inspection may run: each only prints (sqlite.org/cli.html). Not
  * `.open` (it closes the read-only connection and reopens the file read-write: astra's control,
@@ -416,15 +406,19 @@ function rawWriteInExec(e: Exec, paths: LedgerPaths): string | null {
 		const why = unmodeledSqlite(e, paths);
 		return why ? `${why} (${e.argv.map((w) => w.text).join(" ")})` : null;
 	}
-	const script = scriptWord(e);
-	if (script && canonicalOrLexical(resolve(e.dir, script.text)).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
+	// The ledger module's own scripts may name the ledger: one program bun or node runs, no preload, no inline code.
+	const runs = head === "bun" || head === "node" ? scriptRuns(head, e.argv.slice(1), e.dir, e.dirKnown) : [];
+	const only = Array.isArray(runs) && runs.length === 1 && runs[0]!.main && runs[0]!.family !== "shell" ? runs[0]! : null;
+	if (only && !only.word.opaque && (only.dirKnown || only.word.text.startsWith("/")) && canonicalOrLexical(resolve(only.dir, only.word.text)).startsWith(`${LEDGER_SCRIPTS}/`)) return null;
 	return `\`${head}\` on the ledger file outside the ledger module (${e.argv.map((w) => w.text).join(" ")})`;
 }
 
 /**
- * bun's own subcommands (`bun --help`, bun 1.3.14): the word after `bun` that names one is not a script bun
- * runs. `bun test` is never read: test files open scratch ledgers under the test preload, which keeps them off
- * the live roots.
+ * bun's own subcommands (`bun --help`, bun 1.3.14): the word after `bun` (and its options) that names one is not a
+ * script bun runs. `run`, `x` and `exec` are read on (scriptRuns). `bun test` is never read: test files open scratch
+ * ledgers under the test preload, which `bunfig.toml` wires at this repository's root, module roots and test
+ * directories only (ledger/test/isolate-preload.ts), so a `bun test` run from a directory under no such bunfig runs
+ * its files with the real HOME, unread (a stated limit, migration/items/jo-only-boundary.md).
  */
 const BUN_SUBCOMMANDS: Record<string, true> = Object.fromEntries(
 	"test x repl exec install i add a remove rm update audit outdated link unlink publish patch patch-commit pm info why build init create c upgrade feedback completions help"
@@ -435,31 +429,40 @@ const BUN_SUBCOMMANDS: Record<string, true> = Object.fromEntries(
 const SCRIPT_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
 /** The most of one script the gate reads; a larger one is refused rather than read in part. */
 const SCRIPT_CAP = 256 * 1024;
-/**
- * A checkout's tracked script directories, relative to its root. Why these run unread: lanes run them every day
- * (`bun surface/scripts/invariants.ts`, `lane.ts`), they load the ledger module by design, and their text is
- * the reviewed code of an agent-system-2.0 checkout or lane worktree, not code a model wrote this session. The
- * root is found by walking up to a directory holding `ledger/schema.sql` and a `.git` (a checkout or a lane
- * worktree, whose `.git` is a file). A file a model places there by hand is a deliberate act, beyond the
- * accident grade, and shows in the worktree's diff. Reaching machinery stamps through these scripts (`lane.ts
- * run`, `ctx-index --by`, the tick scripts) is G7, the follow-up (migration/items/jo-only-boundary.md).
- */
-const REPO_SCRIPT_DIRS = ["surface/scripts/", "ledger/scripts/", "classifier/scripts/", "gates/scripts/", "install/scripts/", "bin/"];
+/** How deep a command line `bun exec` or `npx -c` runs is read into (each is a shell running another command line). */
+const SHELL_RUN_DEPTH = 4;
 
-/** Is `canonical` a script in a tracked script directory of an agent-system-2.0 checkout (REPO_SCRIPT_DIRS)? */
-function repoScript(canonical: string): boolean {
-	for (let dir = dirname(canonical); dirname(dir) !== dir; dir = dirname(dir)) {
-		if (existsSync(join(dir, "ledger", "schema.sql")) && existsSync(join(dir, ".git"))) {
-			const rel = canonical.slice(dir.length + 1);
-			return REPO_SCRIPT_DIRS.some((d) => rel.startsWith(d));
-		}
+/** The nearest directory holding `p` (the directory of `p`, then each above it) for which `test` holds, or null. */
+function nearestDir(p: string, test: (dir: string) => boolean): string | null {
+	for (let dir = dirname(p); ; dir = dirname(dir)) {
+		if (test(dir)) return dir;
+		if (dirname(dir) === dir) return null;
 	}
-	return false;
 }
 
-/** The file bun or node runs for `path`: the path itself, else with an extension, else a directory's index file; null if none. */
-function scriptFile(path: string): string | null {
-	const candidates = [path, ...SCRIPT_EXTENSIONS.map((x) => path + x), ...SCRIPT_EXTENSIONS.map((x) => join(path, `index${x}`))];
+/**
+ * Is `canonical` a tracked script of an agent-system-2.0 checkout: a file under a `scripts` directory anywhere in
+ * it (`surface/scripts/`, `ledger/scripts/`, `skills/cross-model-review/references/panel/scripts/`, …) or under its
+ * `bin/`? Why these run unread: lanes run them every day (`bun surface/scripts/invariants.ts`, `lane.ts`, the
+ * cross-model-review panel's `panel.ts` that skills/cross-model-review/SKILL.md has a lane run), several load the
+ * ledger module by design, and their text is the checkout's reviewed code, not code a model wrote this session.
+ * The root is the nearest directory holding `ledger/schema.sql` and a `.git` (a checkout or a lane worktree, whose
+ * `.git` is a file). A file a model places there by hand in a checkout or lane worktree is a deliberate act, beyond
+ * the accident grade, and shows in that worktree's diff. A scratch clone of the repository has the same shape, so its
+ * scripts run unread too, and a model may edit a scratch clone: that is a stated limit (migration/items/
+ * jo-only-boundary.md). Reaching machinery stamps through these scripts (`lane.ts run`, `ctx-index --by`, the tick
+ * scripts) is G7, the follow-up.
+ */
+function repoScript(canonical: string): boolean {
+	const root = nearestDir(canonical, (dir) => existsSync(join(dir, "ledger", "schema.sql")) && existsSync(join(dir, ".git")));
+	if (root === null) return false;
+	const parts = canonical.slice(root.length + 1).split("/");
+	return (parts[0] === "bin" && parts.length > 1) || parts.slice(0, -1).includes("scripts");
+}
+
+/** The file an interpreter runs for `path`: the path itself, else (bun and node) with an extension or a directory's index file; null if none. */
+function scriptFile(path: string, js: boolean): string | null {
+	const candidates = js ? [path, ...SCRIPT_EXTENSIONS.map((x) => path + x), ...SCRIPT_EXTENSIONS.map((x) => join(path, `index${x}`))] : [path];
 	return candidates.find((c) => existsSync(c) && statSync(c).isFile()) ?? null;
 }
 
@@ -468,8 +471,8 @@ function scriptFile(path: string): string | null {
  * `cat > f`/`tee f`, an `echo`/`printf` redirected to it), or null when a writer's text cannot be read (`cp`,
  * `curl -o`, a pipe). Empty when nothing in the call writes it.
  */
-function writtenScript(x: Expansion, path: string): string[] | null {
-	const names = new Set([path, ...SCRIPT_EXTENSIONS.map((ext) => path + ext)]);
+function writtenScript(x: Expansion, path: string, js: boolean): string[] | null {
+	const names = new Set([path, ...(js ? SCRIPT_EXTENSIONS.map((ext) => path + ext) : [])]);
 	const texts: string[] = [];
 	for (const e of x.commands) {
 		if (!writeDestinations(e).some((w) => !w.opaque && names.has(resolve(e.dir, w.text)))) continue;
@@ -482,32 +485,159 @@ function writtenScript(x: Expansion, path: string): string[] | null {
 	return texts;
 }
 
+/** A file a command runs as a program or loads before it, or a command line it hands to a shell (G1). */
+interface ScriptRun {
+	/** The command as a refusal names it (`bun`, `bun run`, `python3`, `bunx tsx`, `bun exec`). */
+	via: string;
+	/** The word naming the file, or the command line for `shell`. */
+	word: Word;
+	/** The directory a relative word resolves against, and whether it is known (a `cd` the gate could not follow). */
+	dir: string;
+	dirKnown: boolean;
+	/** The code family the file is judged as; `shell` for the command line `bun exec` or `npx -c` runs. */
+	family: CodeFamily | "shell";
+	/** The program itself, not a module an option (`--preload`, `-r`, `--import`) loads before it. */
+	main: boolean;
+}
+
+/** What `bun x`, `bunx` and npx may run on a file the gate then reads: the TypeScript runners and the two runtimes. */
+const FILE_RUNNERS: Record<string, true> = { tsx: true, "ts-node": true, "ts-node-esm": true, node: true, bun: true };
+/** bunx's and npx's options that take the next word (`bunx --help`, bun 1.3.14; `npm help exec`): the package to install. */
+const PACKAGE_RUNNER_VALUE = /^(?:-p|--package)$/;
+
+const opaqueWord = (w: Word): boolean => w.opaque || w.glob === true;
+
 /**
- * Why a script bun or node runs crosses the Jo-only boundary, or null (G1). The script is read at gate time,
- * with what this same call writes into it, and judged as eval code is (rawWriteInCode): it may not load the
- * ledger module, name a `ledger.db` in an open or write, open a database under `.agent-system-2/`, or load a
- * module by a computed specifier. A script that cannot be read is refused: over SCRIPT_CAP, unreadable, or
- * written in this call from text the gate does not see (`cp`, `curl -o`). A script that is missing and that no
- * command in this call is seen to write runs nothing (bun and node fail on it), so it passes; one written by a
- * writer the gate does not parse (a compiler's output, an unzip) is beyond the accident grade, as a transitive
- * import is. Not read: `bun test` and bun's other subcommands, a bare name that is no file (`bun run
- * typecheck`, a package.json script), the ledger module's own scripts, and a checkout's tracked scripts
- * (REPO_SCRIPT_DIRS), unless this call writes into them.
+ * The files a command runs as programs, the modules its options load first, and the command lines it hands to a
+ * shell, or why the gate cannot name them (an option or a program word not known until it runs). Options are read
+ * by exec.ts interpreterArgs: an unknown one is a flag with no value. Read: bun and node (and tsx, ts-node) after
+ * their options, `bun run`, bun's `--cwd` and ruby's `-C`, every `--preload`/`-r`/`--require`/`--import`/`--loader`
+ * module, `bun exec`'s and `npx -c`'s command line, `bun x`/`bunx`/npx running a FILE_RUNNERS name, and python,
+ * perl, ruby and deno (`deno run|serve|watch <file>`, `deno <file>`). None for bun's other subcommands (`bun test`
+ * included), deno's other subcommands, python `-m`, php and osascript.
  */
-function scriptCrossing(e: Exec, x: Expansion, paths: LedgerPaths): string | null {
-	const head = basename(e.argv[0]!.text);
-	if (head === "bun" && Object.hasOwn(BUN_SUBCOMMANDS, e.argv[1]?.text ?? "")) return null;
-	const word = scriptWord(e);
-	if (!word) return null;
-	// A bare name (no `/`, no `.`) that is no file is a package.json script or a bin: what it runs is not this word's text.
-	const bare = !/[./]/.test(word.text);
-	if (!e.dirKnown && !word.text.startsWith("/")) {
-		return bare ? null : `\`${head}\` running ${word.text} after a \`cd\` the gate could not follow, so it cannot read the script; run it by its absolute path`;
+function scriptRuns(head: string, args: Word[], dir: string, dirKnown: boolean): ScriptRun[] | string {
+	if (head === "bunx" || head === "npx") return packageRuns(head, args, dir, dirKnown);
+	const family = head === "bun" || head === "node" || !Object.hasOwn(FILE_RUNNERS, head) ? interpreterFamily(head) : "js";
+	if (family === null || family === "php" || family === "osascript") return [];
+	const cannot = `\`${head}\` with an option or a program path not known until it runs`;
+	const a = interpreterArgs(family, head, args);
+	if (a.unknown) return cannot;
+	const loads = [...a.loads];
+	let cwd = a.cwd;
+	let rest = a.operand < 0 ? [] : args.slice(a.operand);
+	let via = head;
+	// bun's subcommand, when the first operand names one: `run` is read on, `x` and `exec` below, the others run no file read here.
+	const sub = head === "bun" ? rest[0]?.text : undefined;
+	if (sub === "run") {
+		const r = interpreterArgs("js", head, rest.slice(1));
+		if (r.unknown) return cannot;
+		loads.push(...r.loads);
+		cwd = r.cwd ?? cwd;
+		rest = r.operand < 0 ? [] : rest.slice(1 + r.operand);
+		via = "bun run";
+	} else if (sub !== undefined && Object.hasOwn(BUN_SUBCOMMANDS, sub)) rest = [];
+	let at = dir;
+	let known = dirKnown;
+	if (cwd) {
+		if (opaqueWord(cwd)) return `\`${via}\` with a working directory not known until it runs`;
+		at = resolve(dir, cwd.text);
+		known = dirKnown || cwd.text.startsWith("/");
 	}
-	const path = resolve(e.dir, word.text);
-	const written = writtenScript(x, path);
-	if (written === null) return `\`${head}\` running ${path}, which this same call writes from text the gate cannot read`;
-	const file = scriptFile(path);
+	const runs: ScriptRun[] = loads.map((word) => ({ via, word, dir: at, dirKnown: known, family, main: false }));
+	if (sub === "x") {
+		const more = packageRuns("bun x", args.slice(a.operand + 1), at, known);
+		return typeof more === "string" ? more : [...runs, ...more];
+	}
+	if (sub === "exec") {
+		const line = args[a.operand + 1];
+		return line ? [...runs, { via: "bun exec", word: line, dir: at, dirKnown: known, family: "shell", main: true }] : runs;
+	}
+	if (rest[0]) runs.push({ via, word: rest[0], dir: at, dirKnown: known, family, main: true });
+	return runs;
+}
+
+/** What `bunx`, `bun x` or npx runs (scriptRuns): a FILE_RUNNERS name on its file, or npx `-c`'s command line; none for any other package. */
+function packageRuns(via: string, args: Word[], dir: string, dirKnown: boolean): ScriptRun[] | string {
+	for (let i = 0; i < args.length; i++) {
+		const w = args[i]!;
+		if (opaqueWord(w)) return `\`${via}\` with a package or an option not known until it runs`;
+		const t = w.text;
+		if (via === "npx" && (t === "-c" || t === "--call" || t.startsWith("--call="))) {
+			const line = t.startsWith("--call=") ? { text: t.slice("--call=".length), opaque: false } : args[i + 1];
+			return line ? [{ via: "npx -c", word: line, dir, dirKnown, family: "shell", main: true }] : [];
+		}
+		if (PACKAGE_RUNNER_VALUE.test(t)) {
+			i++;
+			continue;
+		}
+		if (t.startsWith("-")) continue;
+		// `tsx@4` and `@scope/name@1` name the package without the version.
+		const pkg = t.replace(/(?!^)@[^/]*$/, "");
+		if (!Object.hasOwn(FILE_RUNNERS, pkg)) return [];
+		const runs = scriptRuns(pkg, args.slice(i + 1), dir, dirKnown);
+		return typeof runs === "string" ? runs : runs.map((r) => ({ ...r, via: `${via} ${r.via}` }));
+	}
+	return [];
+}
+
+/** The bash call's own environment as the shell sees it: the session's, with the bash tool's `env` input over it (string values only). */
+function callEnv(env: Record<string, string | undefined>, toolEnv: unknown): Record<string, string | undefined> {
+	if (!toolEnv || typeof toolEnv !== "object") return env;
+	const out = { ...env };
+	for (const [name, value] of Object.entries(toolEnv)) if (typeof value === "string") out[name] = value;
+	return out;
+}
+
+/**
+ * Why a command's programs cross the Jo-only boundary, or null (G1). Each file scriptRuns names is read at gate
+ * time with what this same call writes into it, and judged as eval code is (rawWriteInCode, in the interpreter's
+ * family): it may not load the ledger module, name a `ledger.db` in an open or write, open a database under
+ * `.agent-system-2/`, or, outside every git repository (a scratch script), load a module by a computed specifier.
+ * A program word with an expansion is read at the value the session's environment gives it (`"$AS2_SCRATCH/f.ts"`,
+ * `~/f.ts`); one the gate cannot resolve (a substitution, an unset variable) is refused. A script that cannot be
+ * read is refused: over SCRIPT_CAP, unreadable, or written in this call from text the gate does not see (`cp`,
+ * `curl -o`). A script that is missing and that no command in this call is seen to write runs nothing (the
+ * interpreter fails on it), so it passes; one written by a writer the gate does not parse (a compiler's output, an
+ * unzip) is beyond the accident grade, as a transitive import is. A command line `bun exec` or `npx -c` runs is
+ * judged as a bash call of its own (bashCrossing). Not read: `bun test`, bun's and deno's other subcommands, a bare
+ * name that is no file (`bun run typecheck`, a package.json script, a preload's package name), the ledger module's
+ * own scripts, and a checkout's tracked scripts (repoScript), unless this call writes into them.
+ */
+function scriptCrossing(e: Exec, x: Expansion, paths: LedgerPaths, env: Record<string, string | undefined>, depth: number): string | null {
+	const runs = scriptRuns(basename(e.argv[0]!.text), e.argv.slice(1), e.dir, e.dirKnown);
+	if (typeof runs === "string") return `${runs}, so the gate cannot read what it runs; name the script by a literal path or a variable the session sets`;
+	for (const run of runs) {
+		const why = run.family === "shell" ? shellRunCrossing(run, paths, env, depth) : scriptFileCrossing(run, run.family, x, paths);
+		if (why) return why;
+	}
+	return null;
+}
+
+/** Why the command line `bun exec` or `npx -c` runs crosses the boundary: it is judged as a bash call of its own, from the same directory. */
+function shellRunCrossing(run: ScriptRun, paths: LedgerPaths, env: Record<string, string | undefined>, depth: number): string | null {
+	if (opaqueWord(run.word)) return `\`${run.via}\` running a command line not known until it runs, so the gate cannot read it`;
+	if (!run.dirKnown) return `\`${run.via}\` after a \`cd\` the gate could not follow, so the gate cannot read what it runs`;
+	if (depth >= SHELL_RUN_DEPTH) return `\`${run.via}\` nested more than ${SHELL_RUN_DEPTH} command lines deep, which the gate does not read`;
+	const why = bashCrossing(run.word.text, run.dir, env, undefined, paths, depth + 1);
+	return why ? `\`${run.via}\` running \`${run.word.text}\`: ${why}` : null;
+}
+
+/** Why one file scriptRuns names crosses the boundary, or null (scriptCrossing). */
+function scriptFileCrossing(run: ScriptRun, family: CodeFamily, x: Expansion, paths: LedgerPaths): string | null {
+	const { word } = run;
+	const lead = `\`${run.via}\` ${run.main ? "running" : "preloading"}`;
+	if (opaqueWord(word)) return `${lead} ${valuesShown(word)}, a path not known until it runs, so the gate cannot read the script; name it by a literal path or a variable the session sets`;
+	const js = family === "js";
+	// A bare name (no `/`, no `.`) that is no file is, for bun and node, a package.json script, a bin or a preload's package: what runs is not this word's text.
+	const bare = js && !/[./]/.test(word.text);
+	if (!run.dirKnown && !word.text.startsWith("/")) {
+		return bare ? null : `${lead} ${word.text} after a \`cd\` the gate could not follow, so it cannot read the script; run it by its absolute path`;
+	}
+	const path = resolve(run.dir, word.text);
+	const written = writtenScript(x, path, js);
+	if (written === null) return `${lead} ${path}, which this same call writes from text the gate cannot read`;
+	const file = scriptFile(path, js);
 	if (!file && written.length === 0) return null;
 	const texts = [...written];
 	const canonical = file ? canonicalOrLexical(file) : null;
@@ -517,13 +647,17 @@ function scriptCrossing(e: Exec, x: Expansion, paths: LedgerPaths): string | nul
 			size = statSync(canonical).size;
 			if (size <= SCRIPT_CAP) texts.push(readFileSync(canonical, "utf8"));
 		} catch (err) {
-			return `\`${head}\` running ${canonical}, which the gate cannot read (${err instanceof Error ? err.message : String(err)})`;
+			return `${lead} ${canonical}, which the gate cannot read (${err instanceof Error ? err.message : String(err)})`;
 		}
-		if (size > SCRIPT_CAP) return `\`${head}\` running ${canonical}, ${size} bytes, over the ${SCRIPT_CAP / 1024} KiB the gate reads of a script`;
+		if (size > SCRIPT_CAP) return `${lead} ${canonical}, ${size} bytes, over the ${SCRIPT_CAP / 1024} KiB the gate reads of a script`;
 	}
+	// A computed import() in a script inside a git repository or worktree (a `.git` at or above it) is that
+	// repository's code (another product's build script, `await import(path)`), not a scratch script a model
+	// wrote: refused only outside every repository (G1 review round 1).
+	const computedLoads = nearestDir(canonical ?? path, (dir) => existsSync(join(dir, ".git"))) === null;
 	for (const text of texts) {
-		const why = rawWriteInCode(text, paths, dirname(path), "js");
-		if (why) return `\`${head}\` running ${canonical ?? path}: ${why}`;
+		const why = rawWriteInCode(text, paths, dirname(path), family, computedLoads);
+		if (why) return `${lead} ${canonical ?? path}: ${why}`;
 	}
 	return null;
 }
@@ -774,10 +908,11 @@ const LEDGER_ROOT = new RegExp(String.raw`(?:^|[/"'\x60])${dirname(DEFAULT_LEDGE
 const namesLedgerFile = (text: string) => SIBLINGS.some((s) => basename(text) === LEDGER_FILE + s);
 
 /**
- * Why eval code, inline `bun -e` code, or a script bun or node runs (scriptCrossing) crosses the Jo-only
+ * Why eval code, inline `bun -e` code, or a script an interpreter runs (scriptCrossing) crosses the Jo-only
  * boundary or writes the ledger raw, or null.
  * Code may not load the ledger module (`ledger/src`, by import, dynamic import or require), load any module
- * by a specifier computed at run time (JS: eval-code.ts computedModuleLoad, G1), nor set,
+ * by a specifier computed at run time (JS: eval-code.ts computedModuleLoad, G1; only where `computedLoads` holds:
+ * eval, inline code and scripts outside every git repository), nor set,
  * unset or override a boundary name in the environment (eval-code.ts boundaryEnvWrite). Code names
  * the ledger when it carries its path (constant concatenations folded), its file name or any
  * `ledger.db`, the env var, or any literal path that canonicalizes (the direct-write realpath
@@ -791,11 +926,11 @@ const namesLedgerFile = (text: string) => SIBLINGS.some((s) => basename(text) ==
  * database whose target is computed at run time, refuses too: the target may be the ledger
  * (`new Database([…].join("/"))`, adversarial-1).
  */
-function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined): string | null {
+function rawWriteInCode(code: string, paths: LedgerPaths, dir: string, family: CodeFamily | undefined, computedLoads = true): string | null {
 	const facts = codeFacts(code, family);
 	const spec = ledgerModuleImport(facts);
 	if (spec) return `code loading the ledger module ("${spec}"); eval, inline code and the scripts an agent runs never load it`;
-	const load = family === "js" ? computedModuleLoad(facts) : null;
+	const load = family === "js" && computedLoads ? computedModuleLoad(facts) : null;
 	if (load) return `code loading a module whose specifier is computed at run time (${load}), which may be the ledger module; an import() or require() takes one literal string`;
 	const env = boundaryEnvWrite(facts);
 	if (env) return env;
@@ -907,55 +1042,65 @@ function sqliteOnLedgerName(e: Exec): string | null {
 	return db ? `sqlite3 without -readonly on ${db.text}, a ledger file` : null;
 }
 
-/** The first environment-named write (astra-7 B3, astra-8 B2) that names the ledger, as a refusal. */
-function envLedgerWrite(writes: Word[], dir: string, paths: LedgerPaths): Refusal {
+/** The first environment-named write (astra-7 B3, astra-8 B2) that names the ledger, as a refusal reason. */
+function envLedgerWrite(writes: Word[], dir: string, paths: LedgerPaths): string | null {
 	const w = writes.find((x) => wordNamesLedger(x, { dir, dirKnown: true }, paths));
-	return w ? refuse(`an interpreter told by its environment to write the ledger file (${w.text})`) : null;
+	return w ? `an interpreter told by its environment to write the ledger file (${w.text})` : null;
+}
+
+/**
+ * Why a bash command line crosses the boundary or writes the ledger raw, or null. `sessionEnv` is the session's
+ * environment and `toolEnv` the bash tool's `env` input: its string values are what `$NAME` expands to in the
+ * command, over the session's (callEnv). `depth` counts the command lines `bun exec` and `npx -c` nest (shellRunCrossing).
+ */
+function bashCrossing(cmd: string, cwd: string, sessionEnv: Record<string, string | undefined>, toolEnv: unknown, paths: LedgerPaths, depth: number): string | null {
+	const env = callEnv(sessionEnv, toolEnv);
+	const x = expandShell(cmd, cwd, env, toolEnv);
+	const crossing = boundaryEnvInShell(x);
+	if (crossing) return crossing;
+	for (const e of x.commands) {
+		const why = rawWriteInExec(e, paths) ?? sqliteOnLedgerName(e) ?? scriptCrossing(e, x, paths, env, depth);
+		if (why) return why;
+		// git appends its trace to the file a GIT_TRACE* variable names (astra-6 B7).
+		if (gitCall(e)) {
+			for (const w of gitTraceFiles(x.assigned)) {
+				if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e, paths)) return `git writing its trace into the ledger file (${w.text})`;
+			}
+		}
+	}
+	// An interpreter's environment can name a file it writes, whatever command follows (astra-7 B3:
+	// NODE_OPTIONS=--redirect-warnings=<ledger>); row 6 refuses the forms interpreterEnv does not model.
+	const sink = envLedgerWrite(interpreterEnv(x, cwd).writes, cwd, paths);
+	if (sink) return sink;
+	for (const c of x.code) {
+		const why = rawWriteInCode(c.text, paths, c.dir, c.family);
+		if (why) return `inline ${c.lang} code: ${why}`;
+		const codeSink = envLedgerWrite(codeInterpreterEnv(c.text, c.family, c.dir, env).writes, c.dir, paths);
+		if (codeSink) return codeSink;
+	}
+	// What the gate cannot see may name the ledger: refuse only when the command text does (row 6 refuses the rest).
+	if (x.blind.length > 0 && paths.needles.some((n) => cmd.includes(n) || cmd.includes(basename(paths.files[0]!)))) {
+		return `a command naming the ledger that the gate cannot read to the end (${x.blind[0]})`;
+	}
+	return null;
 }
 
 /** Row 10 over one tool call. */
 export function checkRawLedgerWrite(call: ToolCall, ctx: CallContext): Refusal {
 	const paths = ledgerPaths(ctx.env);
 	if (call.toolName === "bash") {
-		const cmd = bashCommand(call.input);
 		const cwd = typeof call.input.cwd === "string" ? resolve(ctx.cwd, call.input.cwd) : ctx.cwd;
-		const x = expandShell(cmd, cwd, ctx.env, call.input.env);
-		const crossing = boundaryEnvInShell(x);
-		if (crossing) return refuse(crossing);
-		for (const e of x.commands) {
-			const why = rawWriteInExec(e, paths) ?? sqliteOnLedgerName(e) ?? scriptCrossing(e, x, paths);
-			if (why) return refuse(why);
-			// git appends its trace to the file a GIT_TRACE* variable names (astra-6 B7).
-			if (gitCall(e)) {
-				for (const w of gitTraceFiles(x.assigned)) {
-					if (w.opaque ? paths.needles.some((n) => w.text.includes(n)) : wordNamesLedger(w, e, paths)) return refuse(`git writing its trace into the ledger file (${w.text})`);
-				}
-			}
-		}
-		// An interpreter's environment can name a file it writes, whatever command follows (astra-7 B3:
-		// NODE_OPTIONS=--redirect-warnings=<ledger>); row 6 refuses the forms interpreterEnv does not model.
-		const sink = envLedgerWrite(interpreterEnv(x, cwd).writes, cwd, paths);
-		if (sink) return sink;
-		for (const c of x.code) {
-			const why = rawWriteInCode(c.text, paths, c.dir, c.family);
-			if (why) return refuse(`inline ${c.lang} code: ${why}`);
-			const codeSink = envLedgerWrite(codeInterpreterEnv(c.text, c.family, c.dir, ctx.env).writes, c.dir, paths);
-			if (codeSink) return codeSink;
-		}
-		// What the gate cannot see may name the ledger: refuse only when the command text does (row 6 refuses the rest).
-		if (x.blind.length > 0 && paths.needles.some((n) => cmd.includes(n) || cmd.includes(basename(paths.files[0]!)))) {
-			return refuse(`a command naming the ledger that the gate cannot read to the end (${x.blind[0]})`);
-		}
-		return null;
+		const why = bashCrossing(bashCommand(call.input), cwd, ctx.env, call.input.env, paths, 0);
+		return why ? refuse(why) : null;
 	}
 	if (call.toolName === "eval") {
 		// The eval tool's `language` picks the comment syntax (py: `#`, js: `//`, `/* */`); any other value blanks no comment.
 		const lang = call.input.language;
 		const family = lang === "py" || lang === "python" ? "python" : lang === "js" || lang === "ts" ? "js" : undefined;
 		const code = String(call.input.code ?? call.input.cell ?? "");
-		const why = rawWriteInCode(code, paths, ctx.cwd, family);
-		// The processes the code starts, with the environment it gives them (astra-8 B2).
-		const r = why ? refuse(why) : envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
+		const why = rawWriteInCode(code, paths, ctx.cwd, family) ?? envLedgerWrite(codeInterpreterEnv(code, family, ctx.cwd, ctx.env).writes, ctx.cwd, paths);
+		// The processes the code starts, with the environment it gives them (astra-8 B2), are judged by envLedgerWrite.
+		const r = why ? refuse(why) : null;
 		// Row 10 runs before row 6, so its refusal also carries row 6's eval rule (PLAN wl-muzs0ytnaet1v4 D1 (f)).
 		if (r && evalProcessStart(codeFacts(code, family), family)) {
 			return { block: true, reason: `${r.reason} This eval also starts a process: run the command with the bash tool, where the gate reads it; eval does not start processes.` };

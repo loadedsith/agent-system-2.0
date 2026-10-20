@@ -572,14 +572,47 @@ const REQUIRE_NAMED = /(?:\b(?:const|let|var|function|typeof)\s+)$/;
 const REQUIRE_FACTORY = /(?<![\w$.])(?:const|let|var)\s+([\w$]+)\s*=\s*(?:[\w$]+\s*\.\s*)?createRequire\s*\(/g;
 
 /**
+ * `code` with the static text of each template literal that has `${…}` masked to `_`, its substitutions kept as
+ * code, so text such as `` `run require(${x})` `` is not read as a load (G1 review round 1). codeFacts leaves such a
+ * template unmasked. A template the scan cannot pair (a nested template, a `}` with no `${`) is left as it is.
+ * Lengths are kept, so an index into the result is an index into `folded`.
+ */
+function maskTemplateText(code: string): string {
+	return code.replace(/`((?:\\.|[^`\\])*)`/g, (t) => {
+		let out = "`";
+		let depth = 0;
+		for (let i = 1; i < t.length - 1; i++) {
+			const c = t[i]!;
+			if (depth === 0 && c === "\\") {
+				out += "__";
+				i++;
+			} else if (c === "$" && t[i + 1] === "{") {
+				depth++;
+				out += "${";
+				i++;
+			} else if (depth > 0 && c === "{") {
+				depth++;
+				out += c;
+			} else if (c === "}") {
+				if (depth === 0) return t;
+				depth--;
+				out += c;
+			} else out += depth > 0 ? c : "_";
+		}
+		return depth === 0 ? `${out}\`` : t;
+	});
+}
+
+/**
  * The first module acquisition in JS code whose specifier the gate cannot read, or null (G1, scratch
  * auth-forgery AUDIT.md § (a)): an `import()` or `require()` whose first argument is not one literal string,
  * `require` taken as a value (`const r = require; r(p)`), or a `createRequire` result called with a computed
  * argument. The specifier may name the ledger module (`["…", "ledger", "src", "index"].join("/")`), so the gate
- * refuses what it cannot name. Read on `uncommented`: string bodies are masked and comments blanked.
+ * refuses what it cannot name. Read on `uncommented` (string bodies masked, comments blanked) with the static
+ * text of `${…}` templates masked too (maskTemplateText).
  */
 export function computedModuleLoad(facts: CodeFacts): string | null {
-	const code = facts.uncommented;
+	const code = maskTemplateText(facts.uncommented);
 	const show = (at: number) => facts.folded.slice(at, at + 60).split("\n")[0]!.trim();
 	const load = DYNAMIC_LOAD.exec(code);
 	if (load) return show(load.index);
