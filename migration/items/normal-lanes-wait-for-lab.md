@@ -1,8 +1,8 @@
 ---
 title: Normal autonomous unnamed lanes wait for their own lab
-status: building
+status: pr-open
 workload: wl-mvh249u2w238jk
-pr: none
+pr: https://github.com/thewolff/agent-system-2.0/pull/297
 ---
 
 A normal-stakes autonomous workload with no named `lane-model:` waits when its own lab is projected out, rather than moving to another lab. Every workload recognized by `isTrainOrFix` is excluded, including normal autonomous merge trains and train-fix workloads. Production-stakes, user-driven, named-model and throwaway workloads retain their existing behavior.
