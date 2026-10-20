@@ -225,7 +225,8 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 /**
  * The repo an open workload is on, from its `repo:` entry — the surface's, or the train tick's on a fix workload it opened
  * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git). An entry Jo reversed
- * (a surface `forgery-reversed:` of the workload naming it, PLAN wl-mvfxw3c4zqfzls D5) is skipped.
+ * (an effective surface `forgery-reversed:` of the workload naming it, PLAN wl-mvfxw3c4zqfzls D5; jo-channel.ts
+ * `reversedRowIds`) is skipped; one whose reversal was itself reversed counts again.
  */
 export function repoOf(ledger: Ledger, workloadId: string): string | null {
 	const rows = ledger.entries(workloadId, "assumption");

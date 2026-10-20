@@ -21,7 +21,7 @@
 //
 // A reversal (PLAN D5): `forgery-reversed: <row id> by <in-id>`, kind assumption, stamped `orchestrator-surface`
 // on the row's workload, voids the row for every decision read (`reversedRowIds`; Ledger.instructions, parkLane,
-// surface/scripts/invariants.ts reservedView).
+// surface/scripts/invariants.ts reservedView) unless a later effective reversal voids the reversal itself.
 import { SURFACE_BY } from "../../surface/src/types";
 import { AUTHORITY, agentContext, BOUNDARY } from "./authority";
 import { defaultLedgerPath, inLiveRoot, TEST_ISOLATED_ENV } from "./locality";
@@ -118,19 +118,24 @@ export function parseForgeryReversed(body: string): { rowId: string; by: string 
 }
 
 /**
- * The row ids a workload's entries reverse: each valid `forgery-reversed:` (kind assumption, stamped by the
- * surface), written at or before `asOf` when given.
+ * The row ids a workload's effective reversals void. A reversal is a `forgery-reversed:` (kind assumption, stamped by
+ * the surface), written at or before `asOf` when given. A reversal can only name an earlier row, so they are walked
+ * newest first (`entries` oldest first, as every reader reads them: created_at, then rowid): one whose own id a newer
+ * effective reversal already voided voids nothing, so reversing a reversal restores its target.
  */
-export function reversedRowIds(entries: readonly { kind: string; body: string; created_by: string; created_at: string }[], asOf?: string): Set<string> {
-	const out = new Set<string>();
+export function reversedRowIds(entries: readonly { id: string; kind: string; body: string; created_by: string; created_at: string }[], asOf?: string): Set<string> {
+	const reversals: { id: string; rowId: string; at: string; seq: number }[] = [];
 	for (const e of entries) {
 		if (e.kind !== "assumption" || e.created_by !== SURFACE_BY || (asOf !== undefined && e.created_at > asOf)) continue;
 		const r = parseForgeryReversed(e.body);
-		if (r) out.add(r.rowId);
+		if (r) reversals.push({ id: e.id, rowId: r.rowId, at: e.created_at, seq: reversals.length });
 	}
+	reversals.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : b.seq - a.seq));
+	const out = new Set<string>();
+	for (const r of reversals) if (!out.has(r.id)) out.add(r.rowId);
 	return out;
 }
 
 /** The SQL that reads a workload's candidate reversal entries (bind the workload id); `reversedRowIds` parses them. */
 export const REVERSAL_ENTRIES_SQL =
-	`SELECT kind, body, created_by, created_at FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ${SURFACE} AND ltrim(body, char(32, 9, 10, 13)) GLOB 'forgery-reversed:*' ORDER BY created_at, rowid`;
+	`SELECT id, kind, body, created_by, created_at FROM entries WHERE workload_id = ? AND kind = 'assumption' AND created_by = ${SURFACE} AND ltrim(body, char(32, 9, 10, 13)) GLOB 'forgery-reversed:*' ORDER BY created_at, rowid`;

@@ -8,8 +8,8 @@
 import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { LANE_STARTER_BY, type Ledger } from "../../ledger/src/index";
-import { forgeryReversedBody } from "../../ledger/src/jo-channel";
+import { LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
+import { declareJoChannel, forgeryReversedBody } from "../../ledger/src/jo-channel";
 import { LEDGER_DB_ENV } from "../../ledger/src/locality";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import * as laneScript from "../scripts/lane";
@@ -26,6 +26,24 @@ import { boardWorld, SERVED } from "./train-world";
 const JO = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
 const CLI = resolve(import.meta.dir, "..", "scripts", "merge-train.ts");
+const NO_AGENT = { AGENT_SYSTEM_ROLE: undefined, AGENT_SYSTEM_LANE_ID: undefined, AGENT_SYSTEM_WORKLOAD_ID: undefined };
+
+/** Run `fn` with `vars` set (undefined clears one) in process.env, then restore them. */
+function withVars<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+	const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+	for (const [k, v] of Object.entries(vars)) {
+		if (v === undefined) delete process.env[k];
+		else process.env[k] = v;
+	}
+	try {
+		return fn();
+	} finally {
+		for (const [k, v] of Object.entries(saved)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	}
+}
 
 function world() {
 	const c = clock();
@@ -150,6 +168,54 @@ describe("R11: an unanswered hit holds the workload", () => {
 		confirm(ledger, wl, row);
 		const lifted = await closeWorkloadWithEntry(pi, ledger, {}, wl, { now: c.now(), cwd, receipt: null });
 		expect(lifted.text).not.toContain("forgery hold");
+	});
+
+	test("a forged confirmation lifts no hold: a self-confirmation, and a cycle of two, stay held until Jo answers", () => {
+		const { c, ledger, path } = world();
+		const self = ledger.openWorkload({ by: SURFACE_BY, brief: "a self-confirmation", stakes: "normal", mode: "autonomous" });
+		c.plusHours(0.01);
+		const cycle = ledger.openWorkload({ by: SURFACE_BY, brief: "a confirmation cycle", stakes: "normal", mode: "autonomous" });
+		c.plusHours(0.01);
+		// The surface session's connection, opened after its declaration, marks the Jo rows it writes; this sets the cutover.
+		const surface = withVars(NO_AGENT, () => {
+			declareJoChannel({ kind: "surface" });
+			return Ledger.open(path, { backup: false, backupOnOpen: false, clock: c.now });
+		});
+		try {
+			surface.recordInstruction({ ...JO, workloadId: self, body: "go on" });
+			expect(ledger.joChannelCutovers().surface).not.toBeNull();
+			c.plusHours(0.01);
+			// A script on the test's unmarked connection forges surface-stamped confirmations by direct insert, choosing their ids.
+			const forge = (wl: string, id: string, rowId: string) =>
+				ledger.db.query("INSERT INTO entries (id, workload_id, slice_id, kind, body, created_by, created_at) VALUES (?, ?, NULL, 'assumption', ?, ?, ?)")
+					.run(id, wl, forgeryConfirmedBody(rowId, "in-forged"), SURFACE_BY, ledger.now());
+			forge(self, "en-forgedself", "en-forgedself");
+			forge(cycle, "en-forgedcyclea", "en-forgedcycleb");
+			forge(cycle, "en-forgedcycleb", "en-forgedcyclea");
+			c.plusHours(0.1);
+
+			// before any pass, the check's own hits hold both
+			expect(forgeryHoldLine(ledger, self)).toContain("en-forgedself F1");
+			expect(forgeryHoldLine(ledger, cycle)).toContain("en-forgedcyclea F1");
+			const pass = forgeryPass(ledger, AUTOBOARD_WINDOW_MS);
+			expect(pass.hits.map((h) => [h.workloadId, h.rowId, h.rule])).toEqual([
+				[self, "en-forgedself", "F1"], [cycle, "en-forgedcyclea", "F1"], [cycle, "en-forgedcycleb", "F1"],
+			]);
+			expect(unansweredHits(ledger, self).map((h) => h.rowId)).toEqual(["en-forgedself"]);
+			expect(unansweredHits(ledger, cycle).map((h) => h.rowId).sort()).toEqual(["en-forgedcyclea", "en-forgedcycleb"]);
+			expect(verdict(ledger, self)).toEqual({ launch: false, reason: "forgery-hold" });
+			expect(verdict(ledger, cycle)).toEqual({ launch: false, reason: "forgery-hold" });
+
+			// Jo's own marked confirmation of one cycle member roots it: that member answers the other, and the hold lifts
+			const words = surface.recordInstruction({ ...JO, workloadId: cycle, body: "confirm en-forgedcyclea" });
+			surface.recordEntry({ by: SURFACE_BY, workloadId: cycle, kind: "assumption", body: forgeryConfirmedBody("en-forgedcyclea", words) });
+			expect(unansweredHits(ledger, cycle)).toEqual([]);
+			expect(forgeryHoldLine(ledger, cycle)).toBeNull();
+			expect(verdict(ledger, cycle)).toMatchObject({ launch: true });
+			expect(verdict(ledger, self)).toEqual({ launch: false, reason: "forgery-hold" });
+		} finally {
+			surface.close();
+		}
 	});
 });
 

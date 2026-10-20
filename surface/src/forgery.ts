@@ -83,16 +83,34 @@ function after(at: string, cutover: string | null): boolean {
 const CONFIRMED = /^forgery-confirmed:\s+(\S+)\s+by\s+in-\S+/;
 
 /**
- * Row ids Jo confirmed as his (`forgery-confirmed: <row id> by <in-…>`, stamped by the surface), less every confirmation a surface
- * `forgery-reversed:` among `entries` names (`reversedRowIds`, as `controlEntries` drops it): a reversed confirmation exempts nothing.
+ * Row ids Jo confirmed as his (`forgery-confirmed: <row id> by <in-…>`). Only a legitimate confirmation exempts: kind
+ * assumption, stamped by the surface, not voided by an effective surface `forgery-reversed:` among `entries`
+ * (`reversedRowIds`, as `controlEntries` drops it), naming a row other than itself, and Jo's authority in its own right:
+ * a surface jo-channel mark, or written before the surface cutover (F1's own rule), or itself exempted by a legitimate
+ * confirmation. The last is a least fixed point from the marked roots, so unmarked confirmations, alone, in a chain or
+ * in a cycle, exempt nothing.
  */
-function confirmedIds(entries: readonly EntryRow[]): Set<string> {
-	const out = new Set<string>();
+function confirmedIds(entries: readonly EntryRow[], surfaceMarked: (id: string) => boolean, surfaceCutover: string | null): Set<string> {
 	const reversed = reversedRowIds(entries);
+	const targets = new Map<string, string>();
+	const roots: string[] = [];
 	for (const e of entries) {
 		if (e.kind !== "assumption" || e.created_by !== SURFACE_BY || reversed.has(e.id)) continue;
 		const m = CONFIRMED.exec(e.body.trim());
-		if (m) out.add(m[1]!);
+		if (!m || m[1] === e.id) continue;
+		targets.set(e.id, m[1]!);
+		if (!after(e.created_at, surfaceCutover) || surfaceMarked(e.id)) roots.push(e.id);
+	}
+	const out = new Set<string>();
+	const legit = new Set(roots);
+	const todo = [...roots];
+	for (let id = todo.pop(); id !== undefined; id = todo.pop()) {
+		const target = targets.get(id)!;
+		out.add(target);
+		if (targets.has(target) && !legit.has(target)) {
+			legit.add(target);
+			todo.push(target);
+		}
 	}
 	return out;
 }
@@ -110,7 +128,7 @@ export function checkForgery(input: ForgeryInput): ForgeryHit[] {
 		marks.set(key, kinds);
 	}
 	const markOf = (table: ForgeryTable, id: string) => marks.get(`${table}\u0000${id}`);
-	const confirmed = confirmedIds(input.entries);
+	const confirmed = confirmedIds(input.entries, (id) => markOf("entries", id)?.has("surface") === true, cutovers.surface);
 	const questions = new Map(input.questions.map((q) => [q.id, q]));
 	const hits = new Map<string, ForgeryHit>();
 	const hit = (table: ForgeryTable, rowId: string, rule: ForgeryRule, detail: string) => {

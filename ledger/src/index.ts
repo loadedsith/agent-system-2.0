@@ -646,7 +646,7 @@ export class Ledger {
 	/**
 	 * The park decision (decision 14), in one transaction with the question read: when a question
 	 * this lane raised is open, or resolved (answer or replan withdrawal) by an instruction no
-	 * `launch:` attempt names and no `forgery-reversed:` voids (PLAN wl-mvfxw3c4zqfzls D5: a reversed
+	 * `launch:` attempt names and no effective `forgery-reversed:` voids (PLAN wl-mvfxw3c4zqfzls D5: a reversed
 	 * answer is no pending resume), write `lane-parked: <laneId> questions <ids> session <path>`.
 	 */
 	parkLane(workloadId: string, input: Stamp & { laneId: string; session: string }): ParkResult {
@@ -806,9 +806,10 @@ export class Ledger {
 	}
 
 	/**
-	 * The workload's instructions, oldest first, leaving out every row a surface `forgery-reversed:` entry of the
-	 * workload names (PLAN wl-mvfxw3c4zqfzls D5): the read every decision reader takes. `withReversed` keeps them, for
-	 * the reads that need the raw rows (the forgery check, the decision log, row 11's dedup).
+	 * The workload's instructions, oldest first, leaving out every row an effective surface `forgery-reversed:` entry of
+	 * the workload names (PLAN wl-mvfxw3c4zqfzls D5; jo-channel.ts reversedRowIds: a reversed reversal voids nothing, so its
+	 * row comes back): the read every decision reader takes. `withReversed` keeps them, for the reads that need the raw rows
+	 * (the forgery check, the decision log, row 11's dedup).
 	 */
 	instructions(workloadId: string, opts: { withReversed?: boolean } = {}): InstructionRow[] {
 		const rows = this.db.query<InstructionRow, [string]>(
@@ -818,9 +819,9 @@ export class Ledger {
 		return reversed.size === 0 ? rows : rows.filter((r) => !reversed.has(r.id));
 	}
 
-	/** The row ids the workload's surface `forgery-reversed:` entries void (jo-channel.ts reversedRowIds). */
+	/** The row ids the workload's effective surface `forgery-reversed:` entries void (jo-channel.ts reversedRowIds). */
 	private reversedIds(workloadId: string): Set<string> {
-		return reversedRowIds(this.db.query<Pick<EntryRow, "kind" | "body" | "created_by" | "created_at">, [string]>(REVERSAL_ENTRIES_SQL).all(workloadId));
+		return reversedRowIds(this.db.query<Pick<EntryRow, "id" | "kind" | "body" | "created_by" | "created_at">, [string]>(REVERSAL_ENTRIES_SQL).all(workloadId));
 	}
 
 	private insertInstruction(input: Stamp & {

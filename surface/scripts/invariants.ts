@@ -171,8 +171,9 @@ const REVIEW_SQL = `SELECT id, workload_id, created_at, body FROM entries
 
 /**
  * The ledger reads `reservedStates` needs, over a read-only connection (the same SQL as `Ledger`'s own). Its
- * `instructions` leaves out a row a surface `forgery-reversed:` names (PLAN wl-mvfxw3c4zqfzls D5) only when that
- * entry was written at or before `asOf` (every reversal when omitted), so an `--as-of` replay keeps history.
+ * `instructions` leaves out a row an effective surface `forgery-reversed:` names (PLAN wl-mvfxw3c4zqfzls D5;
+ * jo-channel.ts reversedRowIds), counting only reversals written at or before `asOf` (every reversal when omitted), so an
+ * `--as-of` replay keeps history: a reversal of a reversal after `asOf` does not yet restore the row.
  */
 export function reservedView(db: Database, asOf?: string): ReservedLedgerView {
 	return {
@@ -181,7 +182,7 @@ export function reservedView(db: Database, asOf?: string): ReservedLedgerView {
 				? db.query<EntryRow, [string]>("SELECT * FROM entries WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId)
 				: db.query<EntryRow, [string, string]>("SELECT * FROM entries WHERE workload_id = ? AND kind = ? ORDER BY created_at, rowid").all(workloadId, kind),
 		instructions: (workloadId: string) => {
-			const reversed = reversedRowIds(db.query<Pick<EntryRow, "kind" | "body" | "created_by" | "created_at">, [string]>(REVERSAL_ENTRIES_SQL).all(workloadId), asOf);
+			const reversed = reversedRowIds(db.query<Pick<EntryRow, "id" | "kind" | "body" | "created_by" | "created_at">, [string]>(REVERSAL_ENTRIES_SQL).all(workloadId), asOf);
 			return db.query<InstructionRow, [string]>("SELECT * FROM instructions WHERE workload_id = ? ORDER BY created_at, rowid").all(workloadId)
 				.filter((i) => !reversed.has(i.id));
 		},

@@ -115,9 +115,27 @@ function confirm(ledger: Ledger, hit: RecordedHit, on: string, inId: string): st
 	return `${head}; the hold on ${wl} is lifted, and it had stopped ${lanes}, so a relaunch is requested`;
 }
 
-/** The mode `wl` has with every reversed mode-flip left out: its newest kept mode-flip, else the mode it opened with. */
+/**
+ * The surface's compensating mode-flip of reversed flip `reversed`: its entry `mode-compensation: <flip id> reverses <row id>`,
+ * written beside the flip (the flip's body stays the bare mode every reader of `mode-flip` instructions reads).
+ */
+function modeCompensationBody(flipId: string, reversed: string): string {
+	return `mode-compensation: ${flipId} reverses ${reversed}`;
+}
+
+const MODE_COMPENSATION = /^mode-compensation:\s+(in-\S+)\s+reverses\s+\S+$/;
+
+/**
+ * The mode `wl` has with every reversed mode-flip and every compensating flip left out: the newest flip Jo made and kept, else
+ * the mode it opened with.
+ */
 function effectiveMode(ledger: Ledger, wl: string): Mode | null {
-	const last = ledger.instructions(wl).findLast((i) => i.kind === "mode-flip");
+	const compensations = new Set<string>();
+	for (const e of ledger.entries(wl, "assumption")) {
+		const m = e.created_by === SURFACE_BY ? MODE_COMPENSATION.exec(e.body.trim()) : null;
+		if (m) compensations.add(m[1]!);
+	}
+	const last = ledger.instructions(wl).findLast((i) => i.kind === "mode-flip" && !compensations.has(i.id));
 	if (last) return last.body as Mode;
 	const opened = ledger.provenance(wl).find((p) => p.tbl === "workloads" && p.action === "insert");
 	const m = opened ? / mode=(autonomous|user-driven)\b/.exec(opened.detail ?? "") : null;
@@ -148,8 +166,22 @@ function copyRoles(ledger: Ledger, wl: string, from: string, to: string): string
 }
 
 /**
- * Void the companions of the reversed answer or withdrawal `insId`: each unreversed surface entry of `wl` with `insId` among
- * its words (the answer's transaction writes them, input.ts apply), Jo's forgery answers aside, gets its own
+ * The reference field of a companion the answer's transaction writes (input.ts apply, applyPair; surface/src/ceiling.ts,
+ * pair-suggest.ts, launch.ts and classifier/src/rounds.ts bodies): the answer id `plan: approved <answer>`,
+ * `pair-taken: <q> by <answer> …`, `ceiling: … by <answer>` and `review-rounds-extend: <sl> +<n> by <answer>` name, or null.
+ */
+function companionAnswerId(body: string): string | null {
+	const m =
+		/^plan:\s+approved\s+(\S+)$/.exec(body) ??
+		/^pair-taken:\s+\S+\s+by\s+(\S+)(?:\s.*)?$/.exec(body) ??
+		/^ceiling:\s.*\sby\s+(\S+)$/.exec(body) ??
+		/^review-rounds-extend:\s+\S+\s+\+\d+\s+by\s+(\S+)$/.exec(body);
+	return m ? m[1]! : null;
+}
+
+/**
+ * Void the companions of the reversed answer or withdrawal `insId`: each unreversed surface entry of `wl` of a known companion
+ * form naming `insId` at its reference field, Jo's forgery answers aside, gets its own
  * `forgery-reversed: <entry> by <inId>`, which `controlEntries` and every reader of reversed ids skip. Returns `<prefix>: <id>`.
  */
 function voidCompanions(ledger: Ledger, wl: string, insId: string, inId: string): string[] {
@@ -158,8 +190,7 @@ function voidCompanions(ledger: Ledger, wl: string, insId: string, inId: string)
 	const out: string[] = [];
 	for (const e of entries) {
 		const body = e.body.trim();
-		if (e.created_by !== SURFACE_BY || reversed.has(e.id) || /^forgery(?:-confirmed|-reversed)?:/.test(body)) continue;
-		if (!body.split(/\s+/).includes(insId)) continue;
+		if (e.created_by !== SURFACE_BY || reversed.has(e.id) || companionAnswerId(body) !== insId) continue;
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: forgeryReversedBody(e.id, inId) });
 		out.push(`${/^([a-z-]+):/.exec(body)?.[1] ?? "entry"}: ${e.id}`);
 	}
@@ -177,6 +208,7 @@ function reverseInstruction(ledger: Ledger, wl: string, ins: InstructionRow, inI
 		const now = ledger.workload(wl)!.mode;
 		if (mode === null || mode === now) return [`mode-flip ${ins.id} voided; ${wl} is ${now} without it, so no flip back`];
 		const flip = ledger.flipMode(wl, { by: SURFACE_BY, author: "jo", channel: "surface", mode });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: modeCompensationBody(flip, ins.id) });
 		return [`mode on ${wl} flipped back ${now} → ${mode} (mode-flip ${flip})${modeFlipControl(ledger, wl, mode)}`];
 	}
 	if (ins.kind === "instruction") return [`instruction ${ins.id} voided for every decision reader`];

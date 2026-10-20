@@ -5,6 +5,8 @@
 //   open, `forgery: hit <wl> <row id> <rule>` on the standing workload once it is closed (a closed workload takes no
 //   entry), stamped FORGERY_CHECK_BY. Jo's answers, `forgery-confirmed: <row id> by <in-…>` and `forgery-reversed:
 //   <row id> by <in-…>` (surface/src/input.ts), follow the same placement and are matched by row id wherever they sit.
+//   An answer counts only when trusted (launch.ts `trustedForgeryAnswers`): it never answers itself, and one the check
+//   flagged answers nothing until Jo answers it, so a forged confirmation, alone or in a chain or cycle, lifts no hold.
 // - A workload is held while it has a recorded hit with neither answer (`unansweredHits`), or, for the read-only
 //   checks that run before a pass has recorded anything (`merge-train.ts stakes --hold-ok`, the launch reserve), a
 //   fresh hit of the check itself (`holdState`). A hit Jo reversed after the workload closed (`forgery-reversed:` on the
@@ -16,8 +18,8 @@
 import type { EntryRow, Ledger } from "../../ledger/src/index";
 import { checkForgery, type ForgeryHit, type ForgeryRule } from "./forgery";
 import {
-	attempts, type ControlEntry, controlEntries, FORGERY_HOLD_REASON, forgeryHitBody, heldLive, holdersOf, laneStopRequestBody, parseForgeryAnswer,
-	parseForgeryHit, parseTrainBoard,
+	attempts, type ControlEntry, controlEntries, FORGERY_HOLD_REASON, forgeryHitBody, forgeryHitRows, heldLive, holdersOf, laneStopRequestBody,
+	parseForgeryAnswer, parseForgeryHit, parseTrainBoard, trustedForgeryAnswers,
 } from "./launch";
 import type { Notify, Speak } from "./notify";
 import { FORGERY_CHECK_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
@@ -80,25 +82,28 @@ function controlOf(ledger: Ledger, wl: string, entries: readonly EntryRow[] = le
 /** A hit's answer: which word, its entry, and the workload the entry sits on. */
 type Answer = NonNullable<RecordedHit["answer"]>;
 
-/** Jo's answers among `control` (on workload `on`), by row id: the first valid `forgery-confirmed:` or `forgery-reversed:` naming it. */
-function answersIn(control: readonly ControlEntry[], on: string, into: Map<string, Answer>): void {
-	for (const c of control) {
-		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
-		const a = parseForgeryAnswer(c.rest);
-		if (a && !into.has(a.rowId)) into.set(a.rowId, { kind: c.prefix === "forgery-confirmed" ? "confirmed" : "reversed", entryId: c.id, on });
+/**
+ * Jo's answers to hits on `wl`'s rows, by row id: the first trusted `forgery-confirmed:` or `forgery-reversed:` naming it among
+ * `own` (on `wl`), then `standing` (on the standing workload). Trust is `trustedForgeryAnswers` over both lists, every row a
+ * recorded hit among them or `fresh` names flagged: an answer the check flagged answers nothing until Jo answers it.
+ */
+function answersOf(own: readonly ControlEntry[], wl: string, standing: readonly ControlEntry[], fresh: readonly string[]): Map<string, Answer> {
+	const both = [...own, ...standing];
+	const flagged = forgeryHitRows(both);
+	for (const id of fresh) flagged.add(id);
+	const ownIds = new Set(own.map((c) => c.id));
+	const out = new Map<string, Answer>();
+	for (const { entry, rowId } of trustedForgeryAnswers(both, flagged)) {
+		if (!out.has(rowId)) out.set(rowId, { kind: entry.prefix === "forgery-confirmed" ? "confirmed" : "reversed", entryId: entry.id, on: ownIds.has(entry.id) ? wl : STANDING_WORKLOAD_ID });
 	}
+	return out;
 }
 
-/**
- * Every recorded hit on `wl`'s rows, one per row id, oldest first: the own-workload form on `wl`, the closed form naming `wl`
- * on the standing workload, each with Jo's answer from either place.
- */
-export function recordedHits(ledger: Ledger, wl: string): RecordedHit[] {
+/** `recordedHits`, with the check's fresh hits (`fresh`, row ids) flagged too when trusting answers. */
+function recordedWith(ledger: Ledger, wl: string, fresh: readonly string[]): { hits: RecordedHit[]; answers: Map<string, Answer> } {
 	const own = wl === STANDING_WORKLOAD_ID ? [] : controlOf(ledger, wl);
 	const standing = controlOf(ledger, STANDING_WORKLOAD_ID);
-	const answers = new Map<string, Answer>();
-	answersIn(own, wl, answers);
-	answersIn(standing, STANDING_WORKLOAD_ID, answers);
+	const answers = answersOf(own, wl, standing, fresh);
 	const out: RecordedHit[] = [];
 	const add = (c: ControlEntry, on: string, form: "own" | "closed") => {
 		if (c.prefix !== "forgery" || c.createdBy !== FORGERY_CHECK_BY) return;
@@ -109,7 +114,15 @@ export function recordedHits(ledger: Ledger, wl: string): RecordedHit[] {
 	};
 	for (const c of own) add(c, wl, "own");
 	for (const c of standing) add(c, STANDING_WORKLOAD_ID, wl === STANDING_WORKLOAD_ID ? "own" : "closed");
-	return out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+	return { hits: out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0)), answers };
+}
+
+/**
+ * Every recorded hit on `wl`'s rows, one per row id, oldest first: the own-workload form on `wl`, the closed form naming `wl`
+ * on the standing workload, each with Jo's trusted answer from either place (`answersOf`).
+ */
+export function recordedHits(ledger: Ledger, wl: string): RecordedHit[] {
+	return recordedWith(ledger, wl, []).hits;
 }
 
 /** The recorded hits on `wl` Jo has answered neither way: what holds it. */
@@ -127,16 +140,15 @@ export function closedReversals(ledger: Ledger, wl: string): RecordedHit[] {
 
 /**
  * The hold as the read-only checks see it: the recorded hits Jo has not answered, and the check's own hits no pass has
- * recorded yet and Jo has not answered (one per row id, its first rule).
+ * recorded yet and Jo has not answered (one per row id, its first rule). Every row the check flags now is flagged when
+ * trusting answers, so a confirmation no pass has recorded a hit on yet answers nothing either.
  */
 export function holdState(ledger: Ledger, wl: string): { unanswered: RecordedHit[]; fresh: ForgeryHit[] } {
-	const recorded = recordedHits(ledger, wl);
+	const scan = scanWorkload(ledger, wl);
+	const { hits: recorded, answers } = recordedWith(ledger, wl, scan.map((h) => h.rowId));
 	const known = new Set(recorded.map((h) => h.rowId));
-	const answers = new Map<string, Answer>();
-	answersIn(wl === STANDING_WORKLOAD_ID ? [] : controlOf(ledger, wl), wl, answers);
-	answersIn(controlOf(ledger, STANDING_WORKLOAD_ID), STANDING_WORKLOAD_ID, answers);
 	const fresh: ForgeryHit[] = [];
-	for (const h of scanWorkload(ledger, wl)) {
+	for (const h of scan) {
 		if (known.has(h.rowId) || answers.has(h.rowId) || fresh.some((x) => x.rowId === h.rowId)) continue;
 		fresh.push(h);
 	}
@@ -306,9 +318,10 @@ export const FORGERY_RULE_NAMES: Record<string, string> = {
 };
 
 /**
- * The reversed cancel withdrawals the schema will still apply (D5, Q2): a `withdrawal` with disposition `cancel` that a surface
- * `forgery-reversed:` on its open workload names, whose slice is still paused with another question open. Resolving the last of
- * those questions fires `questions_resolution_settles_slice` (ledger/schema.sql), which reads raw instructions and cancels the slice.
+ * The reversed cancel withdrawals the schema will still apply (D5, Q2): a `withdrawal` with disposition `cancel` that an effective
+ * surface `forgery-reversed:` on its open workload names (it is out of `Ledger.instructions`: a reversed reversal restores it), whose
+ * slice is still paused with another question open. Resolving the last of those questions fires `questions_resolution_settles_slice`
+ * (ledger/schema.sql), which reads raw instructions and cancels the slice.
  */
 export function deferredCancels(ledger: Ledger, wl?: string): { workloadId: string; rowId: string; sliceId: string; questionIds: string[] }[] {
 	const rows = ledger.db.query<{ workload_id: string; body: string }, [string]>(
@@ -320,6 +333,7 @@ export function deferredCancels(ledger: Ledger, wl?: string): { workloadId: stri
 		if (wl !== undefined && r.workload_id !== wl) continue;
 		const a = parseForgeryAnswer(r.body.slice("forgery-reversed: ".length).trim());
 		if (!a) continue;
+		if (ledger.instructions(r.workload_id).some((i) => i.id === a.rowId)) continue;
 		const ins = ledger.instructions(r.workload_id, { withReversed: true }).find((i) => i.id === a.rowId);
 		if (!ins || ins.kind !== "withdrawal" || ins.disposition !== "cancel" || ins.question_id === null) continue;
 		const q = ledger.question(ins.question_id);

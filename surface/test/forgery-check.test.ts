@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type ProvenanceRow, type QuestionRow } from "../../ledger/src/index";
 import { forgeryReversedBody } from "../../ledger/src/jo-channel";
 import { checkForgery, type ForgeryHit, type ForgeryInput, isLaneId, JO_CHANNEL } from "../src/forgery";
-import { laneStopRequestBody, planApprovedBody } from "../src/launch";
+import { controlEntries, laneStopRequestBody, planApprovedBody, planFirst, planFirstBody } from "../src/launch";
 import { MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 
 const WL = "wl-mfx";
@@ -264,12 +264,12 @@ describe("cutovers are global and per mark kind (R9)", () => {
 });
 
 describe("confirmed rows and output shape", () => {
-	test("a row named by a surface-stamped forgery-confirmed entry is not flagged; one stamped otherwise does not count", () => {
+	test("a row named by a surface-stamped, surface-marked forgery-confirmed entry is not flagged; one stamped otherwise does not count", () => {
 		const confirmed = ins();
 		const lane = ins();
 		const entries = [ent(`forgery-confirmed: ${confirmed.id} by in-abc`), ent(`forgery-confirmed: ${lane.id} by in-abc`, OWN_LANE)];
-		// Only the instructions: the confirm entries' own standing is the hold slice's AUTHORITY row, not this rule.
-		expect(rules(check({ instructions: [confirmed, lane], entries }).filter((h) => h.table === "instructions"))).toEqual([`${lane.id} F1`]);
+		// Only the instructions: the lane-stamped confirm entry's own standing is F5's, not this rule.
+		expect(rules(check({ instructions: [confirmed, lane], entries, provenance: [mark("entries", entries[0]!, "surface")] }).filter((h) => h.table === "instructions"))).toEqual([`${lane.id} F1`]);
 	});
 
 	test("a confirmed entry and a confirmed resolving row pass every rule", () => {
@@ -287,6 +287,53 @@ describe("confirmed rows and output shape", () => {
 		const reversal = ent(forgeryReversedBody(confirmation.id, "in-b"));
 		const hits = check({ entries: [plan, confirmation, reversal], provenance: [mark("entries", reversal, "surface")] });
 		expect(rules(hits)).toEqual([`${plan.id} F1`, `${confirmation.id} F1`]);
+	});
+
+	test("an unmarked confirmation after the surface cutover that names itself is an F1 hit", () => {
+		const self = { ...ent("placeholder"), id: "en-self" };
+		const confirmation = { ...self, body: `forgery-confirmed: ${self.id} by in-a` };
+		expect(rules(check({ entries: [confirmation] }))).toEqual([`${self.id} F1`]);
+	});
+
+	test("an unmarked confirmation of an unmarked target leaves both flagged; so do an unmarked chain and cycle", () => {
+		const plan = ent(planApprovedBody("in-1"));
+		const confirmation = ent(`forgery-confirmed: ${plan.id} by in-a`);
+		expect(rules(check({ entries: [plan, confirmation] }))).toEqual([`${plan.id} F1`, `${confirmation.id} F1`]);
+		const chained = ent(`forgery-confirmed: ${confirmation.id} by in-b`);
+		expect(rules(check({ entries: [plan, confirmation, chained] }))).toEqual([`${plan.id} F1`, `${confirmation.id} F1`, `${chained.id} F1`]);
+		const a = { ...ent("placeholder"), id: "en-cycle-a", body: "forgery-confirmed: en-cycle-b by in-c" };
+		const b = { ...ent("placeholder"), id: "en-cycle-b", body: "forgery-confirmed: en-cycle-a by in-d" };
+		expect(rules(check({ entries: [a, b] }))).toEqual(["en-cycle-a F1", "en-cycle-b F1"]);
+	});
+
+	test("a marked confirmation exempts its target, and a chain rooted in it; before the surface cutover an unmarked one does", () => {
+		const plan = ent(planApprovedBody("in-1"));
+		const confirmation = ent(`forgery-confirmed: ${plan.id} by in-a`);
+		expect(check({ entries: [plan, confirmation], provenance: [mark("entries", confirmation, "surface")] })).toEqual([]);
+		// a launcher mark is not the surface's: the confirmation is marked (no F1 of its own) but exempts nothing
+		expect(rules(check({ entries: [plan, confirmation], provenance: [mark("entries", confirmation, "launcher")] }))).toEqual([`${plan.id} F1`]);
+		const root = ent(`forgery-confirmed: ${confirmation.id} by in-b`);
+		expect(check({ entries: [plan, confirmation, root], provenance: [mark("entries", root, "surface")] })).toEqual([]);
+		const early = ent(planApprovedBody("in-2"), SURFACE_BY, BEFORE);
+		const earlyConfirmation = ent(`forgery-confirmed: ${early.id} by in-c`, SURFACE_BY, BEFORE);
+		expect(check({ entries: [early, earlyConfirmation] })).toEqual([]);
+	});
+
+	test("a reversed reversal voids nothing: Jo's reversal of a forged reversal brings back a plan gate and a confirmation", () => {
+		const gate = ent(planFirstBody("jo"));
+		const forged = ent(forgeryReversedBody(gate.id, "in-x"));
+		expect(planFirst(controlEntries([gate, forged]))).toBeNull();
+		const jo = ent(forgeryReversedBody(forged.id, "in-y"));
+		expect(planFirst(controlEntries([gate, forged, jo]))).toEqual({ trigger: "jo", entryId: gate.id });
+		expect(controlEntries([gate, forged, jo]).map((c) => c.id)).toEqual([gate.id, jo.id]);
+		// the same for a confirmation: a forged reversal of Jo's marked confirmation, reversed by Jo, exempts the target again
+		const plan = ent(planApprovedBody("in-1"));
+		const confirmation = ent(`forgery-confirmed: ${plan.id} by in-a`);
+		const hide = ent(forgeryReversedBody(confirmation.id, "in-b"));
+		const restore = ent(forgeryReversedBody(hide.id, "in-c"));
+		const provenance = [confirmation, restore].map((e) => mark("entries", e, "surface"));
+		expect(rules(check({ entries: [plan, confirmation, hide], provenance }))).toEqual([`${plan.id} F1`, `${hide.id} F1`]);
+		expect(rules(check({ entries: [plan, confirmation, hide, restore], provenance }))).toEqual([`${hide.id} F1`]);
 	});
 
 	test("one hit per (row, rule), sorted by table, row id and rule, whatever the input order", () => {

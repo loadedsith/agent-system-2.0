@@ -8,7 +8,8 @@
 // - It throws where the Jo-only boundary (ledger/src/authority.ts) is in force; an agent connection there refuses a
 //   'jo-channel' provenance row; a temp ledger in a lane-run test can still declare.
 // - A surface `forgery-reversed: <row id> by <in-id>` voids the row for Ledger.instructions, parkLane's resolving
-//   read, and surface/scripts/invariants.ts reservedView as of its time.
+//   read, and surface/scripts/invariants.ts reservedView as of its time, unless a later reversal voids the reversal:
+//   reversing a forged reversal restores its row.
 // The preload (ledger/test/isolate-preload.ts) forgets the declaration after every test.
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -308,6 +309,40 @@ describe("R15: a reversed row is void for every decision reader", () => {
 			expect(has(ids.before)).toBe(true);
 			expect(has(ids.at)).toBe(false);
 			expect(has()).toBe(false);
+		} finally {
+			db.close();
+		}
+	});
+
+	test("a reversed reversal voids nothing: reversing a forged reversal restores the instruction for every reader", () => {
+		const w = seed("r15-rereverse");
+		const ids = withVars(NO_AGENT, () => {
+			const l = open(w.path);
+			try {
+				const row = l.recordInstruction({ by: SURFACE_BY, workloadId: w.wl, body: "ceiling: 50", author: "jo", channel: "surface" });
+				const answer = l.answerQuestion(w.question, { by: SURFACE_BY, answer: "approve", author: "jo", channel: "surface" });
+				// a forger's surface-stamped reversals hide Jo's instruction and his answer
+				const forgedRow = reverse(l, w.wl, row);
+				const forgedAnswer = reverse(l, w.wl, answer);
+				expect(l.instructions(w.wl).map((i) => i.id)).not.toContain(row);
+				expect(l.parkLane(w.wl, { by: LANE, laneId: LANE, session: "/s/1.jsonl" })).toEqual({ parked: false });
+				const between = clock();
+				// Jo reverses both forged reversals: the rows are back
+				reverse(l, w.wl, forgedRow);
+				reverse(l, w.wl, forgedAnswer);
+				expect(l.instructions(w.wl).map((i) => i.id)).toEqual([row, answer]);
+				expect(l.parkLane(w.wl, { by: LANE, laneId: LANE, session: "/s/1.jsonl" })).toEqual({ parked: true, open: 0 });
+				return { row, between };
+			} finally {
+				l.close();
+			}
+		});
+		const db = new Database(w.path, { readonly: true });
+		try {
+			const has = (asOf?: string) => reservedView(db, asOf).instructions(w.wl).some((i) => i.id === ids.row);
+			// as of before Jo's reversal of the reversal, the row was still hidden; after it, and now, it is back
+			expect(has(ids.between)).toBe(false);
+			expect(has()).toBe(true);
 		} finally {
 			db.close();
 		}

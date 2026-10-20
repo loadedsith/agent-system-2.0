@@ -9,8 +9,8 @@ import { deferredCancels, unansweredHits } from "../src/forgery-hold";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, type Command, interpret, isPlanQuestion } from "../src/input";
 import {
-	controlEntries, FORGERY_HOLD_REASON, forgeryConfirmedBody, forgeryHitBody, holdersOf, laneStopRequestBody, launchRequestedBody, planFirst, planFirstBody, resolutions,
-	verdictOf,
+	controlEntries, doneBody, doneLine, FORGERY_HOLD_REASON, forgeryConfirmedBody, forgeryHitBody, holdersOf, laneStopRequestBody, launchRequestedBody, planFirst, planFirstBody,
+	resolutions, verdictOf,
 } from "../src/launch";
 import { FORGERY_CHECK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { tempLedger, workloadWithSlice } from "./helpers";
@@ -271,6 +271,37 @@ describe("reverse <row id> (D5)", () => {
 		say(ledger, `reverse ${forged}`);
 		expect(ledger.workload(wl)!.mode).toBe("user-driven");
 		expect(ledger.instructions(wl, { withReversed: true }).filter((i) => i.kind === "mode-flip").map((i) => i.body)).toEqual(["user-driven", "autonomous", "user-driven"]);
+		ledger.close();
+	});
+
+	test("a legitimate done: entry that mentions the answer's id survives the answer's reversal; the plan companion is voided", () => {
+		const { ledger } = tempLedger();
+		const { wl, q } = planQuestion(ledger);
+		answer(ledger, "approve", q);
+		const ans = ledger.instructions(wl).find((i) => i.kind === "answer" && i.question_id === q)!.id;
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(`the plan Jo approved in ${ans} is built and merged`) });
+		const before = doneLine(control(ledger, wl));
+		expect(before).toContain(ans);
+		hit(ledger, wl, ans);
+
+		say(ledger, `reverse ${ans}`);
+		expect(doneLine(control(ledger, wl))).toBe(before);
+		expect(planFirst(control(ledger, wl))).not.toBeNull();
+		ledger.close();
+	});
+
+	test("a compensating flip is no user decision: open autonomous, flip A to user-driven, flip B to autonomous, reverse B, reverse A ends autonomous", () => {
+		const { ledger } = tempLedger();
+		const { wl } = workloadWithSlice(ledger, { mode: "autonomous" });
+		const a = ledger.flipMode(wl, { ...JO, mode: "user-driven" });
+		const b = ledger.flipMode(wl, { ...JO, mode: "autonomous" });
+		hit(ledger, wl, a);
+		hit(ledger, wl, b);
+
+		say(ledger, `reverse ${b}`);
+		expect(ledger.workload(wl)!.mode).toBe("user-driven");
+		say(ledger, `reverse ${a}`);
+		expect(ledger.workload(wl)!.mode).toBe("autonomous");
 		ledger.close();
 	});
 

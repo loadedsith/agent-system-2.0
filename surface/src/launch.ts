@@ -293,8 +293,9 @@ export function holdersOf(entries: readonly EntryRow[], current: string | null, 
  * writer, and a parsable body. `holders` are the writers of `done-because:` (`holdersOf`); omit it
  * when the reader does not care about that prefix. Everything else — a lane note shaped like a
  * control line, a `launch-requested:` from a lane, a `plan: approved` from anyone but the surface —
- * is dropped here, so no reader sees it. So is an entry Jo reversed: one a surface `forgery-reversed:`
- * among `entries` names (PLAN wl-mvfxw3c4zqfzls D5; ledger/src/jo-channel.ts `reversedRowIds`).
+ * is dropped here, so no reader sees it. So is an entry Jo reversed: one an effective surface `forgery-reversed:`
+ * among `entries` names (PLAN wl-mvfxw3c4zqfzls D5; ledger/src/jo-channel.ts `reversedRowIds`). A reversal a later
+ * effective reversal names voids nothing and is itself dropped, so the entry it named comes back.
  */
 export function controlEntries(entries: readonly EntryRow[], holders: readonly string[] = []): ControlEntry[] {
 	const out: ControlEntry[] = [];
@@ -1320,19 +1321,45 @@ export function parseForgeryAnswer(rest: string): { rowId: string; by: string } 
 	const m = FORGERY_ANSWER_RE.exec(rest);
 	return m ? { rowId: m[1]!, by: m[2]! } : null;
 }
-/** The row ids Jo answered among `control`: each valid `forgery-confirmed:` and `forgery-reversed:`. */
-export function forgeryAnswered(control: readonly ControlEntry[]): Set<string> {
+/** The row ids the `forgery: hit` entries among `control` flag, either form. */
+export function forgeryHitRows(control: readonly ControlEntry[]): Set<string> {
 	const out = new Set<string>();
 	for (const c of control) {
-		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
-		const a = parseForgeryAnswer(c.rest);
-		if (a) out.add(a.rowId);
+		const h = c.prefix === "forgery" ? parseForgeryHit(c.rest) : null;
+		if (h) out.add(h.rowId);
 	}
 	return out;
 }
 /**
+ * Jo's answers among `control`, oldest first: each valid `forgery-confirmed:` and `forgery-reversed:` that names a row other
+ * than itself and is trusted. One no row id in `flagged` names (the flagged rows: the recorded hits, and the check's fresh ones
+ * where the reader has them) is trusted; so is one a trusted `forgery-confirmed:` names. The last is a least fixed point from
+ * the unflagged roots, so a flagged confirmation, alone, in a chain or in a cycle, answers nothing until Jo answers it.
+ */
+export function trustedForgeryAnswers(control: readonly ControlEntry[], flagged: ReadonlySet<string>): { entry: ControlEntry; rowId: string }[] {
+	const answers: { entry: ControlEntry; rowId: string }[] = [];
+	for (const c of control) {
+		if (c.prefix !== "forgery-confirmed" && c.prefix !== "forgery-reversed") continue;
+		const a = parseForgeryAnswer(c.rest);
+		if (a && a.rowId !== c.id) answers.push({ entry: c, rowId: a.rowId });
+	}
+	const trusted = new Set(answers.filter((a) => !flagged.has(a.entry.id)).map((a) => a.entry.id));
+	const todo = [...trusted];
+	for (let id = todo.pop(); id !== undefined; id = todo.pop()) {
+		const a = answers.find((x) => x.entry.id === id)!;
+		if (a.entry.prefix !== "forgery-confirmed" || trusted.has(a.rowId) || !answers.some((x) => x.entry.id === a.rowId)) continue;
+		trusted.add(a.rowId);
+		todo.push(a.rowId);
+	}
+	return answers.filter((a) => trusted.has(a.entry.id));
+}
+/** The row ids Jo answered among `control`: each trusted `forgery-confirmed:` and `forgery-reversed:` (`trustedForgeryAnswers`). */
+export function forgeryAnswered(control: readonly ControlEntry[]): Set<string> {
+	return new Set(trustedForgeryAnswers(control, forgeryHitRows(control)).map((a) => a.rowId));
+}
+/**
  * The forgery hold on a workload from its own control entries (D4): every valid own-workload `forgery: hit <row id> <rule>`
- * whose row id no valid `forgery-confirmed:` or `forgery-reversed:` names, one per row id, oldest first.
+ * whose row id no trusted `forgery-confirmed:` or `forgery-reversed:` names (`forgeryAnswered`), one per row id, oldest first.
  */
 export function forgeryHeld(control: readonly ControlEntry[]): { entryId: string; rowId: string; rule: string }[] {
 	const answered = forgeryAnswered(control);
