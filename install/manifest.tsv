@@ -53,9 +53,11 @@ classifier/test/crosslab.test.ts	test	-
 classifier/test/extension.test.ts	test	-
 classifier/test/fingerprint.test.ts	test	-
 classifier/test/fixtures/classifier-sample-2026-09-28.jsonl	test	-
+classifier/test/fixtures/classifier-sample-2026-10-20.jsonl	test	-
 classifier/test/fixtures/classifier-sample-30.jsonl	test	-
 classifier/test/fixtures/kind-question-2026-09-23.json	test	-
 classifier/test/fixtures/kind-question-2026-09-28.json	test	-
+classifier/test/fixtures/kind-question-2026-10-20.json	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-01T16-05-55.407Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-02T16-24-10.088Z.db.gz	test	-
 classifier/test/fixtures/ledger-replay/backup-2026-10-07T16-37-10.733Z.db.gz	test	-
