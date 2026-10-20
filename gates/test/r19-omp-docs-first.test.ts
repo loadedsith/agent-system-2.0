@@ -91,6 +91,21 @@ function judgeSaying(p: number) {
 	return Object.assign(judge, { calls });
 }
 
+/** A fake judge answering yes only when what it is shown contains `question`; `calls` keeps every text it was shown. */
+function judgeSeeing(question: string) {
+	const calls: string[] = [];
+	const judge = async (): Promise<JudgmentJudge> => ({
+		judge: async (request) => {
+			calls.push(String(request.state));
+			const key = Object.keys(request.questions)[0]!;
+			return { answers: { [key]: { noul: String(request.state).includes(question) ? 1 : 0 } }, model: "jev-1.13.0", provider: "typesafe" };
+		},
+	});
+	return Object.assign(judge, { calls });
+}
+
+const QUESTION = "How do I attach another working directory to this session?";
+
 const tmpLedgerDb = (): string => {
 	const db = join(tmp("r19-ledger"), "ledger.db");
 	Ledger.open(db, { create: true, backup: false, backupOnOpen: false }).close();
@@ -189,29 +204,72 @@ describe("the trigger", () => {
 		expect(long).toHaveLength(24000);
 		await b.f.emit("input", SAID(long), b.ctx);
 		expect(await answer(b)).toEqual({ shown: ANSWER, stop: null });
+		expect(no.calls).toHaveLength(1);
 		expect(no.calls[0]!.state).toBe(long);
 	});
 
-	test("a question after a 30000-character paste reaches the judge: its first 8000 and last 16000 characters, and the cut named", async () => {
-		const question = "How do I attach another working directory to this session?";
-		const said = `${"x".repeat(30000)}\n\n${question}`;
+	test("a question in the middle of a long input reaches the judge", async () => {
+		const said = `${"x".repeat(9000)}\n\n${QUESTION}\n\n${"x".repeat(17000)}`;
 		expect(keywordHit(said)).toBeNull();
-		// Yes only when the trailing question is in what it is shown.
+		const judge = judgeSeeing(QUESTION);
+		const s = session("lane", judge);
+		await s.f.emit("input", SAID(said), s.ctx);
+		expect((await answer(s)).stop).toContain(ROW19);
+		expect(judge.calls.some((shown) => shown.includes(QUESTION))).toBe(true);
+	});
+
+	test("a 30000-character input with no question passes, judged as 2 windows that together cover every character", async () => {
+		const said = Array.from({ length: 6000 }, (_, i) => `${String(i).padStart(4, "0")} `).join("");
+		expect(said).toHaveLength(30000);
+		expect(keywordHit(said)).toBeNull();
+		const judge = judgeSeeing(QUESTION);
+		const s = session("lane", judge);
+		await s.f.emit("input", SAID(said), s.ctx);
+		expect(await answer(s)).toEqual({ shown: ANSWER, stop: null });
+		expect(judge.calls).toHaveLength(2);
+		const [first, second] = judge.calls.toSorted((a, b) => said.indexOf(a) - said.indexOf(b));
+		expect(first).toBe(said.slice(0, 24000));
+		expect(second).toBe(said.slice(23000));
+		// The second window repeats the first one's last 1000 characters, and the two end to end are the input.
+		expect(first!.slice(-1000)).toBe(second!.slice(0, 1000));
+		expect(first + second!.slice(1000)).toBe(said);
+	});
+
+	test("an input of up to 8 windows is judged; a longer one holds with no judge call", async () => {
+		const most = "x".repeat(7 * 23000 + 24000);
+		const judged = judgeSaying(0);
+		const a = session("lane", judged);
+		await a.f.emit("input", SAID(most), a.ctx);
+		expect(await answer(a)).toEqual({ shown: ANSWER, stop: null });
+		expect(judged.calls).toHaveLength(8);
+
+		const unjudged = judgeSaying(0);
+		const b = session("lane", unjudged);
+		await b.f.emit("input", SAID(`${most}x`), b.ctx);
+		expect((await answer(b)).stop).toContain("8 windows");
+		expect(unjudged.calls).toHaveLength(0);
+	});
+
+	test("one window's judge call erroring holds the whole input (fail closed)", async () => {
+		const said = `${"x".repeat(29990)} zzzz`;
 		const calls: string[] = [];
 		const judge = async (): Promise<JudgmentJudge> => ({
 			judge: async (request) => {
 				calls.push(String(request.state));
+				if (String(request.state).includes("zzzz")) throw new Error("no credential");
 				const key = Object.keys(request.questions)[0]!;
-				return { answers: { [key]: { noul: String(request.state).includes(question) ? 1 : 0 } }, model: "jev-1.13.0", provider: "typesafe" };
+				return { answers: { [key]: { noul: 0 } }, model: "jev-1.13.0", provider: "typesafe" };
 			},
 		});
 		const s = session("lane", judge);
 		await s.f.emit("input", SAID(said), s.ctx);
-		expect((await answer(s)).stop).toContain(ROW19);
-		expect(calls).toEqual([`${said.slice(0, 8000)}\n[… ${said.length - 24000} characters omitted …]\n${said.slice(-16000)}`]);
+		const stop = (await answer(s)).stop;
+		expect(stop).toContain(ROW19);
+		expect(stop).toContain("no credential");
+		expect(calls.filter((shown) => !shown.includes("zzzz"))).toHaveLength(1);
 	});
 
-	test("the keyword match runs over the whole input, past any cut", async () => {
+	test("the keyword match runs over the whole input, however long", async () => {
 		const judge = judgeSaying(0);
 		const s = session("lane", judge);
 		await s.f.emit("input", SAID(`${"x".repeat(30000)} what does omp do here?`), s.ctx);

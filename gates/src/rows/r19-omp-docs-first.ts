@@ -5,9 +5,9 @@
 // - A question starts at an input: Ilex's or a lane's `input` (interactive or rpc), a hand's task prompt.
 //   Nothing else starts one, so a hidden continuation or an aside keeps the question it follows.
 // - It triggers at once on a keyword (KEYWORDS, whole words, case-insensitive, over the whole input), else on
-//   one judge call started at the input and awaited at the first answer boundary. The judge is OMP's `judge`
-//   role through classifier/src/judge-ask.ts askJudgment, shown judgeText(input); an error, a timeout or no
-//   judge at all counts as triggered.
+//   the judge, asked at the input and awaited at the first answer boundary. The judge is OMP's `judge` role
+//   through classifier/src/judge-ask.ts askJudgment, shown each of judgeWindows(input) in parallel; a yes, an
+//   error or a timeout on any window, too many windows, or no judge at all counts as triggered.
 // - It is consulted once a successful `read`, `grep`, `find` or `search` (grep's legacy name) since the input
 //   named an `omp://` doc, a file under an `@oh-my-pi/` package, or OMP-HARNESS.md / OMP-RUNTIME.md.
 // - While triggered and unconsulted, every answer attempt is held, with no limit and no release. The hold
@@ -34,20 +34,26 @@ export function keywordHit(text: string): string | null {
 	return KEYWORD_PATTERNS.find(([, re]) => re.test(text))?.[0] ?? null;
 }
 
-/** Inputs up to this many characters reach the judge whole. */
-export const JUDGE_WHOLE = 24_000;
-/** Above JUDGE_WHOLE the judge sees this many characters from the start (what the input opens with)… */
-export const JUDGE_HEAD = 8_000;
-/** …and this many from the end, where a question after a long paste sits. */
-export const JUDGE_TAIL = 16_000;
+/** One judge window: an input up to this many characters reaches the judge whole, in one call. */
+export const JUDGE_WINDOW = 24_000;
+/** Above JUDGE_WINDOW, each window repeats this many characters of the one before, so a question on a cut is whole in one. */
+export const JUDGE_OVERLAP = 1_000;
+/** The most windows the judge is asked about; an input needing more counts with no judge call. */
+export const JUDGE_MAX_WINDOWS = 8;
 /** How long the judge has, from the input to an answer: classifier/extension.ts gives its pair-signal ask the same 10 s. */
 export const JUDGE_TIMEOUT_MS = 10_000;
 
-/** What the judge is shown of `text`: all of it up to JUDGE_WHOLE, else its head and tail with the cut named. */
-export function judgeText(text: string): string {
-	if (text.length <= JUDGE_WHOLE) return text;
-	const omitted = text.length - JUDGE_HEAD - JUDGE_TAIL;
-	return `${text.slice(0, JUDGE_HEAD)}\n[… ${omitted} characters omitted …]\n${text.slice(-JUDGE_TAIL)}`;
+/**
+ * The windows the judge is shown of `text`: all of it up to JUDGE_WINDOW, else windows of JUDGE_WINDOW characters
+ * each starting JUDGE_WINDOW - JUDGE_OVERLAP after the last, up to the one that reaches the end. Null when that takes
+ * more than JUDGE_MAX_WINDOWS.
+ */
+export function judgeWindows(text: string): string[] | null {
+	if (text.length <= JUDGE_WINDOW) return [text];
+	const step = JUDGE_WINDOW - JUDGE_OVERLAP;
+	const count = Math.ceil((text.length - JUDGE_OVERLAP) / step);
+	if (count > JUDGE_MAX_WINDOWS) return null;
+	return Array.from({ length: count }, (_, i) => text.slice(i * step, i * step + JUDGE_WINDOW));
 }
 
 /** The one judge question, keyed as askJudgment sends it. */
@@ -73,33 +79,43 @@ export interface Trigger {
 export type JudgeSource = () => Promise<JudgmentJudge>;
 
 /**
- * The judge's reading of `text`, never rejecting: yes (probability at least one half) triggers, no does not,
- * and anything else triggers (fail closed). `timeoutMs` bounds the whole ask, the judge's own resolution
- * included, and the call is aborted when it runs out.
+ * The judge's reading of `text`, never rejecting: each window of judgeWindows(text) is asked in parallel, and a yes
+ * (probability at least one half) on any of them triggers; all no does not; anything else triggers (fail closed), as
+ * does an input needing more than JUDGE_MAX_WINDOWS. `timeoutMs` bounds the whole ask, the judge's own resolution
+ * included; every call still out is aborted when it runs out or once one window has triggered.
  */
 export async function judgeQuestion(text: string, judge: JudgeSource | undefined, timeoutMs: number = JUDGE_TIMEOUT_MS): Promise<Trigger> {
 	if (!judge) return { triggered: true, why: "no judge is wired into this session, so every input counts" };
+	const windows = judgeWindows(text);
+	if (!windows)
+		return { triggered: true, why: `the input is ${text.length} characters, more than ${JUDGE_MAX_WINDOWS} windows of ${JUDGE_WINDOW} the judge reads, so it counts` };
 	const abort = new AbortController();
-	const late = Promise.withResolvers<Trigger>();
-	const timer = setTimeout(() => {
-		abort.abort();
-		late.resolve({ triggered: true, why: `the judge did not answer within ${timeoutMs} ms, so the input counts` });
-	}, timeoutMs);
-	const asked = (async (): Promise<Trigger> => {
+	const decided = Promise.withResolvers<Trigger>();
+	const timer = setTimeout(() => decided.resolve({ triggered: true, why: `the judge did not answer within ${timeoutMs} ms, so the input counts` }), timeoutMs);
+	const resolved = Promise.resolve().then(judge);
+	const asks = windows.map(async (window, i): Promise<Trigger & { p: number }> => {
+		const where = windows.length > 1 ? ` on window ${i + 1} of ${windows.length}` : "";
 		try {
-			const r = await askJudgment(await judge(), judgeText(text), OMP_QUESTION, { timeoutMs, signal: abort.signal });
-			if (!r.ok) return { triggered: true, why: `the judge failed (${r.reason}), so the input counts` };
+			const r = await askJudgment(await resolved, window, OMP_QUESTION, { timeoutMs, signal: abort.signal });
+			if (!r.ok) return { triggered: true, p: 1, why: `the judge failed${where} (${r.reason}), so the input counts` };
 			const a = r.answers.omp_question;
-			const yes = a?.type === "bool" ? a.bool : 1;
-			return { triggered: yes >= 0.5, why: `the judge read it as a question about OMP (p=${yes.toFixed(2)})` };
+			const p = a?.type === "bool" ? a.bool : 1;
+			return { triggered: p >= 0.5, p, why: `the judge read it as a question about OMP${where} (p=${p.toFixed(2)})` };
 		} catch (err) {
-			return { triggered: true, why: `the judge was unavailable (${String(err).split("\n")[0]}), so the input counts` };
+			return { triggered: true, p: 1, why: `the judge was unavailable${where} (${String(err).split("\n")[0]}), so the input counts` };
 		}
-	})();
+	});
+	// The first window to trigger decides at once; otherwise the input passes once every window has said no.
+	for (const ask of asks) void ask.then(({ triggered, why }) => triggered && decided.resolve({ triggered, why }));
+	void Promise.all(asks).then((all) => {
+		const { triggered, p, why } = all.find((one) => one.triggered) ?? all.reduce((most, one) => (one.p > most.p ? one : most));
+		decided.resolve({ triggered, why: !triggered && all.length > 1 ? `the judge read none of its ${all.length} windows as a question about OMP (highest p=${p.toFixed(2)})` : why });
+	});
 	try {
-		return await Promise.race([asked, late.promise]);
+		return await decided.promise;
 	} finally {
 		clearTimeout(timer);
+		abort.abort();
 	}
 }
 
