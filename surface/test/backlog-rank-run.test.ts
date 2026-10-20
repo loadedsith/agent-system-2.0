@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { publishBackup } from "../scripts/backlog-rank";
 import { type BoardItem, type BoardSnapshot, commentMarker, parseCache, parseLastRun, undoPlan } from "../src/backlog-rank";
 import {
 	AS2, type CallRecord, contentOf, type FakeState, issueId, JI, readCalls, readState, renderValues, seedState, THEWOLFF_TOKEN, writeState,
@@ -192,6 +193,113 @@ describe("R8: thewolff's token reaches every board GraphQL call and nothing else
 });
 
 // ---- R3: the backup -----------------------------------------------------------------------------------------------
+
+// These exercise the real subprocess/transport, not the query constants or a second copy of the parser.
+describe("review regressions: complete typed snapshots and safe retries", () => {
+	test("the transport rejects conflicting scalar and nullability shapes even on an empty board", async () => {
+		const w = world((s) => { s.project.items = []; });
+		for (const type of ["IssueFieldNumberValue", "IssueFieldMultiSelectValue"]) {
+			const query = `query($id: ID!) { node(id: $id) { ... on ProjectV2Item { fieldValues(first: 20) { nodes { ... on ProjectV2ItemIssueFieldValue { issueFieldValue { ... on IssueFieldTextValue { value } ... on ${type} { value } } } } } } } }`;
+			const child = Bun.spawn([process.execPath, FIXTURE, "api", "graphql", "--input", "-"], {
+				env: { ...w.env, GH_TOKEN: THEWOLFF_TOKEN }, stdin: new Blob([JSON.stringify({ query, variables: { id: "PVTI_1" } })]), stdout: "pipe", stderr: "pipe",
+			});
+			const output = await new Response(child.stdout).json();
+			expect(await child.exited).toBe(0);
+			expect(output.errors[0].message).toContain("Fields 'value' conflict");
+		}
+	});
+
+	test("an interrupted backup publication exposes no partial file and a later publication never replaces the original", () => {
+		const w = world();
+		const path = join(w.dir, "backup.json");
+		const original = snapshotOf(state(w));
+		expect(() => publishBackup(path, original, (temporary) => {
+			expect(existsSync(path)).toBe(false);
+			expect(JSON.parse(readFileSync(temporary, "utf8")).items).toHaveLength(original.items.length);
+			throw new Error("interrupted before publication");
+		})).toThrow("interrupted before publication");
+		expect(existsSync(path)).toBe(false);
+		publishBackup(path, original);
+		const bytes = readFileSync(path, "utf8");
+		publishBackup(path, { ...original, items: [] });
+		expect(readFileSync(path, "utf8")).toBe(bytes);
+		expect(readdirSync(w.dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	test("all five issue-field variants survive the schema-aware transport and backup", async () => {
+		const variants = [
+			{ __typename: "IssueFieldTextValue", value: "hello" },
+			{ __typename: "IssueFieldNumberValue", value: 12.5 },
+			{ __typename: "IssueFieldDateValue", value: "2026-12-01" },
+			{ __typename: "IssueFieldSingleSelectValue", value: "P1", optionId: "p1" },
+			{ __typename: "IssueFieldMultiSelectValue", value: null },
+		];
+		const w = world((s) => {
+			s.valuesPageSize = 2;
+			variants.forEach((value, n) => {
+				const id = `F_issue_${n}`;
+				s.project.fields.push({ id, name: `Issue ${n}`, dataType: "TEXT" });
+				s.derived[issueId(JI, 1)]![id] = { __typename: "ProjectV2ItemIssueFieldValue", issueFieldValue: value };
+			});
+		});
+		const r = await run(w);
+		expect(r.stderr).toBe("");
+		expect(r.code).toBe(0);
+		const backup = JSON.parse(readFileSync(runFile(w, lastRun(w).runId, "backup.json"), "utf8")) as BoardSnapshot;
+		const values = backup.items.find((i) => i.id === "PVTI_1")!.fieldValues;
+		expect(variants.map((_, n) => values.find((v) => v.field.id === `F_issue_${n}`)?.issueFieldValue)).toEqual(variants);
+	});
+
+	for (const broken of ['{"projectId":', '{"projectId":"PVT_fake1","fields":[]}', '{"projectId":"PVT_fake1","fields":[],"items":[{}]}', '{"projectId":"PVT_fake1","fields":[],"items":[]}']) {
+		test(`a resumed attempt refuses a corrupt/incomplete existing backup: ${broken}`, async () => {
+			const w = world((s) => { s.faults = ["fail-before", "fail-before", "fail-before"]; });
+			expect((await run(w)).code).toBe(1);
+			const id = lastRun(w).runId;
+			const path = runFile(w, id, "backup.json");
+			writeFileSync(path, broken);
+			tweakState(w, (s) => { s.faults = []; });
+			const prior = mutations(w).length;
+			const retry = await run(w);
+			expect(retry.code).toBe(1);
+			expect(retry.stderr).toContain("backup");
+			expect(mutations(w)).toHaveLength(prior);
+			expect(readFileSync(path, "utf8")).toBe(broken);
+		});
+	}
+
+	test("every nested connection is complete and undo detects changes beyond entry 25 without writing them", async () => {
+		const specs = [
+			["F_labels", "ProjectV2ItemFieldLabelValue", "labels", (n: number) => ({ name: `label-${n}` })],
+			["F_assignees", "ProjectV2ItemFieldUserValue", "users", (n: number) => ({ login: `user-${n}` })],
+			["F_prs", "ProjectV2ItemFieldPullRequestValue", "pullRequests", (n: number) => ({ number: n, repository: { nameWithOwner: JI } })],
+			["F_reviewers", "ProjectV2ItemFieldReviewerValue", "reviewers", (n: number) => n % 2 ? ({ __typename: "Team", slug: `team-${n}` }) : ({ __typename: "User", login: `reviewer-${n}` })],
+		] as const;
+		const w = world((s) => {
+			s.valuesPageSize = 3;
+			for (const [id, type, key, node] of specs) s.derived[issueId(JI, 1)]![id] = { __typename: type, [key]: { nodes: Array.from({ length: 57 }, (_, n) => node(n)) } };
+		});
+		expect((await run(w)).code).toBe(0);
+		const path = runFile(w, lastRun(w).runId, "backup.json");
+		const backup = JSON.parse(readFileSync(path, "utf8")) as BoardSnapshot;
+		for (const [id, , key, node] of specs) expect(backup.items.find((i) => i.id === "PVTI_1")!.fieldValues.find((v) => v.field.id === id)![key]).toEqual({ nodes: Array.from({ length: 57 }, (_, n) => node(n)) });
+		tweakState(w, (s) => {
+			for (const [id, , key, node] of specs) {
+				const connection = s.derived[issueId(JI, 1)]![id]![key];
+				if (!connection || typeof connection !== "object" || !("nodes" in connection) || !Array.isArray(connection.nodes)) throw new Error("missing fixture connection");
+				connection.nodes[56] = node(999);
+			}
+		});
+		const undo = await run(w, ["--undo", path]);
+		expect(undo.code).toBe(0);
+		for (const name of ["Labels", "Assignees", "Linked pull requests", "Reviewers"]) expect(undo.stdout).toContain(`content-derived, not written: jo-issues#1 ${name}`);
+		expect(undo.stdout).toContain("999");
+		for (const [id, , key, node] of specs) {
+			const connection = state(w).derived[issueId(JI, 1)]![id]![key];
+			if (!connection || typeof connection !== "object" || !("nodes" in connection) || !Array.isArray(connection.nodes)) throw new Error("missing fixture connection");
+			expect(connection.nodes[56]).toEqual(node(999));
+		}
+	});
+});
 
 describe("R3: every value of every item is backed up before the first mutation", () => {
 	test("all value types, archived items, paginated items, values and fields, written before the first mutation", async () => {
@@ -489,19 +597,68 @@ describe("R14: a failed attempt says so and exits non-zero; invocations never ov
 		});
 	}
 
-	test("a live lock holder makes a second invocation exit 0 `already running`; a dead holder's lock is taken over", async () => {
+	// Real competing processes share takeLock's actual SQLite transaction. Stdin is a deterministic barrier:
+	// hold before JSON publication, or after acquiring, until the test kills the process.
+	function contender(w: World, name: string, unpublished = false, gated = false) {
+		const marker = join(w.root, name);
+		const script = `
+			import { takeLock } from ${JSON.stringify(SCRIPT)};
+			import { readSync, writeFileSync } from "node:fs";
+			const marker = ${JSON.stringify(marker)};
+			const block = () => readSync(0, Buffer.alloc(1), 0, 1, null);
+			if (${gated}) { writeFileSync(marker, "ready"); block(); }
+			const release = takeLock(${JSON.stringify(join(w.dir, "lock"))}, ${unpublished ? '() => { writeFileSync(marker, "unpublished"); block(); }' : "undefined"});
+			writeFileSync(marker, release ? "acquired" : "busy");
+			if (release) { block(); release(); }
+		`;
+		const child = Bun.spawn([process.execPath, "--eval", script], { stdin: "pipe", stdout: "ignore", stderr: "pipe" });
+		return { child, marker };
+	}
+
+	test("a live unpublished holder excludes runners; killing it releases the mutex without trusting JSON", async () => {
 		const w = world();
-		writeFileSync(join(w.dir, "lock"), JSON.stringify({ pid: process.pid, startedAt: "2026-10-20T19:00:00Z" }));
-		const held = await run(w);
-		expect(held.code).toBe(0);
-		expect(held.stdout).toContain(`already running (pid ${process.pid}`);
-		expect(calls(w)).toHaveLength(0);
-		const dead = Bun.spawnSync(["true"]).pid;
-		writeFileSync(join(w.dir, "lock"), JSON.stringify({ pid: dead, startedAt: "2026-10-20T19:00:00Z" }));
-		const taken = await run(w);
-		expect(taken.code).toBe(0);
+		const held = contender(w, "holder", true);
+		try {
+			await until("holder paused before JSON publication", () => existsSync(held.marker), 10_000);
+			expect(readFileSync(held.marker, "utf8")).toBe("unpublished");
+			expect(existsSync(join(w.dir, "lock"))).toBe(false);
+			const blocked = await run(w);
+			expect(blocked.code).toBe(0);
+			expect(blocked.stdout).toContain("already running");
+			expect(calls(w)).toHaveLength(0);
+		} finally {
+			held.child.kill("SIGKILL");
+			await held.child.exited;
+		}
+		expect((await run(w)).code).toBe(0);
 		expect(lastRun(w)).toMatchObject({ outcome: "succeeded", commented: true });
-		expect(existsSync(join(w.dir, "lock"))).toBe(false);
+	});
+
+	test("contenders racing after a killed published holder admit exactly one owner, never unlink its replacement", async () => {
+		const w = world();
+		const stale = contender(w, "stale");
+		await until("published stale holder", () => existsSync(stale.marker), 10_000);
+		stale.child.kill("SIGKILL");
+		await stale.child.exited;
+		const a = contender(w, "a", false, true);
+		const b = contender(w, "b", false, true);
+		try {
+			await until("both contenders ready", () => existsSync(a.marker) && existsSync(b.marker), 10_000);
+			a.child.stdin.write("g");
+			b.child.stdin.write("g");
+			await until("both takeover contenders", () => readFileSync(a.marker, "utf8") !== "ready" && readFileSync(b.marker, "utf8") !== "ready", 10_000);
+			expect([readFileSync(a.marker, "utf8"), readFileSync(b.marker, "utf8")].sort()).toEqual(["acquired", "busy"]);
+			const blocked = await run(w);
+			expect(blocked.code).toBe(0);
+			expect(blocked.stdout).toContain("already running");
+			expect(calls(w)).toHaveLength(0);
+		} finally {
+			a.child.kill("SIGKILL");
+			b.child.kill("SIGKILL");
+			await Promise.all([a.child.exited, b.child.exited]);
+		}
+		expect((await run(w)).code).toBe(0);
+		expect(readdirSync(join(w.dir, "runs"))).toHaveLength(1);
 	});
 
 	test("two invocations at once: the second exits 0 `already running` while the first finishes", async () => {
@@ -537,6 +694,6 @@ describe("the state dir and --dry-run", () => {
 		expect(r.stdout).toContain("delete jo-issues#7 (closed)");
 		expect(mutations(w)).toHaveLength(0);
 		expect(calls(w).filter((c) => c.kind === "issue comment" || c.kind === "api comments")).toHaveLength(0);
-		expect(readdirSync(w.dir).sort()).toEqual(["cache.jsonl", "goals.md"]);
+		expect(readdirSync(w.dir).sort()).toEqual(["cache.jsonl", "goals.md", "lock.sqlite"]);
 	});
 });

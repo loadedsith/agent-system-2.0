@@ -605,10 +605,18 @@ export interface BoardField {
 	options?: { id: string; name: string }[];
 	[key: string]: unknown;
 }
+/** Issue-owned values retain their discriminant and scalar/nullability after transport alias normalization. */
+export type IssueFieldValue =
+	| { __typename: "IssueFieldTextValue" | "IssueFieldDateValue"; value: string }
+	| { __typename: "IssueFieldNumberValue"; value: number }
+	| { __typename: "IssueFieldSingleSelectValue"; value: string; optionId: string | null }
+	| { __typename: "IssueFieldMultiSelectValue"; value: string | null };
+
 /** One fieldValues node, verbatim: `__typename`, its field, and its type's content (`text`, `number`, `optionId`, …). */
 export interface BoardValue {
 	__typename: string;
 	field: { id: string; name: string; dataType: string };
+	issueFieldValue?: IssueFieldValue | null;
 	[key: string]: unknown;
 }
 export interface BoardItem {
@@ -938,7 +946,8 @@ export function hasRunComment(comments: readonly { body?: string | null }[], run
 }
 
 export function undoCommand(backupPath: string): string {
-	return `as2 backlog-rank --undo ${backupPath}`;
+	const argument = /^[A-Za-z0-9_./-]+$/.test(backupPath) ? backupPath : `'${backupPath.replace(/'/g, "'\\''")}'`;
+	return `as2 backlog-rank --undo ${argument}`;
 }
 
 export interface RankMoves {

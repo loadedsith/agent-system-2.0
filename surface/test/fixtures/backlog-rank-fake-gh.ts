@@ -265,6 +265,115 @@ function page<T>(all: T[], cursor: unknown, size: number): { pageInfo: { hasNext
 	return { pageInfo: { hasNextPage: end < all.length, endCursor: nodes.length > 0 ? String(end) : null }, nodes };
 }
 
+/**
+ * A deliberately bounded GraphQL selection interpreter for the value subgraph exercised by this transport.
+ * Unlike substring routing alone, it projects actual aliases/fragments, honors connection arguments, and checks
+ * scalar response-name merging against GitHub's IssueFieldValue schema (reference/issues, value object headings).
+ * No GraphQL runtime dependency is needed to model this subgraph.
+ */
+interface Selection {
+	name: string;
+	response: string;
+	type?: string;
+	args: Record<string, unknown>;
+	children: Selection[];
+}
+function selections(query: string, variables: Record<string, unknown>): Selection[] {
+	const tokens = query.match(/\.\.\.|"(?:\\.|[^"\\])*"|[_A-Za-z][_0-9A-Za-z]*|-?\d+(?:\.\d+)?|[!$():{},\[\]]/g) ?? [];
+	let at = tokens.indexOf("{");
+	function set(): Selection[] {
+		if (tokens[at++] !== "{") throw new Error("expected selection set");
+		const result: Selection[] = [];
+		while (tokens[at] !== "}") {
+			const name = tokens[at++];
+			if (!name) throw new Error("unterminated selection");
+			if (name === "...") {
+				if (tokens[at++] !== "on") throw new Error("only inline fragments are supported");
+				const type = tokens[at++];
+				result.push({ name, response: name, type, args: {}, children: set() });
+				continue;
+			}
+			let field = name;
+			if (tokens[at] === ":") { at++; field = tokens[at++]!; }
+			const args: Record<string, unknown> = {};
+			if (tokens[at] === "(") {
+				at++;
+				while (tokens[at] !== ")") {
+					if (tokens[at] === ",") { at++; continue; }
+					const key = tokens[at++]!;
+					if (tokens[at++] !== ":") throw new Error("expected argument");
+					const value = tokens[at++];
+					if (value === "$") args[key] = variables[tokens[at++]!];
+					else if (value === "[") {
+						while (tokens[at] !== "]") {
+							if (!tokens[at++]) throw new Error("unterminated argument");
+						}
+						at++;
+					} else args[key] = value?.startsWith('"') ? JSON.parse(value) : Number(value);
+				}
+				at++;
+			}
+			result.push({ name: field, response: name, args, children: tokens[at] === "{" ? set() : [] });
+		}
+		at++;
+		return result;
+	}
+	return set();
+}
+function findSelection(set: Selection[], name: string): Selection | undefined {
+	for (const s of set) {
+		if (s.name === name) return s;
+		const found = findSelection(s.children, name);
+		if (found) return found;
+	}
+}
+// Verified from https://docs.github.com/en/graphql/reference/issues, fetched 2026-10-20.
+const ISSUE_VALUE_SCHEMA: Record<string, Record<string, string>> = {
+	IssueFieldTextValue: { value: "String!" },
+	IssueFieldNumberValue: { value: "Float!" },
+	IssueFieldDateValue: { value: "String!" },
+	IssueFieldSingleSelectValue: { value: "String!", optionId: "String" },
+	IssueFieldMultiSelectValue: { value: "String" },
+};
+function validateIssueValues(set: Selection[]): void {
+	for (const selection of set) {
+		if (selection.name === "issueFieldValue") {
+			const shapes = new Map<string, string>();
+			for (const fragment of selection.children) {
+				if (fragment.name === "__typename") continue;
+				const schema = ISSUE_VALUE_SCHEMA[fragment.type ?? ""];
+				if (!schema) throw new Error(`unknown IssueFieldValue type ${fragment.type}`);
+				for (const field of fragment.children) {
+					const shape = field.name === "__typename" ? "String!" : schema[field.name];
+					if (!shape) throw new Error(`unknown ${fragment.type}.${field.name}`);
+					const previous = shapes.get(field.response);
+					if (previous && previous !== shape) throw new Error(`Fields '${field.response}' conflict: ${previous} and ${shape}`);
+					shapes.set(field.response, shape);
+				}
+			}
+		}
+		validateIssueValues(selection.children);
+	}
+}
+function projectValue(raw: unknown, set: Selection[]): unknown {
+	if (raw === null || raw === undefined) return null;
+	if (Array.isArray(raw)) return raw.map((node) => projectValue(node, set));
+	if (typeof raw !== "object") return raw;
+	const result: Node = {};
+	for (const s of set) {
+		if (s.name === "...") {
+			if (s.type === Reflect.get(raw, "__typename") || s.type === "ProjectV2FieldCommon") Object.assign(result, projectValue(raw, s.children));
+			continue;
+		}
+		let value = Reflect.get(raw, s.name);
+		if (value && typeof value === "object" && "nodes" in value && Array.isArray(value.nodes) && typeof s.args.first === "number") {
+			value = page(value.nodes, s.args.after, s.args.first);
+		}
+		result[s.response] = s.children.length ? projectValue(value, s.children) : value;
+	}
+	return result;
+}
+
 // ---- mutations ----------------------------------------------------------------------------------------------------
 
 /** One aliased mutation of mutationBatches' shape, applied to the state: its result, or an error message. */
@@ -499,6 +608,14 @@ async function ghMain(argv: string[]): Promise<void> {
 		}
 		record.kind = "graphql query";
 		logCall();
+		const selection = selections(q, vars);
+		try {
+			validateIssueValues(selection);
+		} catch (e) {
+			return out({ errors: [{ message: e instanceof Error ? e.message : String(e) }] });
+		}
+		const valueSelection = findSelection(selection, "fieldValues");
+		const valueNodes = valueSelection?.children.find((s) => s.name === "nodes")?.children ?? [];
 		if (q.includes("fields(first: 100")) {
 			const fields = state.project.fields.map((f) => ({ __typename: f.dataType === "SINGLE_SELECT" ? "ProjectV2SingleSelectField" : f.dataType === "ITERATION" ? "ProjectV2IterationField" : f.dataType === "MULTI_SELECT" ? "ProjectV2MultiSelectField" : "ProjectV2Field", ...f }));
 			return out({ data: { user: { projectV2: isProject ? { id: p.id, fields: page(fields, vars.cursor, state.fieldsPageSize) } : null } } });
@@ -511,13 +628,13 @@ async function ghMain(argv: string[]): Promise<void> {
 				isArchived: i.isArchived,
 				createdAt: i.createdAt,
 				content: renderContent(state, i.contentId),
-				fieldValues: page(renderValues(state, i), null, state.valuesPageSize),
+				fieldValues: page(renderValues(state, i).map((v) => projectValue(v, valueNodes)), null, Math.min(state.valuesPageSize, Number(valueSelection?.args.first))),
 			}));
 			return out({ data: { user: { projectV2: isProject ? { id: p.id, items: page(items, vars.cursor, state.pageSize) } : null } } });
 		}
 		if (q.includes("node(id: $id)")) {
 			const item = p.items.find((i) => i.id === vars.id);
-			return out({ data: { node: item ? { fieldValues: page(renderValues(state, item), vars.cursor, state.valuesPageSize) } : null } });
+			return out({ data: { node: item ? { fieldValues: page(renderValues(state, item).map((v) => projectValue(v, valueNodes)), vars.cursor, Math.min(state.valuesPageSize, Number(valueSelection?.args.first))) } : null } });
 		}
 		fail(`fake gh: unmodelled graphql query: ${q.slice(0, 80)}`);
 	}

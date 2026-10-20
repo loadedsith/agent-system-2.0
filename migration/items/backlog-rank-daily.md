@@ -2,7 +2,7 @@
 title: Daily Jev re-rank of both backlogs with resumable project-board sync and undo
 status: building
 workload: wl-mvh42n85yo0m4g
-pr: pending
+pr: https://github.com/thewolff/agent-system-2.0/pull/299
 ---
 
 ## Purpose
@@ -31,9 +31,11 @@ Jo's current placements are:
 ]
 ```
 
-`cache.jsonl` stores validated Jev answer sets by issue text, filed date, goals, and question version. Unchanged inputs reuse cached answers across days; an edited issue or changed goals require a new answer. A failed or malformed answer fails before board writes. Run state is under `runs/<run-id>/`: `order.json` is the ranked order, `backup.json` is the pre-mutation board snapshot, `attempts.jsonl` records attempts and writes, and `jev.jsonl` records Jev call metadata. `last-run.json` tracks the latest run and `lock` prevents overlapping invocations. Keep this directory writable and backed up: it contains the undo material and resumable state.
+`cache.jsonl` stores validated Jev answer sets by issue text, filed date, goals, and question version. Unchanged inputs reuse cached answers across days; an edited issue or changed goals require a new answer. A failed or malformed answer fails before board writes. Run state is under `runs/<run-id>/`: `order.json` is the ranked order, `backup.json` is the pre-mutation board snapshot, `attempts.jsonl` records attempts and writes, and `jev.jsonl` records Jev call metadata. `last-run.json` tracks the latest run. A transaction held in `lock.sqlite` prevents overlapping invocations and releases automatically on process exit; `lock` contains diagnostic metadata only and is never stale-owner authority. Keep this directory writable and backed up: it contains the undo material and resumable state.
 
 Backups contain all board field values, including archived items. Undo restores the item set and writable item-level values (text, number, date, single-select, iteration, and supported multi-select fields), plus archive state. Labels, assignees, milestones, repository, linked PRs, reviewers, titles, and issue fields are content-derived from the issue and are not written by this tool; undo reports their differences rather than changing the issue. Preserve each run's backup before making any manual board changes you may need to reverse.
+
+The snapshot is flushed to a temporary file and published without replacing an existing backup. Its SHA-256 checksum, structure and project identity are validated before mutations, including on retries. Keep `backup.json` unchanged: an incomplete or modified backup refuses mutation rather than being silently replaced.
 
 ## Optional hourly catch-up
 

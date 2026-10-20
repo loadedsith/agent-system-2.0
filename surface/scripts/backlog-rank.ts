@@ -6,7 +6,7 @@
 //   bun surface/scripts/backlog-rank.ts [--dry-run | --now | --undo <backup.json>]      (as2 backlog-rank …)
 //
 // State dir: $AGENT_SYSTEM_BACKLOG_RANK_DIR, else $HOME/.agent-system-2/backlog-rank/ (goals.md, pins.json, cache.jsonl,
-// runs/<id>/{backup.json,order.json,attempts.jsonl,jev.jsonl}, last-run.json, lock).
+// runs/<id>/{backup.json,order.json,attempts.jsonl,jev.jsonl}, last-run.json, lock.sqlite (permanent mutex), lock (diagnostic)).
 // Board: thewolff's project $AGENT_SYSTEM_BACKLOG_RANK_PROJECT (default 1). Comment issue: $AGENT_SYSTEM_BACKLOG_RANK_COMMENT
 // (owner/repo#N, default thewolff/jo-issues#153). Ledger: $AGENT_SYSTEM_LEDGER_DB, else ~/.agent-system-2/ledger.db.
 //
@@ -21,8 +21,8 @@
 //
 // Exit: 0 done, not due, or already running · 1 a failed attempt, comment, undo or read · 2 usage, or no goals.
 import { Database } from "bun:sqlite";
-import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { askJudgment, type JudgmentJudge } from "../../classifier/src/judge-ask";
 import { defaultLedgerPath } from "../../ledger/src/locality";
@@ -31,7 +31,7 @@ import {
 	type BoardValue, beginAttempt, boardDiff, type CacheEntry, cacheKey, cacheLine, calendarDay, checkAnswers, checkPins, commentBody, dateCandidates,
 	desiredItems, dueRule, failAttempt, hasRunComment, isJevJudge, itemLaneStates, itemsFromIssues, itemUrgency, ISSUE_LIST_LIMIT, jevRank, judgeState,
 	type DesiredItem, type LaneInstruction, type LaneState, type LaneWorkload, type LastRun, MAX_ATTEMPTS, markCommented, MUTATION_PAUSE_MS, type MutationBatch,
-	mutationBatches, newRunId, nextStep, parseCache, parseGoals, parseLastRun, type PlacedPin, previousRanks, type Ranked, rankedAt, rankMoves,
+	mutationBatches, newRunId, nextStep, parseCache, parseGoals, parseLastRun, type PlacedPin, previousRanks, type Ranked, rankedAt, rankMoves, type IssueFieldValue,
 	type RunComment, type SkippedPin, startRun, undoCommand, undoPlan,
 } from "../src/backlog-rank";
 import { ompPackagesRoot } from "./chaos-stub";
@@ -136,15 +136,6 @@ function saveRun(dir: string, run: LastRun): LastRun {
 
 // ---- the lock (D2) ------------------------------------------------------------------------------------------------
 
-function pidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (e) {
-		return prop(e, "code") === "EPERM";
-	}
-}
-
 /** The lock holder's pid and start, or null when the lock is gone or unreadable (a torn write). */
 function lockHolder(path: string): { pid: number; startedAt: string } | null {
 	try {
@@ -157,33 +148,44 @@ function lockHolder(path: string): { pid: number; startedAt: string } | null {
 	}
 }
 
-/** Take the lock (created with wx, holding the pid and start time); a dead holder's lock is taken over. Null when a live process holds it. */
-function takeLock(path: string): { pid: number; startedAt: string } | null {
-	const body = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
-	for (let i = 0; i < 2; i++) {
+/**
+ * A SQLite write transaction is the process mutex, held until release or process death. Never unlink/replace its
+ * database: every contender must lock the same inode. The JSON file is diagnostic only, not ownership authority.
+ * This reuses the repository's BEGIN IMMEDIATE serialization without a platform-specific flock binary.
+ */
+export function takeLock(path: string, beforePublish?: () => void): (() => void) | null {
+	const db = new Database(`${path}.sqlite`, { create: true });
+	try {
+		db.exec("PRAGMA busy_timeout = 0");
+		db.exec("BEGIN IMMEDIATE");
+	} catch (e) {
+		db.close();
+		if (prop(e, "code") === "SQLITE_BUSY" || prop(e, "errno") === 5) return null;
+		throw e;
+	}
+	try {
+		beforePublish?.();
+		writeAtomic(path, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+	} catch (e) {
+		db.exec("ROLLBACK");
+		db.close();
+		throw e;
+	}
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
 		try {
-			const fd = openSync(path, "wx");
-			writeSync(fd, body);
-			closeSync(fd);
-			return null;
-		} catch (e) {
-			if (prop(e, "code") !== "EEXIST") throw e;
+			try {
+				unlinkSync(path);
+			} catch (e) {
+				if (prop(e, "code") !== "ENOENT") throw e;
+			}
+		} finally {
+			db.exec("ROLLBACK");
+			db.close();
 		}
-		const holder = lockHolder(path);
-		if (holder && holder.pid !== process.pid && pidAlive(holder.pid)) return holder;
-		try {
-			unlinkSync(path); // the holder is dead (or the lock is torn): take it over
-		} catch {}
-	}
-	return lockHolder(path) ?? { pid: 0, startedAt: "?" };
-}
-
-function releaseLock(path: string): void {
-	if (lockHolder(path)?.pid === process.pid) {
-		try {
-			unlinkSync(path);
-		} catch {}
-	}
+	};
 }
 
 // ---- gh ----------------------------------------------------------------------------------------------------------
@@ -249,6 +251,13 @@ async function closedPins(skipped: readonly SkippedPin[]): Promise<Set<string>> 
 
 // ---- the board (D6) -----------------------------------------------------------------------------------------------
 
+const PAGE = "pageInfo { hasNextPage endCursor }";
+const NESTED = {
+	ProjectV2ItemFieldLabelValue: { key: "labels", nodes: "name" },
+	ProjectV2ItemFieldUserValue: { key: "users", nodes: "login" },
+	ProjectV2ItemFieldPullRequestValue: { key: "pullRequests", nodes: "number repository { nameWithOwner }" },
+	ProjectV2ItemFieldReviewerValue: { key: "reviewers", nodes: "__typename ... on User { login } ... on Team { slug } ... on Mannequin { login }" },
+} as const;
 const FIELD_REF = "field { ... on ProjectV2FieldCommon { id name dataType } }";
 /** Every ProjectV2ItemFieldValue type with its content, verbatim. */
 const VALUE_NODE = [
@@ -259,16 +268,12 @@ const VALUE_NODE = [
 	`... on ProjectV2ItemFieldSingleSelectValue { optionId name ${FIELD_REF} }`,
 	`... on ProjectV2ItemFieldIterationValue { iterationId title startDate duration ${FIELD_REF} }`,
 	`... on ProjectV2ItemFieldMultiSelectValue { options { id name } ${FIELD_REF} }`,
-	`... on ProjectV2ItemFieldLabelValue { labels(first: 25) { nodes { name } } ${FIELD_REF} }`,
-	`... on ProjectV2ItemFieldUserValue { users(first: 25) { nodes { login } } ${FIELD_REF} }`,
+	...Object.entries(NESTED).map(([type, { key, nodes }]) => `... on ${type} { ${key}(first: 25) { ${PAGE} nodes { ${nodes} } } ${FIELD_REF} }`),
 	`... on ProjectV2ItemFieldMilestoneValue { milestone { title number } ${FIELD_REF} }`,
 	`... on ProjectV2ItemFieldRepositoryValue { repository { nameWithOwner } ${FIELD_REF} }`,
-	`... on ProjectV2ItemFieldPullRequestValue { pullRequests(first: 25) { nodes { number repository { nameWithOwner } } } ${FIELD_REF} }`,
-	`... on ProjectV2ItemFieldReviewerValue { reviewers(first: 25) { nodes { __typename ... on User { login } ... on Team { slug } ... on Mannequin { login } } } ${FIELD_REF} }`,
-	"... on ProjectV2ItemIssueFieldValue { issueFieldValue { __typename ... on IssueFieldTextValue { value } ... on IssueFieldNumberValue { value } "
-	+ `... on IssueFieldDateValue { value } ... on IssueFieldSingleSelectValue { value optionId } ... on IssueFieldMultiSelectValue { value } } ${FIELD_REF} }`,
+	"... on ProjectV2ItemIssueFieldValue { issueFieldValue { __typename ... on IssueFieldTextValue { textValue: value } ... on IssueFieldNumberValue { numberValue: value } "
+	+ `... on IssueFieldDateValue { dateValue: value } ... on IssueFieldSingleSelectValue { singleSelectValue: value optionId } ... on IssueFieldMultiSelectValue { multiSelectValue: value } } ${FIELD_REF} }`,
 ].join(" ");
-const PAGE = "pageInfo { hasNextPage endCursor }";
 /** Field values per item page: a project has a few dozen fields at most; the rest come by FIELD_VALUES_QUERY. */
 const VALUES_FIRST = 20;
 export const FIELDS_QUERY = `query($owner: String!, $number: Int!, $cursor: String) { user(login: $owner) { projectV2(number: $number) { id fields(first: 100, after: $cursor) { ${PAGE} nodes { __typename ... on ProjectV2FieldCommon { id name dataType } ... on ProjectV2SingleSelectField { options { id name } } ... on ProjectV2MultiSelectField { options: multiSelectOptions { id name } } ... on ProjectV2IterationField { configuration { duration startDay iterations { id title startDate duration } completedIterations { id title startDate duration } } } } } } } }`;
@@ -388,6 +393,28 @@ class Board {
 					cursor = page.pageInfo.endCursor;
 				}
 			}
+			for (const value of values) {
+				const type = prop(value, "__typename");
+				if (typeof type !== "string" || !Object.hasOwn(NESTED, type)) continue;
+				const { key, nodes: selection } = NESTED[type as keyof typeof NESTED];
+				const connection = prop(value, key);
+				if (connection === null) continue;
+				const initial = asPage(connection, `${id} ${key}`);
+				let firstPage = true;
+				const complete = await allPages(`${id} ${key}`, async (nestedCursor) => {
+					if (firstPage) {
+						firstPage = false;
+						return initial;
+					}
+					// These value types are not Nodes. Locate by field ID, not fieldValueByName (names need not be unique).
+					const query = `query($id: ID!, $cursor: String, $nestedCursor: String) { node(id: $id) { ... on ProjectV2Item { fieldValues(first: 100, after: $cursor) { ${PAGE} nodes { __typename ... on ${type} { ${FIELD_REF} ${key}(first: 25, after: $nestedCursor) { ${PAGE} nodes { ${selection} } } } } } } } }`;
+					const candidates = await allPages(`${id} nested field values`, async (cursor) => asPage(prop(prop(await this.query(query, { id, cursor, nestedCursor }, `reading ${id} ${key}`), "node"), "fieldValues"), "nested field values"));
+					const found = candidates.find((v) => prop(v, "__typename") === type && prop(prop(v, "field"), "id") === prop(prop(value, "field"), "id"));
+					if (!found) throw new Error(`${id} ${key}: field disappeared while paginating`);
+					return asPage(prop(found, key), `${id} ${key}`);
+				});
+				Reflect.set(value as object, key, { nodes: complete });
+			}
 			items.push(boardItem(node, id, values));
 		}
 		return { projectId, fields: fields.map(boardField), items };
@@ -411,6 +438,42 @@ function boardItem(node: unknown, id: string, values: unknown[]): BoardItem {
 	const fieldValues = values.map((v): BoardValue => {
 		const f = prop(v, "field");
 		if (typeof prop(v, "__typename") !== "string" || typeof prop(f, "id") !== "string") throw new Error(`${id}: a field value without its type or field: ${JSON.stringify(v)}`);
+		const issue = prop(v, "issueFieldValue");
+		if (issue && typeof issue === "object") {
+			const type = prop(issue, "__typename");
+			let normalized: IssueFieldValue;
+			switch (type) {
+				case "IssueFieldTextValue":
+				case "IssueFieldDateValue": {
+					const value = prop(issue, type === "IssueFieldTextValue" ? "textValue" : "dateValue");
+					if (typeof value !== "string") throw new Error(`${id}: incomplete ${type}`);
+					normalized = { __typename: type, value };
+					break;
+				}
+				case "IssueFieldNumberValue": {
+					const value = prop(issue, "numberValue");
+					if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${id}: incomplete ${type}`);
+					normalized = { __typename: type, value };
+					break;
+				}
+				case "IssueFieldSingleSelectValue": {
+					const value = prop(issue, "singleSelectValue");
+					const optionId = prop(issue, "optionId");
+					if (typeof value !== "string" || !(optionId === null || typeof optionId === "string")) throw new Error(`${id}: incomplete ${type}`);
+					normalized = { __typename: type, value, optionId };
+					break;
+				}
+				case "IssueFieldMultiSelectValue": {
+					const value = prop(issue, "multiSelectValue");
+					if (!(value === null || typeof value === "string")) throw new Error(`${id}: incomplete ${type}`);
+					normalized = { __typename: type, value };
+					break;
+				}
+				default:
+					throw new Error(`${id}: unknown issue field value ${String(type)}`);
+			}
+			return { ...v as BoardValue, issueFieldValue: normalized };
+		}
 		return v as BoardValue;
 	});
 	return {
@@ -690,7 +753,7 @@ async function attempt(cfg: Config, goals: string[], start: LastRun): Promise<{ 
 		const snap = await board.snapshot();
 		const plan = runPlan(desiredFrom(ranking, stamp));
 		plan(snap); // a refused board (fields) ends the attempt before the backup and any write
-		if (!existsSync(rp.backup)) writeFileSync(rp.backup, `${JSON.stringify(snap, null, 1)}\n`, { flag: "wx" });
+		publishBackup(rp.backup, snap);
 		await converge(board, snap, plan, stats, cfg);
 		run = saveRun(cfg.stateDir, advance(run, "written"));
 		log(`run ${run.runId}: the board matches on readback (${stats.done} writes)`);
@@ -867,10 +930,53 @@ async function dryRun(cfg: Config): Promise<number> {
 	return 0;
 }
 
+/** Publish only a completed, flushed snapshot, with the channel protocol's no-replace hard link. */
+export function publishBackup(path: string, snapshot: BoardSnapshot, beforePublish?: (temporary: string) => void): void {
+	if (!existsSync(path)) {
+		const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+		const fd = openSync(tmp, "wx", 0o600);
+		try {
+			const checksum = createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+			writeFileSync(fd, `${JSON.stringify({ ...snapshot, checksum }, null, 1)}\n`);
+			fsyncSync(fd);
+			beforePublish?.(tmp);
+			try {
+				linkSync(tmp, path);
+			} catch (e) {
+				if (prop(e, "code") !== "EEXIST") throw e;
+			}
+		} finally {
+			closeSync(fd);
+			unlinkSync(tmp);
+		}
+	}
+	const original = readBackup(path);
+	if (original.projectId !== snapshot.projectId) throw new Error(`${path}: backup project does not match ${snapshot.projectId}`);
+}
+
 function readBackup(path: string): BoardSnapshot {
-	const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
-	if (typeof prop(raw, "projectId") !== "string" || !Array.isArray(prop(raw, "fields")) || !Array.isArray(prop(raw, "items"))) throw new Error(`${path} is not a board backup`);
-	return raw as BoardSnapshot;
+	try {
+		const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+		const fields = prop(raw, "fields");
+		const items = prop(raw, "items");
+		if (typeof prop(raw, "projectId") !== "string" || !Array.isArray(fields) || !Array.isArray(items)) throw new Error("missing project, fields or items");
+		const payload = { projectId: prop(raw, "projectId"), fields, items };
+		const checksum = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+		if (prop(raw, "checksum") !== checksum) throw new Error("missing or mismatched snapshot checksum");
+		for (const f of fields) boardField(f);
+		for (const item of items) {
+			if (typeof prop(item, "id") !== "string" || typeof prop(item, "type") !== "string" || typeof prop(item, "createdAt") !== "string"
+				|| typeof prop(item, "isArchived") !== "boolean" || !Array.isArray(prop(item, "fieldValues"))
+				|| !(typeof prop(item, "contentId") === "string" || prop(item, "contentId") === null)) throw new Error("incomplete item");
+			for (const value of prop(item, "fieldValues") as unknown[]) {
+				boardField(prop(value, "field"));
+				if (typeof prop(value, "__typename") !== "string") throw new Error("untyped field value");
+			}
+		}
+		return raw as BoardSnapshot;
+	} catch (e) {
+		throw new Error(`${path}: invalid board backup: ${message(e)}`);
+	}
 }
 
 /** Make the board's item set, writable values and archive state match a backup; re-runnable after any failure (D6). */
@@ -929,13 +1035,14 @@ async function main(argv: string[]): Promise<number> {
 	}
 	mkdirSync(cfg.stateDir, { recursive: true });
 	const lock = statePaths(cfg.stateDir).lock;
-	const holder = takeLock(lock);
-	if (holder) {
-		log(`already running (pid ${holder.pid}, since ${holder.startedAt})`);
+	const release = takeLock(lock);
+	if (!release) {
+		const holder = lockHolder(lock);
+		log(`already running (pid ${holder?.pid ?? "unpublished"}, since ${holder?.startedAt ?? "?"})`);
 		return 0;
 	}
 	const onSignal = (signal: string, code: number) => process.on(signal, () => {
-		releaseLock(lock);
+		release();
 		process.exit(code);
 	});
 	onSignal("SIGINT", 130);
@@ -948,7 +1055,7 @@ async function main(argv: string[]): Promise<number> {
 		console.error(`backlog-rank: ${oneLine(message(e))}`);
 		return e instanceof Refusal ? 2 : 1;
 	} finally {
-		releaseLock(lock);
+		release();
 	}
 }
 

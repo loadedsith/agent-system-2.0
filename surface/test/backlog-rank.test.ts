@@ -703,6 +703,14 @@ describe("R6: the #153 comment", () => {
 		expect(undoCommand("/b.json")).toBe("as2 backlog-rank --undo /b.json");
 	});
 
+	test("the advertised undo command passes a hostile backup path as exactly one literal shell argument", () => {
+		const path = "/state/a space/quote'/$HOME/back\\slash;echo injected/backup.json";
+		const result = Bun.spawnSync(["/bin/sh", "-c", `as2() { printf '%s\\n' "$@"; }; ${undoCommand(path)}`], { env: { HOME: "/expanded-home" } });
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.toString()).toBe("");
+		expect(result.stdout.toString()).toBe(`backlog-rank\n--undo\n${path}\n`);
+	});
+
 	test("an abandoned run says it failed after 3 attempts, the phase, k of n writes, and the undo command only with a backup", () => {
 		const failed = (backupPath: string | null) => commentBody({ runId: RUN, outcome: "abandoned", failure: { phase: "writing", attempts: 3, writesDone: 40, writesTotal: 120, error: "HTTP 502" }, backupPath });
 		const withBackup = failed("/state/runs/r/backup.json");
