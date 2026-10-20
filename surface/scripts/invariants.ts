@@ -37,7 +37,7 @@
 // | stuck-question | a question open for more than 30 min | `stuck-question:<q>` |
 // | stuck-review | a `hand-spawn: … review yes` with no `hand-settled:` after 45 min while any lane on the workload is alive | `stuck-review:<token>` |
 // | provider-refusal-loop | 2+ `lane-exit:` on one workload within 30 min, each with refusal evidence (`usage polic`, `non-retryable`, `refusal`) in ledger entries/messages from 2 min before to 5 min after the exit (never past as-of), or, for `outcome error`, in the final `prompt_result` of the lane's rpc log `lane-<n>.jsonl` (read as it is now) | `provider-refusal-loop:<wl>:<first lane>` |
-// | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive | `silent-orchestrator:<last entry id>` |
+// | silent-orchestrator | no `wl-orchestrator` entry for 2 h while any lane process is alive; the train tick's rows there (MERGE_TRAIN_BY: its boards' skips, notices and cutover, PLAN wl-mvbjiettjrfpxc D10) are not the orchestrator's | `silent-orchestrator:<last entry id>` |
 // | checkout-behind-main | `git rev-parse HEAD` differs from `origin/main` in the checkout. Behind (HEAD is an ancestor of origin/main): `behind origin/main by <n>; fast-forward at a lull` (or `fast-forward would refuse` with the modified tracked files, or `git status failed` when cleanliness could not be read). Diverged (neither is an ancestor of the other): `DIVERGED … needs a person`. Ahead only (origin/main is an ancestor of HEAD: local commits not yet on main) is not a finding. It never fetches, so origin/main is whatever the checkout already has. | `checkout-behind-main:<head12>:<origin12>` (`…:diverged:…` when diverged) |
 // | process-older-than-head | an `omp --cwd <checkout>` process (not a persistent seat: commands naming `/seat-sessions/` are skipped) started before HEAD arrived, where "arrived" is the later of HEAD's commit time and its newest reflog entry | `process-older-than-head:<pid>:<head12>` |
 // | ff-lull | checkout-behind-main with tracked files clean (`git status --porcelain --untracked-files=no` succeeded and printed nothing) AND zero review hands in flight. In flight = a `hand-spawn: … review yes` token with no `hand-settled: <token>` whose spawning lane has a live `lane.ts run` process: the `liveReviews` set the classifier passes to `builderLabs`. Unsettled review hands whose lane is gone are listed, not counted. The text cites the fingerprint rule (classifier/src/fingerprint.ts header: a review's fingerprint covers its lane's worktree only) rather than asserting the fast-forward is safe. | `ff-lull:<origin12>:<id of the newest review hand-settled entry>`, so one notice per lull |
@@ -72,7 +72,7 @@ import type { EntryKind, EntryRow, InstructionRow, WorkloadStatusRow } from "../
 import { assertNotLiveLedgerUnderTest, canonicalPath, defaultLedgerPath, homeDir } from "../../ledger/src/locality";
 import { type ReservedLedgerView, reservedStates } from "../src/errors";
 import { laneDir } from "../src/launch";
-import { STANDING_WORKLOAD_ID } from "../src/types";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 export const INVARIANTS = [
 	"dead-lane", "silent-lane", "orphan-hand", "no-independent-lab", "stale-reserved", "stuck-question", "stuck-review",
@@ -164,7 +164,7 @@ const QUESTION_SQL = `SELECT q.id, q.workload_id, q.created_at, q.body FROM ques
   ORDER BY q.created_at`;
 const NEAR_SQL = `SELECT body FROM entries WHERE workload_id = :wl AND created_at BETWEEN :from AND :to
   UNION ALL SELECT body FROM messages WHERE workload_id = :wl AND created_at BETWEEN :from AND :to`;
-const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
+const ORCH_SQL = `SELECT id, created_at FROM entries WHERE workload_id = :wl AND created_by <> :tick AND created_at <= :asOf ORDER BY created_at DESC LIMIT 1`;
 const REVIEW_SQL = `SELECT id, workload_id, created_at, body FROM entries
   WHERE (body LIKE 'hand-spawn:% review yes %' OR body LIKE 'hand-settled: %') AND created_at <= :asOf ORDER BY created_at, rowid`;
 
@@ -496,7 +496,7 @@ export function check(input: Input): Report {
 	}
 
 	// ---- 8. silent-orchestrator -----------------------------------------------------------------
-	const orch = run<{ id: string; created_at: string }>(ORCH_SQL, { ":wl": STANDING_WORKLOAD_ID, ":asOf": asOf });
+	const orch = run<{ id: string; created_at: string }>(ORCH_SQL, { ":wl": STANDING_WORKLOAD_ID, ":tick": MERGE_TRAIN_BY, ":asOf": asOf });
 	const lastOrch = orch.rows[0];
 	if (!liveLanes) skip("silent-orchestrator", NO_PGREP);
 	else if (liveLanes.size > 0 && (!lastOrch || lastOrch.created_at < ago(120 * MIN))) {
