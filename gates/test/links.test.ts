@@ -111,6 +111,60 @@ describe("T1 openable text", () => {
     expect(elapsed).toBeLessThan(2000);
    },120_000);
   }
+  for(const shape of ["relative-tokens","test-run-json"] as const) {
+   test(`${render.name} avoids multi-relative-path freeze: ${shape}`, () => {
+    const relativeDir=shape === "relative-tokens" ? "test" : "classifier/test";
+    const dir=join(root,relativeDir);
+    mkdirSync(dir,{recursive:true});
+    const linked=new Set([0,199,399]);
+    for(const i of linked) writeFileSync(join(dir,`file${i}.test.ts`),"test");
+    const entries=Array.from({length:400},(_,i)=>{
+     const prefix=shape === "test-run-json" || i%3 === 0 ? "./" : i%3 === 1 ? `../${basename(root)}/` : "";
+     const file=`${prefix}${relativeDir}/file${i}.test.ts`;
+     const shown=linked.has(i) ? render(join(dir,`file${i}.test.ts`),opts) : file;
+     return shape === "relative-tokens"
+      ? {text:`${file} passed ok`,expected:`${shown} passed ok`}
+      : {text:`{"file":"${file}","pass":1,"fail":0,"status":"passed ok"}`,expected:`{"file":"${shown}","pass":1,"fail":0,"status":"passed ok"}`};
+    });
+    const text=shape === "relative-tokens" ? entries.map(e=>e.text).join(" ") : `test-run: {"solo":[${entries.map(e=>e.text).join(",")}]}`;
+    const expected=shape === "relative-tokens" ? entries.map(e=>e.expected).join(" ") : `test-run: {"solo":[${entries.map(e=>e.expected).join(",")}]}`;
+    // Real first directories keep ./, ../ and cwd-relative starts eligible. Missing
+    // relative files stay plain, while the three real files must still be linked.
+    render("warm ordinary text",opts);
+    const started=performance.now();
+    const actual=render(text,opts);
+    const elapsed=performance.now()-started;
+    expect(actual).toBe(expected);
+    // A generous freeze guard, not a throughput promise or a microbenchmark.
+    expect(elapsed).toBeLessThan(2000);
+   },120_000);
+  }
+  test(`${render.name} preserves longest spaced paths across slash boundaries`, () => {
+   const dir=join(root,"slash prefix");
+   mkdirSync(join(dir,"branch"),{recursive:true});
+   const nested=join(dir,"branch extended","nested dir");
+   mkdirSync(nested,{recursive:true});
+   for(const name of ["plan.md","plan.md extended notes.md"]) writeFileSync(join(nested,name),"plan");
+   const p=join(nested,"plan.md extended notes.md"),tail=" trailing ./not-present/file.ts passed ok";
+   for(const prefix of [dir,"~/slash prefix","./slash prefix","slash prefix",`../${basename(root)}/slash prefix`]) {
+    const source=`${prefix}/branch extended/nested dir/plan.md extended notes.md:3-5`;
+    for(const wrapper of ["","**","`"]) {
+     const kept=wrapper === "`" ? "" : wrapper;
+     expect(render(`${wrapper}${source}${wrapper}${tail}`,opts)).toBe(`${kept}${render(`${p}:3-5`,opts)}${kept}${tail}`);
+    }
+   }
+  });
+  test(`${render.name} keeps nonexistent descendants plain without slash endpoints`, () => {
+   const dir=join(root,"prune-boundary");
+   mkdirSync(join(dir,"existing"),{recursive:true});
+   writeFileSync(join(dir,"leaf.md"),"leaf");
+   for(const prefix of [dir,"~/prune-boundary","./prune-boundary","prune-boundary",`../${basename(root)}/prune-boundary`]) {
+    for(const descendant of ["leaf.md/nope","missing/nope","existing/missing/nope"]) {
+     const source=`${prefix}/${descendant} passed ok`;
+     expect(render(source,opts)).toBe(source);
+    }
+   }
+  });
  }
  test("formatting and prose separators stay outside path targets", () => {
   for (const name of ["README.md", "missing.md"]) {

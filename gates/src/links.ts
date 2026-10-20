@@ -109,29 +109,40 @@ function pathCandidates(text: string, o: LinkOptions): PathCandidates {
   if (first === ends.length || /\s/.test(text[start]!)) return null;
   const token = text.slice(start, ends[first]);
   if (SCHEME.test(token)) return null;
-  const slash = slashes[after(slashes, start)];
+  const slashStart = after(slashes, start), slash = slashes[slashStart];
   // A slash-free run containing spaces cannot satisfy pathTarget's bare name.ext rule.
   // Without a slash or dot even the first token is ordinary prose: no suffix probes.
   if (slash === undefined && !token.includes(".")) return null;
-  if (slash !== undefined && slash > start && !token.startsWith("~/") &&
-      (o.exists ?? diskKind)(absolute(text.slice(start, slash), o)) !== "dir") {
-   // The first token may still be a bare filename before some unrelated later slash.
-   return existing(ends[first]!);
+  let limit = slash === undefined ? first + 1 : ends.length;
+  for (let i = slashStart; i < slashes.length; i++) {
+   const boundary = slashes[i]!;
+   // Every crossed slash needs a real directory, including spaces in its name.
+   // Include the slash so the first ~/ prefix expands to the configured home.
+   if ((o.exists ?? diskKind)(absolute(text.slice(start, boundary + 1), o)) === "dir") continue;
+   // Keep only indexed whitespace ends strictly before the impossible slash.
+   // Inventing an end here would turn /file/nope into a partial /file link.
+   limit = after(ends, boundary);
+   // Before the first slash, only the first bare name.ext token can be a path.
+   if (i === slashStart) limit = Math.min(limit, first + 1);
+   break;
   }
   // Across spaces only exact existence can win, longest first. Parent fallback is
   // deliberately left to the ordinary single-token parser.
-  for (let i = slash === undefined ? first : ends.length - 1; i >= first; i--) {
+  for (let i = limit - 1; i >= first; i--) {
    const found = existing(ends[i]!);
    if (found) return found;
   }
   return null;
 
   function existing(end: number): ExistingPath | null {
-   let raw = text.slice(start, end);
+   let raw = end === ends[first] ? token : text.slice(start, end);
    let path = pathTarget(raw, o, false);
    if (!path) {
-    raw = trimPathToken(raw, o);
-    path = pathTarget(raw, o, false);
+    const trimmed = trimPathToken(raw, o);
+    if (trimmed !== raw) {
+     raw = trimmed;
+     path = pathTarget(raw, o, false);
+    }
    }
    return path ? { raw, hit: pathHit(raw, path) } : null;
   }
