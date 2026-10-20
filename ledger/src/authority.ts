@@ -24,7 +24,12 @@ export interface AuthorityRow {
 	writer: string;
 	/** Where the reader that trusts the row lives. */
 	reader: string;
-	authority: "jo-only" | "words, not authority";
+	/**
+	 * `jo-only`: only the surface writes it, for Jo. `machinery`: a machinery stamp's row the Jo-only rows answer
+	 * (`forgery:`, PLAN wl-mvfxw3c4zqfzls D4), listed for its writer and readers; never Jo's authority. `words, not
+	 * authority`: row 11's direct channel.
+	 */
+	authority: "jo-only" | "machinery" | "words, not authority";
 }
 
 const jo = (kind: AuthorityRow["kind"], name: string, reader: string): AuthorityRow => ({ kind, name, writer: SURFACE_BY, reader, authority: "jo-only" });
@@ -43,7 +48,7 @@ export const AUTHORITY: readonly AuthorityRow[] = [
 	jo("control-prefix", "plan", "surface/src/launch.ts controlEntries, planFirst"),
 	jo("control-prefix", "done", "surface/src/launch.ts controlEntries, doneLine"),
 	jo("control-prefix", "repo", "surface/src/decision-log.ts; surface/src/merge-train.ts"),
-	jo("control-prefix", "lane-stop", "surface/src/launch.ts validWriter (a `requested` line); surface/src/errors.ts"),
+	jo("control-prefix", "lane-stop", "surface/src/launch.ts validWriter (a `requested` line; the forgery check's `requested forgery-hold by forgery-check`, the runner honours it as Jo's stop); surface/src/errors.ts"),
 	jo("control-prefix", "ceiling", "surface/src/ceiling.ts effectiveCeiling"),
 	jo("control-prefix", "lane-model", "surface/src/launch.ts laneModel"),
 	jo("control-prefix", "superseded", "surface/src/launch.ts supersededBy"),
@@ -59,6 +64,15 @@ export const AUTHORITY: readonly AuthorityRow[] = [
 	jo("control-prefix", "rank-audit", "surface/src/rank-audit.ts; surface/src/render.ts"),
 	jo("control-prefix", "cap", "PR-B's cap reader, through joAuthority"),
 	jo("control-prefix", "switch", "PR-B's switch reader, through joAuthority"),
+	jo("control-prefix", "forgery-confirmed", "surface/src/launch.ts forgeryHeld; surface/src/forgery.ts checkForgery (the row is not flagged again); surface/src/forgery-hold.ts unansweredHits"),
+	jo("control-prefix", "forgery-reversed", "surface/src/launch.ts controlEntries, forgeryHeld; ledger/src/index.ts Ledger.instructions, parkLane; surface/scripts/invariants.ts reservedView; surface/src/decision-log.ts repoOf; surface/src/forgery-hold.ts unansweredHits"),
+	{
+		kind: "control-prefix",
+		name: "forgery",
+		writer: "forgery-check (surface/src/types.ts FORGERY_CHECK_BY: the train tick's forgery pass, the lane launcher's reserve)",
+		reader: "surface/src/launch.ts forgeryHeld, launchable; surface/src/forgery-hold.ts unansweredHits (the merge train's landingReady, boardLanding, stakes --hold-ok; the close; the train tick's stop request); surface/src/errors.ts",
+		authority: "machinery",
+	},
 	{
 		kind: "direct-channel",
 		name: "direct",

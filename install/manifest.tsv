@@ -1095,6 +1095,9 @@ voice/VOICE.md	doc	-
 voice/agent-collaboration-with-adhd-and-autism.md	doc	-
 surface/src/launch.ts	module	-
 surface/src/forgery.ts	module	-
+surface/src/forgery-hold.ts	module	-
+surface/src/forgery-words.ts	module	-
+surface/src/notify.ts	module	-
 surface/extensions/launch.ts	module	-
 surface/extensions/lane-tools.ts	module	-
 surface/scripts/lane.ts	module	-
@@ -1104,6 +1107,9 @@ ledger/test/lane.test.ts	test	-
 surface/test/fake-omp.ts	test	-
 surface/test/launch.test.ts	test	-
 surface/test/forgery-check.test.ts	test	-
+surface/test/forgery-tick.test.ts	test	-
+surface/test/forgery-hold.test.ts	test	-
+surface/test/forgery-words.test.ts	test	-
 surface/test/lane-script.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-

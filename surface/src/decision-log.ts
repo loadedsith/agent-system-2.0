@@ -10,6 +10,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Ledger } from "../../ledger/src/index";
+import { reversedRowIds } from "../../ledger/src/jo-channel";
 import { reservedStates } from "./errors";
 import { type Identity, authorSlug } from "./identity";
 import { controlEntries, doneBecause, doneLine, holdersOf, reservedPrefix } from "./launch";
@@ -223,12 +224,15 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 
 /**
  * The repo an open workload is on, from its `repo:` entry — the surface's, or the train tick's on a fix workload it opened
- * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git).
+ * (PLAN wl-mv8s8srodefytc D8); never a lane's (Codex review B7: a lane's note never routes git). An entry Jo reversed
+ * (a surface `forgery-reversed:` of the workload naming it, PLAN wl-mvfxw3c4zqfzls D5) is skipped.
  */
 export function repoOf(ledger: Ledger, workloadId: string): string | null {
 	const rows = ledger.entries(workloadId, "assumption");
+	const reversed = reversedRowIds(rows);
 	for (let i = rows.length - 1; i >= 0; i--) {
 		const e = rows[i]!;
+		if (reversed.has(e.id)) continue;
 		if ((e.created_by === SURFACE_BY || e.created_by === MERGE_TRAIN_BY) && e.body.startsWith(REPO_PREFIX)) return e.body.slice(REPO_PREFIX.length).trim();
 	}
 	return null;
