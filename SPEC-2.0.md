@@ -33,9 +33,9 @@ The work-kind rule is keyed on the **shape of the task**, read off the slice bri
 | Kind | What the slice does | Tier (to be named in A1.3) |
 |---|---|---|
 | locate | find where something is; no interpretation | lowest |
-| understand | read and report on a surface; no writes | mid |
-| change-small | write, single file, checkable by a test or diff | mid |
-| change-large | write, multi-file or with no mechanical check | mid-high |
+| understand | read and report on a surface; no repository writes (a smoke run or check that writes only scratch files and its report is understand) | mid |
+| change-small | write a change the brief already specifies, carried out rather than worked out: one module and its own tests, a new uncalled pure function in its own file with its test, a mechanical mirror of an existing pattern, or a docs-only edit of any size whose content is dictated | mid |
+| change-large | write code whose design or correctness the worker must work out: new behaviour across modules, a shared format and its readers, interface-fixing tests, end-to-end tests of real programs, or any concurrency, timing, process, security or authority, performance or replay/identity fix, however few files | mid-high |
 | judge | design, review, decide; anything whose output is a ruling rather than an artifact | top |
 
 Consequence (blast radius, reversibility) is **not** in the taxonomy: it is carried by the
@@ -156,6 +156,7 @@ model's reading, not Jo's; 1.x-style prompts, not B9 six-field briefs (productio
 expected higher, so 0.55 errs safe). Re-measured after the first real month from ledger pull-ups
 versus gate failures (P-16).
 **Re-measured 2026-09-28** with the S1-corrected question (sha256 `5a72c35c…`; `research/classifier-sample.md` § Re-measurement 2026-09-28): the same 30 briefs plus two review additions, `typesafe/jev-1.13.0`, $0.00101 total. Agreement 21/30 (70.0%) on the original thirty against the unchanged 09-23 hand labels, 2/2 on the additions (both change-large); two of the nine misses are two-file edits the old labels call change-small and the ruled taxonomy calls change-large. **Threshold stays 0.55, inclusive** (ruled 2026-09-29 after the M3 gate run, Jo: *"let's follow your recco"* — a brief answered at exactly 0.55 was under-served in one of two live draws; the sweeps below were computed strictly-below, the code flags at or below): it is the lowest value that routes no brief below its hand label's tier (0.50 leaves a judge brief on standard); the count knee is 0.60, which routes all 32 identically. The corrected question costs precision — 7 of 32 flagged, 5 of them false flags, over-served briefs 3 → 10 of 30 — because it lowers confidence on correct locate and change-small answers.
+**Re-measured 2026-10-20** with the right-sizing question (`questionSha256` `2c0d0886…`, file sha256 `5b74aa66…`; `research/classifier-sample.md` § Re-measurement 2026-10-20), `typesafe/jev-1.13.0`, after the 2026-10-19 hand-size audit found 8 firm over-sizes among 20 change-large hands. § A1.1's understand, change-small and change-large rows follow it: change-small is a change the brief already specifies, change-large one whose design or correctness the worker must work out. On the audit's 20 the 8 firm route standard and the 9 correct stay strong; 27/32 on the 09-28 sample against its labels (two additions relabelled change-small), none routed below its label's tier at 0.55 inclusive, which stays the threshold (not re-swept). Sealed held-out set B: 7/7 correct strong, 0/3 over on standard — dictated code-plus-own-test changes still route strong, a shortfall Jo accepted 2026-10-20 (`q-mvg42w7vgege0w`). At workload open, 2 of 124 replayed briefs newly skip plan-first (Jo: keep, `q-mvg45v0ez6f1mo`) and the ×3 ceiling applies to 45 instead of 62.
 
 **Named local fallback — Laya (ruled 2026-09-28, Jo: *"let's go with your recco"*).** ConvAI's
 `laya` (Apache-2.0, self-hosted, TypeSafe-wire-compatible) is the exit if TypeSafe's terms, price,
@@ -511,6 +512,25 @@ Hole this closed, for the record: before this ruling nothing in `REQUIREMENTS.md
 review process for workload output (`grep review|approv` 2026-09-23: no requirement), and A4's
 "approved" was undefined.
 
+**Amended 2026-10-19 — the merge train lands a normal lane's PR** (`migration/items/merge-train-auto-board.md`;
+jo-issues #132; Jo, ledger input `in-mvbjiylsgdtqf4`: "it is of the utmost importance to me that agents can
+merge autonomsly"; built in wl-mvbjiettjrfpxc, plan revision 6). This amends the normal row above and the
+completion rule of `DESIGN-lane-launcher.md` decision 11 (on this repository a lane never merges: Jo
+integrates). An autonomous normal-stakes lane on a repository the test runner serves
+(`testRunner.repos`), a merge train or train fix lane excepted, never asks Jo to integrate. A
+cross-lab review slice must pass before the PR is done. Once the PR is green at its head with that
+review passed, the lane records `done-because:` and releases, the surface closes the workload, and
+the merge train boards and lands the PR; a done line's "merged on main" is met by that hand-off. The
+train tick boards a PR only when its workload is closed, was autonomous at normal stakes, carries a
+holder `done-because:` newer than the tick's `train-autoboard: on` cutover row, has its newest
+full-suite run green at the PR's head (a head ahead of it only by `.ai/decision-log/` commits
+counts), and has its cross-lab review passed. A PR that fails a test gets a `train-board-skip:`
+ledger row, no line to Jo, and Jo's `train <N>` still lands it. For these PRs the normal row's "told
+in one line after the merge" no longer holds: Jo hears only of a production-stakes merge, a
+conflict the owner fails twice, a red main (once per `main-red` issue), or a main protection the
+tick cannot verify (named once per episode). Production-stakes and user-driven lanes keep the rule
+above unchanged; production auto-boarding is a non-goal.
+
 **Amended 2026-10-01 — cross-lab review** (MIGRATION.md item 23; Jo: *"any review should happen
 via a model from a lab that did not build it. if the agent building it was anthropic? we use openai
 or kimi. if those are unavailable due to spend reasons or login issues i should be alerted and
@@ -685,6 +705,26 @@ code manually at some point?"*
   recreates the shared-checkout collision the 1.x charter already recorded once
   (`.ai/plumb-seat-charter.md:67-70`). If it happens anyway, the runtime records the foreign
   diff as a ledger entry and the next slice's brief includes it; that is mitigation, not a mode.
+
+**Amended 2026-10-19 — inbound agent channel** (`migration/items/agent-channel.md`; Jo, answering
+q-mv8wcymfkx3y0w: *"notes"*, ledger input `in-mv8yzvhuwz9jwg`; plan
+`/Users/jowolff/agent-scratch/agent-system-2.0/wl-mv8vx7wdj5nx1c/PLAN.md` rev 6; built in
+wl-mv8vx7wdj5nx1c). Other agents reach the orchestrator through one inbound channel, never
+through Jo's steering path. Each sender is configured in `profile/config.yml` under
+`channel.senders[]` with an `id`, a `transport` and an `authority`; the authority belongs to the
+sender, not to anything a message says. Phase 1 has one sender, `{ id: plumb, transport:
+omp-mailbox, authority: notes }`, and `notes` (notes and proposals) is the only authority built.
+A message is never authored as Jo: it is a `messages` row on `wl-orchestrator` with sender
+`plumb`, created_by `channel:plumb` and the body prefix `channel-note from plumb:`, and the
+channel writes no instruction, answer, stakes or mode flip, or ceiling change. The orchestrator
+reads it as information from that sender, and replies with `orchestrator_reply` or closes it
+with `orchestrator_channel_done`. A line that names a waiting needs-you row and a word that
+answers it is a proposal: it renders as `#n plumb proposes <word> <target>` and carries the
+target's own number, never one of its own, and only Jo's typed `n <word>` (or another word that
+fits the row) applies, as Jo's ordinary row. Flip and ceiling words from a sender answer no
+numbered row, so they stay notes. A sender's `from` is self-claimed, so a spoof costs a
+misattributed note, never an action. Grant words wait for a phase with sender proof; phase 2
+(Juno, remote, notes only) starts only after Jo's go is recorded as an instruction.
 
 ### B6 · Spec-and-plan option is offered inside the lane (P-12)
 
