@@ -637,6 +637,17 @@ describe("undo plan from a backup (D6)", () => {
 		expect(undoPlan(backup, restored, { multiSelect: true }).ops).toEqual([]);
 	});
 
+	test("the Title field's text value is the issue's own title: a changed title is listed, never written", () => {
+		const title = (t: string): BoardValue => ({ __typename: "ProjectV2ItemFieldTextValue", field: { id: "F_title", name: "Title", dataType: "TITLE" }, text: t });
+		const fields = [...FIELDS, { id: "F_title", name: "Title", dataType: "TITLE" }];
+		const before = board([card("I_1", JI, 1, "2026-10-15T00:00:00Z", [title("Old title")])], fields);
+		const after = board([card("I_1", JI, 1, "2026-10-15T00:00:00Z", [title("New title")])], fields);
+		const plan = undoPlan(before, after, { multiSelect: true });
+		expect(plan.ops).toEqual([]);
+		expect(plan.contentDiffs).toHaveLength(1);
+		expect(plan.contentDiffs[0]).toStartWith("jo-issues#1 Title: ");
+	});
+
 	test("previous Rank values by issue, for the comment's moves", () => {
 		expect(previousRanks(backup)).toEqual(new Map([["jo-issues#1", 3], ["jo-issues#2", 5]]));
 	});

@@ -804,8 +804,12 @@ export function mutationBatches(projectId: string, ops: readonly BoardOp[], size
 	return batches;
 }
 
-/** The value types the run and undo may write, by `__typename` (D6); multi-select only where the live schema has it. */
+/**
+ * The value types the run and undo may write, by `__typename` (D6); multi-select only where the live schema has it. The
+ * Title field's value comes back as a text value but is the issue's own title: content-derived, never written.
+ */
 function writableValue(v: BoardValue, multiSelect: boolean): FieldValueInput | null | undefined {
+	if (v.field.dataType === "TITLE") return undefined;
 	switch (v.__typename) {
 		case "ProjectV2ItemFieldTextValue":
 			return typeof v.text === "string" ? { text: v.text } : null;
