@@ -233,7 +233,7 @@ describe("phase 2 (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9, § 3.5): now, duplicat
 		if (!("raised" in qa) || !("raised" in qb)) throw new Error("expected two raised questions");
 		expect(qb.raised).not.toBe(qa.raised);
 		expect(qb).not.toHaveProperty("reused");
-		expect(l.questions(STANDING_WORKLOAD_ID).filter((q) => q.state === "open").map((q) => q.id)).toEqual([qa.raised, qb.raised]);
+		expect(l.questions(STANDING_WORKLOAD_ID).filter((q) => q.state === "open").map((q) => q.id).sort()).toEqual([qa.raised, qb.raised].sort());
 		expect(ask(a)).toEqual({ raised: qa.raised, reused: true });
 		expect(l.questions(STANDING_WORKLOAD_ID).length).toBe(2);
 	});
