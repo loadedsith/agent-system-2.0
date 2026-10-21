@@ -26,7 +26,9 @@
 //   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy (after the same
 //                                        live-lane check), then omp in the TUI in the foreground (--model when Jo
 //                                        named one, --resume when recorded on that same model), spawned in one write
-//                                        with its lane-started: while the workload is still held by its lane id
+//                                        with its lane-started: while the workload is still held by its lane id, its
+//                                        first prompt and the workload's state supplied as `@prompt.md` (resume too);
+//                                        AGENT_SYSTEM_BY_HAND=1
 //   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
 //                                        runner alive, accept, end omp (SIGTERM, then SIGKILL after the
 //                                        grace, each only while the pid's start time matches
@@ -68,7 +70,7 @@ import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
@@ -82,6 +84,7 @@ import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { sendNotice } from "../src/notice";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import { renderWorkload } from "../src/render";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
@@ -293,6 +296,24 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 	const out = prompt.split("\n");
 	out.splice(out.indexOf(`stakes: ${w.stakes} · mode: ${w.mode}`) + 1, 0, ceilingLine);
 	return out.join("\n");
+}
+
+/**
+ * The by-hand lane's first prompt (PLAN-2 D1b): `promptFor`'s, then `## Workload state now` with the workload's block as
+ * the orchestrator's on-demand read renders it (`renderWorkload`: slices, open questions, pending messages, recent entries),
+ * read from the ledger at launch. Read-only: the lane gets no orchestrator tool. The runner's prompt is `promptFor`'s alone.
+ */
+function byHandPromptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared): string {
+	const now = ledger.inFlight().find((x) => x.workload.id === w.id);
+	if (!now) throw new Fail("interactive", `workload ${w.id} is not open`, STARTER_EXIT.closed!);
+	// Jo's ruling (in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1): by-hand lanes have spend context, not a meter.
+	// Only cmdRun stops at the ceiling or sends ceiling notices; the extension reports paired spend to the lane and Jo's pane.
+	const es = ledger.entries(w.id);
+	const control = controlEntries(es, holdersOf(es, now.workload.holder));
+	const instructions = ledger.instructions(w.id);
+	const spent: Spend = { ...scanSpend(p.sessionDir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control, Date.now(), null) };
+	const pairedLine = pairedCeilingPromptLine(effectiveCeiling(control, instructions, w.stakes), originalCeiling(control, instructions, w.stakes), spent);
+	return `${promptFor(ledger, w, laneId, p, pairedLine)}\n\n## Workload state now\n\n${renderWorkload(ledger, now)}\n`;
 }
 
 /**
@@ -1783,22 +1804,17 @@ async function cmdInteractive(wl: string): Promise<number> {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
-		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
+		// PLAN-2 D1/D2: written before the spawn and passed as OMP's `@file` initial message, on a fresh session and a resume alike.
+		const firstPromptPath = join(p.dir, "prompt.md");
+		writeFileSync(firstPromptPath, byHandPromptFor(ledger, w, laneId, p));
+		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume, firstPromptPath });
 		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		// After `laneEnv`, which drops any inherited value: only this by-hand launch carries it (PLAN-2 D4).
+		env[BY_HAND_ENV] = "1";
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
-		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
+		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt supplied from ${firstPromptPath}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
-		// Jo's ruling (in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1): a by-hand lane is paired with Jo and has no meter. It
-		// is never stopped at the ceiling and puts no ceiling question or notice on the surface; only `cmdRun` meters. The
-		// lane extension (surface/extensions/lane.ts) reports its spend instead: to the lane at every turn start, to Jo's pane
-		// at each 25 % of the original ceiling. The first prompt says so, with the spend so far.
-		const es = ledger.entries(wl);
-		const control = controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null));
-		const instructions = ledger.instructions(wl);
-		const spent: Spend = { ...scanSpend(p.sessionDir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control, Date.now(), null) };
-		const pairedLine = pairedCeilingPromptLine(effectiveCeiling(control, instructions, w.stakes), originalCeiling(control, instructions, w.stakes), spent);
-		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, pairedLine));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.

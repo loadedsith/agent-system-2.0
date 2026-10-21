@@ -52,3 +52,13 @@ due until Jo raises the ceiling. `surface/test/train-tick.test.ts`, under
 at expiry and already pending before expiry, plus the ceiling-refusal/raise interaction. The standing rulings,
 auto-start veto window and paired-workload ceiling exception are unchanged.
 
+The merge with PR 258 keeps the canonical call/result adapters and paired-spend imports.
+The by-hand first prompt is composed once in `byHandPromptFor`: paired ceiling/spend context
+followed by `## Workload state now`, written once before spawning OMP and passed through its
+native `@file` argument on fresh and resumed sessions. A second `promptFor` write would erase
+the workload-state suffix. `surface/test/by-hand-context.test.ts`, under
+`by-hand lane: the first prompt reaches the session`, seeds $1.25 of earlier spend against a
+$1 ceiling and checks both contexts in the actual initial session message on fresh launches
+and same-model resumes, with no ceiling stop, added question or ceiling notice. The autonomous
+RPC path, unmetered paired policy and test timeouts are unchanged.
+
