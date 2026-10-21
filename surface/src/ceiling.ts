@@ -243,6 +243,24 @@ export function crossed(s: Spend, c: Ceiling): 0 | 80 | 100 {
 	return 0;
 }
 
+/**
+ * Whether the workload is stopped at its ceiling (PLAN wl-mvgn310dpi5gcg D3): each half's maximum over its `spend:` rows
+ * (workload-cumulative, but concurrent lanes can write them out of order) against `effectiveCeiling`, at `crossed` 100.
+ * The spend and the ceiling when stopped, else null.
+ */
+export function ceilingStopped(control: readonly ControlEntry[], instructions: readonly InstructionRow[], stakes: Stakes): { spend: Spend; ceiling: Ceiling } | null {
+	const spend: Spend = { usd: 0, tokens: 0, wallMin: 0 };
+	for (const c of control) {
+		const s = c.prefix === "spend" ? parseSpend(c.rest) : null;
+		if (s === null) continue;
+		spend.usd = Math.max(spend.usd, s.usd);
+		spend.tokens = Math.max(spend.tokens, s.tokens);
+		spend.wallMin = Math.max(spend.wallMin, s.wallMin);
+	}
+	const ceiling = effectiveCeiling(control, instructions, stakes);
+	return crossed(spend, ceiling) === 100 ? { spend, ceiling } : null;
+}
+
 // ---- the notices -------------------------------------------------------------------------------
 
 /** The meter's two notice levels (PLAN wl-mvfkv7llkp7nk0 § 4): 80 % of either half, and the stop at 100 %. */

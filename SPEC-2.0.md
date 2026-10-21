@@ -33,9 +33,9 @@ The work-kind rule is keyed on the **shape of the task**, read off the slice bri
 | Kind | What the slice does | Tier (to be named in A1.3) |
 |---|---|---|
 | locate | find where something is; no interpretation | lowest |
-| understand | read and report on a surface; no writes | mid |
-| change-small | write, single file, checkable by a test or diff | mid |
-| change-large | write, multi-file or with no mechanical check | mid-high |
+| understand | read and report on a surface; no repository writes (a smoke run or check that writes only scratch files and its report is understand) | mid |
+| change-small | write a change the brief already specifies, carried out rather than worked out: one module and its own tests, a new uncalled pure function in its own file with its test, a mechanical mirror of an existing pattern, or a docs-only edit of any size whose content is dictated | mid |
+| change-large | write code whose design or correctness the worker must work out: new behaviour across modules, a shared format and its readers, interface-fixing tests, end-to-end tests of real programs, or any concurrency, timing, process, security or authority, performance or replay/identity fix, however few files | mid-high |
 | judge | design, review, decide; anything whose output is a ruling rather than an artifact | top |
 
 Consequence (blast radius, reversibility) is **not** in the taxonomy: it is carried by the
@@ -156,6 +156,7 @@ model's reading, not Jo's; 1.x-style prompts, not B9 six-field briefs (productio
 expected higher, so 0.55 errs safe). Re-measured after the first real month from ledger pull-ups
 versus gate failures (P-16).
 **Re-measured 2026-09-28** with the S1-corrected question (sha256 `5a72c35c…`; `research/classifier-sample.md` § Re-measurement 2026-09-28): the same 30 briefs plus two review additions, `typesafe/jev-1.13.0`, $0.00101 total. Agreement 21/30 (70.0%) on the original thirty against the unchanged 09-23 hand labels, 2/2 on the additions (both change-large); two of the nine misses are two-file edits the old labels call change-small and the ruled taxonomy calls change-large. **Threshold stays 0.55, inclusive** (ruled 2026-09-29 after the M3 gate run, Jo: *"let's follow your recco"* — a brief answered at exactly 0.55 was under-served in one of two live draws; the sweeps below were computed strictly-below, the code flags at or below): it is the lowest value that routes no brief below its hand label's tier (0.50 leaves a judge brief on standard); the count knee is 0.60, which routes all 32 identically. The corrected question costs precision — 7 of 32 flagged, 5 of them false flags, over-served briefs 3 → 10 of 30 — because it lowers confidence on correct locate and change-small answers.
+**Re-measured 2026-10-20** with the right-sizing question (`questionSha256` `2c0d0886…`, file sha256 `5b74aa66…`; `research/classifier-sample.md` § Re-measurement 2026-10-20), `typesafe/jev-1.13.0`, after the 2026-10-19 hand-size audit found 8 firm over-sizes among 20 change-large hands. § A1.1's understand, change-small and change-large rows follow it: change-small is a change the brief already specifies, change-large one whose design or correctness the worker must work out. On the audit's 20 the 8 firm route standard and the 9 correct stay strong; 27/32 on the 09-28 sample against its labels (two additions relabelled change-small), none routed below its label's tier at 0.55 inclusive, which stays the threshold (not re-swept). Sealed held-out set B: 7/7 correct strong, 0/3 over on standard — dictated code-plus-own-test changes still route strong, a shortfall Jo accepted 2026-10-20 (`q-mvg42w7vgege0w`). At workload open, 2 of 124 replayed briefs newly skip plan-first (Jo: keep, `q-mvg45v0ez6f1mo`) and the ×3 ceiling applies to 45 instead of 62.
 
 **Named local fallback — Laya (ruled 2026-09-28, Jo: *"let's go with your recco"*).** ConvAI's
 `laya` (Apache-2.0, self-hosted, TypeSafe-wire-compatible) is the exit if TypeSafe's terms, price,

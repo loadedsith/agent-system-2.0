@@ -26,3 +26,47 @@ Not changed: the review round limit and its `extend` / `accept` / `stop` questio
 The train tick needs no reinstall: it runs `surface/scripts/train-tick.ts` from the checkout on each pass. No schema change and no ledger rewrite. `notice:`, `ruling-applied:`, `plan: approved auto`, `plan: halted` and `train-hold:` rows are new and inert under the old code. A ceiling question left open from before the deploy is not settled by anything new: answer it with `cancel-slice sl-ceiling-…` (withdraws it and cancels its slice) or `withdraw q-…` (withdraws it and replans the slice).
 
 **Reversal.** Revert the PR on main, fast-forward, re-run the install, restart `as2` and relaunch the lanes. Rows already written stay in the ledger. The old reader drops a `plan: approved` from any writer but the surface (`validWriter`, `surface/src/launch.ts`), so a workload auto-started before the revert reads as plan-first and unapproved again: its lane may add no change slice until Jo approves its next plan question. A ceiling over 80 % may raise the old ceiling question at the lane's next poll.
+
+## PR 267 train repair
+
+The runner's claim/model readiness window and runtime deadline start at the child spawn,
+not before repository/profile preparation. Preparation may block on git before OMP exists;
+it must not consume the child's readiness allowance. Ceiling thresholds and the pre-prompt
+ceiling check are unchanged. `surface/test/lane-model-script.test.ts`, under
+`T5c: lane-ready: only just before the first prompt`, covers delayed preparation followed by
+a delayed model reply and retains the at-ceiling relaunch's no-readiness/no-prompt checks.
+
+The classifier's six-round review-loop reset scenario in `classifier/test/crosslab.test.ts`
+uses the existing fingerprint injection to isolate loop accounting from repeated git scans.
+It retains every round and behavioral assertion; the read-only review and fingerprint tests
+still exercise real git. Neither repair increases a test or readiness timeout.
+
+The merge with main retains the one-live-lane reservation and spawn guards alongside the
+notice-only ceiling meter and the unmetered paired path. Train head-wake accounting remains
+unchanged: a wake counts when the tick writes the request or its launcher succeeds, deduplicated
+per request. Hold-expiry wakes count whenever a new or already-pending launch request exists,
+even when the launcher remains capped; the drain can serve that request without waking the same
+hold again. A ceiling refusal writes no request, calls no launcher and leaves an expired hold
+due until Jo raises the ceiling. `surface/test/train-tick.test.ts`, under
+`retries of a released train and fork PRs`, covers capped expiry/drain for requests newly written
+at expiry and already pending before expiry, plus the ceiling-refusal/raise interaction. The standing rulings,
+auto-start veto window and paired-workload ceiling exception are unchanged.
+
+The merge with PR 258 keeps the canonical call/result adapters and paired-spend imports.
+The by-hand first prompt is composed once in `byHandPromptFor`: paired ceiling/spend context
+followed by `## Workload state now`, written once before spawning OMP and passed through its
+native `@file` argument on fresh and resumed sessions. A second `promptFor` write would erase
+the workload-state suffix. `surface/test/by-hand-context.test.ts`, under
+`by-hand lane: the first prompt reaches the session`, seeds $1.25 of earlier spend against a
+$1 ceiling and checks both contexts in the actual initial session message on fresh launches
+and same-model resumes, with no ceiling stop, added question or ceiling notice. The autonomous
+RPC path, unmetered paired policy and test timeouts are unchanged.
+
+The PR 267 merge with main keeps main's auto-boarding semantics: a ready PR reuses the
+newest open train regardless of age or half-ceiling, remains pending when Jo-held or done,
+and creates a train only when none exists. The import resolution retains the escalation
+hold/task dependencies and drops the obsolete `meter` import. In the by-hand prompt test,
+EOF may record the expected lane death while an open slice remains, so the incidental
+empty-deaths assertion is removed; no lane-stop, ceiling-stop, prompt, spend, or state
+regression checks are removed or changed.
+

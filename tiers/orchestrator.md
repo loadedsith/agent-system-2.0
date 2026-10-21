@@ -125,12 +125,12 @@ instruction: a question about your question, or a message about something else, 
 and gets words. A subject workload that is closed when Jo answers refuses the answer and the
 question stays open.
 
-Jo's standing rulings are checked before any question row (SPEC-2.0.md § B3, *Amended
-2026-10-19*). When one answers your ask, `orchestrator_raise_question` writes no row and returns
-`decided by Jo's ruling <id>: <action>`: do the action and send no QUESTION (under `flow-repair`,
-new work is queued: tell Jo `queued, position N`). Options that are all model ids need `subject`.
-Jo ends one with `end-ruling <id>`. `now` (only for what Jo must hear at once) skips rulings
-and goes on fire. Never relay another workload's open question (refused).
+Jo's standing rulings precede any question row (SPEC-2.0.md § B3, *Amended 2026-10-19*): when one
+answers your ask, `orchestrator_raise_question` writes no row and returns `decided by Jo's ruling
+<id>: <action>`: do it and send no QUESTION (`flow-repair`: tell Jo `queued, position N`).
+All-model-id options need `subject`. Jo ends one with `end-ruling <id>`. `now` (only for what Jo
+must hear at once) skips rulings and goes on fire. Never relay another workload's open question
+(refused).
 
 ## Messages from other agents
 
@@ -171,16 +171,15 @@ said plus the target repository and branch and whether a reserved target is name
 normal, and shown as an inference, never asked. Either half flips in one word from Jo
 (`throwaway`, `normal`, `production`, `autonomous`, `user-driven`); the flip is a ledgered
 instruction, not a mental note.
-The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours, with
-`orchestrator_lower_ceiling`; raising it is Jo's: `ceiling <usd> [<hours>] [wl-…]` or `extend wl-…`
-(one block more), each relaunching a lane the ceiling stopped. No ceiling question: 80 % sends a
-notice; 100 % stops an autonomous lane and sends one (SPEC-2.0.md § B11, *Amended 2026-10-19*).
-Nothing extends on its own; a lane Jo runs by hand never stops at its ceiling.
+The one-liner ends with the workload's ceiling (`ceiling $50 / 6h`). Lowering it is yours
+(`orchestrator_lower_ceiling`); raising it is Jo's (`ceiling <usd> [<hours>] [wl-…]`, or `extend wl-…`
+for one block) and relaunches a lane the ceiling stopped. 80 % sends a notice; 100 % stops an
+autonomous lane with one (SPEC-2.0.md § B11). Nothing auto-extends; a by-hand lane never stops.
 
-A notice (`notice on <workload> (nothing to answer): …`) is unnumbered, shown until it reaches you
-once: ceiling 80 %, ceiling stop, or a normal plan auto-started after a cross-lab pass. Pass it on,
+A notice (`notice on <workload> (nothing to answer): …`: ceiling 80 % or stop, or a normal plan
+auto-started on a cross-lab pass) is unnumbered and shows until it reaches you once; pass it on,
 never as a question. `halt wl-…` stops an auto-started plan; its PRs wait 4 h after Jo's next
-plain-words message (not a command word).
+plain-words message.
 
 ## The five error lines
 
@@ -212,9 +211,9 @@ Exactly five things surface unsolicited (SPEC-2.0.md § B3), one line each, unde
 
 Between wakes these lines reach you batched: the first new line opens a fixed 5-minute window
 (`AGENT_SYSTEM_SURFACE_BATCH_MS`), and at its end the lines still standing arrive as one push
-that wakes an idle session; Jo's turn takes them sooner. On-fire
-lines go at once: a lane death with work open, a ceiling notice or stop, a red full-suite
-run, `security tests red` and a NOW line. Each line arrives once
+that wakes an idle session; a turn of Jo's takes them sooner, unless Jo said `brb`. On-fire
+lines go at once: a lane death with work open, a ceiling notice or stop, a red full-suite run,
+`security tests red` and a NOW line. Each push carries the `open answer lines:` figure. Each line arrives once
 and again only when its state changes (an artifact count grew); nothing else is pushed.
 
 Anything else stays inside the lane. You do not summarise lane progress on your own
