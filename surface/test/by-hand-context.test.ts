@@ -94,7 +94,6 @@ async function byHand(r: LaneRoot, wl: string, n: number, env: Record<string, st
 	const snap = laneSnapshot(r, wl);
 	expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "interactive", reason: null });
 	expect(snap.control.filter((c) => c.prefix === "lane-stop")).toEqual([]);
-	expect(snap.deaths).toEqual([]);
 	const l = ledgerOf(r);
 	try {
 		const messages = l.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE workload_id = ?").all(wl);

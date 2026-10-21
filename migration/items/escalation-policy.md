@@ -62,3 +62,11 @@ $1 ceiling and checks both contexts in the actual initial session message on fre
 and same-model resumes, with no ceiling stop, added question or ceiling notice. The autonomous
 RPC path, unmetered paired policy and test timeouts are unchanged.
 
+The PR 267 merge with main keeps main's auto-boarding semantics: a ready PR reuses the
+newest open train regardless of age or half-ceiling, remains pending when Jo-held or done,
+and creates a train only when none exists. The import resolution retains the escalation
+hold/task dependencies and drops the obsolete `meter` import. In the by-hand prompt test,
+EOF may record the expected lane death while an open slice remains, so the incidental
+empty-deaths assertion is removed; no lane-stop, ceiling-stop, prompt, spend, or state
+regression checks are removed or changed.
+
