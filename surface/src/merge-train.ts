@@ -15,11 +15,10 @@
 // and wakes a train only when it is `actionable`; `trainTaskWindows` feeds surface/src/errors.ts `trainRouted`.
 // Auto-boarding (PLAN wl-mvbjiettjrfpxc D1-D3, D5): a train's members are Jo's `train:` bindings and the tick's `train-board:`
 // rows (`trainMembers`); `landingReady` is the ledger half of "a lane finished green", `boardLanding` puts a ready PR on its
-// repository's usable train (opening one when there is none), and `trainBrief` reads its members from `merge-train.ts list`.
+// repository's newest open train (pending when held or done, opening one only when none exists), and `trainBrief` reads its members from `merge-train.ts list`.
 // Part 4 (PLAN wl-mvbjiettjrfpxc D1, D6, D7): the train tick's boarding scan (`autoboardCandidates`, `boardedWorkloads`,
 // `boardSkips`), main's protection read live (`protectionGap`) with its episodes, and the main-red notices, on the standing workload.
 import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
-import { meter } from "./rank-launch";
 import { type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, launchRequestedBody, type OwnerTrainTask, parseTrainBoard, parseTrainFix, planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { canonicalPath } from "../../ledger/src/locality";
@@ -1404,8 +1403,6 @@ export function raiseTwiceFailed(ledger: Ledger, wl: string, d: TwiceFailed): st
 
 /** D1: a workload closed longer ago than this is no longer scanned (the scan stays bounded). */
 export const AUTOBOARD_WINDOW_MS = 14 * 86_400_000;
-/** D3: an auto-boarded train takes new PRs only while its metered spend is under this share of both ceiling halves. */
-export const TRAIN_ROTATE_SHARE = 0.5;
 
 /** `train-autoboard: on <iso>`: the cutover the train tick writes once on the standing workload (MERGE_TRAIN_BY); receipts before it never board. */
 export function trainAutoboardBody(at: string): string {
@@ -1517,12 +1514,6 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	return { ready: true, workloadId: wl, pr: pr!, sha: sha!, run: newestRun.request.runId, review: review.entryId, checkout, repo, closedAt: w.closed_at };
 }
 
-/** Train `wl`'s newest metered spend (`meter`, surface/src/rank-launch.ts) against its ceiling (D3): true while both halves are under TRAIN_ROTATE_SHARE. */
-function underRotateShare(ledger: Ledger, wl: string): boolean {
-	const { ceiling, spend } = meter(ledger, wl);
-	return spend.usd < ceiling.usd * TRAIN_ROTATE_SHARE && spend.wallMin < ceiling.wallMin * TRAIN_ROTATE_SHARE;
-}
-
 /** Every workload, open or closed, that ever carried a membership entry (`train:` or `train-board:`) and is a train, oldest first. */
 function everyTrain(ledger: Ledger): string[] {
 	return ledger.db.query<{ id: string }, [string, string]>(
@@ -1541,11 +1532,11 @@ export type BoardResult = { boarded: true; train: string; opened: boolean; entry
  * head <head> run <run> review <entry>`, `head` the PR's live head the tick read (G when omitted). The transaction first re-reads,
  * over every train of the candidate's repository (`identity`, `repoIdentity` by default): membership (a PR a train worked, i.e.
  * whose PR slice it has, open or closed, never boards: merged, skipped by Jo or left; a PR on an open train is on it already; a
- * board on a closed train with no PR slice is void, R16), the hold (the repo's newest open train held by Jo's stop: nothing
- * boards), and each open train's liveness and standing `done-because:`. Then it boards the repo's newest usable train (open, opened
- * after the cutover, not held, no done-because, under TRAIN_ROTATE_SHARE of both ceiling halves), or with none opens one as
- * `openTrainFix` does: MERGE_TRAIN_BY, autonomous, normal, no `plan:`, no `ceiling:`, `repo:` the candidate's checkout, `done:`
- * TRAIN_DONE, brief `trainBrief(…, "board")`. The board then makes the train `actionable` (`#n boarded`).
+ * board on a closed train with no PR slice is void, R16). For the fixed main target it selects the repo's newest open train:
+ * a Jo stop or effective `done-because:` leaves the PR pending, otherwise it appends regardless of train age or spend.
+ * Only when no matching open train exists does it open one as `openTrainFix` does: MERGE_TRAIN_BY, autonomous, normal,
+ * no `plan:`, no `ceiling:`, `repo:` the candidate's checkout, `done:` TRAIN_DONE, brief `trainBrief(…, "board")`.
+ * The board then makes the train `actionable` (`#n boarded`); launch ceiling enforcement is unchanged.
  */
 export function boardLanding(
 	ledger: Ledger, l: Extract<Landing, { ready: true }>, opts: { head?: string; identity?: (checkout: string) => string } = {},
@@ -1571,19 +1562,19 @@ export function boardLanding(
 			if (ledger.workload(t)!.status === "open") return no(`#${l.pr} is already on open merge train ${t}`);
 		}
 		const open = trains.filter((t) => ledger.workload(t)!.status === "open");
-		const held = (t: string) => trainHold({ entries: ledger.entries(t), instructions: ledger.instructions(t), questions: ledger.questions(t) });
 		const newest = open.at(-1);
-		if (newest !== undefined && held(newest) !== null) return no(`the repository's newest merge train ${newest} is held by Jo's stop`);
-		const usable = open.filter((t) => {
-			const tw = ledger.workload(t)!;
-			const entries = ledger.entries(t);
-			return tw.created_at > cutover.createdAt && held(t) === null && doneBecause(entries, holdersOf(entries, tw.holder, ledger.holders(t))) === null &&
-				underRotateShare(ledger, t);
-		}).at(-1);
+		if (newest !== undefined) {
+			const tw = ledger.workload(newest)!;
+			const entries = ledger.entries(newest);
+			if (trainHold({ entries, instructions: ledger.instructions(newest), questions: ledger.questions(newest) }) !== null)
+				return no(`the repository's newest merge train ${newest} is held by Jo's stop`);
+			if (doneBecause(entries, holdersOf(entries, tw.holder, ledger.holders(newest))) !== null)
+				return no(`the repository's newest merge train ${newest} has a standing done-because`);
+		}
 		const board = trainBoardBody({ pr: l.pr, workload: l.workloadId, head, run: l.run, review: l.review });
-		if (usable !== undefined) {
-			const entryId = ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: usable, kind: "assumption", body: board });
-			return { boarded: true, train: usable, opened: false, entryId };
+		if (newest !== undefined) {
+			const entryId = ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: newest, kind: "assumption", body: board });
+			return { boarded: true, train: newest, opened: false, entryId };
 		}
 		const train = newId("workload");
 		ledger.openWorkload({ by: MERGE_TRAIN_BY, id: train, brief: trainBrief(train, [l.pr], "board"), stakes: "normal", mode: "autonomous" });
