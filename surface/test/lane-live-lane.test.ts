@@ -328,6 +328,37 @@ describe("D4: endStale on real child processes", () => {
 		expect(calls.filter(([pid]) => pid === 101)).toEqual([[101, "SIGTERM"]]);
 		expect(calls.filter(([pid]) => pid === 102).slice(0, 2)).toEqual([[102, "SIGTERM"], [102, "SIGKILL"]]);
 	});
+
+	// Review sl-review-exit r2: the SIGKILL pass probes under the same aggregate deadline as every other pass, so slow
+	// probes of many pids end at the deadline plus one probe, not one probe per pid past it. Simulated pids.
+	test("ten slow-probing stale omps: endStale returns by the deadline plus one probe", async () => {
+		const run = () => {
+			Bun.sleepSync(50);
+			return { exitCode: 0, stdout: `S ${OMP_START}\n`, stderr: "" };
+		};
+		const stale = Array.from({ length: 10 }, (_, i) => ({ laneId: `lane-${i}`, pid: 200 + i, start: OMP_START }));
+		const t0 = Date.now();
+		const left = await laneScript.endStale(stale, { run, kill: () => undefined, log: () => undefined, graceMs: 100, deadlineMs: 300, pollMs: 50 });
+		const ms = Date.now() - t0;
+		expect(ms).toBeLessThan(300 + 50 + 150);
+		expect(left.length).toBeGreaterThan(0);
+	});
+
+	// Review sl-review-exit r2: a pid whose probes failed at first gets its SIGTERM late; its SIGKILL waits its own grace.
+	test("a pid first seen after the others' grace still gets its own grace between SIGTERM and SIGKILL", async () => {
+		const calls: [string, number][] = [];
+		const t0 = Date.now();
+		const run = () => {
+			if (Date.now() - t0 < 400) throw new Error("ps: temporarily unavailable");
+			return { exitCode: 0, stdout: `S ${OMP_START}\n`, stderr: "" };
+		};
+		await laneScript.endStale([{ laneId: "lane-a", pid: 301, start: OMP_START }], { run, kill: (_pid, sig) => calls.push([sig, Date.now()]), log: () => undefined, graceMs: 300, deadlineMs: 2_000, pollMs: 50 });
+		const term = calls.find(([s]) => s === "SIGTERM")?.[1];
+		const killAt = calls.find(([s]) => s === "SIGKILL")?.[1];
+		expect(term).toBeDefined();
+		expect(killAt).toBeDefined();
+		expect(killAt! - term!).toBeGreaterThanOrEqual(300);
+	});
 });
 
 // ---- the starter as the process it is: the real probe, the exit code ------------------------------------------------

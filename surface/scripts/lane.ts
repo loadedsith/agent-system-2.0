@@ -873,12 +873,13 @@ export interface EndStaleOptions {
 /**
  * D4 (r1 F4): end the stale omps before this process spawns its own, within one aggregate deadline (`STALE_END_MS`). Each
  * is sent SIGTERM only while `ps -p <pid> -o stat=,lstart=` still matches its recorded start time (`ompPidState` `same`:
- * a reused pid, a zombie, a gone pid or one with no recorded start time is never signalled); they are polled together;
- * the survivors get SIGKILL `END_GRACE_MS` after the SIGTERM or at the deadline, whichever comes first, each right after
- * its own fresh probe still reads `same`. The deadline is checked before every probe but that one escalation pass, which
- * may overrun it by one ps bound per survivor. It never throws: every ps or kill failure is one `log` line, and it returns what is still
- * alive (or was never shown gone) at the deadline, on cancel, or once none is left. Only POSIX `ps` fields and
- * `process.kill` (D5). Callers wait outside any ledger transaction and spawn whatever it returns.
+ * a reused pid, a zombie, a gone pid or one with no recorded start time is never signalled); they are polled together.
+ * A pid gets SIGKILL `END_GRACE_MS` after its own SIGTERM, or one poll before the deadline, whichever comes first, and
+ * each signal follows that pid's own fresh probe in the same pass, never a match cached from an earlier one. The deadline
+ * and the cancel check come before every probe, so it returns by the deadline plus one ps bound. It never throws: every
+ * ps or kill failure is one `log` line, and it returns what is still alive (or was never shown gone) at the deadline, on
+ * cancel, or once none is left. Only POSIX `ps` fields and `process.kill` (D5). Callers wait outside any ledger
+ * transaction and spawn whatever it returns.
  */
 export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = {}): Promise<StaleOmp[]> {
 	const run = o.run ?? runPs;
@@ -887,6 +888,9 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 	const cancelled = o.cancelled ?? (() => false);
 	const deadline = Date.now() + (o.deadlineMs ?? STALE_END_MS);
 	const pollMs = o.pollMs ?? 250;
+	const graceMs = o.graceMs ?? END_GRACE_MS;
+	// The last escalation is due one poll before the deadline, so its pass still probes before the deadline stops probing.
+	const killCap = deadline - pollMs;
 	/** The pid is still the recorded omp; a failed probe is logged and counted as alive (never shown gone), never signalled. */
 	const state = (s: StaleOmp): PidState => ompPidState(s.pid, s.start, run, (reason) => log(`endStale: ${s.laneId} omp pid ${s.pid}: ps failed: ${reason}`));
 	const signal = (s: StaleOmp, sig: "SIGTERM" | "SIGKILL"): void => {
@@ -897,41 +901,33 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 		}
 	};
 	const past = (): boolean => Date.now() >= deadline;
-	const termed = new Set<StaleOmp>();
-	let killed = false;
-	/**
-	 * One probe of every pid in `of`, the cancel check (and, unless `escalating`, the deadline) before each; the unprobed
-	 * rest is kept as is.
-	 */
-	const probe = (of: readonly StaleOmp[], escalating = false): StaleOmp[] => {
+	/** Each pid's SIGKILL due time, set at its own SIGTERM. */
+	const killDue = new Map<StaleOmp, number>();
+	/** One probe of every pid in `of`, the cancel check and the deadline before each; the unprobed rest is kept as is. */
+	const probe = (of: readonly StaleOmp[]): StaleOmp[] => {
 		const next: StaleOmp[] = [];
 		for (let i = 0; i < of.length; i++) {
-			if (cancelled() || (!escalating && past())) return [...next, ...of.slice(i)];
+			if (cancelled() || past()) return [...next, ...of.slice(i)];
 			const s = of[i]!;
 			const st = state(s);
 			if (st === "unknown") log(`endStale: ${s.laneId} omp pid ${s.pid}: alive with no recorded start time, not signalled`);
 			if (st !== "same" && st !== "failed") continue;
-			if (st === "same" && !termed.has(s)) {
-				termed.add(s);
-				signal(s, "SIGTERM");
-			} else if (st === "same" && killed) signal(s, "SIGKILL");
+			if (st === "same") {
+				const due = killDue.get(s);
+				if (due === undefined) {
+					killDue.set(s, Math.min(Date.now() + graceMs, killCap));
+					signal(s, "SIGTERM");
+				} else if (Date.now() >= due) signal(s, "SIGKILL");
+			}
 			next.push(s);
 		}
 		return next;
 	};
 	/** The pids not shown gone at their newest probe (a failed probe counts as alive and is never signalled). */
 	let left = probe(stale);
-	const killAt = Math.min(Date.now() + (o.graceMs ?? END_GRACE_MS), deadline);
-	while (left.length > 0 && !cancelled()) {
-		if (!killed && Date.now() >= killAt) {
-			killed = true;
-			// Every SIGKILL follows its own pid's fresh start-time probe (`probe`), never a match cached from an earlier pass:
-			// a slow probe of one pid must not let another pid's reused number be killed.
-			left = probe(left, true);
-			continue;
-		}
-		if (past()) break;
-		await Bun.sleep(Math.max(1, Math.min(pollMs, (killed ? deadline : killAt) - Date.now())));
+	while (left.length > 0 && !cancelled() && !past()) {
+		const nextDue = Math.min(deadline, ...left.map((s) => killDue.get(s) ?? deadline).filter((d) => d > Date.now()));
+		await Bun.sleep(Math.max(1, Math.min(pollMs, nextDue - Date.now())));
 		left = probe(left);
 	}
 	for (const s of left) log(`endStale: ${s.laneId} omp pid ${s.pid}: not shown gone when endStale returned`);
