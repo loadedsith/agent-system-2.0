@@ -2,7 +2,7 @@
 title: Auto-boarding reuses the repository's open main train instead of creating a replacement
 status: building
 workload: wl-mvh33rgh9gisqo
-pr: none
+pr: 302
 ---
 
 ## Problem and scope
