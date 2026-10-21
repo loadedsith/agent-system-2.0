@@ -23,7 +23,9 @@
 // - Runtime artifact (§ B3 item 3; SPEC-2.0.md:409-410): the lane declares each slice's artifact
 //   command with the `slice_artifact` tool (an `assumption` entry, `artifact-command: …`); every
 //   bash result whose command is a declared one writes that slice's `artifact-failed:` or
-//   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged.
+//   `artifact-passed:` outcome. A refused push is P-11 row 8's own writer, unchanged. A pair_run that
+//   ran is read as its bash equivalent (gates/src/pair-call.ts canonicalResult; PLAN-2
+//   wl-mvb9mw00ycfjeo D5), so a declared artifact run through the pairing tools records the same outcomes.
 // - Artifact tree (wl-muptjioqjtvthc PLAN.md § 1): a declared artifact that exits 0 with the same
 //   working tree (surface/src/wtree.ts) at its tool_call and its tool_result writes `artifact-tree:`.
 //   The declarations of open, paused and done slices count (surface/src/signals.ts
@@ -52,6 +54,7 @@ import { spawnSync } from "node:child_process";
 import { lstatSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homeDir, type InstructionRow, type Ledger, type SliceRow } from "../../ledger/src/index";
+import { canonicalCall, canonicalResult } from "../../gates/src/pair-call";
 import { SCRATCH_ENTRY, scratchRootFor } from "../../gates/src/scratch";
 import { gateSession } from "../../gates/src/session";
 import { openScratchEntry } from "../src/errors";
@@ -564,7 +567,8 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 
 	// The tree a declared artifact runs on, taken before it runs. Surface loads before the gates, so the
 	// command here is still the model's; originalInput also covers a fence that ran first.
-	pi.on("tool_call", (event, ctx) => {
+	pi.on("tool_call", (typed, ctx) => {
+		const event = canonicalCall(typed, ctx.cwd);
 		if (event.toolName !== "bash" || !event.toolCallId) return undefined;
 		const s = laneSide(ctx);
 		if (!s) return undefined;
@@ -581,8 +585,9 @@ export default function laneRow(pi: SurfaceAPI, env: Record<string, string | und
 		return undefined;
 	});
 
-	pi.on("tool_result", (event, ctx) => {
+	pi.on("tool_result", (result, ctx) => {
 		pushAsides(ctx, "tool result");
+		const event = canonicalResult(result, ctx.cwd);
 		if (event.toolName !== "bash") return undefined;
 		const st = laneState(ctx);
 		const before = event.toolCallId ? st.trees.get(event.toolCallId) : undefined;
