@@ -220,7 +220,7 @@ interface World {
 	ago: <T>(ms: number, fn: () => T) => T;
 }
 
-function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number } = {}): World {
+function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number } = {}): World {
 	const root = realpathSync(tmp("trun"));
 	roots.push(root);
 	const gid = statSync(root).gid;
@@ -287,7 +287,8 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 
 	const cap = o.capMin ?? 2;
 	const config = join(root, "config.yml");
-	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n`);
+	const workers = o.fullWorkers === undefined ? "" : `  fullWorkers: ${o.fullWorkers}\n`;
+	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n${workers}`);
 
 	const env: Record<string, string> = {
 		PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "en_US.UTF-8", USER: process.env.USER ?? "jo",
@@ -786,6 +787,26 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		]);
 		expect(run.verdict).toBe("green");
 	});
+
+	test("fullWorkers (wl-mvg2kzuvwngdmo): the trusted phase writes it into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
+		for (const [workers, n] of [[3, 3], [undefined, 1]] as const) {
+			const w = world({ fullWorkers: workers });
+			const { wl, slice } = workload(w);
+			const runId = request(w, wl, slice, PR.green, fx.head.green);
+			await spawnRun(w, runId).exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("green");
+			expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
+			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n });
+			const lines = runnerLog(w, runId).split("\n");
+			const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
+			const workersLine = at(/ full workers \d+$/);
+			expect(lines.filter((l) => / full workers /.test(l))).toHaveLength(1);
+			expect(lines[workersLine]).toMatch(new RegExp(`^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z full workers ${n}$`));
+			expect(at(/ took the lock$/)).toBeLessThan(workersLine);
+			expect(at(new RegExp(` full ${runId} → exit `))).toBeGreaterThan(workersLine);
+		}
+	}, 120_000);
 
 	test("red keeps the slice open with every failing name and its whole first error line (25 of them), and messages the orchestrator when no lane holds the workload", async () => {
 		const w = world();
@@ -1987,16 +2008,26 @@ test("publication contention leaves a local error verdict and releases the run l
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
 	arm(w, runId, "result");
-	const child = spawnRun(w, runId);
+	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
 	await reached(w, runId, "result");
+	const deadline = Date.parse(/post-sweep finalization started; deadline (.+)/.exec(runnerLog(w, runId))![1]!);
 	w.ledger.db.exec("BEGIN IMMEDIATE");
 	try {
+		// The runner is another process, so spend its real clock budget at the hook;
+		// publication must inherit the remainder rather than start a fresh timeout.
+		await until("most of the shared finalization budget is spent", () => Date.now() >= deadline - 500, 2000);
+		const resumedAt = Date.now();
 		go(w, runId, "result");
-		await until("publication fails within its finite retry budget", () => child.exitCode !== null, 30_000);
+		await until("publication fails within the post-sweep deadline", () => child.exitCode !== null, 3000);
+		const exitedAt = Date.now();
+		expect(exitedAt).toBeGreaterThanOrEqual(deadline);
+		expect(exitedAt).toBeLessThan(deadline + 1000);
+		console.info(`publication under held ledger: exited ${exitedAt - resumedAt} ms after resume, ${exitedAt - deadline} ms after the shared deadline`);
 		expect(child.exitCode).toBe(START_EXIT.failed);
 		const result = JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"));
 		expect(result.verdict).toBe("error");
 		expect(result.reason).toContain("result publication failed:");
+		expect(result.reason).toContain("post-sweep deadline exceeded during publication");
 		const db = lockDbOf(w);
 		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
 	} finally {
@@ -2006,4 +2037,37 @@ test("publication contention leaves a local error verdict and releases the run l
 	}
 	expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(0);
 	expect(w.ledger.slice(slice)!.state).toBe("open");
+});
+
+test("publication retries a transient ledger lock within the post-sweep deadline and settles atomically", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	arm(w, runId, "result");
+	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+	try {
+		await reached(w, runId, "result");
+		w.ledger.db.exec("BEGIN IMMEDIATE");
+		try {
+			go(w, runId, "result");
+			await until("publication attempts the held ledger", () => marks(w, runId, "publication-busy").length > 0);
+			expect(child.exitCode).toBeNull();
+			expect(existsSync(join(w.runs, runId, "result.json"))).toBe(false);
+		} finally {
+			w.ledger.db.exec("ROLLBACK");
+			go(w, runId, "result");
+		}
+		await until("publication succeeds after the ledger lock clears", () => child.exitCode !== null, 3000);
+		expect(child.exitCode).toBe(0);
+		const results = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results;
+		expect(results).toHaveLength(1);
+		expect(results[0]!.verdict).toBe("green");
+		expect(w.ledger.slice(slice)!.state).toBe("done");
+		expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "green" });
+		const db = lockDbOf(w);
+		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+	} finally {
+		go(w, runId, "result");
+		await child.exited;
+	}
 });
