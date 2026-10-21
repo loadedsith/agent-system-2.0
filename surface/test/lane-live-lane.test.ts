@@ -306,6 +306,28 @@ describe("D4: endStale on real child processes", () => {
 		expect(cs.map((c) => c.signalCode)).toEqual(["SIGKILL", "SIGKILL", "SIGKILL"]);
 		expect(k.calls.filter(([, s]) => s === "SIGKILL").map(([pid]) => pid).sort()).toEqual(cs.map((c) => c.pid).sort());
 	}, 20_000);
+
+	// Review sl-review-exit: a slow probe of one pid crosses the grace after another pid's omp exited and its number was
+	// reused; the escalation must re-probe that pid, not SIGKILL it on the match its earlier probe cached. Simulated pids
+	// and a recording kill: no real process is signalled.
+	test("a pid reused while another pid's slow probe crosses the grace is not SIGKILLed", async () => {
+		const calls: [number, string][] = [];
+		let reused = false;
+		let slowProbes = 0;
+		const run = (args: string[]) => {
+			const pid = Number(args[1]);
+			if (pid === 102 && ++slowProbes === 2) {
+				Bun.sleepSync(300);
+				reused = true;
+			}
+			const start = pid === 101 && reused ? "Tue Oct 21 12:00:00 2026" : OMP_START;
+			return { exitCode: 0, stdout: `S ${start}\n`, stderr: "" };
+		};
+		const stale = [{ laneId: "lane-a", pid: 101, start: OMP_START }, { laneId: "lane-b", pid: 102, start: OMP_START }];
+		await laneScript.endStale(stale, { run, kill: (pid, sig) => calls.push([pid, sig]), log: () => undefined, graceMs: 100, deadlineMs: 800, pollMs: 50 });
+		expect(calls.filter(([pid]) => pid === 101)).toEqual([[101, "SIGTERM"]]);
+		expect(calls.filter(([pid]) => pid === 102).slice(0, 2)).toEqual([[102, "SIGTERM"], [102, "SIGKILL"]]);
+	});
 });
 
 // ---- the starter as the process it is: the real probe, the exit code ------------------------------------------------

@@ -874,8 +874,9 @@ export interface EndStaleOptions {
  * D4 (r1 F4): end the stale omps before this process spawns its own, within one aggregate deadline (`STALE_END_MS`). Each
  * is sent SIGTERM only while `ps -p <pid> -o stat=,lstart=` still matches its recorded start time (`ompPidState` `same`:
  * a reused pid, a zombie, a gone pid or one with no recorded start time is never signalled); they are polled together;
- * the survivors get SIGKILL `END_GRACE_MS` after the SIGTERM or at the deadline, whichever comes first. The deadline is
- * checked before every probe. It never throws: every ps or kill failure is one `log` line, and it returns what is still
+ * the survivors get SIGKILL `END_GRACE_MS` after the SIGTERM or at the deadline, whichever comes first, each right after
+ * its own fresh probe still reads `same`. The deadline is checked before every probe but that one escalation pass, which
+ * may overrun it by one ps bound per survivor. It never throws: every ps or kill failure is one `log` line, and it returns what is still
  * alive (or was never shown gone) at the deadline, on cancel, or once none is left. Only POSIX `ps` fields and
  * `process.kill` (D5). Callers wait outside any ledger transaction and spawn whatever it returns.
  */
@@ -898,12 +899,15 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 	const past = (): boolean => Date.now() >= deadline;
 	const termed = new Set<StaleOmp>();
 	let killed = false;
-	/** One probe of every pid in `of`, the deadline and the cancel check before each; the unprobed rest is kept as is. */
-	const probe = (of: readonly { s: StaleOmp; same: boolean }[]): { s: StaleOmp; same: boolean }[] => {
-		const next: { s: StaleOmp; same: boolean }[] = [];
+	/**
+	 * One probe of every pid in `of`, the cancel check (and, unless `escalating`, the deadline) before each; the unprobed
+	 * rest is kept as is.
+	 */
+	const probe = (of: readonly StaleOmp[], escalating = false): StaleOmp[] => {
+		const next: StaleOmp[] = [];
 		for (let i = 0; i < of.length; i++) {
-			if (cancelled() || past()) return [...next, ...of.slice(i)];
-			const s = of[i]!.s;
+			if (cancelled() || (!escalating && past())) return [...next, ...of.slice(i)];
+			const s = of[i]!;
 			const st = state(s);
 			if (st === "unknown") log(`endStale: ${s.laneId} omp pid ${s.pid}: alive with no recorded start time, not signalled`);
 			if (st !== "same" && st !== "failed") continue;
@@ -911,24 +915,27 @@ export async function endStale(stale: readonly StaleOmp[], o: EndStaleOptions = 
 				termed.add(s);
 				signal(s, "SIGTERM");
 			} else if (st === "same" && killed) signal(s, "SIGKILL");
-			next.push({ s, same: st === "same" });
+			next.push(s);
 		}
 		return next;
 	};
-	/** The pids not shown gone at their newest probe, each with whether that probe matched (`same`; a failed probe is never signalled). */
-	let left = probe(stale.map((s) => ({ s, same: false })));
+	/** The pids not shown gone at their newest probe (a failed probe counts as alive and is never signalled). */
+	let left = probe(stale);
 	const killAt = Math.min(Date.now() + (o.graceMs ?? END_GRACE_MS), deadline);
 	while (left.length > 0 && !cancelled()) {
 		if (!killed && Date.now() >= killAt) {
 			killed = true;
-			for (const p of left) if (p.same) signal(p.s, "SIGKILL");
+			// Every SIGKILL follows its own pid's fresh start-time probe (`probe`), never a match cached from an earlier pass:
+			// a slow probe of one pid must not let another pid's reused number be killed.
+			left = probe(left, true);
+			continue;
 		}
 		if (past()) break;
 		await Bun.sleep(Math.max(1, Math.min(pollMs, (killed ? deadline : killAt) - Date.now())));
 		left = probe(left);
 	}
-	for (const p of left) log(`endStale: ${p.s.laneId} omp pid ${p.s.pid}: not shown gone when endStale returned`);
-	return left.map((p) => p.s);
+	for (const s of left) log(`endStale: ${s.laneId} omp pid ${s.pid}: not shown gone when endStale returned`);
+	return left;
 }
 
 /** D4: the stale set as the ledger stands now (`staleOmps`), read by the process about to spawn omp, outside any transaction. */
