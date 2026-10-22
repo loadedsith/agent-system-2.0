@@ -12,7 +12,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index"
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
-import { controlEntries, LANE_CAP_ENV, laneExitBody, laneReadyBody, launchRequestedBody, queuedBody, queuedOf, STARTER_EXIT } from "../src/launch";
+import { controlEntries, LANE_CAP_ENV, laneExitBody, laneReadyBody, laneStartedBody, launchRequestedBody, queuedBody, queuedOf, STARTER_EXIT } from "../src/launch";
 import type { PidState } from "../src/omp-probe";
 import { inputSpent } from "../src/orchestrator-question";
 import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
@@ -384,6 +384,27 @@ describe("the queue gate (D5-D7)", () => {
 			expect({ mode: config.mode, r: reserve(l, low, config) }).toEqual({ mode: config.mode, r: { ok: true, laneId: laneIdOf(low, 1), cause: config.mode === "order" ? `request ${req}` : "first" } });
 			expect(isQueuedNow(l, low)).toBe(false);
 			expect(queuePosition(l, top, l.now())).toMatchObject({ position: 1, of: 1 });
+		}
+	});
+
+	test("an earlier lane still live refuses a queued workload the queue gate would hold: held, before the gate, with no launch: and no rank-shown: written, in every mode (PLAN wl-mvifaz8r8dieps R14)", () => {
+		for (const config of MODES) {
+			const { l, open } = world();
+			open("HIGH top", { unblocks: 0.9, repo: REPO_B, queued: true });
+			const low = open("low", { unblocks: 0.1, queued: true });
+			// an earlier lane's runner started on low and has no lane-exit:; with no launch: of its own, low stays queued, cause first
+			const earlier = laneIdOf(low, 1);
+			l.recordEntry({ by: LANE_RUNNER_BY, workloadId: low, kind: "assumption", body: laneStartedBody(earlier, { pid: 4101, start: "Mon Oct 20 11:00:00 2026", session: null, argv: [], runnerPid: 4001 }) });
+			const rankShown = () => l.db.query<{ n: number }, []>("SELECT count(*) AS n FROM entries WHERE body LIKE 'rank-shown:%'").get()!.n;
+			const shownBefore = rankShown();
+			// with that lane gone, the queue gate alone refuses low: top, queued above it, is launchable
+			expect({ mode: config.mode, r: reserve(l, low, config) }).toEqual({ mode: config.mode, r: { ok: false, reason: "queued: position 2" } });
+			const p = fakeProbe({ omp: "same", runner: "gone" });
+			expect({ mode: config.mode, r: reserve(l, low, config, 3, false, undefined, p.probeFor) }).toEqual({ mode: config.mode, r: { ok: false, reason: `held: ${earlier} still running (omp pid 4101)` } });
+			expect(p.calls).toEqual([{ laneId: earlier, what: "omp", pid: 4101 }]);
+			expect(launches(l, low)).toEqual([]);
+			expect(rankShown()).toBe(shownBefore);
+			expect(isQueuedNow(l, low)).toBe(true);
 		}
 	});
 

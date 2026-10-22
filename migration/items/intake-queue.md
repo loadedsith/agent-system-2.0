@@ -6,6 +6,8 @@ pr: 264
 ---
 **Stacks on PR #158 (`migration/items/rank-ordered-launch.md`) and merges after it.** Workload `wl-mvbcjadqgblr7k` (plan rev 3 at `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvbcjadqgblr7k/PLAN.md`, D1–D9). Its branch is cut from PR #158's branch and uses #158's `rankOpen`, rank gate and drain order unchanged in shape. It adds the intake queue, which #158 does not have: a new ask waits in rank order while the started work outnumbers the lane slots, instead of opening one more workload that competes for a slot.
 
+Ported onto main with #158 by workload wl-mvifaz8r8dieps (PR pending), superseding #264.
+
 **What changed.**
 - Queued is a control entry, not a schema status (D1). The open tool writes `queued: <reason>` (prefix `queued`, writer the surface alone, `queuedBody` in `surface/src/launch.ts`) in the open's own transaction. `queuedOf` reads it: the workload is queued until its first `launch:` attempt of any cause. No schema change; `ledger/schema.sql` stays at its version.
 - The cap (D2). `startedIdle` (`surface/src/rank-launch.ts`): open workloads, not the standing one, not `due:`, not queued, with a launch attempt or a slice, and no live holder. While more of them exist than `laneCap` (`AGENT_SYSTEM_MAX_LANES`, default 3), the open tool queues the ask. The ask is still a whole open workload, with its `done:`, `repo:`, ceiling and Jev ask.
