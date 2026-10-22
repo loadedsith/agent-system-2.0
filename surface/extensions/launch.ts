@@ -30,6 +30,9 @@ const inactive = text("This session is not the orchestrator surface; nothing was
 /** The open and tick line for a workload the rank gate queues behind a higher-ranked launchable one. */
 const queuedLine = (workloadId: string, above: string): string =>
 	`${workloadId} queued behind ${above} (Jev rank); it launches once nothing ranked above it is launchable`;
+/** The open and tick line for a queued workload the intake queue's gate holds behind a launchable one ranked above it (PLAN wl-mvbcjadqgblr7k D5). */
+const intakeQueuedLine = (workloadId: string, position: string): string =>
+	`${workloadId} queued at position ${position} (intake queue, rank order); it launches once no queued workload ranked above it is launchable`;
 /** The open and tick line for a priority stop `preemptFor` wrote (PLAN wl-mv8wzytml878b4 D4). */
 export const priorityPausingLine = (p: { laneId: string; workloadId: string; forWl: string }): string =>
 	`priority-pausing ${p.laneId} on ${p.workloadId} for ${p.forWl}`;
@@ -78,9 +81,11 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
 			default: {
-				// Jev ranking's refusals (D7): `ranked: below <wl>` and `parallel: <reason>`.
+				// Jev ranking's refusals (D7): `ranked: below <wl>`, `queued: position <n>` (the intake queue) and `parallel: <reason>`.
 				const below = /^ranked: below (\S+)$/.exec(verdict.reason);
 				if (below) return { attempted: false, code: null, line: queuedLine(workloadId, below[1]!) };
+				const position = /^queued: position (\d+)$/.exec(verdict.reason);
+				if (position) return { attempted: false, code: null, line: intakeQueuedLine(workloadId, position[1]!) };
 				return { attempted: false, code: null, line: `${workloadId} held by the parallel rule (Jev rank) — ${verdict.reason.replace(/^parallel: /, "")}; it launches when no lane it would run beside holds it` };
 			}
 		}
@@ -91,8 +96,11 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 		const out = (r.stdout.trim() || r.stderr.trim()).split("\n").filter(Boolean);
 		const last = out[out.length - 1] ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
 		// The reservation's own gate run binds: a higher-ranked workload that became launchable after the pre-check queues this one.
-		const below = r.code === STARTER_EXIT["not-launchable"] ? /not launched: ranked: below (\S+)$/.exec(last) : null;
+		const refused = r.code === STARTER_EXIT["not-launchable"] ? last : "";
+		const below = /not launched: ranked: below (\S+)$/.exec(refused);
 		if (below) return { attempted: true, code: r.code, line: queuedLine(workloadId, below[1]!) };
+		const position = /not launched: queued: position (\d+)$/.exec(refused);
+		if (position) return { attempted: true, code: r.code, line: intakeQueuedLine(workloadId, position[1]!) };
 		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
 	} catch (err) {
 		return { attempted: true, code: null, line: `${workloadId}: the starter could not be run: ${String(err)}` };

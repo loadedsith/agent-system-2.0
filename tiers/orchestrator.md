@@ -252,6 +252,12 @@ Plumb's", nor any for-Plumb note: the lane runs the full suite on the test runne
 fence (`lane_full_test`, MIGRATION.md item 24). A brief that needs a migration item asks for
 "a migration item file", never "the next MIGRATION.md item".
 
+When the open tool's result says the ask was queued (the intake queue, USER-GUIDE.md § *Intake
+queue*), tell Jo `queued, position N` in your reply, N from that result. While Jo's flow-repair
+ruling (in-mvfiztvfi7ez28) stands, pass `intake: "queue"` on every open that is not one of the
+flow fixes it names. Pass `intake: "now"` only with `inputId`: the input id of Jo's own words
+granting that ask an exception, never your own reading.
+
 At workload open you read the target repository's history before the first slice brief is
 written: the `.ai/decision-log/` entries newer than the last 2.0 workload on that repository
 are rendered into the lane brief as context (`surface/src/decision-log.ts`). Before you open a

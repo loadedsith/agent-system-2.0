@@ -5,10 +5,10 @@ import { TEST_RUNNER_BY } from "../../ledger/src/index";
 import { consumeLines } from "../src/delivery";
 import { errorLines, parseDue, reservedStates, waitingReserved } from "../src/errors";
 import { ensureStandingWorkload, identityOf, recordIdentity } from "../src/identity";
-import { laneExitBody, laneStopAcceptedBody, laneStopRequestBody, planFirstBody } from "../src/launch";
+import { laneExitBody, laneStopAcceptedBody, laneStopRequestBody, planFirstBody, queuedBody } from "../src/launch";
 import { Numbering } from "../src/numbering";
 import { oneLiner, rankLines, renderWake } from "../src/render";
-import { briefHash, formatOverride, formatSignal, goalsHash, rankOpen, type SignalAnswers } from "../src/rank";
+import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
 import { artifactFailures, laneDiedShutdownBody } from "../src/signals";
 import { testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf } from "../src/test-run";
 import { ARTIFACT_FAILED_PREFIX, LEDGER_TOOL, ORCHESTRATOR_RECIPIENT, RANK_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -654,5 +654,62 @@ describe("T9 rank and priority pause in the render (PLAN wl-mv8wzytml878b4 D4)",
 		expect(lineOf(wake.text, wl)).toContain(" · lane: none · slices: ");
 		expect(wake.text).not.toContain("priority-");
 		expect(renderWake(ledger, { workloadId: wl }).text).not.toContain("priority-");
+	});
+});
+
+describe("the intake queue in the render (PLAN wl-mvbcjadqgblr7k D8)", () => {
+	const at = (hour: number): string => new Date(2026, 9, 14, hour).toISOString();
+	const open = (ledger: Ledger, brief: string) => ledger.openWorkload({ by: SURFACE_BY, brief, stakes: "normal", mode: "autonomous" });
+	const lineOf = (text: string, wl: string) => text.split("\n").find((l) => l.startsWith(`- ${wl}`))!;
+	const queue = (ledger: Ledger, wl: string) => ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: queuedBody("intake queue") });
+	function signal(ledger: Ledger, wl: string, unblocks: number): void {
+		const answers: SignalAnswers = {
+			unblocks_jo: { type: "bool", bool: unblocks }, cuts_spend: { type: "bool", bool: 0.1 }, fixes_breakage: { type: "bool", bool: 0.1 },
+			states_deadline: { type: "bool", bool: 0.05 }, irreversible: { type: "bool", bool: 0.05 }, builds_enforcer: { type: "bool", bool: 0.1 },
+			deadline_when: { type: "choice", choice: "none", confidence: 0.9 },
+		};
+		const body = formatSignal({ brief: briefHash(ledger.workload(wl)!.brief), goals: goalsHash([]), askedOn: rankDay(ledger.now()), judge: "typesafe/jev-1.13.0", tokens: 1, cost: 0, answers });
+		ledger.recordEntry({ by: RANK_BY, workloadId: wl, kind: "assumption", body });
+	}
+
+	/** Three open workloads: `plain` never queued, `older` queued unscored, `newer` queued and scored (so it ranks first in the queue). */
+	function queued() {
+		const c = clock(at(9));
+		const { ledger } = tempLedger(c.now);
+		ensureStandingWorkload(ledger);
+		const plain = open(ledger, "Plain ask");
+		c.at(at(10));
+		const older = open(ledger, "Older ask, unscored");
+		queue(ledger, older);
+		c.at(at(11));
+		const newer = open(ledger, "Newer ask, scored");
+		queue(ledger, newer);
+		signal(ledger, newer, 0.9);
+		c.at(at(12));
+		return { ledger, plain, older, newer };
+	}
+
+	test("a queued workload's wake line, block and oneLiner carry queued #N of M in queue order; an unqueued one carries none; no needs-you line", () => {
+		const { ledger, plain, older, newer } = queued();
+		const wake = renderWake(ledger, { trigger: "tick" });
+		expect(lineOf(wake.text, newer)).toContain("· mode: autonomous · queued #1 of 2 · ceiling ");
+		expect(lineOf(wake.text, older)).toContain("· mode: autonomous · queued #2 of 2 · ceiling ");
+		expect(lineOf(wake.text, plain)).not.toContain("queued");
+		expect(wake.text.match(/queued #\d/g)).toHaveLength(2);
+		expect(oneLiner(ledger, ledger.workload(older)!)).toStartWith("stakes: normal · mode: autonomous · queued #2 of 2 — flip either with one word: ");
+		expect(oneLiner(ledger, ledger.workload(plain)!)).not.toContain("queued");
+		expect(renderWake(ledger, { workloadId: newer }).text).toContain("\nstakes: normal · mode: autonomous · queued #1 of 2 — flip either");
+		// waiting by design: never a needs-you line, and the needs-you block never names the queue
+		expect(wake.lines.filter((l) => l.workloadId === older || l.workloadId === newer)).toEqual([]);
+		expect(wake.text.slice(0, wake.text.indexOf("## open workloads"))).not.toContain("queued");
+	});
+
+	test("after its launch attempt the tag is gone and the next queued workload moves to #1 of 1", () => {
+		const { ledger, older, newer } = queued();
+		ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: newer, kind: "assumption", body: "launch: lane-a cause first requested-by surface" });
+		const wake = renderWake(ledger, { trigger: "tick" });
+		expect(lineOf(wake.text, newer)).not.toContain("queued");
+		expect(oneLiner(ledger, ledger.workload(newer)!)).not.toContain("queued");
+		expect(lineOf(wake.text, older)).toContain(" · queued #1 of 1 · ");
 	});
 });

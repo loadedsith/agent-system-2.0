@@ -88,6 +88,7 @@ export const CONTROL_PREFIXES = [
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
+	"queued",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -170,6 +171,8 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
+ * `queued: <reason>` is the surface's alone (PLAN wl-mvbcjadqgblr7k D1): the open tool writes it in the open's transaction on an ask
+ * it puts in the intake queue; `queuedOf` reads it, and the first `launch:` attempt after it, of any cause, ends the queued state.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -225,6 +228,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-override": [SURFACE_BY],
 	"rank-unpin": [SURFACE_BY],
 	"rank-audit": [SURFACE_BY],
+	queued: [SURFACE_BY],
 };
 
 export interface ControlEntry {
@@ -443,9 +447,11 @@ export function instructionLine(i: InstructionRow): string {
 
 /**
  * Jev ranking's gate refusals (PLAN wl-mv8k039gvogt8g D7, surface/src/rank-launch.ts): `ranked: below <wl>` when a
- * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds. `launchable` never returns them.
+ * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds, and the intake queue's
+ * `queued: position <n>` (PLAN wl-mvbcjadqgblr7k D5) when a queued workload ranked above it is launchable now.
+ * `launchable` never returns them.
  */
-export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}`;
+export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}` | `queued: position ${number}`;
 export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
@@ -819,6 +825,24 @@ export function priorityPausingOf(control: readonly ControlEntry[]): { laneId: s
 		const forWl = priorityFor(STOP_REQUESTED.exec(c.rest)?.[1] ?? null);
 		if (forWl === null || laneExit(control, c.laneId) !== null || attemptAfter(control, i)) continue;
 		return { laneId: c.laneId, forWl, requestId: c.id };
+	}
+	return null;
+}
+
+/** `queued: <reason>`: the open tool's record that the ask went into the intake queue (PLAN wl-mvbcjadqgblr7k D1). */
+export function queuedBody(reason: string): string {
+	return `queued: ${oneLine(reason)}`;
+}
+
+/**
+ * The workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D1): its newest valid `queued:` entry (the surface's alone,
+ * `controlEntries`) with no valid `launch:` attempt of any cause after it, or null. The first attempt ends the state.
+ */
+export function queuedOf(control: readonly ControlEntry[]): { entryId: string; reason: string; createdAt: string } | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "queued") continue;
+		return attemptAfter(control, i) ? null : { entryId: c.id, reason: c.rest, createdAt: c.createdAt };
 	}
 	return null;
 }
