@@ -19,10 +19,10 @@ Ported onto main by workload `wl-mvifaz8r8dieps` as PR #305, which merges #158's
 - Flow signals unchanged (D9). A queued ask stays `status='open'`, so ROOT-CAUSE signal 2 still counts it. USER-GUIDE.md § *Intake queue* gives a separate read-only `sqlite3 -readonly` query for the queued count.
 - Tests: `surface/test/intake-queue.test.ts` (new, manifest row added), `surface/test/render.test.ts` (the `queued #N of M` tag and its end at launch).
 
-**After merge.** Merge PR #158 first, then this PR, and pull. Run `install/install.sh` so the installed orchestrator tier (`{profile}/agent/agents/orchestrator.md`) carries the intake rule, then restart Ilex so the open tool's `intake` parameter and the render load. No config change: the cap reads the existing `AGENT_SYSTEM_MAX_LANES`.
+**After merge.** PR #305 carries #158's change, so no separate #158 merge is needed; pull after #305 lands. Run `install/install.sh` so the installed orchestrator tier (`{profile}/agent/agents/orchestrator.md`) carries the intake rule, then restart Ilex so the open tool's `intake` parameter and the render load. No config change: the cap reads the existing `AGENT_SYSTEM_MAX_LANES`.
 
 **Out of scope.** A `queued` schema status (needs a schema version 6 and a ledger upgrade path); a second score or order for the queue; changing ROOT-CAUSE signal 2; deciding which asks are flow fixes (Ilex's judgment under Jo's ruling, prompt-only).
 
-**Live acceptance.** After the merges, the install step and an Ilex restart: the next ask Ilex opens while started-but-idle workloads exceed the lane cap (or with `intake: "queue"`) gets a `queued:` entry, Ilex tells Jo `queued, position N`, the wake line shows `queued #N of M`, and when a lane frees the drain launches the queue top with cause `first`.
+**Live acceptance.** After the merge, the install step and an Ilex restart: the next ask Ilex opens while started-but-idle workloads exceed the lane cap (or with `intake: "queue"`) gets a `queued:` entry, Ilex tells Jo `queued, position N`, the wake line shows `queued #N of M`, and when a lane frees the drain launches the queue top with cause `first`.
 
 **Rollback.** Revert the PR. A queued ask is already an open workload; its `queued:` entry stays in the ledger as history, and Jo's launch word starts any of them at once.
