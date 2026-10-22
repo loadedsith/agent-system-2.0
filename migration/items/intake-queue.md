@@ -2,11 +2,11 @@
 title: Intake queue
 status: open
 workload: wl-mvbcjadqgblr7k
-pr: 264
+pr: 305
 ---
-**Stacks on PR #158 (`migration/items/rank-ordered-launch.md`) and merges after it.** Workload `wl-mvbcjadqgblr7k` (plan rev 3 at `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvbcjadqgblr7k/PLAN.md`, D1–D9). Its branch is cut from PR #158's branch and uses #158's `rankOpen`, rank gate and drain order unchanged in shape. It adds the intake queue, which #158 does not have: a new ask waits in rank order while the started work outnumbers the lane slots, instead of opening one more workload that competes for a slot.
+**Carries PR #158 (`migration/items/rank-ordered-launch.md`) whole.** Built by workload `wl-mvbcjadqgblr7k` (plan rev 3 at `/Users/jowolff/agent-scratch/agent-system-2.0/wl-mvbcjadqgblr7k/PLAN.md`, D1–D9) on PR #158's branch, using #158's `rankOpen`, rank gate and drain order unchanged in shape. It adds the intake queue, which #158 does not have: a new ask waits in rank order while the started work outnumbers the lane slots, instead of opening one more workload that competes for a slot.
 
-Ported onto main with #158 by workload wl-mvifaz8r8dieps (PR pending), superseding #264.
+Ported onto main by workload `wl-mvifaz8r8dieps` as PR #305, which merges #158's head a643caf and #264's head d8e2ed18 and supersedes #264.
 
 **What changed.**
 - Queued is a control entry, not a schema status (D1). The open tool writes `queued: <reason>` (prefix `queued`, writer the surface alone, `queuedBody` in `surface/src/launch.ts`) in the open's own transaction. `queuedOf` reads it: the workload is queued until its first `launch:` attempt of any cause. No schema change; `ledger/schema.sql` stays at its version.
