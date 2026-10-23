@@ -169,7 +169,7 @@ if origin is absent or its recorded session is an existing regular file:
     resume = resumePlan(control, laneId, unconsumedResolutions, model)
 else:
     # A recorded path that disappeared is not itself a readiness timeout.
-    candidates = regular files immediately inside this workload's sessions directory
+    candidates = regular .jsonl files immediately inside this workload's sessions directory
     newest = greatest mtime; equal mtimes choose lexicographically greatest absolute path
     provenance = newest session-bearing started/parked entry whose session realpath
                  matches newest's realpath; use that origin lane's lane-started.model
@@ -183,18 +183,22 @@ stderrCapture = drain child.stderr immediately; forward every chunk and retain o
 record lane-started: (pid, start time, session path, argv, model, ranModel, resumeSkipped)
 readiness = wait ≤ 3 min for workload.changed_by == laneId and, with a named model, get_state's provider/id == it
             else fail at readiness (no claim timeout) or model (model mismatch/no answer)
-on child exit before readiness: stage startup, outcome never-ready, context = bounded captured stderr
+on child exit before readiness with no decided failure/stop: stage startup, outcome never-ready, context = bounded captured stderr
 meter at 100 % → stop before lane-ready: (no prompt); else record lane-ready:, send prompt p1
 ```
 
-The `startup` stage is reserved for an observed OMP exit before readiness; it is distinct from a live process that
+The `startup` stage is reserved for an observed OMP exit before readiness when no explicit failure or stop has been
+decided. Runner read-loop failures keep their actual stage/cause before terminating OMP; model/headroom failures,
+elapsed readiness timeouts and accepted stops also retain precedence. Startup is distinct from a live process that
 never claims before the readiness deadline (`readiness`) or fails the model check (`model`). The runner owns OMP's
 stderr pipe, drains it while OMP runs, and forwards chunks to runner stderr. It retains a fixed 8192-byte tail,
 then normalizes whitespace and reports at most the final 1000 characters (with a truncation marker), or `no stderr`.
 After exit, settling waits for EOF or 250 ms, then cancels the reader without awaiting cancellation. A runner crash
 may lose undecided diagnostics; the bounded tail is context, not a crash parser, and a long stack-only tail may omit
 the first diagnostic. No retry/race repair is attempted for a session that vanishes during discovery or after
-selection.
+selection. Captured stderr is bounded, not redacted: diagnostic text may persist in ledger bodies and committed
+decision logs, including any sensitive text OMP emitted. Descendant stderr retention is not guaranteed after the
+runner closes its pipe; no particular descendant error, signal or shutdown behavior is claimed.
 
 Runner signal handling pseudocode (≤ 30 lines in the original; *amended 2026-10-08, MIGRATION.md item 40, workload `wl-muq1v31q5ly7ls`*: the turn end waits for a settled omp, may send up to two continue prompts on the same omp, holds for the lane's own unsettled hands, and writes every death it decides before EOF; the decision is `turnEnd` in `surface/src/turn-end.ts`):
 
@@ -272,7 +276,7 @@ Every failure the refuters raised. "Jo sees" means the § B3 line as the poll pu
 | `omp` binary missing | Starter preflight, after the reservation: `omp` not on PATH (exit 2) | `launch-failed: <laneId>: preflight: omp not on PATH`, message `lane-died: <laneId>: launch failed at preflight: omp not on PATH`; pre-claim released | Tool result line at open, and the lane-died line within one poll | Install OMP; `orchestrator_launch_lane <wl>` |
 | `git worktree add` fails (path exists and is not a worktree, base ref missing, disk) | Starter exit 5 with git's stderr | `launch-failed: … worktree: <stderr line>` + `lane-died:` message; pre-claim released | Same | Fix the path or branch by hand (`as2 lane cleanup <wl>` when it is a stale worktree); relaunch on Jo's word |
 | Fence denies the worktree path (a lane whose worktree resolved under `~/.agent-system-2/`, e.g. a symlinked repo parent) | Starter preflight compares `canonical(worktree)` against `fenceTargets` for a no-op command in that dir (`gates/src/fence.ts:199-204`); any target that is a prefix of the worktree is exit 4 | `launch-failed: … worktree inside a fenced path <p>` + `lane-died:` message | Same | Move the checkout or set `AGENT_SYSTEM_LEDGER_DB` elsewhere; relaunch |
-| OMP exits before readiness (startup failure, not a readiness timeout) | Runner child-exit event before claim/model readiness | `launch-failed: <laneId>: startup: omp exit code <code> signal <signal>; <bounded stderr context>` and `lane-died: <laneId>: launch failed at startup: …`; release pre-claim and write `lane-exit:` | lane-died line within one poll; runner log path in entry | Inspect runner log and stderr context; correct startup cause, then relaunch on Jo's word |
+| OMP exits before readiness (startup failure, not a readiness timeout) | Runner child-exit event before claim/model readiness, with no already-decided failure or accepted stop | `launch-failed: <laneId>: startup: omp exit code <code> signal <signal> before ready; <bounded stderr context>` and `lane-died: <laneId>: launch failed at startup: …`; release pre-claim and write `lane-exit:` | lane-died line within one poll; runner log path in entry | Inspect runner log and stderr context; correct startup cause, then relaunch on Jo's word |
 | OMP remains alive but does not claim before the readiness deadline | Runner: no `workload.changed_by == laneId` within 3 min | Runner SIGKILLs `omp`, releases pre-claim, writes `launch-failed: … never ready in 3m` and `lane-died: <laneId>: launch failed at readiness: no claim in 3m`, `lane-exit:` | lane-died line within one poll; runner log path in entry | Read `~/.agent-system-2/lanes/<wl>/runner.log`; fix the readiness cause and relaunch on Jo's word |
 | Named model not confirmed (*added 2026-10-09, MIGRATION.md item 85*): OMP's first `get_state` reports another `provider/id`, no model, `success: false`, or no answer within the readiness window | Runner, before `lane-ready:`: `stateModelCheck` on the first `get_state` response; the readiness poll for the timeout | Runner SIGKILLs `omp` before any prompt, releases, writes exactly one `launch-failed: <laneId> model: named <X>, omp started <Y> (…)` (or `… get_state reported no provider/id model`, `… get_state failed: <e>`, `… no get_state model within 3m`), `lane-died: <laneId>: launch failed at model: …`, `lane-exit: … outcome never-ready` | lane-died line within one poll | Fix the selector or the profile's auth for that provider, then relaunch with `model`; `model: "default"` returns to the profile default and resumes the newest session only if it ran on the default |
 | Relaunch on another model than the recorded session (*added 2026-10-09, item 85*) | Runner at spawn: `resumePlan` compares the session's origin lane's `lane-started:` `model` with the named one (legacy entry: default; no `lane-started:`: unknown) | No `--resume`: OMP starts a fresh session in the same session dir; `lane-started:` records `resumeSkipped: "<session> ran on <model>"` and `runner.log` says so | Nothing pushed; the first prompt carries the brief and the workload's ledger state, not the old conversation | None. Naming the old model again resumes only the session the normal origin rule (`resumeOrigin`) picks at that spawn, and only when its origin lane ran on that model; older sessions are never searched, so once a lane on the other model has recorded a session the switch back starts fresh too |

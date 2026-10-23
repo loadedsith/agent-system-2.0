@@ -1874,14 +1874,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock, f.stage === HEADROOM_STAGE ? LANE_RUNNER_BY : LANE_STARTER_BY);
 			return f.code;
 		}
-		child.kill("SIGKILL");
-		const code = await child.exited;
-		await stderrCapture?.settle();
+		// Decide before killing: the child-exit handler must not turn this runner failure into startup SIGKILL.
 		if (!ready && outcome === null) {
 			readinessStage = f.stage;
 			readinessFailure = `${f.stage} failed: ${f.message}`;
 		}
 		outcome ??= ready ? "died" : "never-ready";
+		child.kill("SIGKILL");
+		const code = await child.exited;
+		await stderrCapture?.settle();
 		finish(code, child.signalCode ?? null);
 		return f.code;
 	}
