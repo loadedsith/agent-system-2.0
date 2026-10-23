@@ -21,6 +21,8 @@ Ported onto main by workload `wl-mvifaz8r8dieps` as PR #305, which merges #158's
 
 **Budget invariant batching.** The port's full suite exposed a five-second timeout in the aggregate `surface/test/decision-log.test.ts` byte-budget invariant. It keeps all 1,227 seeded budget cases and their assertions in independent batches of at most 16, with each fixture initialized once in `beforeAll`; no timeout or production-rendering change.
 
+**Final-head close cases.** The port's full suite also exposed a five-second aggregate timeout in `surface/test/close-fresh.test.ts`. Its metadata-only and code-changing merged-PR scenarios now register as separate tests, preserving both fixtures, outcomes and every assertion under the existing timeout.
+
 **After merge.** PR #305 carries #158's change, so no separate #158 merge is needed; pull after #305 lands. Run `install/install.sh` so the installed orchestrator tier (`{profile}/agent/agents/orchestrator.md`) carries the intake rule, then restart Ilex so the open tool's `intake` parameter and the render load. No config change: the cap reads the existing `AGENT_SYSTEM_MAX_LANES`.
 
 **Out of scope.** A `queued` schema status (needs a schema version 6 and a ledger upgrade path); a second score or order for the queue; changing ROOT-CAUSE signal 2; deciding which asks are flow fixes (Ilex's judgment under Jo's ruling, prompt-only).
