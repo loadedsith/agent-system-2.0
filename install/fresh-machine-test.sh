@@ -11,7 +11,7 @@
 # command under zsh and bash alike, and `as2 off` / `as2 on` flip gates.fence.enabled in the
 # rendered profile config. The installed OMP reads the rendered setupVersion, it equals that OMP's
 # CURRENT_SETUP_VERSION and selects no first-launch setup scene, and install's last line names the
-# providers the profile routes to with the once-per-profile /login (M7 finding 2); the eleven
+# providers served by the shared OMP auth broker (M7 finding 2); the eleven
 # look-and-feel keys copied from Jo's default profile are in the rendered profile at their values
 # and the installed OMP reads each one back. The profile's mcp.json (profile/mcp.json) lands beside
 # config.yml and OMP's own MCP discovery under that HOME and profile finds exactly the ctx server,
@@ -117,6 +117,10 @@ else
 	ok "overlay done"
 fi
 
+step "2b. install the repository's locked OMP packages"
+(cd "$CLONE" && bun install --frozen-lockfile) || die "bun install --frozen-lockfile exited $?"
+ok "locked OMP packages installed"
+
 step "3. install with a temp HOME: $FAKE_HOME"
 mkdir -p "$FAKE_HOME"
 run_install || die "install exited $?"
@@ -157,11 +161,11 @@ done
 WANT_AT="$(awk -F'\t' -v clone="$CLONE" '$2 == "skill" { n = $1; sub(/\/SKILL\.md$/, "", n); sub(/^.*\//, "", n); print n "\t" clone "/" $1 }' "$CLONE/install/manifest.tsv" | LC_ALL=C sort)"
 WANT="$(printf '%s\n' "$WANT_AT" | cut -f1)"
 [ "$(printf '%s' "$WANT" | grep -c .)" -eq 25 ] || die "manifest has $(printf '%s' "$WANT" | grep -c .) skill rows, expected 25 (DESIGN-2.0.md § C6.1's 22 plus the 3 vendored plugin skills)"
-# The listing goes through the installed omp package's own discovery (Settings → cfgSkills →
-# discoverSkills), the code path the CLI uses (sdk.ts `cfgSkills.get(settings)`; OMP 18.4.4 has no
-# Settings.getGroup, which this step called on 18.3.0); omp has no skill-listing subcommand.
-OMP_PKG="$(dirname "$(dirname "$(readlink -f "$(command -v omp)")")")"
-[ -f "$OMP_PKG/src/index.ts" ] || die "omp package not found from $(command -v omp) (expected $OMP_PKG/src/index.ts)"
+# Discovery uses the repository's exact locked OMP package. The release executable may be a
+# standalone binary with no adjacent source tree, while AS2 extensions still require inspectable
+# modules for compatibility tests and fresh-machine probes.
+OMP_PKG="$CLONE/node_modules/@oh-my-pi/pi-coding-agent"
+[ -f "$OMP_PKG/src/index.ts" ] || die "locked omp package not found at $OMP_PKG; run bun install --frozen-lockfile in the clone"
 LISTING="$WORK/skill-listing.txt"
 (cd "$WORK" && env -i PATH="$PATH" HOME="$FAKE_HOME" OMP_PROFILE=agent-system-2 bun -e "
 	const m = await import('$OMP_PKG/src/index.ts');
@@ -292,9 +296,9 @@ AS2="$FAKE_HOME/.local/bin/as2"
 [ "$(readlink "$AS2")" = "$CLONE/bin/as2" ] || die "$AS2 links to $(readlink "$AS2"), not $CLONE/bin/as2"
 reinstall_out="$(run_install)" || die "install (launcher re-run) exited $?"
 printf '%s\n' "$reinstall_out" | grep -qF "note: $FAKE_HOME/.local/bin is not on PATH" || die "install did not print the not-on-PATH notice for $FAKE_HOME/.local/bin"
-LOGIN_WANT="==> first launch: this profile routes to anthropic, openai-codex, moonshot, typesafe; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE/agent.db)"
+LOGIN_WANT="==> provider auth: this profile routes to anthropic, openai-codex, moonshot, devbar, typesafe and uses OMP's shared broker at http://127.0.0.1:8765"
 [ "$(printf '%s\n' "$reinstall_out" | tail -n 1)" = "$LOGIN_WANT" ] || die "install's last line is '$(printf '%s\n' "$reinstall_out" | tail -n 1)', expected '$LOGIN_WANT'"
-ok "install's last line names the four providers and the once-per-profile /login"
+ok "install's last line names the five providers and the shared auth broker"
 # Phoenix is on by default on macOS (wl-mv65t5d34lts00 PLAN.md § 8.1; install.sh step 6e is macOS only), but never
 # from a HOME that is not the user's own: this install's temp HOME must not replace the real gui/<uid> job with one
 # pointing into it.

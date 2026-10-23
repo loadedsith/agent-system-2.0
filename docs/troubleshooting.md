@@ -44,7 +44,7 @@ Reviews must run on a lab other than the builder's. With credentials for one lab
 
 ### Every bash call is refused after an OMP update
 
-The gates read OMP settings through host members verified on one OMP major.minor (`VERIFIED_HOST` in `gates/src/host.ts`, `18.8` today) and refuse every bash call on any other, with a line naming both versions. Go back to an 18.8 release, or re-verify: run `bun test gates/test/host.test.ts` against the new host before bumping the pin.
+The gates read OMP settings through host members verified on one OMP major/minor (`VERIFIED_HOST` in `gates/src/host.ts`, `18.12` today) and refuse every bash call on any other. `package.json` and `bun.lock` also pin the inspectable OMP modules to `18.12.6`, and the installer refuses when that package version differs from `omp --version`. After an OMP update, update the package pin, run `bun install --save-text-lockfile`, then run `bun test gates/test/host.test.ts gates/test/shell-start-bash.test.ts gates/test/shell-start-session.test.ts` before bumping the pins.
 
 ### Every bash call is refused for the rest of a session
 

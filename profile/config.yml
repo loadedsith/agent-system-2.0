@@ -4,8 +4,8 @@
 #   ~/.omp/profiles/<profile>/agent/config.yml   (omp://config-usage.md § Profiles)
 # filling {repo} with the checkout's absolute path, places profile/models.yml beside it, and links
 # the six tier files in tiers/ into ~/.omp/profiles/<profile>/agent/agents/ (they carry no model
-# pin). <profile> is $AGENT_SYSTEM_PROFILE, default agent-system-2. Credentials are added per
-# machine after install ("clone, run install, add your keys"), never here.
+# pin). <profile> is $AGENT_SYSTEM_PROFILE, default agent-system-2. Authentication uses OMP's
+# loopback auth broker, backed by the default profile's credential store; no secrets enter this file.
 #
 # Sections owned by other migration steps are marked slots; each owner fills only its own.
 
@@ -22,6 +22,15 @@
 # session (credentials live in the profile's own agent.db). Reversal: delete the key and the wizard
 # runs on the next launch.
 setupVersion: 2
+
+# ── Shared provider authentication ──
+# The broker serves the default OMP profile's credential store on loopback. The bearer token stays
+# in OMP's mode-0600 token file; this profile resolves it at runtime rather than copying OAuth refresh
+# tokens into its own agent.db. `omp` and `as2` therefore see the same current logins.
+auth:
+  broker:
+    url: http://127.0.0.1:8765
+    token: '!cat "$HOME/.omp/auth-broker.token"'
 
 # ── Look and feel (Jo, 2026-09-30: "i hate my omp i guess layout and prompt composer"; as2 never
 #    renders thinking blocks) ──
@@ -184,6 +193,8 @@ skills:
 # (config/model-resolver.ts resolveRoleChain).
 
 modelRoles:
+  # Top-level orchestrator only. Hands remain pinned by task.agentModelOverrides below.
+  default: devbar/gpt-5.6-sol
   judge: typesafe/jev-1.13.0
 retry:
   fallbackChains:

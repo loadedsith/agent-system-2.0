@@ -15,11 +15,14 @@ as2 was built for one user on one Mac. This page lists what you can change today
 
 Edit the files in the checkout and re-run `bash install/install.sh`. The installer overwrites the installed `config.yml`, `models.yml` and `mcp.json` on every run, so edits made directly in `~/.omp/profiles/` are lost at the next install. The one exception is `as2 on` / `as2 off`, which flips `gates.fence.enabled` in the installed file until the next install.
 
+`package.json` and `bun.lock` pin `@oh-my-pi/pi-coding-agent` and its exact dependency graph to the OMP executable version. `install/install.sh` compares `omp --version` with the `package.json` pin before its first write; `bun install --frozen-lockfile` proves the lock agrees with that pin.
+
 ### `profile/config.yml` keys
 
 | Key | Default | Notes |
 |---|---|---|
 | `task.agentModelOverrides.<tier>` | Anthropic, then OpenAI Codex, then Moonshot, per tier | Attempt order; unusable entries are skipped at spawn. A model may not appear in a higher tier's row, and every provider must be in the lab map (`classifier/src/tier-table.ts`, `classifier/src/lab.ts`) |
+| `modelRoles.default` | `devbar/gpt-5.6-sol` | Top-level orchestrator default. DevBar is deliberately absent from `task.agentModelOverrides`, so it does not participate in builder or reviewer lab routing |
 | `modelRoles.judge` | `typesafe/jev-1.13.0` | See "Hardcoded today": changing it alone makes every dispatch fail |
 | `retry.fallbackChains.judge` | `[]` | Keeps OMP from falling back to another judge |
 | `gates.fence.enabled` | `true` | `false` runs bash unwrapped; the gates write one ledger entry per lane session saying so |
@@ -42,6 +45,8 @@ Edit the files in the checkout and re-run `bash install/install.sh`. The install
 | `AGENT_SYSTEM_CONTRACT` | `contract/output-types.md` in the checkout | The output-types contract |
 | `AGENT_SYSTEM_DECISION_LOG` | `<repo>/.ai/decision-log` | Where decision-log entries are read from, and written when no lane branch can take one |
 | `AGENT_SYSTEM_TEST_RUNS` | `test-runs/` beside the ledger | The test runner's runs root |
+| `AGENT_SYSTEM_SELF_REPAIR` | unset | Internal launcher marker set only by `as2 repair`; `1` enables the narrow recovery exception |
+| `AGENT_SYSTEM_SELF_REPAIR_ROOTS` | unset | Colon-separated roots supplied by `as2 repair`; file tools and bash writes outside them are refused |
 
 ### Per workload, by typing
 
@@ -79,7 +84,7 @@ Each item names where it lives, so a change starts in the right file.
 ### Platform
 
 - **macOS only.** The write fence is a Seatbelt profile run through `/usr/bin/sandbox-exec` (`gates/src/fence.ts`), and every bash call is refused when `sandbox-exec` is missing unless the fence is off. The `_as2test` user is created with `dscl` (`install/as2test-setup.sh`). The ledger backup and the nightly chaos run are launchd agents; off macOS the installer skips the backup job and refuses `--chaos-nightly`. No Linux fence, test-runner setup or scheduler exists.
-- **OMP 18.8.** `VERIFIED_HOST` in `gates/src/host.ts` refuses any other major.minor, and `setupVersion` in `profile/config.yml` matches one OMP release's first-launch wizard. After an OMP upgrade, `gates/test/host.test.ts` and `install/fresh-machine-test.sh` say whether the pin still holds.
+- **OMP 18.12.6.** `package.json` and `bun.lock` pin the same version; `VERIFIED_HOST` in `gates/src/host.ts` is `18.12`, and `MEASURED_HOST` in `gates/src/shell-start.ts` is `18.12.6`. After an OMP upgrade, update the package pin, run `bun install --save-text-lockfile`, then run `gates/test/host.test.ts`, the shell-start tests and `install/fresh-machine-test.sh` before trusting it.
 - **HerdR and moshi** are not used by as2's machinery. Planned seat integrations are optional ([MIGRATION.md](../MIGRATION.md) items 93 and 98).
 
 ## Ticket systems

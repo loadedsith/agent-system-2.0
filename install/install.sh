@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # agent-system 2.0 install (migration steps M2 ledger, M6 profile + skills).
-#
-# Reads install/manifest.tsv (SPEC-2.0.md § B8: the manifest IS the machinery table) and installs
+# Reads install/manifest.tsv (SPEC-2.0.md § B8: the manifest IS the machinery table), verifies that
+# the `omp` executable and the repository's locked OMP packages are the same version, then installs
 # each row by its kind. Today that means: create or verify the ledger from the manifest's one
 # ledger-schema row, using its one ledger-init row, take the first scheduled copy with its one
 # ledger-backup row, (macOS) write the periodic backup job from its one ledger-backup-agent row
@@ -23,8 +23,7 @@
 # value across a re-install, and on macOS, unless that value is off and only when $HOME is this user's
 # own home, the Phoenix LaunchAgent is (re)installed with install/phoenix-agent.sh on; a Phoenix that
 # does not start is reported and does not fail the install. The last line names the providers the rendered profile
-# routes to and says each needs a /login once per profile (the profile's setupVersion skips OMP's
-# first-launch sign-in scene).
+# routes to and says they use the shared OMP auth broker configured in profile/config.yml.
 # File links also install in the default OMP profile (persistent seats do not use the as2 profile):
 # ~/.omp/agent/extensions/as2-open-links.ts points into this checkout. If herdr is on PATH, its
 # as2.file-links plugin is linked from install/herdr-file-links; without herdr one notice is printed.
@@ -63,10 +62,10 @@
 #          1 other failure (=off: launchctl not on PATH, `launchctl print` failed for a reason other
 #            than "Could not find service", or bootout failed, each with the plist kept; or the
 #            plist removal failed)
-#          2 manifest or profile check failed, an argument other than the flags (or a flag twice, or
-#            an =off form with an installing flag), --chaos-nightly refused: not macOS, or omp or git
-#            not on PATH, or --scratch-sweep refused: not macOS, or --train-tick refused: not macOS, gh,
-#            bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
+#          2 manifest, profile or OMP version check failed; an argument other than the flags (or a flag
+#            twice, or an =off form with an installing flag); --chaos-nightly refused: not macOS, or
+#            omp or git not on PATH; --scratch-sweep refused: not macOS; or --train-tick refused:
+#            not macOS, gh, bun, omp, git or osascript not on PATH, or `gh auth status` failed (nothing written)
 #          3 ledger path refused as synced or network folder (nothing written)
 #          4 the ledger file exists at a schema version other than the supported one (5), e.g. a
 #            version-1 to -4 ledger from before schema v5 (nothing written; no upgrade exists:
@@ -494,6 +493,12 @@ bun -e '
 	if (!doc?.mcpServers?.ctx?.command) { console.error(`install: profile: ${process.argv[1]} has no mcpServers.ctx with a command`); process.exit(1); }
 ' "$REPO/$MCP_ROW" || fail "profile mcp.json refused" 2
 
+command -v omp >/dev/null 2>&1 || fail "omp not found on PATH" 2
+OMP_EXEC_VERSION="$(omp --version 2>/dev/null | awk -F/ 'NR == 1 { print $2 }')"
+OMP_PACKAGE_VERSION="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); const v = p?.dependencies?.["@oh-my-pi/pi-coding-agent"]; if (typeof v === "string") process.stdout.write(v)' "$REPO/package.json" 2>/dev/null || true)"
+[ -n "$OMP_EXEC_VERSION" ] && [ "$OMP_EXEC_VERSION" = "$OMP_PACKAGE_VERSION" ] \
+	|| fail "OMP executable ${OMP_EXEC_VERSION:-unknown} does not match the AS2 package lock ${OMP_PACKAGE_VERSION:-unavailable}; update package.json to the installed omp version, run bun install --save-text-lockfile, then re-run install" 2
+step "OMP aligned: executable and AS2 package pin are $OMP_EXEC_VERSION"
 # ---- 3. install the ledger ---------------------------------------------------------------------
 # ledger-init creates or verifies the ledger from the ledger-schema row. It refuses a schema file
 # other than the module's (exit 2) and a synced or network folder (exit 3, ledger/src/locality.ts),
@@ -661,8 +666,7 @@ fi
 
 step "install complete: ledger at $LEDGER_DB"
 
-# ---- 7. provider login, once per profile ---------------------------------------------------------
-# The profile's setupVersion (profile/config.yml) skips OMP's first-launch wizard, its sign-in scene
-# included, so the one step left is logging in. Credentials go to the profile's own agent.db, so a
-# new profile needs its own logins even when the default profile has them.
-step "first launch: this profile routes to $PROVIDERS; OMP needs a login to each once per profile: run /login in the as2 session (credentials stay in $PROFILE_DIR/agent.db)"
+# ---- 7. provider authentication ---------------------------------------------------------------
+# profile/config.yml points this profile at the loopback OMP auth broker. The broker is backed by
+# the default profile's credential store, so provider logins are shared without copying OAuth tokens.
+step "provider auth: this profile routes to $PROVIDERS and uses OMP's shared broker at http://127.0.0.1:8765"

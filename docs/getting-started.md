@@ -9,7 +9,7 @@ The installer checks only for `bun`. Everything else below is needed at run time
 | Need | Why | Notes |
 |---|---|---|
 | **macOS** | The write fence runs every bash call under `/usr/bin/sandbox-exec` (`gates/src/fence.ts`); the test-runner setup uses `dscl`; the backup job is a launchd agent | No Linux support. On a non-macOS host the installer skips the backup job, and the fence has no equivalent |
-| **OMP (oh-my-pi) 18.8.x** | as2 is a set of OMP extensions, tier files and a profile | The gates refuse to run on an OMP whose major.minor is not `VERIFIED_HOST` in `gates/src/host.ts` (`18.8` today). The author's OMP is the `@oh-my-pi/pi-coding-agent` package installed globally with Bun |
+| **OMP (oh-my-pi) 18.12.6** | as2 is a set of OMP extensions, tier files and a profile | `package.json` and `bun.lock` pin the inspectable OMP modules to the executable version. The installer refuses a mismatch. Run `bun install --frozen-lockfile` after cloning or updating the lock |
 | **Bun** | The ledger module uses `bun:sqlite`; every script and test runs on Bun | The repository's GitHub workflow pins Bun 1.3.14 |
 | **git** | Lanes work in git worktrees and push branches | |
 | **GitHub CLI (`gh`), logged in** | A workload close pushes the lane branch and makes sure a PR exists through `gh`; the test runner reads PRs with `gh pr list -R <owner/repo>` | Not checked anywhere ([MIGRATION.md](../MIGRATION.md) item 17). Lanes push to the repository's `origin`, so work on repositories you can push to |
@@ -18,13 +18,14 @@ The installer checks only for `bun`. Everything else below is needed at run time
 
 ### Provider accounts
 
-The installer's last line names the providers the rendered profile routes to. From `profile/config.yml` today they are:
+The installer's last line names the providers the rendered profile routes to. The profile uses OMP's loopback auth broker, backed by the default OMP profile's credential store, so normal `omp` and `as2` use the same current logins. From `profile/config.yml` today the providers are:
 
 | Provider (OMP name) | Used for |
 |---|---|
 | `anthropic` | Row 1 of every tier (`fast`, `standard`, `strong`, `deep`) |
 | `openai-codex` | Row 2 of every tier |
 | `moonshot` | Row 3 of every tier |
+| `devbar` | The top-level orchestrator default, `devbar/gpt-5.6-sol`; its command-backed credential is resolved at use time and it is not in any hand tier |
 | `typesafe` | The judge model `typesafe/jev-1.13.0`, which the classifier asks before every dispatch |
 
 - **The judge is required.** The classifier's 0.55 confidence threshold was measured on `typesafe/jev-1.13.0` only, and the classifier refuses to route on an answer from any other model. With no TypeSafe credential, every dispatch fails closed (`profile/config.yml`, "Judge role"). Making the judge any judge-capable model, with the threshold re-measured, is planned ([MIGRATION.md](../MIGRATION.md) item 95).
@@ -38,6 +39,7 @@ Clone anywhere outside a synced folder, then run the installer from the checkout
 ```sh
 git clone https://github.com/thewolff/agent-system-2.0.git
 cd agent-system-2.0
+bun install --frozen-lockfile
 bash install/install.sh
 ```
 
@@ -51,7 +53,7 @@ bash install/install.sh
 6. Writes the OMP profile to `~/.omp/profiles/agent-system-2/agent/`: `config.yml` (rendered), `models.yml`, `mcp.json`, and symbolic links from `agents/` to the six tier files in `tiers/`. Skills are used in place from `<checkout>/skills`.
 7. Links `bin/as2` to `~/.local/bin/as2`, and prints a note when `~/.local/bin` is not on PATH.
 8. Registers the profile's session directory as a ctx history root, when `ctx` is installed.
-9. Prints the providers to log in to.
+9. Prints the providers served by OMP's shared loopback auth broker.
 
 `as2 install` runs the same script once the launcher is on PATH.
 
@@ -60,7 +62,7 @@ bash install/install.sh
 | `AGENT_SYSTEM_LEDGER_DB` | `$HOME/.agent-system-2/ledger.db` | Ledger file |
 | `AGENT_SYSTEM_PROFILE` | `agent-system-2` | OMP profile name; the profile lives at `~/.omp/profiles/<name>/agent` |
 
-The installer never touches OMP's default profile. as2 runs in its own profile, which does not load skills from `~/.claude`, `~/.codex` or `~/.agents` (`skills.enable*: false` in `profile/config.yml`).
+The installer never loads skills or settings from OMP's default profile. Authentication is the deliberate exception: `profile/config.yml` points at OMP's loopback auth broker, which serves the default profile's credential store without copying OAuth refresh tokens. as2 otherwise runs in its own profile and does not load skills from `~/.claude`, `~/.codex` or `~/.agents` (`skills.enable*: false` in `profile/config.yml`).
 
 To prove the installer on your machine without touching your real `$HOME`, run `bash install/fresh-machine-test.sh`. It clones the checkout into a temporary directory, installs under a temporary `$HOME`, and checks the ledger, profile, skills, extensions, launcher and refusals. It exits 0 when every check passes and leaves its work directory in place as evidence.
 
@@ -100,7 +102,9 @@ env <OTEL_…=…> OMP_PROFILE=agent-system-2 AGENT_SYSTEM_ROLE=orchestrator omp
 
 `as2 --print` shows that command without running it. The working directory is always the checkout, whatever directory you start from. The `OTEL_…` words are the tracing switch (`observability.phoenix`, `all` by default): the orchestrator's spans go to the local Phoenix at `http://127.0.0.1:6006`, project `as2-orchestrator`. `as2 phoenix off` leaves only `OTEL_SDK_DISABLED=true`; see USER-GUIDE § *Trace to Phoenix*.
 
-The profile sets `setupVersion`, so OMP's first-launch wizard, including its sign-in scene, is skipped. Log in to each provider the installer named with `/login` inside the session. Credentials are stored in the profile's own `agent.db`, so logins in OMP's default profile do not carry over.
+The profile sets `setupVersion`, so OMP's first-launch wizard, including its sign-in scene, is skipped. Provider authentication comes from OMP's shared loopback auth broker. Log in or out through normal OMP; new `as2` processes see the same broker credentials.
+
+`as2 repair` is the recovery entry point when AS2 itself is broken. It keeps the normal gates, reserved-action rules, protected-branch rules and OS fence, but allows the orchestrator to dispatch only the dedicated `.omp/agents/self-repair.md` agent, pinned to the same DevBar model as the top-level orchestrator. File tools and fenced bash may write only inside this checkout and AS2's installed profile, state, launcher, launch-agent and HerdR configuration roots; `eval` remains blocked. Ordinary `as2` sessions retain the orchestrator's no-code/no-dispatch rule.
 
 On its first wake the orchestrator chooses a name and pronouns for itself and records them in the ledger. Each wake (launch, restart, compaction) opens with the ledger rendered: a *needs you* section and one line per open workload.
 
@@ -109,6 +113,7 @@ Other launcher commands:
 | Command | Effect |
 |---|---|
 | `as2 off` / `as2 on` | Set `gates.fence.enabled` in the installed profile's `config.yml` to `false` / `true`. A re-install resets it to the template's value (`true`) |
+| `as2 repair` | Start a self-repair session confined to the AS2 checkout and installed AS2 directories |
 | `as2 lane <workload>` | Run a user-driven workload's lane in this terminal |
 | `as2 lane stop <workload>` | Ask the workload's lane to stop |
 | `as2 lane log <workload>` | Print the path of the lane's runner log and its last 40 lines (once; it does not follow) |

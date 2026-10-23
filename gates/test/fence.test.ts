@@ -212,6 +212,34 @@ describe("the fence refuses sandboxed writes into the configured ledger director
 	});
 });
 
+describe("self-repair fence confinement", () => {
+	const home = tmp("repair-fence-home");
+	const repo = tmp("repair-fence-repo");
+	const install = tmp("repair-fence-install");
+	const outside = tmp("repair-fence-outside");
+	const env = {
+		HOME: home,
+		PATH: process.env.PATH,
+		AGENT_SYSTEM_ROLE: "orchestrator",
+		AGENT_SYSTEM_SELF_REPAIR: "1",
+		AGENT_SYSTEM_SELF_REPAIR_ROOTS: `${repo}:${install}`,
+	};
+
+	test("allows writes in the repository and install root but denies every outside write", async () => {
+		const command = `printf repo > ${join(repo, "repo.txt")}; printf install > ${join(install, "install.txt")}; printf outside > ${join(outside, "outside.txt")}`;
+		const f = fakePi();
+		registerFence(f.pi, env, async () => ON, CERTIFIED);
+		const ctx = ctxOf(repo);
+		const revised = (await f.emit("tool_call", { toolName: "bash", toolCallId: "repair-fence", input: { command } }, ctx)) as Revised;
+		expect(revised?.input?.command).toContain("sandbox-exec");
+		const result = sh(String(revised?.input?.command), repo, env);
+		expect(result.code).not.toBe(0);
+		expect(readFileSync(join(repo, "repo.txt"), "utf8")).toBe("repo");
+		expect(readFileSync(join(install, "install.txt"), "utf8")).toBe("install");
+		expect(existsSync(join(outside, "outside.txt"))).toBe(false);
+	});
+});
+
 describe("the fence refuses sandboxed writes to .git/hooks and the .git entry", () => {
 	const env = { HOME: tmp("fence-git-home"), PATH: process.env.PATH };
 	let work = "";
@@ -608,7 +636,7 @@ describe("the host settings reach the fence only through the reader it is handed
 		getGlobalSettings: () => (fence === undefined ? {} : { gates: { fence: { enabled: fence } } }),
 		autoBackground,
 	});
-	const modules = (Settings: { current?: unknown; loadReadOnly: (o: { cwd: string }) => Promise<unknown> }, version = "18.8.5") =>
+	const modules = (Settings: { current?: unknown; loadReadOnly: (o: { cwd: string }) => Promise<unknown> }, version = "18.12.6") =>
 		({
 			version,
 			Settings,
@@ -669,7 +697,7 @@ describe("the host settings reach the fence only through the reader it is handed
 		const f = fakePi();
 		registerFence(f.pi, { HOME: d, PATH: process.env.PATH }, (ctx) => fenceSettingsFrom(m, ctx));
 		const r = await f.emit("tool_call", { toolName: "bash", toolCallId: "hm1", input: { command: "true" } }, ctxOf(d));
-		expect(r?.reason).toContain('OMP 18.8.5: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry');
+		expect(r?.reason).toContain('OMP 18.12.6: lookup("bash.autoBackground.enabled") is missing from @oh-my-pi/pi-coding-agent/config/registry');
 	});
 
 	test("registered with no reader, every bash call is refused with the reason named", async () => {
