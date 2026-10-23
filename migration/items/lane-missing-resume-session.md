@@ -2,7 +2,7 @@
 title: Recover a missing recorded lane session from the newest compatible workload session
 status: building
 workload: wl-mvl91mlce720w0
-pr: none
+pr: 309
 ---
 
 When a lane's recorded resume path has disappeared, startup does not treat that absence as a readiness timeout. The runner scans only regular `.jsonl` files immediately inside the workload's session directory and chooses the newest by modification time; equal mtimes break toward the lexicographically greatest absolute path. It resolves the selected file's origin through the newest session-bearing started/parked provenance entry, matching regular-file realpaths, then checks that origin lane's recorded model against the newest valid workload `lane-model:` choice. Legacy model metadata means the profile default; absent provenance is unknown. A missing candidate or an unknown/incompatible newest origin starts a fresh session. The runner does not fall back to an older candidate after that guard fails. An existing recorded regular file keeps the existing model policy and is not displaced by a newer disk file.
