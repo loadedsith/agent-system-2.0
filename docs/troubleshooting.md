@@ -46,6 +46,8 @@ Reviews must run on a lab other than the builder's. With credentials for one lab
 
 The gates read OMP settings through host members verified on one OMP major.minor (`VERIFIED_HOST` in `gates/src/host.ts`, `18.8` today) and refuse every bash call on any other, with a line naming both versions. Go back to an 18.8 release, or re-verify: run `bun test gates/test/host.test.ts` against the new host before bumping the pin.
 
+If the refusal instead says `Cannot find package '@oh-my-pi/pi-natives' imported from .../pi-utils/src/dirs.ts?mtime=...`, OMP's extension reload query bypassed compatibility rewriting for the `pi-utils/dirs` subpath. AS2 imports `VERSION` through the package-root export for this reason. Reinstalling dependencies alone does not prove the extension-loader path; run a live `as2` bash call.
+
 ### Every bash call is refused for the rest of a session
 
 The fence checks after the fact that the command which ran was its own wrapper. If another extension loaded after the gates replaced or blocked a bash call, the fence records a bypass in the ledger and refuses every later bash call until the session restarts (`gates/src/fence.ts`). The fence also refuses bash outright while OMP's `bash.autoBackground.enabled` is `false`; leave that setting unset.
