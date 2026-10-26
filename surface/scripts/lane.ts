@@ -68,12 +68,12 @@ import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index"
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
-import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
+import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainLaunchFailures } from "../src/merge-train";
 import {
-	branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	launchRowsFor, maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
@@ -362,14 +362,20 @@ class Refused extends Error {
  * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
  * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
  * Both policies first run the live-lane check (`liveRefusal`, PLAN wl-mvgn310dpi5gcg D2) in that transaction, its ps through
- * `probeFor` (the tests pass a fake), so no other reservation lands between the probe and the claim.
+ * `probeFor` (the tests pass a fake), so no other reservation lands between the probe and the claim. The open merge trains
+ * are the cap-exempt set (`openTrains`, PLAN wl-mvpsrr4tr0p1xc D1), read inside the transaction; an admitted train then
+ * passes `trainGate` (D3, D4) in the same transaction.
  */
 export function reserve(
 	ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig(),
-	probeFor: (laneId: string) => RunnerProbe = (laneId) => runnerProbe(wl, laneId),
+	probeFor: (laneId: string, workloadId: string) => RunnerProbe = (laneId, of) => runnerProbe(of, laneId),
 ): ReserveResult {
-	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
-	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? decideRanked(ledger, rows, config) });
+	const input = {
+		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who, capExempt: () => new Set(openTrains(ledger)),
+	};
+	if (!interactive) {
+		return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? trainGate(ledger, rows, probeFor, decideRanked(ledger, rows, config)) });
+	}
 	try {
 		return ledger.write(() => {
 			const r = ledger.reserveLane(wl, {
@@ -377,7 +383,7 @@ export function reserve(
 				decide: (rows) => {
 					const held = liveRefusal(rows, probeFor);
 					if (held !== null) return held;
-					const v = decideInteractive(rows);
+					const v = trainGate(ledger, rows, probeFor, decideInteractive(rows));
 					if (v.launch) writePickSnapshot(ledger, rows.now);
 					return v;
 				},
@@ -392,10 +398,57 @@ export function reserve(
 }
 
 /** D2: `held: <laneId> still running (<omp|runner> pid <n>)` while an earlier lane on the workload is live (`liveLaneOf`), else null. */
-function liveRefusal(rows: ReserveRows, probeFor: (laneId: string) => RunnerProbe): ReserveVerdict | null {
+function liveRefusal(rows: ReserveRows, probeFor: (laneId: string, workloadId: string) => RunnerProbe): ReserveVerdict | null {
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
-	const live = liveLaneOf(control, probeFor);
+	const live = liveLaneOf(control, (laneId) => probeFor(laneId, rows.workload.id));
 	return live === null ? null : { launch: false, reason: `held: ${live.laneId} still running (${live.what} pid ${live.pid})` };
+}
+
+/**
+ * PLAN wl-mvpsrr4tr0p1xc D3 and D4 on an admitted cap-exempt train (`rows.capExempt`), inside the reservation's transaction;
+ * any other verdict passes unchanged. D3: `held: train lane <laneId> live on <wl>` while another open train has a lane
+ * (`liveTrainLane`, its pre-claimed attempts included). D4: `not-launchable: train launch limit: <n> consecutive failed
+ * launches (<lane ids>)` once `trainLaunchFailures` counts TRAIN_LAUNCH_LIMIT, whatever the cause: Jo's fresh word is a
+ * reset, so it already counts from zero.
+ */
+function trainGate(ledger: Ledger, rows: ReserveRows, probeFor: (laneId: string, workloadId: string) => RunnerProbe, v: ReserveVerdict): ReserveVerdict {
+	if (!v.launch || !rows.capExempt) return v;
+	const other = liveTrainLane(ledger, rows.workload.id, rows.now, probeFor, true);
+	if (other !== null) return { launch: false, reason: `held: train lane ${other.laneId} live on ${other.workloadId}` };
+	const failed = trainLaunchFailures({
+		entries: rows.entries, instructions: rows.instructions, questions: rows.questions, holder: rows.workload.holder, holderLeaseUntil: rows.workload.holder_lease_until, now: rows.now,
+	});
+	if (failed.count >= TRAIN_LAUNCH_LIMIT) {
+		return { launch: false, reason: `not-launchable: train launch limit: ${TRAIN_LAUNCH_LIMIT} consecutive failed launches (${failed.lanes.join(", ")})` };
+	}
+	return v;
+}
+
+/**
+ * D3 (PLAN wl-mvpsrr4tr0p1xc): a lane of an open merge train other than `wl`, or null: one holding it under a live lease, one
+ * `liveLaneOf` finds alive (its ps through `probeFor`), and with `pending` (the reservation) a `launch:` attempt with no
+ * `lane-started:`, `launch-failed:` or `lane-exit:` whose pre-claim lease (PRECLAIM_LEASE_MS from the attempt) has not
+ * lapsed at `now`. Global across repositories: one served repository today, and no git call inside the transaction.
+ */
+function liveTrainLane(
+	ledger: Ledger, wl: string, now: string, probeFor: (laneId: string, workloadId: string) => RunnerProbe, pending: boolean,
+): { laneId: string; workloadId: string } | null {
+	for (const other of openTrains(ledger)) {
+		if (other === wl) continue;
+		const w = ledger.workload(other);
+		if (w === null) continue;
+		if (w.holder !== null && heldLive(w, now)) return { laneId: w.holder, workloadId: other };
+		const entries = ledger.entries(other);
+		const control = controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(other)));
+		const live = liveLaneOf(control, (laneId) => probeFor(laneId, other));
+		if (live !== null) return { laneId: live.laneId, workloadId: other };
+		if (!pending) continue;
+		for (const a of attempts(control)) {
+			const ended = control.some((c) => c.laneId === a.laneId && (c.prefix === "lane-started" || c.prefix === "launch-failed" || c.prefix === "lane-exit"));
+			if (!ended && Date.parse(a.createdAt) + PRECLAIM_LEASE_MS >= Date.parse(now)) return { laneId: a.laneId, workloadId: other };
+		}
+	}
+	return null;
 }
 
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
@@ -541,7 +594,7 @@ async function cmdDrain(after: string): Promise<number> {
 				const order = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, ledger.now());
 				const next = order.find((id) => {
 					if (tried.has(id)) return false;
-					const rows = ledger.launchRows(id, cap);
+					const rows = launchRowsFor(ledger, id, cap);
 					return rows !== null && verdictOf(rows).launch;
 				});
 				if (next === undefined) break;
@@ -813,14 +866,23 @@ export function stillReserved(workload: Pick<WorkloadRow, "holder"> | null, lane
  * D2b: the spawn, inside the one ledger write that spawns omp and records its `lane-started:` (the runner's `startAsOwner`
  * body, `cmdInteractive`'s spawn write). With nothing spawned yet (`current` null), the workload must still be held by
  * `laneId` (`stillReserved`), else nothing is spawned and a `held` Fail (stage `reserve`) rolls the write back: another
- * starter reserved after this reservation's pre-claim lapsed. A busy-retried write passes the child it already spawned,
- * which is returned as is: one spawn per lane.
+ * starter reserved after this reservation's pre-claim lapsed. On an open merge train (PLAN wl-mvpsrr4tr0p1xc D3) the same
+ * refusal follows while another open train holds a live lease or has a started lane `liveLaneOf` finds alive (its ps
+ * through `probeFor`): the spawn and its record share this write, so two trains' spawns serialize and the second sees the
+ * first's `lane-started:`. A busy-retried write passes the child it already spawned, which is returned as is: one spawn per lane.
  */
-export function spawnIfReserved<C>(ledger: Pick<Ledger, "workload">, wl: string, laneId: string, current: C | null, spawnChild: () => C): C {
+export function spawnIfReserved<C>(
+	ledger: Ledger, wl: string, laneId: string, current: C | null, spawnChild: () => C,
+	probeFor: (laneId: string, workloadId: string) => RunnerProbe = (l, of) => runnerProbe(of, l),
+): C {
 	if (current !== null) return current;
 	const w = ledger.workload(wl);
 	if (!stillReserved(w, laneId)) {
 		throw new Fail("reserve", `${laneId} not started: held: ${wl} is held by ${w?.holder ?? "no one"}, not ${laneId}; another starter reserved it after this reservation's pre-claim lapsed; no omp spawned`, STARTER_EXIT.held!);
+	}
+	if (openTrains(ledger).includes(wl)) {
+		const other = liveTrainLane(ledger, wl, ledger.now(), probeFor, false);
+		if (other !== null) throw new Fail("reserve", `${laneId} not started: held: train lane ${other.laneId} live on ${other.workloadId}; no omp spawned`, STARTER_EXIT.held!);
 	}
 	return spawnChild();
 }
@@ -1534,9 +1596,12 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						return;
 					}
 					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
+					// The prompt's row cut (PLAN wl-mvpsrr4tr0p1xc D2): taken before `promptFor` reads the rows, so every instruction older
+					// than lane-ready:'s time was in this prompt, and a train's resolution counts as delivered only then (`consumedByReady`).
+					const readAt = ledger.now();
 					const prompt = promptFor(ledger, w, laneId, p, ceilingLine);
 					// lane-ready: immediately before the first prompt (item 85): a runner lane that ended without one never got a prompt (builderLabs).
-					record(laneReadyBody(laneId, ledger.now()));
+					record(laneReadyBody(laneId, readAt));
 					sendPrompt(prompt);
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {

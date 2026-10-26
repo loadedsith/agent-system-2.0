@@ -16,7 +16,7 @@ import { type Ceiling, crossed, effectiveCeiling, parseSpend, type Spend } from 
 import { repoOf } from "./decision-log";
 import { ensureStandingWorkload } from "./identity";
 import {
-	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, type LaunchVerdict, verdictOf,
+	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, launchRowsFor, type LaunchVerdict, verdictOf,
 } from "./launch";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
@@ -72,11 +72,12 @@ export function pendingRequest(rows: ReserveRows): string | null {
  * `show`: `launchable`'s decision unchanged. `order` / `parallel`: a refusal stays a refusal; a pending Jo request admits
  * at once with cause `request <id>` (even when `launchable` reports `first`, so the reservation consumes it); otherwise
  * the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under `parallel`
- * refused `parallel: <reason>` when `parallelVerdict` holds it.
+ * refused `parallel: <reason>` when `parallelVerdict` holds it. A cap-exempt workload (an open merge train, PLAN
+ * wl-mvpsrr4tr0p1xc D1) takes no slot, so it is admitted on `launchable`'s verdict alone in every mode.
  */
 export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict {
 	const v = verdictOf(rows);
-	if (config.mode === "show" || !v.launch) return v;
+	if (config.mode === "show" || !v.launch || rows.capExempt) return v;
 	const request = pendingRequest(rows);
 	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
 	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
@@ -96,15 +97,16 @@ export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConf
 }
 
 /**
- * The first workload ranked above `workloadId` that is launchable now (`launchRows` + `verdictOf`), or null. Under
- * `parallel` a higher workload the parallel rule holds does not block the ones below it: the drain tries the next.
+ * The first workload ranked above `workloadId` that is launchable now (`launchRowsFor` + `verdictOf`), or null. Under
+ * `parallel` a higher workload the parallel rule holds does not block the ones below it: the drain tries the next. A
+ * cap-exempt workload never blocks one below it: it takes no slot (PLAN wl-mvpsrr4tr0p1xc D1).
  */
 function higherLaunchable(ledger: Ledger, workloadId: string, now: string, cap: number, config: RankConfig): string | null {
 	for (const item of rankOpen(ledger, now)) {
 		if (item.workloadId === workloadId) return null;
 		if (item.state === "running" || item.mode !== "autonomous") continue;
-		const rows = ledger.launchRows(item.workloadId, cap);
-		if (!rows || !verdictOf(rows).launch) continue;
+		const rows = launchRowsFor(ledger, item.workloadId, cap);
+		if (!rows || rows.capExempt || !verdictOf(rows).launch) continue;
 		if (config.mode === "parallel" && parallelVerdict(ledger, item.workloadId, now, config).verdict === "hold") continue;
 		return item.workloadId;
 	}
@@ -247,7 +249,7 @@ export function rankShadowLine(ledger: Ledger, pid: number, picked: string, trie
 	const now = ledger.now();
 	const would = drainOrder(ledger, now).find((id) => {
 		if (tried.has(id)) return false;
-		const rows = ledger.launchRows(id, cap);
+		const rows = launchRowsFor(ledger, id, cap);
 		return rows !== null && verdictOf(rows).launch;
 	}) ?? null;
 	let parallel = "-";

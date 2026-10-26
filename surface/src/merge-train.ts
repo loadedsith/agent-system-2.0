@@ -20,7 +20,7 @@
 // `boardSkips`), main's protection read live (`protectionGap`) with its episodes, and the main-red notices, on the standing workload.
 import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import {
-	type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard, parseTrainFix,
+	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard, parseTrainFix,
 	planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
@@ -1906,4 +1906,114 @@ export function protectionPassOvers(ledger: Ledger, wl: string): Set<number> {
 		if (protection && !(sl && (sl.state === "done" || sl.state === "cancelled"))) out.add(n);
 	}
 	return out;
+}
+
+// ---- the train's own lane outside the cap (PLAN wl-mvpsrr4tr0p1xc D2, D4) -------------------------------------------
+
+const READY_AT_RE = /^at (\S+)$/;
+
+/**
+ * D2: the newest prompt row cut on a workload: the time the newest `lane-ready: <laneId> at <iso>` of a lane some `launch:`
+ * attempt named carries (the runner takes it before `promptFor` reads the rows), or that entry's own time when its body
+ * names none; null when no launched lane ever got ready.
+ */
+export function lastReadyAt(control: readonly ControlEntry[]): string | null {
+	const launched = new Set(attempts(control).map((a) => a.laneId));
+	let out: string | null = null;
+	for (const c of control) {
+		if (c.prefix !== "lane-ready" || c.laneId === null || !launched.has(c.laneId)) continue;
+		const at = READY_AT_RE.exec(c.rest)?.[1] ?? c.createdAt;
+		if (out === null || at > out) out = at;
+	}
+	return out;
+}
+
+/**
+ * D2's consumption rule for a cap-exempt train, one rule for every cause: the resolution whose instruction was written at
+ * `instructionAt` is consumed when some launched lane wrote a `lane-ready:` whose time is later (strict, `lastReadyAt`), so
+ * it was in that lane's first prompt. Naming it in a `launch: … cause resume` consumes nothing: a launch that never gets ready
+ * leaves it to wake the train again (bounded by `trainLaunchFailures`). `launchable` applies it to a cap-exempt workload's
+ * resolutions; the tick's `actionable` reads it for an answered or withdrawn lane question.
+ */
+export function consumedByReady(control: readonly ControlEntry[], instructionAt: string): boolean {
+	const cut = lastReadyAt(control);
+	return cut !== null && instructionAt < cut;
+}
+
+/** D4: this many consecutive train launches that never got ready stop every launch path (PR #308's `RETRY_LIMIT` number, not an import). */
+export const TRAIN_LAUNCH_LIMIT = 3;
+/** D4: the options of Jo's NOW question at the limit: `relaunch` resets the count, `stop` leaves it. Not `retry` (`twiceFailed` reads that). */
+export const TRAIN_LAUNCH_OPTIONS: readonly string[] = ["relaunch", "stop"];
+
+/** What `trainLaunchFailures` reads: the train's rows and its holder now. */
+export interface TrainLaunchRows {
+	entries: readonly EntryRow[];
+	instructions: readonly InstructionRow[];
+	questions: readonly QuestionRow[];
+	holder: string | null;
+	holderLeaseUntil: string | null;
+	now: string;
+}
+
+/** The consecutive failed launches since the newest reset (D4), oldest first. */
+export interface TrainLaunchFailures {
+	count: number;
+	/** The counted attempts' lane ids. */
+	lanes: string[];
+	/** One line per counted attempt: `<laneId> (<launch time>): <why it ended without readiness>`. */
+	failures: string[];
+	/** The oldest and newest counted attempt's `launch:` time; null when none is counted. */
+	first: string | null;
+	last: string | null;
+}
+
+/**
+ * D4: the train's `launch:` attempts after the newest reset, walked newest first, counting each that has no `lane-ready:` and
+ * has ended: it has a `launch-failed:` or a `lane-exit: … outcome never-ready`, or a later attempt exists, or it is the newest
+ * attempt and the workload is no longer held by it under a live lease (a starter or runner that died before readiness without
+ * finalizing). The walk stops at an attempt whose lane wrote `lane-ready:`; the newest attempt still held under a live lease
+ * and not ready is in flight and not counted. A reset is Jo's `launch-requested: by jo`, Jo's `relaunch` answer to the D4
+ * question (the tick's, options `TRAIN_LAUNCH_OPTIONS`) or a `train:` binding; an attempt counts only when written after it
+ * (entry order on a tie with an entry, the attempt on a tie with an answer). Pure: pass the rows one read took.
+ */
+export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures {
+	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.holder));
+	const order = new Map(control.map((c, i) => [c.id, i]));
+	const resets: { at: string; index: number | null }[] = [];
+	for (const c of control) {
+		if (c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo\b/.test(c.rest)) resets.push({ at: c.createdAt, index: order.get(c.id)! });
+	}
+	for (const b of prBindings(rows.entries, rows.instructions, ["train"])) {
+		const index = order.get(b.entryId);
+		if (index !== undefined) resets.push({ at: b.createdAt, index });
+	}
+	for (const q of rows.questions) {
+		if (q.created_by !== MERGE_TRAIN_BY || !(JSON.parse(q.options) as string[]).includes("relaunch")) continue;
+		const ins = joAnswer(q, rows.instructions, "relaunch");
+		if (ins) resets.push({ at: ins.created_at, index: null });
+	}
+	const reset = resets.reduce<{ at: string; index: number | null } | null>((a, r) => (a === null || r.at > a.at || (r.at === a.at && (r.index ?? Infinity) > (a.index ?? Infinity)) ? r : a), null);
+	const list = attempts(control).filter((a) => reset === null || a.createdAt > reset.at || (a.createdAt === reset.at && (reset.index === null || order.get(a.entryId)! > reset.index)));
+	const counted: { laneId: string; at: string; line: string }[] = [];
+	const live = heldLive({ holder: rows.holder, holder_lease_until: rows.holderLeaseUntil }, rows.now);
+	for (let i = list.length - 1; i >= 0; i--) {
+		const a = list[i]!;
+		if (control.some((c) => c.prefix === "lane-ready" && c.laneId === a.laneId)) break;
+		const failed = control.find((c) => c.prefix === "launch-failed" && c.laneId === a.laneId);
+		const exit = laneExit(control, a.laneId);
+		const next = list[i + 1];
+		const why = failed ? `launch-failed: ${failed.rest}`
+			: exit?.outcome === "never-ready" ? "lane-exit: outcome never-ready"
+			: next ? `no lane-ready:, superseded by ${next.laneId}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`
+			: rows.holder === a.laneId && live ? null
+			: `no lane-ready:, ${rows.holder === a.laneId ? "its lease lapsed" : `the workload is held by ${rows.holder ?? "no one"}`}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`;
+		if (why !== null) counted.unshift({ laneId: a.laneId, at: a.createdAt, line: `${a.laneId} (${a.createdAt}): ${why}` });
+	}
+	return {
+		count: counted.length,
+		lanes: counted.map((c) => c.laneId),
+		failures: counted.map((c) => c.line),
+		first: counted[0]?.at ?? null,
+		last: counted.at(-1)?.at ?? null,
+	};
 }

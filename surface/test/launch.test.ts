@@ -4,17 +4,21 @@
 import { describe, expect, test } from "bun:test";
 import { handBuilderBody, handSettledBody, handSpawnBody, laneBuilderBody, reviewParkBody, reviewSameLabBody, reviewWithheldBody } from "../../classifier/src/lab";
 import { reviewGroupBody, reviewLimitBody, reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type ReserveRows, type WorkloadRow } from "../../ledger/src/index";
 import {
-	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv, launchable, maxTimeMs,
-	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, requirementsProblem, reservedPrefix,
-	supersededBody, supersededBy, supersedeInstructionBody,
+	LANE_RUNNER_BY, LANE_STARTER_BY, TEST_RUNNER_BY, type EntryRow, type InstructionRow, type QuestionRow, type ReserveRows, type WorkloadRow,
+} from "../../ledger/src/index";
+import {
+	boundPrs, CLASSIFIER_MACHINERY_PREFIXES, controlEntries, decideLaunch, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf, INTENDED_OUTCOMES, joInstructionsFor, LANE_OUTCOMES, laneArgv, laneEnv,
+	laneExitBody, laneReadyBody, launchable, launchFailedBody, launchRequestedBody, maxTimeMs,
+	PLAN_FILE_MAX_BYTES, PLAN_QUESTION_SHAPE, PLAN_REQUIREMENTS_SHAPE, planAutoApprovedBody, planFirst, planFirstBody, planHaltedBody, planQuestionProblem, prBindingInstructionBody, requirementsProblem,
+	reservedPrefix, supersededBody, supersededBy, supersedeInstructionBody,
 	testPrBody, testPrInstructionBody, type Resolution, resumePlan, resumeSession, TRAIN_LANDS_LINE, verdictOf, waivedPrs, waivePrBody, waivePrInstructionBody,
 } from "../src/launch";
+import { consumedByReady, TRAIN_LAUNCH_LIMIT, TRAIN_LAUNCH_OPTIONS, trainLaunchFailures, type TrainLaunchRows } from "../src/merge-train";
 import type { CleanShellRead } from "../../gates/src/clean-shell";
 import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { pairOfferBody, pairSignalBody, pairSignalFailedBody } from "../src/pair-suggest";
-import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 
 const NOW = "2026-10-01T10:00:00.000Z";
 const workload = (over: Partial<WorkloadRow> = {}): WorkloadRow => ({
@@ -66,7 +70,7 @@ describe("launch predicate matrix (§ 3 states)", () => {
 
 describe("awaiting close: the holder's done-because: stands (L1, the by-hand wasted launch)", () => {
 	const rows = (w: WorkloadRow, entries: EntryRow[], holders: string[] = []): ReserveRows => ({
-		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, cap: 3, now: NOW,
+		workload: w, entries, questions: [], instructions: [], slices: [], holders, liveLanes: 0, capExempt: false, cap: 3, now: NOW,
 	});
 	const done = (by: string) => entry(by, "done-because: all five slices done");
 	test("a by-hand holder's receipt, no launch: history: the ledger's recorded holder makes it the holder's; nothing launches", () => {
@@ -765,5 +769,149 @@ describe("plan approval by the auto-start's fixed writer (PLAN wl-mvfkv7llkp7nk0
 		expect(planFirst(control(rows))).toEqual({ trigger: "halted by Jo (instruction in-9)", entryId: halted.id });
 		expect(planFirst(control([...rows, entry(SURFACE_BY, "plan: approved in-10")]))).toBeNull();
 		expect(planFirst(control([first(), entry("lane-m-1", planHaltedBody("in-9"))]))).toMatchObject({ trigger: "your word" });
+	});
+});
+
+// ---- the merge train's own lane outside the cap (PLAN wl-mvpsrr4tr0p1xc D1, D2, D4) ----------------------------------
+
+/** Minute `m` past 10:00 on the fixture day, with `ms` milliseconds: explicit times, so order never rests on `seq`. */
+const T = (m: number, ms = 0) => `2026-10-01T10:${String(m).padStart(2, "0")}:00.${String(ms).padStart(3, "0")}Z`;
+let tseq = 0;
+const row = (by: string, body: string, at: string): EntryRow =>
+	({ id: `et-${++tseq}`, workload_id: "wl-m", slice_id: null, kind: "assumption", body, created_by: by, created_at: at } as EntryRow);
+const attempt = (lane: string, at: string, cause = "first") => row(LANE_STARTER_BY, `launch: ${lane} cause ${cause} requested-by tick`, at);
+const ready = (lane: string, readAt: string, at = readAt) => row(LANE_RUNNER_BY, laneReadyBody(lane, readAt), at);
+const failed = (lane: string, at: string) => row(LANE_STARTER_BY, launchFailedBody(lane, "spawn", "omp exited 1"), at);
+const exited = (lane: string, outcome: string, at: string) => row(LANE_RUNNER_BY, laneExitBody(lane, { code: 0, signal: null, outcome }), at);
+const resolvedAt = (instructionId: string, laneId: string, createdAt: string): Resolution => ({ instructionId, questionId: "q1", laneId, kind: "answer", body: "yes", createdAt });
+
+describe("cap-exempt launch predicate (PLAN wl-mvpsrr4tr0p1xc D1)", () => {
+	test("a cap-exempt workload skips only the cap refusal: at or over the cap it launches; held, closed, user-driven, awaiting-close and died-not-relaunched stand", () => {
+		expect(launchable(workload(), [], null, [], NOW, 3, 3)).toEqual({ launch: false, reason: "cap" });
+		expect(launchable(workload(), [], null, [], NOW, 3, 3, true)).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(launchable(workload(), [], null, [], NOW, 7, 3, true)).toEqual({ launch: true, cause: { kind: "first" } });
+		const live = workload({ holder: "lane-m-1", holder_lease_until: "2026-10-01T10:05:00.000Z" });
+		expect(launchable(live, control([], live.holder), null, [], NOW, 7, 3, true)).toEqual({ launch: false, reason: "held" });
+		expect(launchable(workload({ status: "closed" }), [], null, [], NOW, 7, 3, true)).toEqual({ launch: false, reason: "closed" });
+		expect(launchable(workload({ mode: "user-driven" }), [], null, [], NOW, 7, 3, true)).toEqual({ launch: false, reason: "user-driven" });
+		expect(launchable(workload(), [], "the train is empty", [], NOW, 7, 3, true)).toEqual({ launch: false, reason: "awaiting-close" });
+		expect(launchable(workload(), control([attempt("lane-m-1", T(1))]), null, [], NOW, 7, 3, true)).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+
+	test("verdictOf passes the rows' capExempt through", () => {
+		const rows = (capExempt: boolean): ReserveRows => ({
+			workload: workload(), entries: [], questions: [], instructions: [], slices: [], holders: [], liveLanes: 3, capExempt, cap: 3, now: NOW,
+		});
+		expect(verdictOf(rows(false))).toEqual({ launch: false, reason: "cap" });
+		expect(verdictOf(rows(true))).toEqual({ launch: true, cause: { kind: "first" } });
+	});
+});
+
+describe("cap-exempt consumption: a resolution is spent only by a ready lane's prompt (PLAN wl-mvpsrr4tr0p1xc D2)", () => {
+	const answer = resolvedAt("in-1", "lane-m-1", T(5));
+	const base = () => [attempt("lane-m-1", T(1)), attempt("lane-m-2", T(6), "resume in-1")];
+	const verdict = (entries: EntryRow[], capExempt: boolean) => launchable(workload(), control(entries), null, [answer], NOW, 0, 3, capExempt);
+
+	test("a resume attempt that never got ready consumes nothing for the train; elsewhere naming the id consumes it, as today", () => {
+		expect(verdict(base(), false)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		expect(verdict(base(), true)).toEqual({ launch: true, cause: { kind: "resume", ids: ["in-1"] } });
+		expect(verdict([...base(), failed("lane-m-2", T(7))], true)).toEqual({ launch: true, cause: { kind: "resume", ids: ["in-1"] } });
+	});
+
+	test("a launched lane's lane-ready: later than the instruction consumes it, whatever cause the attempt named; the same millisecond does not", () => {
+		expect(verdict([...base(), ready("lane-m-2", T(5, 1))], true)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		expect(verdict([...base(), ready("lane-m-2", T(5))], true)).toEqual({ launch: true, cause: { kind: "resume", ids: ["in-1"] } });
+		// a first-cause lane that got ready after the answer carried it in its prompt too
+		expect(verdict([attempt("lane-m-1", T(1)), ready("lane-m-1", T(8))], true)).toEqual({ launch: false, reason: "died-not-relaunched" });
+	});
+
+	test("the time is the body's row cut, not the entry's write time; a lane-ready: of a lane no launch: named counts for nothing", () => {
+		// read before the answer, written after it: the prompt did not carry the answer
+		expect(verdict([...base(), ready("lane-m-2", T(4), T(9))], true)).toEqual({ launch: true, cause: { kind: "resume", ids: ["in-1"] } });
+		expect(verdict([...base(), ready("lane-m-9", T(9))], true)).toEqual({ launch: true, cause: { kind: "resume", ids: ["in-1"] } });
+		expect(consumedByReady(control([...base(), ready("lane-m-2", T(9))]), T(5))).toBe(true);
+		expect(consumedByReady(control([...base(), ready("lane-m-2", T(9))]), T(9))).toBe(false);
+		expect(consumedByReady(control(base()), T(5))).toBe(false);
+	});
+});
+
+describe("trainLaunchFailures: consecutive train launches that never got ready (PLAN wl-mvpsrr4tr0p1xc D4)", () => {
+	const LATER = "2026-10-01T11:00:00.000Z";
+	const rows = (entries: EntryRow[], over: Partial<TrainLaunchRows> = {}): TrainLaunchRows =>
+		({ entries, instructions: [], questions: [], holder: null, holderLeaseUntil: null, now: LATER, ...over });
+	const threeFailed = () => [
+		attempt("lane-m-1", T(1)), failed("lane-m-1", T(2)),
+		attempt("lane-m-2", T(3)), exited("lane-m-2", "never-ready", T(4)),
+		attempt("lane-m-3", T(5)), failed("lane-m-3", T(6)),
+	];
+
+	test("the limit is 3 and the D4 question's options are relaunch / stop, never retry", () => {
+		expect(TRAIN_LAUNCH_LIMIT).toBe(3);
+		expect([...TRAIN_LAUNCH_OPTIONS]).toEqual(["relaunch", "stop"]);
+	});
+
+	test("launch-failed:, a never-ready exit, a superseded attempt and a dead newest attempt each count; the walk stops at a lane that got ready", () => {
+		const entries = [
+			attempt("lane-m-1", T(1)), ready("lane-m-1", T(2)), exited("lane-m-1", "completed", T(3)),
+			attempt("lane-m-2", T(4)), failed("lane-m-2", T(5)),
+			attempt("lane-m-3", T(6)), exited("lane-m-3", "never-ready", T(7)),
+			attempt("lane-m-4", T(8)),
+			attempt("lane-m-5", T(9)),
+		];
+		const f = trainLaunchFailures(rows(entries));
+		expect(f.count).toBe(4);
+		expect(f.lanes).toEqual(["lane-m-2", "lane-m-3", "lane-m-4", "lane-m-5"]);
+		expect(f.first).toBe(T(4));
+		expect(f.last).toBe(T(9));
+		expect(f.failures).toHaveLength(4);
+		expect(f.failures[0]).toStartWith(`lane-m-2 (${T(4)}): launch-failed:`);
+		expect(f.failures[1]).toBe(`lane-m-3 (${T(6)}): lane-exit: outcome never-ready`);
+		expect(f.failures[2]).toStartWith(`lane-m-4 (${T(8)}): no lane-ready:, superseded by lane-m-5`);
+		expect(f.failures[3]).toStartWith(`lane-m-5 (${T(9)}): no lane-ready:`);
+	});
+
+	test("the newest attempt held by its lane under a live lease is in flight and not counted; lapsed, or held by another, it counts", () => {
+		const entries = [attempt("lane-m-1", T(1)), attempt("lane-m-2", T(2))];
+		expect(trainLaunchFailures(rows(entries, { holder: "lane-m-2", holderLeaseUntil: "2026-10-01T11:05:00.000Z" })).lanes).toEqual(["lane-m-1"]);
+		expect(trainLaunchFailures(rows(entries, { holder: "lane-m-2", holderLeaseUntil: "2026-10-01T10:30:00.000Z" })).lanes).toEqual(["lane-m-1", "lane-m-2"]);
+		expect(trainLaunchFailures(rows(entries, { holder: "jo", holderLeaseUntil: null })).lanes).toEqual(["lane-m-1", "lane-m-2"]);
+		expect(trainLaunchFailures(rows([]))).toEqual({ count: 0, lanes: [], failures: [], first: null, last: null });
+	});
+
+	test("Jo's launch word resets the count; the tick's request does not, and a backlog of Jo requests before the failures resets nothing", () => {
+		const jo = (at: string) => row(SURFACE_BY, launchRequestedBody("jo", at), at);
+		const tick = (at: string) => row(MERGE_TRAIN_BY, launchRequestedBody("merge-train", at), at);
+		expect(trainLaunchFailures(rows(threeFailed())).count).toBe(3);
+		expect(trainLaunchFailures(rows([...threeFailed(), jo(T(7))])).count).toBe(0);
+		expect(trainLaunchFailures(rows([...threeFailed(), jo(T(7)), attempt("lane-m-4", T(8)), failed("lane-m-4", T(9))])).lanes).toEqual(["lane-m-4"]);
+		expect(trainLaunchFailures(rows([...threeFailed(), tick(T(7))])).count).toBe(3);
+		expect(trainLaunchFailures(rows([jo(T(0)), jo(T(0, 5)), ...threeFailed()])).count).toBe(3);
+		// a request written in the same millisecond as an attempt, before it in entry order, resets only what precedes it
+		expect(trainLaunchFailures(rows([...threeFailed(), jo(T(7)), attempt("lane-m-4", T(7)), failed("lane-m-4", T(8))])).lanes).toEqual(["lane-m-4"]);
+	});
+
+	test("Jo's relaunch answer to the tick's D4 question resets; a stop answer, a lane's question or an unanswered one does not", () => {
+		const question = (over: Partial<QuestionRow> = {}): QuestionRow => ({
+			id: "q-d4", workload_id: "wl-m", slice_id: "sl-1", body: "train launch limit", options: JSON.stringify(TRAIN_LAUNCH_OPTIONS), state: "answered",
+			resolved_by: "in-a", created_by: MERGE_TRAIN_BY, created_at: T(7), changed_by: SURFACE_BY, changed_at: T(8), rev: 1, ...over,
+		});
+		const answerRow = (body: string): InstructionRow => ({
+			id: "in-a", workload_id: "wl-m", slice_id: "sl-1", kind: "answer", question_id: "q-d4", disposition: null, channel: "surface", author: "jo", body,
+			created_by: SURFACE_BY, created_at: T(8),
+		} as InstructionRow);
+		const count = (q: QuestionRow, body: string) => trainLaunchFailures(rows(threeFailed(), { questions: [q], instructions: [answerRow(body)] })).count;
+		expect(count(question(), "relaunch")).toBe(0);
+		expect(count(question(), "stop")).toBe(3);
+		expect(count(question({ created_by: "lane-m-3" }), "relaunch")).toBe(3);
+		expect(count(question({ state: "open", resolved_by: null }), "relaunch")).toBe(3);
+	});
+
+	test("a new train: binding resets the count", () => {
+		const ins = { id: "in-t", workload_id: "wl-m", slice_id: null, kind: "instruction", question_id: null, disposition: null, channel: "surface", author: "jo",
+			body: prBindingInstructionBody("train", "wl-m", [12]), created_by: SURFACE_BY, created_at: T(7) } as InstructionRow;
+		const binding = row(SURFACE_BY, `train: 12 in-t`, T(7));
+		expect(trainLaunchFailures(rows([...threeFailed(), binding], { instructions: [ins] })).count).toBe(0);
+		// the entry naming no such instruction is no binding
+		expect(trainLaunchFailures(rows([...threeFailed(), binding])).count).toBe(3);
 	});
 });

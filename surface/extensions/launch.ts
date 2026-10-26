@@ -16,8 +16,9 @@
 // below a launchable one is reported queued behind it and no starter runs; in `show` it is `verdictOf`.
 import type { Ledger } from "../../ledger/src/index";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
+	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, launchRowsFor, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
 } from "../src/launch";
+import { openTrains } from "../src/merge-train";
 import { rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
@@ -42,7 +43,7 @@ export interface LaunchOutcome {
  * `requested-by` the starter records. Never throws: an exec failure is a line.
  */
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = launchRowsFor(ledger, workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
 	const verdict = rankGate(ledger, rows, readRankConfig(env));
 	if (!verdict.launch) {
@@ -55,7 +56,8 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 			case "held":
 				return { attempted: false, code: null, line: `${workloadId} is held by ${rows.workload.holder} (lease until ${rows.workload.holder_lease_until ?? "none"}); nothing launched` };
 			case "cap": {
-				const live = ledger.liveLaneHolders(rows.now).map((l) => `${l.holder} on ${l.workloadId}`);
+				// Only the lanes the cap counts: an open merge train's lane takes no slot (PLAN wl-mvpsrr4tr0p1xc D1).
+				const live = ledger.liveLaneHolders(rows.now, new Set(openTrains(ledger))).map((l) => `${l.holder} on ${l.workloadId}`);
 				return { attempted: false, code: null, line: `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees` };
 			}
 			case "awaiting-close":
@@ -93,7 +95,7 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
  * poll and no process. Null when there is no such workload.
  */
 export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = launchRowsFor(ledger, workloadId, laneCap(env));
 	return rows && rankGate(ledger, rows, readRankConfig(env));
 }
 

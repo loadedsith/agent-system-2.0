@@ -14,6 +14,7 @@ import { spendBody } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { controlEntries, doneBody, laneExitBody, laneStopRequestBody, launchRequestedBody, STARTER_EXIT, verdictOf } from "../src/launch";
+import { applyTrain, interpret } from "../src/input";
 import { briefHash, formatOverride, formatSignal, goalsHash, parseShown, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
 import { parallelRead, parallelVerdict, parseRankConfig, type RankConfig, readRankConfig } from "../src/rank-launch";
 import { testRequestedBody } from "../src/test-run";
@@ -605,5 +606,59 @@ describe("T20 Jo's picks write their snapshot in the pick's transaction", () => 
 		await expect(call({ workloadId: hi })).rejects.toThrow("injected");
 		expect(snapshots(l)).toHaveLength(1);
 		l.close();
+	});
+});
+
+// ---- PLAN wl-mvpsrr4tr0p1xc D1: the open merge train is outside the cap and the rank gate ------------------------------
+
+describe("D1 the open train under the rank gate and the cap", () => {
+	/** A merge train on `l` as Jo's `train <pr>` word opens it, scored when `unblocks` is given. */
+	function trainOn(l: Ledger, pr: number, unblocks?: number): string {
+		const cmd = interpret(l, `train ${pr}`);
+		if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+		const wl = applyTrain(l, cmd, tmp("train-repo")).workloadId;
+		if (unblocks !== undefined) signal(l, wl, unblocks);
+		return wl;
+	}
+
+	test("order and parallel: a train Jev ranks below a launchable workload is admitted on launchable's verdict alone, by the reservation and the surface's check", () => {
+		const { l, open } = world();
+		open("hi: Jev ranks it above the train", { unblocks: 0.9 });
+		const train = trainOn(l, 101, 0.1);
+		expect(launchVerdict(l, homeWith(ORDER_YAML), train)).toEqual({ launch: true, cause: { kind: "first" } });
+		// a parallel budget of 0 holds every ordinary workload (`parallel: budget unknown`); the train takes no slot and is not held
+		expect(launchVerdict(l, homeWith("jevRank:\n  mode: parallel\n  parallelBudgetUsd: 0\n"), train)).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(reserve(l, train, ORDER)).toMatchObject({ ok: true, laneId: laneIdOf(train, 1), cause: "first" });
+	});
+
+	test("order: a launchable train ranked above never queues the workload below it", () => {
+		const { l, open } = world();
+		const lo = open("lo", { unblocks: 0.1 });
+		const train = trainOn(l, 101, 0.9);
+		pin(l, train);
+		expect(verdictOf(l.launchRows(train, 3)!)).toEqual({ launch: true, cause: { kind: "first" } });
+		// the same pin on an ordinary workload queues the one below it
+		const pinned = open("pinned ordinary", { unblocks: 0.5 });
+		pin(l, pinned);
+		expect(reserve(l, lo, ORDER)).toEqual({ ok: false, reason: `ranked: below ${pinned}` });
+		running(l, pinned);
+		expect(reserve(l, lo, ORDER)).toMatchObject({ ok: true, laneId: laneIdOf(lo, 1), cause: "first" });
+	});
+
+	test("cap 1 full of an ordinary lane: the train is admitted, and the cap line names only the cap-counted lane while the train's lane runs", async () => {
+		const { l, open } = world();
+		const busy = open("busy", { unblocks: 0.5 });
+		const next = open("next", { unblocks: 0.4 });
+		const train = trainOn(l, 101, 0.1);
+		running(l, busy);
+		const env = { ...homeWith(ORDER_YAML), AGENT_SYSTEM_MAX_LANES: "1" };
+		expect(launchVerdict(l, env, next)).toEqual({ launch: false, reason: "cap" });
+		expect(launchVerdict(l, env, train)).toEqual({ launch: true, cause: { kind: "first" } });
+		running(l, train);
+		const f = fakePi(undefined, { exec: true });
+		expect(await triggerLaunch(f.pi, l, env, next, "open")).toEqual({
+			attempted: false, code: null, line: `${next} queued behind ${laneIdOf(busy, 1)} on ${busy} (cap 1); the tick launches it when a slot frees`,
+		});
+		expect(f.execs.calls).toEqual([]);
 	});
 });
