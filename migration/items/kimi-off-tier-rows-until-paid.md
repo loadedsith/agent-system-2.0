@@ -2,9 +2,9 @@
 title: Opus is the as2 default role; Kimi is off the tier rows until Moonshot is paid
 status: building
 workload: wl-mvplvvhwvmy134
-pr: pending
+pr: 314
 ---
-**Built on branch `wl/wl-mvplvvhwvmy134`.** Jo approved both changes on 2026-10-26 (ledger input `in-mvplvhx6h1c35s`). The Moonshot/Kimi account is suspended for insufficient balance, and Jo is paid on 2026-10-30.
+**Built on branch `wl/wl-mvplvvhwvmy134`, PR #314.** Jo approved both changes on 2026-10-26 (ledger input `in-mvplvhx6h1c35s`). The Moonshot/Kimi account is suspended for insufficient balance, and Jo is paid on 2026-10-30.
 
 ## What changed
 
