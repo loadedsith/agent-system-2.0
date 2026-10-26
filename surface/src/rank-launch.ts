@@ -16,7 +16,7 @@ import { type Ceiling, crossed, effectiveCeiling, parseSpend, type Spend } from 
 import { repoOf } from "./decision-log";
 import { ensureStandingWorkload } from "./identity";
 import {
-	attempts, boundPrs, causeText, consumedIds, controlEntries, decideLaunch, holdersOf, launchRowsFor, type LaunchVerdict, verdictOf,
+	attempts, boundPrs, causeText, consumedIds, controlEntries, holdersOf, launchRowsFor, type LaunchVerdict, verdictOf,
 } from "./launch";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
@@ -73,11 +73,17 @@ export function pendingRequest(rows: ReserveRows): string | null {
  * at once with cause `request <id>` (even when `launchable` reports `first`, so the reservation consumes it); otherwise
  * the workload is refused `ranked: below <wl>` while a higher-ranked workload is launchable now, and under `parallel`
  * refused `parallel: <reason>` when `parallelVerdict` holds it. A cap-exempt workload (an open merge train, PLAN
- * wl-mvpsrr4tr0p1xc D1) takes no slot, so it is admitted on `launchable`'s verdict alone in every mode.
+ * wl-mvpsrr4tr0p1xc D1) takes no slot, so it is admitted on `launchable`'s verdict alone in every mode, `show` included,
+ * with a pending request promoted to its cause so the reservation consumes it.
  */
 export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig): LaunchVerdict {
 	const v = verdictOf(rows);
-	if (config.mode === "show" || !v.launch || rows.capExempt) return v;
+	if (!v.launch) return v;
+	if (rows.capExempt) {
+		const request = pendingRequest(rows);
+		return request !== null ? { launch: true, cause: { kind: "request", id: request } } : v;
+	}
+	if (config.mode === "show") return v;
 	const request = pendingRequest(rows);
 	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
 	const above = higherLaunchable(ledger, rows.workload.id, rows.now, rows.cap, config);
@@ -89,9 +95,8 @@ export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig):
 	return v;
 }
 
-/** `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch` itself). */
+/** `rankGate` in `reserveLane`'s verdict shape: what the starter composes into its reservation (in `show`, `decideLaunch`'s verdict, a cap-exempt request promoted). */
 export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig): ReserveVerdict {
-	if (config.mode === "show") return decideLaunch(rows);
 	const v = rankGate(ledger, rows, config);
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }

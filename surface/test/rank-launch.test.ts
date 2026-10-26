@@ -661,4 +661,24 @@ describe("D1 the open train under the rank gate and the cap", () => {
 		});
 		expect(f.execs.calls).toEqual([]);
 	});
+
+	test("show, order and parallel: a never-launched train's pending request is its launch cause, so the reservation consumes it", () => {
+		for (const config of [SHOW, ORDER, parallel(0)]) {
+			const { l, open } = world();
+			open("hi: Jev ranks it above the train", { unblocks: 0.9 });
+			const train = trainOn(l, 101, 0.1);
+			const req = request(l, train);
+			// launchable alone reads `first`; the gate promotes Jo's request for the cap-exempt train in every mode
+			expect(verdictOf(l.launchRows(train, 3, { capExempt: new Set([train]) })!)).toEqual({ launch: true, cause: { kind: "first" } });
+			expect(reserve(l, train, config)).toMatchObject({ ok: true, laneId: laneIdOf(train, 1), cause: `request ${req}` });
+			expect(launches(l, train)).toEqual([expect.stringContaining(`cause request ${req}`)]);
+		}
+	});
+
+	test("show: an ordinary workload's pending request on its first launch still launches `first`", () => {
+		const { l, open } = world();
+		const wl = open("ordinary", { unblocks: 0.5 });
+		request(l, wl);
+		expect(reserve(l, wl, SHOW)).toMatchObject({ ok: true, laneId: laneIdOf(wl, 1), cause: "first" });
+	});
 });
