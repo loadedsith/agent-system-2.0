@@ -4,12 +4,12 @@
 // with a fake GitHub origin only.
 import { expect } from "bun:test";
 import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
-import { LANE_STARTER_BY, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
-import { decideLaunch, parseTrainBoard } from "../src/launch";
+import { decideLaunch, laneReadyBody, parseTrainBoard } from "../src/launch";
 import { recordTrainTask, TRAIN_ALERT_REPO, type TrainTask } from "../src/merge-train";
 import { makeRunId, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -185,6 +185,18 @@ export function protectedRules(strict = true): unknown[] {
 	return [{ type: "required_status_checks", ruleset_id: 1, parameters: { strict_required_status_checks_policy: strict, required_status_checks: [{ context: "as2/full-suite" }] } }];
 }
 
+/**
+ * The fake launcher's reservation: lane.ts launch's (decideLaunch consumes the request), with no process behind the lane, and
+ * the runner's `lane-ready:` at once, so the lane counts as having had its first prompt (PLAN wl-mvpsrr4tr0p1xc D2: only a
+ * ready lane's exit ends the train's work, and only never-ready launches count toward the launch limit).
+ */
+export function launchReady(ledger: Ledger, wl: string): { code: number; line: string } {
+	const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
+	if (!r.ok) return { code: 1, line: r.reason };
+	ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: wl, kind: "assumption", body: laneReadyBody(r.laneId, ledger.now()) });
+	return { code: 0, line: `launched ${r.laneId}` };
+}
+
 /** A train on `prs` (#101 and #106 by default) held by TRAIN_LANE, the autonomous owner of #101, a fake gh and launcher, on one ledger with a settable clock. */
 export function world(prs: readonly number[] = [101, 106]) {
 	const c = clock();
@@ -202,11 +214,10 @@ export function world(prs: readonly number[] = [101, 106]) {
 	g.prs.set(106, { head: H0, branch: "feature/other" });
 	const launches: string[] = [];
 	const notes: string[] = [];
-	/** The fake launcher: lane.ts launch's reservation (decideLaunch consumes the request), with no process behind the lane. */
+	/** The fake launcher (`launchReady`). */
 	const launch = (wl: string) => {
 		launches.push(wl);
-		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
-		return r.ok ? { code: 0, line: `launched ${r.laneId}` } : { code: 1, line: r.reason };
+		return launchReady(ledger, wl);
 	};
 	const run = () => tick({ ledger, gh: g.gh, launch, notify: (_t, text) => { notes.push(text); return true; } });
 	/** The train lane's lane_train_return for PR `pr` at the fake PR's current head. */
@@ -275,8 +286,7 @@ export function boardWorld() {
 	const logs: string[] = [];
 	const launch = (wl: string) => {
 		launches.push(wl);
-		const r = ledger.reserveLane(wl, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: MERGE_TRAIN_BY, decide: decideLaunch });
-		return r.ok ? { code: 0, line: `launched ${r.laneId}` } : { code: 1, line: r.reason };
+		return launchReady(ledger, wl);
 	};
 	const run = () => tick({ ledger, gh: g.gh, launch, notify: () => true, log: (l) => logs.push(l), config: SERVED });
 	c.plusHours(0.01);

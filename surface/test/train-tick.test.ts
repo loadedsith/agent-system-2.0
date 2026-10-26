@@ -11,7 +11,7 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "..
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody } from "../src/launch";
+import { controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody } from "../src/launch";
 import {
 	actionable, fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs,
 	trainRetries, trainSliceId, type TrainTask, trainWakeBody,
@@ -44,7 +44,7 @@ describe("settles and deliveries (D8, D10)", () => {
 		expect(w.launches).not.toContain(w.train);
 	});
 
-	test("an actionable train no lane holds live is woken", () => {
+	test("an actionable train no lane holds live is woken; never launched, it launches on its own cause `first`, with no request (PLAN wl-mvpsrr4tr0p1xc D2)", () => {
 		const w = world();
 		w.task(101);
 		w.c.plusHours(0.05);
@@ -52,7 +52,8 @@ describe("settles and deliveries (D8, D10)", () => {
 		w.c.plusHours(0.2); // the train lane's lease has lapsed
 		w.run();
 		expect(w.launches).toContain(w.train);
-		expect(controlEntries(w.ledger.entries(w.train)).some((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY)).toBe(true);
+		expect(controlEntries(w.ledger.entries(w.train)).filter((c) => c.prefix === "launch").map((c) => c.rest)).toEqual([`cause first requested-by ${MERGE_TRAIN_BY}`]);
+		expect(controlEntries(w.ledger.entries(w.train)).some((c) => c.prefix === "launch-requested")).toBe(false);
 	});
 
 	test("attempt 1 failed with the owner gone: exactly one fix workload, reused for attempt 2", () => {
@@ -431,6 +432,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		test(`a capped hold-expiry request (${pending ? "pending before expiry" : "newly written"}) served by the drain consumes the expiry once, without a second launch`, () => {
 			const w = world([101]);
 			w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: `launch: ${TRAIN_LANE} cause first requested-by ${SURFACE_BY}` });
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneReadyBody(TRAIN_LANE, w.c.now()) });
 			const holdId = held(w, TRAIN_LANE, "2026-10-01T12:00:00.000Z");
 			const pendingId = pending ? w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: w.train, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, w.c.now(), "prior wake") }) : null;
 			w.c.at("2026-10-01T12:00:00.000Z");
@@ -453,6 +455,7 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 			const r = w.ledger.reserveLane(w.train, { by: LANE_STARTER_BY, cap: 10, leaseMs: 60_000, requestedBy: LANE_RUNNER_BY, decide: decideLaunch });
 			expect(r).toMatchObject({ ok: true, cause: `request ${requests()[0]!.id}` });
 			if (!r.ok) throw new Error(r.reason);
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneReadyBody(r.laneId, w.c.now()) });
 			expect(w.ledger.releaseWorkload(w.train, { by: r.laneId, holder: r.laneId }).released).toBe(true);
 			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(r.laneId, { code: 0, signal: null, outcome: "released" }) });
 			w.c.plusHours(1);
@@ -484,7 +487,8 @@ describe("retries of a released train and fork PRs (D8-D10, review gtb-r1)", () 
 		w.run();
 		w.run();
 		expect(trainLaunches(w)).toBe(1);
-		expect(requests()).toHaveLength(1);
+		// never launched: the train's own cause `first` starts it, so the tick writes no request (PLAN wl-mvpsrr4tr0p1xc D2)
+		expect(requests()).toEqual([]);
 		expect(holdWakes(w, holdId)).toBe(1);
 	});
 
@@ -902,6 +906,7 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 	const settledWorld = () => {
 		const w = world([101]);
 		w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: `launch: ${TRAIN_LANE} cause first requested-by ${SURFACE_BY}` });
+		w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneReadyBody(TRAIN_LANE, w.c.now()) });
 		w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, 101), task: "PR #101", doneCondition: "terminal", inputs: "#101" });
 		expect(w.ledger.claimWorkload(w.owner, { by: LANE_STARTER_BY, holder: OWNER_LANE, leaseMs: 6 * 3_600_000 }).won).toBe(true);
 		w.task(101);
@@ -929,6 +934,7 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 			const r = w.ledger.reserveLane(w.train, { by: LANE_STARTER_BY, cap: 10, leaseMs: 3 * MIN, requestedBy: LANE_RUNNER_BY, decide: decideLaunch });
 			if (!r.ok) return;
 			drained.push(w.c.now());
+			w.ledger.recordEntry({ by: LANE_RUNNER_BY, workloadId: w.train, kind: "assumption", body: laneReadyBody(r.laneId, w.c.now()) });
 			// the pass-over only inside a longer note (review r1 #3), then lane_release with #101 open, then the runner's exit
 			w.ledger.recordEntry({ by: r.laneId, workloadId: w.train, kind: "assumption", body: `train chain (${r.laneId}): #101 left with its owner; train-error: pr 101 live lane ${OWNER_LANE} on wl/${w.owner}` });
 			w.ledger.recordEntry({ by: r.laneId, workloadId: w.train, kind: "assumption", body: releasedOpenBody(r.laneId, 1) });
@@ -1019,7 +1025,9 @@ describe("the relaunch loop, replaying wl-mvggzumu8zs5xc (PLAN wl-mvgn310dpi5gcg
 		}
 		lines = w.run();
 		expect(lines.filter((l) => l.includes("not requested"))).toEqual([]);
-		for (const wl of [w.train, w.owner]) expect(w.requested(wl)).toBe(1);
+		// the owner on the tick's request; the never-launched train on its own cause `first`, with no request (PLAN wl-mvpsrr4tr0p1xc D2)
+		expect(w.requested(w.owner)).toBe(1);
+		expect(w.requested(w.train)).toBe(0);
 		expect([...w.launches].sort()).toEqual([w.train, w.owner].sort());
 	});
 
