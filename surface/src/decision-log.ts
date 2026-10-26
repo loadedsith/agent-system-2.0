@@ -170,10 +170,14 @@ function fitEntry(heading: string, content: readonly string[], share: number, na
  * naming `dir`. When even the header line exceeds `maxBytes`, the result is that line clipped to fit.
  */
 export function decisionLogContext(dir: string, opts: ContextOptions = {}): string {
+	return renderLogContext(readLog(dir), dir, opts);
+}
+
+/** `decisionLogContext` over entries already read: pure, no file I/O (`dir` only names the log in the "not rendered" line). */
+export function renderLogContext(entries: readonly LogEntry[], dir: string, opts: ContextOptions = {}): string {
 	const now = opts.now ?? new Date().toISOString();
 	const maxBytes = opts.maxBytes ?? DECISION_LOG_MAX_BYTES;
 	const entryBytes = opts.entryBytes ?? DECISION_LOG_ENTRY_BYTES;
-	const entries = readLog(dir);
 	const superseded = new Set(entries.map((e) => e.frontmatter.supersedes).filter((s): s is string => !!s && s !== "null" && s !== "~"));
 	let picked = entries.filter((e) => e.frontmatter.status !== "superseded" && !superseded.has(basename(e.path)) && !superseded.has(basename(e.path, ".md")));
 	if (opts.since) picked = picked.filter((e) => e.date > opts.since!);

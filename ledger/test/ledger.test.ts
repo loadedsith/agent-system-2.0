@@ -6,6 +6,7 @@ import { basename, dirname, join } from "node:path";
 // Only names that also existed before the N1-N4 fixes, so each regression below fails on its own
 // assertion against the old module rather than the whole file failing to load.
 import { assertLocalPath, defaultLedgerPath, Ledger, LEDGER_DB_ENV, LedgerLocationError, SCHEMA_VERSION } from "../src/index";
+import { mountLocality } from "../src/locality";
 
 const REPO = join(import.meta.dir, "..", "..");
 const SQLITE3 = existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
@@ -341,6 +342,65 @@ describe("locality", () => {
 		expect(r.exitCode).toBe(3);
 		expect(r.stderr.toString()).toContain("a synced folder");
 		expect(existsSync(target)).toBe(false);
+	});
+
+	// statfs(2) through bun:ffi is arm64 macOS only; every other platform still runs df.
+	const statfsHost = process.platform === "darwin" && process.arch === "arm64";
+
+	test.skipIf(!statfsHost)("arm64 macOS: the probe asks the kernel and starts no child process (T1)", () => {
+		const dir = scratch("t1");
+		const target = join(dir, "ledger.db");
+		const script = join(dir, "probe.ts");
+		// Plain JS, no types: the recorders must be installed before locality.ts loads, so it is imported
+		// dynamically (a static import would be hoisted above them).
+		writeFileSync(script, `
+			const calls = [];
+			for (const name of ["spawn", "spawnSync"]) {
+				const real = Bun[name].bind(Bun);
+				Bun[name] = (...args) => { calls.push(args[0]); return real(...args); };
+			}
+			const { mountLocality, assertLocalPath } = await import(${JSON.stringify(join(REPO, "ledger", "src", "locality.ts"))});
+			const where = mountLocality(process.argv[2]);
+			assertLocalPath(process.argv[2]);
+			console.log(JSON.stringify({ where, calls }));
+		`);
+		const r = Bun.spawnSync(["bun", script, target], { stdout: "pipe", stderr: "pipe" });
+		expect(r.stderr.toString()).toBe("");
+		expect(r.exitCode).toBe(0);
+		expect(JSON.parse(r.stdout.toString())).toEqual({ where: "local", calls: [] });
+	});
+
+	/** /sbin/mount as [mount point, flags] rows. */
+	const mountTable = () => Bun.spawnSync(["/sbin/mount"], { stdout: "pipe", stderr: "pipe" }).stdout.toString().split("\n")
+		.flatMap((l) => {
+			const m = /^.+? on (.+) \((.*)\)$/.exec(l);
+			return m ? [{ mp: m[1]!, flags: m[2]!.split(",").map((s) => s.trim()) }] : [];
+		});
+	const under = (mp: string, path: string) => mp === "/" || path === mp || path.startsWith(`${mp}/`);
+
+	test.skipIf(!statfsHost)("arm64 macOS: the statfs answer agrees with /sbin/mount for the temp dir, / and /dev (T2)", () => {
+		const table = mountTable();
+		for (const [path, viaData] of [[realpathSync(scratch("t2")), true], ["/", false], ["/dev", false]] as const) {
+			// A path under the firmlinked /private, /Users, ... is listed by /sbin/mount under the Data volume.
+			const candidates = table.filter((e) => under(e.mp, path) || (viaData && under(e.mp, `/System/Volumes/Data${path}`)));
+			const entry = candidates.sort((a, b) => b.mp.length - a.mp.length)[0];
+			expect(entry, path).toBeDefined();
+			expect(entry!.flags, path).toContain("local");
+			expect(mountLocality(path), path).toBe("local");
+		}
+	});
+
+	const autoHome = statfsHost ? mountTable().find((e) => e.mp === "/System/Volumes/Data/home" && e.flags[0] === "autofs") : undefined;
+	test.skipIf(!autoHome)("arm64 macOS: the autofs indirect-map root is reported as network (T2, skipped when /sbin/mount does not list map auto_home on /System/Volumes/Data/home)", () => {
+		const where = mountLocality("/System/Volumes/Data/home");
+		expect(where.startsWith("network:/System/Volumes/Data/home ")).toBe(true);
+		expect(where).toContain("(autofs)");
+	});
+
+	test("a path whose every ancestor below / is missing reports the locality of / (T3)", () => {
+		const missing = join("/", `ledger-missing-${process.pid}-${Date.now()}`, "a", "b", "ledger.db");
+		expect(existsSync(dirname(dirname(dirname(missing))))).toBe(false);
+		expect(mountLocality(missing)).toBe(mountLocality("/"));
 	});
 });
 
