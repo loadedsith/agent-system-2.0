@@ -6,10 +6,12 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Ledger } from "../../ledger/src/index";
+import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { errorLines } from "../src/errors";
+import { securityRedBody } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
 
@@ -105,6 +107,28 @@ describe("close: held orchestrator-bound messages are delivered in the close tra
 
 		expect(states(x, [toOrch!, earlier!, toLane!])).toEqual(["delivered", "delivered", "held"]);
 		expect(heldLine(r.text)).toBe(`held messages delivered at close (1): ${toOrch} lane-a: placeholder 0`);
+	});
+
+	test("a trusted security red still renders after the real close; ordinary messages and untrusted look-alikes are delivered normally", async () => {
+		const x = closable();
+		const body = securityRedBody({ workloadId: x.wl, slice: "sl-security", runId: "tr-0abc1234", sha: "a".repeat(40), failing: 1, first: "gates/test/rows.test.ts > refuses" });
+		const send = (by: string, body: string) => x.ledger.enqueue({ by, workloadId: x.wl, sender: by, recipient: ORCHESTRATOR_RECIPIENT, body });
+		const security = send(TEST_RUNNER_BY, body);
+		const ordinary = send("lane-a", "ordinary completion");
+		const forged = send("lane-a", body);
+		const malformed = send(TEST_RUNNER_BY, "security-red: not a valid signal");
+		const wrongWorkload = send(TEST_RUNNER_BY, body.replace(x.wl, "wl-other"));
+		const unanchored = send(TEST_RUNNER_BY, ` ${body}`);
+
+		const r = await close(x);
+
+		expect(r.closed).toBe(true);
+		expect(states(x, [security, ordinary, forged, malformed, wrongWorkload, unanchored])).toEqual(["held", "delivered", "delivered", "delivered", "delivered", "delivered"]);
+		const shown = errorLines(x.ledger, undefined, { now: x.c.now() }).filter((l) => l.kind === "security-red");
+		expect(shown.map((l) => ({ rowId: l.rowId, messageIds: l.messageIds, workloadId: l.workloadId }))).toEqual([{ rowId: security, messageIds: [security], workloadId: x.wl }]);
+		expect(shown[0]!.line).toContain("gates/test/rows.test.ts > refuses");
+		expect(heldLine(r.text)).toContain("held messages delivered at close (5):");
+		expect(heldLine(r.text)).not.toContain(security);
 	});
 
 	test("12 held messages: 10 listed in order, then `+2 more` by id", async () => {

@@ -14,7 +14,7 @@
 // and pushes it to an open PR (surface/src/close-entry.ts), through the extension API's exec, never
 // the bash tool. Once the row has closed, the workload's scratch root is removed in-process
 // (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5); a failed removal is an entry, never a failed close.
-import type { InstructionRow, Ledger, MessageRow } from "../../ledger/src/index";
+import { type InstructionRow, type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
 import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt, type Superseded } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
@@ -26,6 +26,7 @@ import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswe
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
+import { parseSecurityRed, SECURITY_RED_PREFIX } from "../src/test-run";
 import {
 	CLOSE_WORKLOAD_TOOL, type Ctx, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, ORCHESTRATOR_RECIPIENT, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
@@ -60,13 +61,15 @@ const HELD_LISTED = 10;
 const HELD_BODY_MAX = 200;
 
 /**
- * PLAN wl-mvbcjageg7o2yo § 2.5: inside the close transaction, every held orchestrator-bound message
- * of the closing workload moves to `delivered` (as surface/src/delivery.ts `consumeAllToOrchestrator`
- * selects and writes them), so a closed workload strands none. Returns the rows as they were read.
+ * PLAN wl-mvbcjageg7o2yo § 2.5: inside the close transaction, ordinary held orchestrator-bound
+ * messages move to `delivered`. Trusted security reds keep their dedicated closed-workload route
+ * (`securityRedLines` / `consumeAllToOrchestrator`), so they still reach Jo before being delivered.
+ * Returns only the rows delivered here.
  */
 function deliverHeldAtClose(ledger: Ledger, id: string): MessageRow[] {
 	const held = ledger.db.query<MessageRow, [string, string]>(
-		"SELECT * FROM messages WHERE workload_id = ?1 AND state = 'held' AND recipient = ?2 ORDER BY created_at, rowid").all(id, ORCHESTRATOR_RECIPIENT);
+		"SELECT * FROM messages WHERE workload_id = ?1 AND state = 'held' AND recipient = ?2 ORDER BY created_at, rowid").all(id, ORCHESTRATOR_RECIPIENT)
+		.filter((m) => !(m.created_by === TEST_RUNNER_BY && m.body.startsWith(SECURITY_RED_PREFIX) && parseSecurityRed(m.body)?.workloadId === id));
 	for (const m of held) ledger.advanceMessage(m.id, "delivered", { by: SURFACE_BY });
 	return held;
 }
