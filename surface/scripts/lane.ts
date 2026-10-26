@@ -3,8 +3,9 @@
 // 14): one Bun file with subcommands, every ledger write through the module (P-11 row 10).
 //
 //   launch <wl> [--requested-by <who>]  the starter the surface execs: reserve (predicate inside the
-//                                        transaction), preflight, worktree + branch, system prompt,
-//                                        spawn `run` detached; prints `lane <laneId> runner <pid>`
+//                                        transaction, after the live-lane check: an earlier lane whose runner or
+//                                        omp still runs refuses `held`, liveLaneOf), preflight, worktree + branch,
+//                                        system prompt, spawn `run` detached; prints `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
 //                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
@@ -14,16 +15,20 @@
 //                                        the recorded omp and runner pids (liveRunnerOf); a lane id held or running,
 //                                        or one whose owner ps could not verify, exits 7 (held) before any ledger
 //                                        write or spawn; it spawns omp only while the lock still names it (startAsOwner,
-//                                        else exit 7 with nothing written); only the lock's owner finalizes, and it
+//                                        else exit 7 with nothing written) and the workload is still held by its lane id
+//                                        (spawnIfReserved, else exit 7 with launch-failed:); only the lock's owner finalizes, and it
 //                                        frees the lock on exit. Every ps call is bounded (PS_TIMEOUT_MS in
 //                                        src/omp-probe.ts), since some run inside ledger writes. The quota guard
-//                                        (PLAN wl-mv71x5rwdu7eo0 § 4, classifier/src/headroom.ts) is here only: Jo's
-//                                        named model projected out spawns no omp (launch-failed: … headroom); an
-//                                        unnamed lane on an out lab is moved by set_model before its first prompt
-//                                        (lane-headroom:)
-//   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy, then
-//                                        omp in the TUI in the foreground (--model when Jo named one, --resume
-//                                        when recorded on that same model)
+//                                        (classifier/src/headroom.ts) is here only: configured budget comparisons may
+//                                        retain a week-only out source without changing its model. Otherwise Jo's
+//                                        named model refuses before omp (launch-failed: … headroom); an unnamed lane
+//                                        moves to a base-in-quota strong-row model before its first prompt (lane-headroom:)
+//   interactive <wl>                     `as2 lane <wl>`: reserve under the interactive policy (after the same
+//                                        live-lane check), then omp in the TUI in the foreground (--model when Jo
+//                                        named one, --resume when recorded on that same model), spawned in one write
+//                                        with its lane-started: while the workload is still held by its lane id, its
+//                                        first prompt and the workload's state supplied as `@prompt.md` (resume too);
+//                                        AGENT_SYSTEM_BY_HAND=1
 //   stop <wl>                            write the lane-stop: request; wait for lane-exit:; with no
 //                                        runner alive, accept, end omp (SIGTERM, then SIGKILL after the
 //                                        grace, each only while the pid's start time matches
@@ -52,7 +57,8 @@ import { SCRATCH_ENV } from "../../gates/src/scratch";
 import { ensureScratchRoot } from "../src/scratch-root";
 import { canonicalPath, homeDir } from "../../ledger/src/locality";
 import {
-	type EntryRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type ReserveResult, type Stakes, type WorkloadRow,
+	type EntryRow, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, defaultLedgerPath, type QuestionRow, type ReserveResult, type ReserveRows, type ReserveVerdict, type SliceRow, type Stakes,
+	type WorkloadRow,
 } from "../../ledger/src/index";
 import {
 	type Ceiling, ceilingKey, type CeilingNoticeLevel, ceilingNoticeBody, crossed, effectiveCeiling, originalCeiling, pairedCeilingPromptLine, parseCeilingNotice, scanSpend, type Spend,
@@ -64,7 +70,7 @@ import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
 import {
-	branchBody, branchName, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
 	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
@@ -78,6 +84,7 @@ import { waitingReserved } from "../src/errors";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { sendNotice } from "../src/notice";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import { renderWorkload } from "../src/render";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
 import { parseHeartbeat, runDirOf, runsRoot, testRuns } from "../src/test-run";
@@ -292,6 +299,24 @@ function promptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared, 
 }
 
 /**
+ * The by-hand lane's first prompt (PLAN-2 D1b): `promptFor`'s, then `## Workload state now` with the workload's block as
+ * the orchestrator's on-demand read renders it (`renderWorkload`: slices, open questions, pending messages, recent entries),
+ * read from the ledger at launch. Read-only: the lane gets no orchestrator tool. The runner's prompt is `promptFor`'s alone.
+ */
+function byHandPromptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prepared): string {
+	const now = ledger.inFlight().find((x) => x.workload.id === w.id);
+	if (!now) throw new Fail("interactive", `workload ${w.id} is not open`, STARTER_EXIT.closed!);
+	// Jo's ruling (in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1): by-hand lanes have spend context, not a meter.
+	// Only cmdRun stops at the ceiling or sends ceiling notices; the extension reports paired spend to the lane and Jo's pane.
+	const es = ledger.entries(w.id);
+	const control = controlEntries(es, holdersOf(es, now.workload.holder));
+	const instructions = ledger.instructions(w.id);
+	const spent: Spend = { ...scanSpend(p.sessionDir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control, Date.now(), null) };
+	const pairedLine = pairedCeilingPromptLine(effectiveCeiling(control, instructions, w.stakes), originalCeiling(control, instructions, w.stakes), spent);
+	return `${promptFor(ledger, w, laneId, p, pairedLine)}\n\n## Workload state now\n\n${renderWorkload(ledger, now)}\n`;
+}
+
+/**
  * The model and session this attempt starts on, read fresh at every spawn: Jo's named model (`laneModel`, null for the
  * profile default) and the session `resumeOrigin` picks (decisions 6, 7, 14), resumed only when its origin lane ran on that
  * same model (`resumePlan`, MIGRATION.md item 85); `skipped` says why a recorded session was not resumed.
@@ -336,15 +361,22 @@ class Refused extends Error {
  * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
  * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
  * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
+ * Both policies first run the live-lane check (`liveRefusal`, PLAN wl-mvgn310dpi5gcg D2) in that transaction, its ps through
+ * `probeFor` (the tests pass a fake), so no other reservation lands between the probe and the claim.
  */
-export function reserve(ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig()): ReserveResult {
+export function reserve(
+	ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig(),
+	probeFor: (laneId: string) => RunnerProbe = (laneId) => runnerProbe(wl, laneId),
+): ReserveResult {
 	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
-	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => decideRanked(ledger, rows, config) });
+	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? decideRanked(ledger, rows, config) });
 	try {
 		return ledger.write(() => {
 			const r = ledger.reserveLane(wl, {
 				...input,
 				decide: (rows) => {
+					const held = liveRefusal(rows, probeFor);
+					if (held !== null) return held;
 					const v = decideInteractive(rows);
 					if (v.launch) writePickSnapshot(ledger, rows.now);
 					return v;
@@ -357,6 +389,13 @@ export function reserve(ledger: Ledger, wl: string, who: string, interactive: bo
 		if (err instanceof Refused) return err.result;
 		throw err;
 	}
+}
+
+/** D2: `held: <laneId> still running (<omp|runner> pid <n>)` while an earlier lane on the workload is live (`liveLaneOf`), else null. */
+function liveRefusal(rows: ReserveRows, probeFor: (laneId: string) => RunnerProbe): ReserveVerdict | null {
+	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
+	const live = liveLaneOf(control, probeFor);
+	return live === null ? null : { launch: false, reason: `held: ${live.laneId} still running (${live.what} pid ${live.pid})` };
 }
 
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
@@ -745,6 +784,47 @@ export function liveRunnerOf(control: readonly ControlEntry[], laneId: string, s
 	return null;
 }
 
+/**
+ * The first live lane on a workload (PLAN wl-mvgn310dpi5gcg D2), or null: every lane id with a `lane-started:` after its newest
+ * `lane-exit:`, newest first, checked by `liveRunnerOf` with `probeFor(laneId)`. Released or not, a lane whose runner or omp
+ * is alive refuses a new reservation, and so does one ps could not answer for (`uninspected`) or could not verify
+ * (`unverified`), as `cmdRun` treats them. A crashed runner (both pids gone) never refuses.
+ */
+export function liveLaneOf(control: readonly ControlEntry[], probeFor: (laneId: string) => RunnerProbe): (LiveRunner & { laneId: string }) | null {
+	const done = new Set<string>();
+	for (let i = control.length - 1; i >= 0; i--) {
+		const { prefix, laneId } = control[i]!;
+		if (laneId === null || done.has(laneId)) continue;
+		if (prefix === "lane-exit") done.add(laneId);
+		if (prefix !== "lane-started") continue;
+		done.add(laneId);
+		const live = liveRunnerOf(control, laneId, process.pid, probeFor(laneId));
+		if (live !== null) return { laneId, ...live };
+	}
+	return null;
+}
+
+/** Whether `laneId` still holds the workload it reserved (D2b): a lapsed lease with the holder unchanged still does. */
+export function stillReserved(workload: Pick<WorkloadRow, "holder"> | null, laneId: string): boolean {
+	return workload !== null && workload.holder === laneId;
+}
+
+/**
+ * D2b: the spawn, inside the one ledger write that spawns omp and records its `lane-started:` (the runner's `startAsOwner`
+ * body, `cmdInteractive`'s spawn write). With nothing spawned yet (`current` null), the workload must still be held by
+ * `laneId` (`stillReserved`), else nothing is spawned and a `held` Fail (stage `reserve`) rolls the write back: another
+ * starter reserved after this reservation's pre-claim lapsed. A busy-retried write passes the child it already spawned,
+ * which is returned as is: one spawn per lane.
+ */
+export function spawnIfReserved<C>(ledger: Pick<Ledger, "workload">, wl: string, laneId: string, current: C | null, spawnChild: () => C): C {
+	if (current !== null) return current;
+	const w = ledger.workload(wl);
+	if (!stillReserved(w, laneId)) {
+		throw new Fail("reserve", `${laneId} not started: held: ${wl} is held by ${w?.holder ?? "no one"}, not ${laneId}; another starter reserved it after this reservation's pre-claim lapsed; no omp spawned`, STARTER_EXIT.held!);
+	}
+	return spawnChild();
+}
+
 /** Whether a `ps -o command=` line is `lane.ts run <wl> <laneId>` (how `cmdLaunch` and chaos start a runner), whatever the path to lane.ts. */
 export function isRunnerCommand(command: string, wl: string, laneId: string): boolean {
 	const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1023,8 +1103,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	};
 	/** OMP's `--max-time`: the ceiling's remaining wall plus the margin, or AGENT_SYSTEM_LANE_MAX_TIME when that is set and shorter; fixed at the spawn. */
 	let maxTime = laneMaxTime(process.env);
-	const spawnedAt = Date.now();
-	let deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+	let deadlineAt = Number.MAX_SAFE_INTEGER;
 	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
 
 	let child: Subprocess<"pipe", "pipe", "inherit"> | null = null;
@@ -1050,11 +1129,20 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let ranModel: string | null = null;
 	/**
 	 * Ready also waits for the first `get_state` (every lane, PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that
-	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when projected out of quota, must first be moved (`move`).
+	 * `provider/id` (`stateModelCheck`); an unnamed lane's model, when still out after budget comparison, must first be moved (`move`).
 	 */
 	let modelChecked = false;
 	/** The quota signal, read once before the spawn (classifier/src/headroom.ts; `AS2_HEADROOM_POLLS` names the polls in tests). */
 	const room = headroom();
+	// Installed strong-row order is counterfactual budget evidence, not verified spawn availability or permission to replace a pin.
+	// A broken table disables only comparison; ordinary admission remains possible and moveOff reports the existing failure.
+	let strongRow: string[] = [];
+	let strongRowFailure: string | null = null;
+	try {
+		strongRow = loadTierTable(profileConfig()).strong.map(modelIdentity);
+	} catch (err) {
+		strongRowFailure = oneLine(err);
+	}
 	/** An unnamed lane's move off an out lab: `set_model` to `to` was sent; ready waits for `get_state` to report `to` (set in `moveOff`). */
 	let move = null as { from: string; to: string; reason: string } | null;
 	/** omp's error on the first prompt that ended `error` (D3 keeps the first), for the death line. */
@@ -1370,16 +1458,19 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			resumeSkipped = start.skipped;
 			if (resumeSkipped !== null) process.stderr.write(`runner: ${laneId} starts a fresh session on ${model ?? "the profile default"}: ${resumeSkipped}\n`);
 			if (room.note !== null) process.stderr.write(`runner: ${laneId} quota guard open: ${room.note}\n`);
-			// PLAN wl-mv71x5rwdu7eo0 § 4: Jo's named model projected out of quota is refused before any omp, never replaced; the
-			// catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
-			const out = model === null ? null : room.outFor(model);
-			if (out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${out}`, STARTER_EXIT["not-launchable"]!);
+			// Budget comparison can retain Jo's named source, never substitute it. An out decision still fails before any omp,
+			// and the catch below finalizes it as the runner (`failAfterReserve` by lane-runner).
+			if (model !== null) {
+				if (strongRowFailure !== null) process.stderr.write(`runner: ${laneId} quota guard comparison unavailable: the strong row could not be read: ${strongRowFailure}\n`);
+				const decision = room.decisionFor(model, strongRow);
+				if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
+				if (decision.out !== null) throw new Fail(HEADROOM_STAGE, `named ${model}, ${decision.out}`, STARTER_EXIT["not-launchable"]!);
+			}
 			argv = laneArgv({
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
 			});
 			maxTime = argv[argv.indexOf("--max-time") + 1]!;
-			deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
 		const frames = join(p.dir, `lane-${ordinal}.jsonl`);
@@ -1390,7 +1481,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		 * The spawn and its lane-started: record are one ledger write, after the run lock is read as this runner's inside it
 		 * (`startAsOwner`; openai review r3): a lock removed before this point, with the lane dir or alone, ends the run here
 		 * with exit 7 and no omp, and this runner records and releases nothing, since a runner that took the vacant lock may
-		 * own the lane id now. A busy-retried write runs the body again: the spawn happens once, the record is rewritten.
+		 * own the lane id now. Then, before the spawn, the workload must still be held by this lane id (`spawnIfReserved`, D2b):
+		 * another starter's reservation after this one's pre-claim lapsed ends the run with exit 7, no omp, and launch-failed:.
+		 * A busy-retried write runs the body again: the spawn happens once, the record is rewritten.
 		 * The record's one ps call (omp's start time) is bounded (`runPs`, review r4), so the write holds the ledger's lock for
 		 * at most PS_TIMEOUT_MS past the spawn; a ps past it rolls the write back and the run fails with omp killed (`startRecord`).
 		 * Known limitation (moonshot review r3 minor 3): a SIGKILL of this runner after the spawn and before the write commits
@@ -1398,10 +1491,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		 * closes with this runner, which is the only end it gets.
 		 */
 		const omp = startAsOwner(ledger, lock, () => {
-			if (child === null) {
+			child = spawnIfReserved(ledger, wl, laneId, child, () => {
 				runStart = Date.now();
-				child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
-			}
+				return spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+			});
 			record(startRecord());
 			return child;
 		});
@@ -1416,11 +1509,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			lostLock = true;
 			throw new Fail("run", `${laneId} not started: lost the run lock ${lock.path} before the spawn (${now}); no omp spawned, nothing recorded or released`, STARTER_EXIT.held!);
 		}
+		// Preparation can block on git and profile reads. The child's readiness window and
+		// max-time start at its actual spawn, just like the ceiling meter's live wall time.
+		const spawnedAt = runStart!;
+		deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
 		send({ id: STATE_ID, type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
 		// waits for OMP's first get_state (PLAN wl-mv71x5rwdu7eo0 § 4): a named model must be exactly that provider/id (item 85), and an
-		// unnamed lane on a lab projected out of quota is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
+		// unnamed lane still out after budget comparison is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
 		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
 			if (ready || finished || outcome !== null || fatal !== null) return;
@@ -1484,22 +1581,19 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			omp.kill("SIGKILL");
 		};
 		/**
-		 * PLAN wl-mv71x5rwdu7eo0 § 4: an unnamed lane whose first get_state model `from` is projected out (`reason`) moves, before its
-		 * first prompt, to the first entry of the installed profile's strong row (`:level` dropped) that is not out, in row order:
-		 * `set_model`, then a get_state that must report it (omp://rpc.md § Model: `{ type: "set_model", provider, modelId }`).
-		 * An unreadable tier table or a row with every entry out is never-ready at stage `headroom`.
+		 * An unnamed lane whose first get_state model `from` remains out (`reason`) after budget comparison moves, before its
+		 * first prompt, to the first base-in-quota entry of the installed strong row (`:level` dropped), in row order.
+		 * Destination decisions never use comparators: retention protects the source, not another out destination.
+		 * `set_model`, then a get_state must report it. An unreadable tier table or every entry out is never-ready at `headroom`.
 		 */
 		const moveOff = (from: string, reason: string): void => {
-			let row: string[];
-			try {
-				row = loadTierTable(join(profileAgentDir(), "config.yml")).strong.map(modelIdentity);
-			} catch (err) {
-				failModel(`${from} is out (${reason}); the strong row could not be read: ${oneLine(err)}`, HEADROOM_STAGE);
+			if (strongRowFailure !== null) {
+				failModel(`${from} is out (${reason}); the strong row could not be read: ${strongRowFailure}`, HEADROOM_STAGE);
 				return;
 			}
-			const to = row.find((s) => room.outFor(s) === null);
+			const to = strongRow.find((s) => room.decisionFor(s).out === null);
 			if (to === undefined) {
-				failModel(`${from} is out (${reason}); every strong-row entry is out: ${row.map((s) => `${s} (${room.outFor(s)})`).join("; ")}`, HEADROOM_STAGE);
+				failModel(`${from} is out (${reason}); every strong-row entry is out: ${strongRow.map((s) => `${s} (${room.decisionFor(s).out})`).join("; ")}`, HEADROOM_STAGE);
 				return;
 			}
 			move = { from, to, reason };
@@ -1571,7 +1665,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				const sessionFile = data && typeof data.sessionFile === "string" ? data.sessionFile : typeof o.sessionFile === "string" ? o.sessionFile : null;
 				let rerecord = false;
 				// OMP's first get_state answer names the model it started (item 85): recorded as ranModel; a named model must equal it, and
-				// an unnamed lane's is checked against the quota signal (PLAN wl-mv71x5rwdu7eo0 § 4): not out, or no model reported, is ready.
+				// an unnamed lane's source receives the same budget comparison: in quota or retained, or no model reported, is ready.
 				if (o.type === "response" && o.id === STATE_ID && !stateSeen) {
 					stateSeen = true;
 					ranModel = stateModelOf(o);
@@ -1581,9 +1675,13 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						if (check.ok) modelChecked = true;
 						else failModel(check.reason);
 					} else {
-						const out = ranModel === null ? null : room.outFor(ranModel);
-						if (out === null) modelChecked = true;
-						else moveOff(ranModel!, out);
+						if (ranModel === null) modelChecked = true;
+						else {
+							const decision = room.decisionFor(ranModel, strongRow);
+							if (decision.retained !== null) process.stderr.write(`runner: ${laneId} ${decision.retained}\n`);
+							if (decision.out === null) modelChecked = true;
+							else moveOff(ranModel, decision.out);
+						}
 					}
 				}
 				// The move's set_model answer: on success, ask OMP which model it now runs; a refusal fails the launch at `headroom`.
@@ -1706,43 +1804,43 @@ async function cmdInteractive(wl: string): Promise<number> {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
 		});
-		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume });
+		// PLAN-2 D1/D2: written before the spawn and passed as OMP's `@file` initial message, on a fresh session and a resume alike.
+		const firstPromptPath = join(p.dir, "prompt.md");
+		writeFileSync(firstPromptPath, byHandPromptFor(ledger, w, laneId, p));
+		const argv = interactiveArgv({ worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, model, resume, firstPromptPath });
 		const { env, notes } = laneSpawnEnv(process.env, profileConfig(), { workloadId: wl, laneId });
 		env.OMP_PROFILE = PROFILE;
+		// After `laneEnv`, which drops any inherited value: only this by-hand launch carries it (PLAN-2 D4).
+		env[BY_HAND_ENV] = "1";
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
-		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt copied to ${join(p.dir, "prompt.md")}`);
+		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt supplied from ${firstPromptPath}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
-		// Jo's ruling (in-mvfo7nphl9xn28, PLAN wl-mvfkv7llkp7nk0 § 4.1): a by-hand lane is paired with Jo and has no meter. It
-		// is never stopped at the ceiling and puts no ceiling question or notice on the surface; only `cmdRun` meters. The
-		// lane extension (surface/extensions/lane.ts) reports its spend instead: to the lane at every turn start, to Jo's pane
-		// at each 25 % of the original ceiling. The first prompt says so, with the spend so far.
-		const es = ledger.entries(wl);
-		const control = controlEntries(es, holdersOf(es, ledger.workload(wl)?.holder ?? null));
-		const instructions = ledger.instructions(wl);
-		const spent: Spend = { ...scanSpend(p.sessionDir, new Map(), { usd: 0, tokens: 0, wallMin: 0 }), wallMin: wallMinutes(control, Date.now(), null) };
-		const pairedLine = pairedCeilingPromptLine(effectiveCeiling(control, instructions, w.stakes), originalCeiling(control, instructions, w.stakes), spent);
-		writeFileSync(join(p.dir, "prompt.md"), promptFor(ledger, w, laneId, p, pairedLine));
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.
 		const preexisting = topLevelSessions(p.sessionDir);
-		const child = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-		omp = child;
 		// The lane's identity is OMP's process, not this wrapper's (Codex review B5): `lane.ts stop` compares this pid and start time.
 		// The start time is read once, at the first record while omp runs, and reused, as `ompStart` in `cmdRun`: the session
 		// re-record after omp exits runs no ps, so a ps failing there cannot end in the catch, which would record launch-failed:
 		// for a lane that ran and drop its lane-exit: (openai review r5).
 		let ompStart: string | null = null;
-		const record = (session: string | null): void => {
-			ompStart ??= startTime(child.pid) ?? "";
-			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid: child.pid, start: ompStart, session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }) });
+		const record = (pid: number, session: string | null): void => {
+			ompStart ??= startTime(pid) ?? "";
+			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: laneStartedBody(laneId, { pid, start: ompStart, session, argv, runnerPid: process.pid, model, resumeSkipped: skipped }) });
 		};
-		record(resume);
+		// The spawn and its first lane-started: in one write, only while the workload is still held by this lane id
+		// (`spawnIfReserved`, D2b); a busy-retried write spawns once, as the runner's does.
+		const child = ledger.write(() => {
+			const c = spawnIfReserved(ledger, wl, laneId, omp, () => spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" }));
+			omp = c;
+			record(c.pid, resume);
+			return c;
+		});
 		const code = await child.exited;
 		// The session OMP wrote: a new top-level file, never one that existed before the spawn; a resumed lane appends to its
 		// resume path, which it already recorded, so it finds no new file.
 		const session = newLaneSession(p.sessionDir, preexisting);
-		if (session !== null && session !== resume) record(session);
+		if (session !== null && session !== resume) record(child.pid, session);
 		// Once per lane, in one transaction with the release: `lane.ts stop` may have written the exit already; when it accepted
 		// the stop but has not written it yet (it waits to see omp gone), this wrapper writes the same stop exit with the real code.
 		ledger.write(() => {
