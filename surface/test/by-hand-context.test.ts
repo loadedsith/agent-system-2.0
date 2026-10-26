@@ -1,14 +1,16 @@
 // A by-hand lane (`as2 lane <wl>`) gets its first prompt in the session (PLAN wl-mvb9mw00ycfjeo PLAN-2 D1, D1b, D2, the D4
-// marker; R1, R2, R7's env part): the launcher writes prompt.md (`promptFor` plus `## Workload state now`, the workload's
-// block from surface/src/render.ts) before the spawn and passes it as OMP's native `@<path>` argument, which the fake omp
-// consumes into the session's first user message as OMP does. A resume on the same model gets the fresh context once
+// marker; R1, R2, R7's env part): the launcher writes prompt.md (`promptFor` with paired spend context plus
+// `## Workload state now`, the workload's block from surface/src/render.ts) before the spawn and passes it as OMP's native
+// `@<path>` argument, which the fake omp consumes into the session's first user message as OMP does. A resume on the same
+// model gets the fresh context once
 // more; a session on another model is not resumed and the fresh one gets it too. AGENT_SYSTEM_BY_HAND=1 reaches a by-hand
 // lane only: an inherited value never reaches an autonomous lane, whose argv and prompt stay as they were. Every root here
 // has spaces in its path, so prompt.md's path does too. These spawn processes: they run in the full suite outside the fence.
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
+import { ceilingBody, parseCeilingNotice } from "../src/ceiling";
 import { recordRepo } from "../src/decision-log";
 import { doneBody, laneDir, laneExit, laneModelBody, laneStarted, worktreePath } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
@@ -40,7 +42,7 @@ const QUESTION = "question-mark-5150 which token file owns the offset?\nsecond q
 const INSTRUCTION = "instruction-mark-9001 use the v3 token schema\nsecond instruction line: then drop v2";
 const ENTRY = "entry-mark-4471 assumption: the offset is 4px on every breakpoint";
 
-/** A user-driven workload on the root's repo, seeded with a multiline brief, a done: line, an open slice with an open question on it, Jo's multiline instruction and one assumption entry. */
+/** A user-driven workload on the root's repo, already past a tiny ceiling, with a multiline brief, a done: line, an open slice with an open question on it, Jo's multiline instruction and one assumption entry. */
 function seeded(r: LaneRoot): { wl: string; sl: string; q: string; instruction: string } {
 	const l = ledgerOf(r);
 	try {
@@ -51,6 +53,11 @@ function seeded(r: LaneRoot): { wl: string; sl: string; q: string; instruction: 
 		const q = l.raiseQuestion({ by: SURFACE_BY, workloadId: wl, sliceId: sl, body: QUESTION, options: ["tokens", "theme"] });
 		const instruction = l.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: INSTRUCTION, author: "jo", channel: "surface" });
 		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ENTRY });
+		l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody({ usd: 1, wallMin: 60 }, "test tiny ceiling") });
+		// Earlier workload spend, without a recorded session to resume: even the first by-hand launch starts past 100 %.
+		const sessions = join(laneDir(wl, r.home), "sessions");
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(join(sessions, "earlier-spend.jsonl"), `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { totalTokens: 1250, cost: { total: 1.25 } } } })}\n`);
 		return { wl, sl, q, instruction };
 	} finally {
 		l.close();
@@ -84,6 +91,16 @@ async function byHand(r: LaneRoot, wl: string, n: number, env: Record<string, st
 	const code = await tui.exited;
 	const out = await new Response(tui.stdout).text();
 	await until(`lane-exit: of ${laneId}`, () => laneExit(laneSnapshot(r, wl).control, laneId));
+	const snap = laneSnapshot(r, wl);
+	expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "interactive", reason: null });
+	expect(snap.control.filter((c) => c.prefix === "lane-stop")).toEqual([]);
+	const l = ledgerOf(r);
+	try {
+		const messages = l.db.query<{ body: string }, [string]>("SELECT body FROM messages WHERE workload_id = ?").all(wl);
+		expect(messages.flatMap((m) => parseCeilingNotice(m.body) ?? [])).toEqual([]);
+	} finally {
+		l.close();
+	}
 	const events = fakeRecords(r).filter((x) => x.pid === started.pid && x.event);
 	return { laneId, code, out, rec: rec as FakeRecord & { argv: string[]; session: string; env: Record<string, string> }, prompted, events, prompt };
 }
@@ -97,6 +114,9 @@ function expectContext(prompt: string, s: { wl: string; sl: string; q: string },
 	expect(prompt).toStartWith(`You are lane ${laneId} on workload ${s.wl}.\n`);
 	expect(prompt).toContain(`\ndone: ${DONE}\n`);
 	expect(prompt).toContain(`\nbrief: ${BRIEF}\n`);
+	expect(prompt.match(/\nceiling: /g)).toHaveLength(1);
+	expect(prompt).toContain("\nstakes: normal · mode: user-driven\nceiling: $1 / 60 min for the workload; spent so far $1.25 / ");
+	expect(prompt).toContain(" min (1250 tokens); you are paired with Jo; you are never stopped at the ceiling; the extension tells Jo the spend in the pane at every 25 % of the original ceiling ($1, so every $0.25).\n");
 	expect(prompt.match(/\n## Workload state now\n/g)).toHaveLength(1);
 	const state = prompt.split("\n## Workload state now\n\n")[1]!;
 	expect(state).toStartWith(`## ${s.wl}\nbrief: ${BRIEF}\ndone: ${DONE}\n`);
@@ -126,7 +146,7 @@ function expectNewer(state: string, prompt: string, instruction: string): void {
 }
 
 describe("by-hand lane: the first prompt reaches the session (PLAN-2 D1, D1b, D2)", () => {
-	test("fresh: prompt.md is promptFor plus the workload state, passed as the one `@<path>` argument last, and is the session's first user message; AGENT_SYSTEM_BY_HAND=1; the notice says supplied", async () => {
+	test("fresh past the ceiling: paired spend and workload state reach the session as one `@<path>` initial message, without a ceiling stop or notice; AGENT_SYSTEM_BY_HAND=1", async () => {
 		const r = makeRoot();
 		const s = seeded(r);
 		setScript(r, { steps: [] });
@@ -149,9 +169,10 @@ describe("by-hand lane: the first prompt reaches the session (PLAN-2 D1, D1b, D2
 		expect(run.rec.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: s.wl, AGENT_SYSTEM_LANE_ID: run.laneId, [BY_HAND]: "1" });
 		expect(run.out).toContain(`first prompt supplied from ${path}`);
 		expect(run.out).not.toContain("copied");
+		expect(laneSnapshot(r, s.wl).questions.map((q) => q.id)).toEqual([s.q]);
 	}, 60_000);
 
-	test("resume on the same model: --resume the earlier session, and the fresh context (the new lane id, Jo's newer instruction, the newer entry) is its one new user message", async () => {
+	test("resume past the ceiling on the same model: --resume the earlier session with paired spend and fresh workload state as its one new user message, without a ceiling stop or notice", async () => {
 		const r = makeRoot();
 		const s = seeded(r);
 		setScript(r, { steps: [] });
@@ -177,6 +198,7 @@ describe("by-hand lane: the first prompt reaches the session (PLAN-2 D1, D1b, D2
 		const l2 = ledgerOf(r);
 		expect(l2.instructions(s.wl)).toHaveLength(instructionsBefore);
 		l2.close();
+		expect(laneSnapshot(r, s.wl).questions.map((q) => q.id)).toEqual([s.q]);
 	}, 90_000);
 
 	test("model mismatch: Jo named another model since, so the earlier session is not resumed; the fresh session's first user message is the context, and the notice says why", async () => {
