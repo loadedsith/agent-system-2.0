@@ -104,8 +104,8 @@ function heldDeliveredLine(held: MessageRow[]): string | null {
  * current branch; surface/src/close-entry.ts), then the row closes, stamped
  * `orchestrator-surface`, in one transaction with the ledger's own live-holder check, the close
  * receipt, which the entry carries and the ledger holds only once the row closes, and the
- * delivery of the workload's held orchestrator-bound messages, which the result and the entry
- * name (PLAN wl-mvbcjageg7o2yo § 2.5; a refused or failed close leaves them held); a closed
+ * delivery of the workload's ordinary held orchestrator-bound messages, which the result and
+ * entry name; trusted security-red signals stay held for display (a refused or failed close leaves all held). A closed
  * workload's branch is then pushed and an open PR made sure of. Past the check and the pinned
  * commit, a git or gh failure is named in the result and never blocks the close. `cwd` is the
  * repository when the workload has no `repo:` entry. Never throws for a refusal.
@@ -151,7 +151,7 @@ export async function closeWorkloadWithEntry(
 	if (entry?.refused) return refused(`${id} cannot close: ${entry.refused}`);
 	const commit = entry?.commit ?? null;
 	// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
-	// PLAN wl-mvbcjageg7o2yo § 2.5: the held orchestrator-bound messages are delivered in it, before the close; a refused or failed close rolls them back to held.
+	// Ordinary held orchestrator-bound messages deliver before close; trusted security-red signals retain display-owned delivery. A failed close rolls delivery back.
 	let held: MessageRow[] = [];
 	try {
 		held = ledger.write(() => {

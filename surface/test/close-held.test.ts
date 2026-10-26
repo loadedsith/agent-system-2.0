@@ -1,6 +1,6 @@
-// PLAN wl-mvbcjageg7o2yo § 2.5, R15: closing a workload moves its held orchestrator-bound messages
-// to `delivered` in the close transaction and names them in the close result and the tick's entry
-// line; a message to anyone else stays held, and a refused or failed close leaves every one held.
+// PLAN wl-mvbcjageg7o2yo § 2.5, R15: closing delivers ordinary held orchestrator-bound messages
+// transactionally and names them. Trusted security-red signals stay held for display-owned delivery;
+// messages to others stay held, and a refused or failed close leaves every message held.
 // The host has no exec and the profile serves no repo, so the close renders its decision-log entry
 // untracked in a scratch checkout and touches no git (close-entry.test.ts (d)).
 import { afterAll, describe, expect, test } from "bun:test";
