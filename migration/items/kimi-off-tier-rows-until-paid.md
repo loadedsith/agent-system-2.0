@@ -28,3 +28,5 @@ pr: 314
 2. In `classifier/test/tier-table.test.ts`, restore the three-provider assertion (`anthropic`, `openai-codex`, `moonshot`) and the original T17 (each tier's `[2]` entry is the moonshot entry above, and no row names `kimi-code/`).
 3. Revert the tier-block comment in `profile/config.yml` ("Rows 2-3 (openai-codex, moonshot) ...") to drop the removal note. The `surface/test/chaos-stub.test.ts` derivation needs no change.
 4. Merge, fast-forward the main checkout, re-run install, relaunch lanes.
+
+Re-adding the rows does not clear refusals already recorded. A workload whose ledger has `provider-refused: moonshot status 429 token <dt>` keeps skipping Moonshot, because `refusedProviders` in `classifier/extension.ts` honours a quota 429 while `kimiOutRuleActive(now)` holds, that is until `KIMI_OUT_RULE.endsAt` (2026-11-01T00:00:00-07:00) in `classifier/src/lab.ts`. Only a `provider-ok: moonshot by <instruction>` written by the surface clears it earlier, and nothing in `surface/` writes that entry today, so those workloads get Moonshot back at the rule's end, not at the restore.
