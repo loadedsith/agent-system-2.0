@@ -18,6 +18,8 @@ pr: 244
   - After 7 days, or with no entry at all, nothing shows.
 - **New prefix.** `daily-report` is a reserved control prefix that only the `daily-report` writer may write.
 
+**Upstream integration.** The merge-train conflict refresh keeps the runner's spend baseline beside upstream's spawn-based readiness/deadline clock, and keeps report rendering beside security-red, ceiling notices and channel lines. The wall-led ceiling detector reads historical runner questions directly: upstream removed the interactive `isCeilingQuestion` helper when ceilings became notices. This does not restore ceiling questions or change ceiling authority.
+
 **Install.** After merge, run `bash install/install.sh --daily-report`. It writes `~/Library/LaunchAgents/com.agent-system-2.daily-report.plist` (07:00 local, with the ledger and profile this install used) and loads it. To see a report at once, run `launchctl kickstart gui/$(id -u)/com.agent-system-2.daily-report`, or `bun surface/scripts/daily-report.ts --dry-run` for a report that writes nothing. Restart as2 so the surface renders the new line.
 
 **Rollback.** `bash install/install.sh --daily-report=off` boots the job out and deletes its plist, and writes nothing else; with the plist gone the missed line never shows. Then revert the PR. The report files and `daily-report:` entries already written are harmless to leave.

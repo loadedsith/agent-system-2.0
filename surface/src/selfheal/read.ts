@@ -14,8 +14,7 @@
 import { accessSync, constants, createReadStream, type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
-import type { EntryRow, Ledger, QuestionRow } from "../../../ledger/src/index";
-import { isCeilingQuestion } from "../input";
+import { type EntryRow, LANE_RUNNER_BY, type Ledger, type QuestionRow } from "../../../ledger/src/index";
 import { controlEntries, laneStarted, modelProblem } from "../launch";
 import { parseTestRun } from "../test-run";
 import {
@@ -223,12 +222,13 @@ function readHandRoutings(ledger: Ledger, from: string, to: string): HandRouting
 	return out;
 }
 
+/** Historical runner ceiling questions remain in the ledger after the ceiling-notice cutover. */
 function readCeilingQuestions(ledger: Ledger, from: string, to: string): DetectorInputs["ceilingQuestions"] {
 	const rows = ledger.db.query<QuestionRow, [string, string]>(
 		"SELECT * FROM questions WHERE created_at >= ? AND created_at < ? ORDER BY created_at, rowid",
 	).all(from, to);
 	return rows
-		.filter((q) => isCeilingQuestion(q, ledger.slice(q.slice_id)))
+		.filter((q) => q.created_by === LANE_RUNNER_BY && q.slice_id.startsWith("sl-ceiling-") && ledger.slice(q.slice_id) !== null)
 		.map((q) => ({ id: q.id, workloadId: q.workload_id, at: q.created_at, body: q.body }));
 }
 

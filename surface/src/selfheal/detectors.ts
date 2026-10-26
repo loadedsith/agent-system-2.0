@@ -80,7 +80,7 @@ export interface HandRouting {
 	at: string;
 }
 
-/** A ceiling question (`isCeilingQuestion`): its id, workload, time and body. */
+/** A historical runner ceiling question: its id, workload, time and body. */
 export interface CeilingQuestion {
 	id: string;
 	workloadId: string;
@@ -251,7 +251,7 @@ export function pasteDrop(sessions: readonly OrchestratorSession[]): Finding[] {
 	return out;
 }
 
-/** The first line `ceilingQuestionBody` (surface/src/ceiling.ts) writes; the shares are its floored percentages of the unrounded figures. */
+/** The historical runner ceiling question's first line; the shares are its floored percentages of the unrounded figures. */
 const CEILING_BODY = /has used \$(\d+(?:\.\d+)?) of its \$(\d+(?:\.\d+)?) ceiling \((\d+) %\) and (\d+) of (\d+) minutes \((\d+) %\)/;
 
 /** ceiling-wall: a ceiling question whose minutes are ≥ 80 % used while its dollars are < 30 % used. */
