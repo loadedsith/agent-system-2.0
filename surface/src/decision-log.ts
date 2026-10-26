@@ -173,7 +173,7 @@ export function decisionLogContext(dir: string, opts: ContextOptions = {}): stri
 	return renderLogContext(readLog(dir), dir, opts);
 }
 
-/** `decisionLogContext` over entries already read: pure, no file I/O (`dir` only names the log in the "not rendered" line). */
+/** `decisionLogContext` over entries already read: no file I/O (`dir` only names the log in the "not rendered" line); `opts.now` defaults to the clock. */
 export function renderLogContext(entries: readonly LogEntry[], dir: string, opts: ContextOptions = {}): string {
 	const now = opts.now ?? new Date().toISOString();
 	const maxBytes = opts.maxBytes ?? DECISION_LOG_MAX_BYTES;

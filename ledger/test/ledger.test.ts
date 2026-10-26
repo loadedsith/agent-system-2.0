@@ -370,11 +370,11 @@ describe("locality", () => {
 		expect(JSON.parse(r.stdout.toString())).toEqual({ where: "local", calls: [] });
 	});
 
-	/** /sbin/mount as [mount point, flags] rows. */
+	/** /sbin/mount as { source, mount point, flags } rows. */
 	const mountTable = () => Bun.spawnSync(["/sbin/mount"], { stdout: "pipe", stderr: "pipe" }).stdout.toString().split("\n")
 		.flatMap((l) => {
-			const m = /^.+? on (.+) \((.*)\)$/.exec(l);
-			return m ? [{ mp: m[1]!, flags: m[2]!.split(",").map((s) => s.trim()) }] : [];
+			const m = /^(.+?) on (.+) \((.*)\)$/.exec(l);
+			return m ? [{ source: m[1]!, mp: m[2]!, flags: m[3]!.split(",").map((s) => s.trim()) }] : [];
 		});
 	const under = (mp: string, path: string) => mp === "/" || path === mp || path.startsWith(`${mp}/`);
 
@@ -390,7 +390,8 @@ describe("locality", () => {
 		}
 	});
 
-	const autoHome = statfsHost ? mountTable().find((e) => e.mp === "/System/Volumes/Data/home" && e.flags[0] === "autofs") : undefined;
+	// Only the indirect map's root: Apple autofs never makes it a trigger, so statfs mounts nothing.
+	const autoHome = statfsHost ? mountTable().find((e) => e.source === "map auto_home" && e.mp === "/System/Volumes/Data/home" && e.flags[0] === "autofs") : undefined;
 	test.skipIf(!autoHome)("arm64 macOS: the autofs indirect-map root is reported as network (T2, skipped when /sbin/mount does not list map auto_home on /System/Volumes/Data/home)", () => {
 		const where = mountLocality("/System/Volumes/Data/home");
 		expect(where.startsWith("network:/System/Volumes/Data/home ")).toBe(true);
