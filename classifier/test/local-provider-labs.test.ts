@@ -31,8 +31,8 @@ describe("user-local provider labs", () => {
 
 	test("labOf reads the local map and built-ins still win", () => {
 		const home = tmp("local-lab-home");
-		const path = localConfigPath("provider-labs.local.yml", { HOME: home });
-		mkdirSync(join(home, ".config", "as2"), { recursive: true });
+		const path = localConfigPath("provider-labs.yml", { HOME: home });
+		mkdirSync(join(home, ".as2"), { recursive: true });
 		writeFileSync(path, "providers:\n  private-gateway: openai\n", { mode: 0o600 });
 		const oldHome = process.env.HOME;
 		process.env.HOME = home;
@@ -42,8 +42,8 @@ describe("user-local provider labs", () => {
 		} finally { if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome; }
 	});
 
-	test("relative XDG_CONFIG_HOME is ignored", () => {
-		const home = tmp("xdg-home");
-		expect(localConfigPath("config.local.yml", { HOME: home, XDG_CONFIG_HOME: "relative" })).toBe(join(home, ".config", "as2", "config.local.yml"));
+	test("the canonical root is ~/.as2 regardless of XDG_CONFIG_HOME", () => {
+		const home = tmp("dot-as2-home");
+		expect(localConfigPath("config.yml", { HOME: home, XDG_CONFIG_HOME: "/elsewhere" })).toBe(join(home, ".as2", "config.yml"));
 	});
 });

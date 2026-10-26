@@ -1,19 +1,16 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { Lab } from "./lab";
 
 const PROVIDER = /^[a-z0-9][a-z0-9._-]*$/;
 const VALID_LABS: Record<Lab, true> = { anthropic: true, openai: true, kimi: true };
 const BUILT_INS: Record<string, true> = { anthropic: true, openai: true, "openai-codex": true, "kimi-code": true, moonshot: true };
 
-export const localConfigRoot = (env: Record<string, string | undefined> = process.env): string => {
-	const home = env.HOME || homedir();
-	const xdg = env.XDG_CONFIG_HOME;
-	return resolve(xdg && isAbsolute(xdg) ? xdg : join(home, ".config"), "as2");
-};
+export const localConfigRoot = (env: Record<string, string | undefined> = process.env): string =>
+	resolve(env.HOME || homedir(), ".as2");
 
-export const localConfigPath = (name: "config.local.yml" | "models.local.yml" | "provider-labs.local.yml", env: Record<string, string | undefined> = process.env): string =>
+export const localConfigPath = (name: "config.yml" | "models.yml" | "provider-labs.yml", env: Record<string, string | undefined> = process.env): string =>
 	join(localConfigRoot(env), name);
 
 export function secureLocalFile(path: string, uid: number | undefined = process.getuid?.()): string | null {
@@ -29,7 +26,7 @@ export function secureLocalFile(path: string, uid: number | undefined = process.
 	} finally { closeSync(fd); }
 }
 
-export function parseProviderLabs(text: string, path = "provider-labs.local.yml"): Readonly<Record<string, Lab>> {
+export function parseProviderLabs(text: string, path = "provider-labs.yml"): Readonly<Record<string, Lab>> {
 	let doc: unknown;
 	try { doc = Bun.YAML.parse(text); } catch (error) { throw new Error(`${path} is not valid YAML: ${String(error)}`); }
 	if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw new Error(`${path} must be a mapping with only a providers key`);
@@ -49,7 +46,7 @@ export function parseProviderLabs(text: string, path = "provider-labs.local.yml"
 let cachedKey = "";
 let cached: Readonly<Record<string, Lab>> = Object.freeze({});
 export function localProviderLabs(env: Record<string, string | undefined> = process.env): Readonly<Record<string, Lab>> {
-	const path = localConfigPath("provider-labs.local.yml", env);
+	const path = localConfigPath("provider-labs.yml", env);
 	const text = secureLocalFile(path);
 	const key = `${path}\0${text ?? ""}`;
 	if (key !== cachedKey) { cachedKey = key; cached = text === null ? Object.freeze({}) : parseProviderLabs(text, path); }

@@ -49,7 +49,7 @@ export function labOf(selector: string): Lab | null {
 	return Object.hasOwn(local, provider) ? local[provider]! : null;
 }
 
-export const unknownLabReason = (provider: string) => `unknown lab for provider ${provider}; add it to classifier/src/lab.ts or the user-local provider-labs.local.yml`;
+export const unknownLabReason = (provider: string) => `unknown lab for provider ${provider}; add it to classifier/src/lab.ts or the user-local provider-labs.yml`;
 
 // ---- D2: which dispatches are reviews -------------------------------------------------------
 

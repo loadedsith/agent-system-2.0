@@ -10,7 +10,7 @@ function mapping(text: string, path: string): Record<string, unknown> {
 }
 
 export function configOverlayPath(env: Record<string, string | undefined> = process.env): string | null {
-	const path = localConfigPath("config.local.yml", env);
+	const path = localConfigPath("config.yml", env);
 	return secureLocalFile(path) === null ? null : path;
 }
 
@@ -26,32 +26,32 @@ function atomicWrite(destination: string, text: string): void {
 }
 
 export function snapshotConfig(destinationDir: string, env: Record<string, string | undefined> = process.env): string | null {
-	const source = localConfigPath("config.local.yml", env);
+	const source = localConfigPath("config.yml", env);
 	const text = secureLocalFile(source);
 	if (text === null) return null;
 	mapping(text, source);
-	const destination = join(destinationDir, "config.local.yml");
+	const destination = join(destinationDir, "config.yml");
 	atomicWrite(destination, text);
 	return destination;
 }
 
 export function validateLocalOverlays(env: Record<string, string | undefined> = process.env): void {
-	const config = localConfigPath("config.local.yml", env);
+	const config = localConfigPath("config.yml", env);
 	const configText = secureLocalFile(config);
 	if (configText !== null) mapping(configText, config);
-	const models = localConfigPath("models.local.yml", env);
+	const models = localConfigPath("models.yml", env);
 	const modelText = secureLocalFile(models);
 	if (modelText !== null) {
 		const parsed = mapping(modelText, models);
 		if (!parsed.providers || typeof parsed.providers !== "object" || Array.isArray(parsed.providers)) throw new Error(`${models} must contain a providers mapping`);
 	}
-	const labs = localConfigPath("provider-labs.local.yml", env);
+	const labs = localConfigPath("provider-labs.yml", env);
 	const labText = secureLocalFile(labs);
 	if (labText !== null) parseProviderLabs(labText, labs);
 }
 
 export function mergeModels(baseText: string, env: Record<string, string | undefined> = process.env): { text: string; overlaid: boolean } {
-	const path = localConfigPath("models.local.yml", env);
+	const path = localConfigPath("models.yml", env);
 	const localText = secureLocalFile(path);
 	if (localText === null) return { text: baseText, overlaid: false };
 	const base = mapping(baseText, "profile/models.yml");

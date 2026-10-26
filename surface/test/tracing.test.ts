@@ -214,13 +214,13 @@ describe("the lane spawn env: lane.ts laneSpawnEnv(process env, config path, bin
 
 	test("a secure local settings file is appended to an existing overlay list", () => {
 		const home = root("lane-overlay");
-		const local = join(home, ".config", "as2", "config.local.yml");
+		const local = join(home, ".as2", "config.yml");
 		mkdirSync(dirname(local), { recursive: true });
 		writeFileSync(local, "modelRoles:\n  default: private-gateway/private-model\n", { mode: 0o600 });
 		const config = join(home, "config.yml");
 		writeFileSync(config, SWITCHED_OFF);
 		const got = laneScript.laneSpawnEnv({ ...BASE, HOME: home, PI_CONFIG_FILES: "/existing.yml" }, config, { workloadId: "wl-a", laneId: "lane-a-1" });
-		expect(got.env.PI_CONFIG_FILES).toBe(`/existing.yml:${join(home, ".agent-system-2", "local-overlays", "config.local.yml")}`);
+		expect(got.env.PI_CONFIG_FILES).toBe(`/existing.yml:${join(home, ".agent-system-2", "local-overlays", "config.yml")}`);
 	});
 
 	test("the template switched off, a malformed block and a missing file are the off env; malformed and missing say why", () => {

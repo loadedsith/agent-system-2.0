@@ -129,7 +129,7 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 		mkdirSync(agentDir, { recursive: true });
 		copyFileSync(join(import.meta.dir, "..", "..", "profile", "config.yml"), join(agentDir, "config.yml"));
 		if (over.PI_CONFIG_FILES) {
-			const local = join(home, ".config", "as2", "config.local.yml");
+			const local = join(home, ".as2", "config.yml");
 			mkdirSync(dirname(local), { recursive: true });
 			writeFileSync(local, "modelRoles: {}\n", { mode: 0o600 });
 		}
@@ -165,7 +165,7 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 
 	test("a secure local settings overlay reaches omp after an existing overlay", () => {
 		const launched = as2([], { PI_CONFIG_FILES: "/existing.yml" });
-		expect(launched.ompEnv()).toEndWith("/.agent-system-2/local-overlays/config.local.yml");
+		expect(launched.ompEnv()).toEndWith("/.agent-system-2/local-overlays/config.yml");
 		expect(launched.ompEnv()).toStartWith("/existing.yml:");
 	});
 
