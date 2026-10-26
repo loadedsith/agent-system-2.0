@@ -1,5 +1,5 @@
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { closeSync, constants, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { localConfigPath, parseProviderLabs, secureLocalFile } from "../classifier/src/local-provider-labs";
 
 function mapping(text: string, path: string): Record<string, unknown> {
@@ -12,6 +12,27 @@ function mapping(text: string, path: string): Record<string, unknown> {
 export function configOverlayPath(env: Record<string, string | undefined> = process.env): string | null {
 	const path = localConfigPath("config.local.yml", env);
 	return secureLocalFile(path) === null ? null : path;
+}
+
+function atomicWrite(destination: string, text: string): void {
+	mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+	const tmp = join(dirname(destination), `.${basename(destination)}.${crypto.randomUUID()}.tmp`);
+	let fd = -1;
+	try {
+		fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+		writeSync(fd, text); fsyncSync(fd); closeSync(fd); fd = -1;
+		renameSync(tmp, destination);
+	} finally { if (fd >= 0) closeSync(fd); rmSync(tmp, { force: true }); }
+}
+
+export function snapshotConfig(destinationDir: string, env: Record<string, string | undefined> = process.env): string | null {
+	const source = localConfigPath("config.local.yml", env);
+	const text = secureLocalFile(source);
+	if (text === null) return null;
+	mapping(text, source);
+	const destination = join(destinationDir, "config.local.yml");
+	atomicWrite(destination, text);
+	return destination;
 }
 
 export function validateLocalOverlays(env: Record<string, string | undefined> = process.env): void {
@@ -37,15 +58,14 @@ export function mergeModels(baseText: string, env: Record<string, string | undef
 	const local = mapping(localText, path);
 	const providers = local.providers;
 	if (!providers || typeof providers !== "object" || Array.isArray(providers)) throw new Error(`${path} must contain a providers mapping`);
-	return { text: Bun.YAML.stringify({ ...base, providers: { ...((base.providers as object | undefined) ?? {}), ...providers } }), overlaid: true };
+	const publicProviders = (base.providers && typeof base.providers === "object" && !Array.isArray(base.providers)) ? base.providers as Record<string, unknown> : {};
+	for (const provider of Object.keys(providers)) if (Object.hasOwn(publicProviders, provider)) throw new Error(`${path} cannot replace public provider ${provider}`);
+	return { text: Bun.YAML.stringify({ ...base, providers: { ...publicProviders, ...providers } }), overlaid: true };
 }
 
 export async function installModels(basePath: string, destination: string, env: Record<string, string | undefined> = process.env): Promise<boolean> {
 	const merged = mergeModels(await Bun.file(basePath).text(), env);
-	mkdirSync(dirname(destination), { recursive: true });
-	const tmp = `${destination}.tmp.${process.pid}`;
-	writeFileSync(tmp, merged.text, { mode: 0o600 });
-	renameSync(tmp, destination);
+	atomicWrite(destination, merged.text);
 	return merged.overlaid;
 }
 
@@ -53,8 +73,9 @@ if (import.meta.main) {
 	try {
 		const [command, ...args] = process.argv.slice(2);
 		if (command === "validate") validateLocalOverlays();
+		else if (command === "snapshot-config" && args.length === 1) process.stdout.write(`${snapshotConfig(args[0]!) ?? ""}\n`);
 		else if (command === "install-models" && args.length === 2) process.stdout.write((await installModels(args[0]!, args[1]!)) ? "overlaid\n" : "public-only\n");
-		else throw new Error("usage: bun install/local-overlays.ts validate | install-models <base> <destination>");
+		else throw new Error("usage: bun install/local-overlays.ts validate | snapshot-config <dir> | install-models <base> <destination>");
 	} catch (error) {
 		process.stderr.write(`local overlays: ${error instanceof Error ? error.message : String(error)}\n`);
 		process.exit(2);

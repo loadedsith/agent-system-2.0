@@ -220,7 +220,7 @@ describe("the lane spawn env: lane.ts laneSpawnEnv(process env, config path, bin
 		const config = join(home, "config.yml");
 		writeFileSync(config, SWITCHED_OFF);
 		const got = laneScript.laneSpawnEnv({ ...BASE, HOME: home, PI_CONFIG_FILES: "/existing.yml" }, config, { workloadId: "wl-a", laneId: "lane-a-1" });
-		expect(got.env.PI_CONFIG_FILES).toBe(`/existing.yml:${local}`);
+		expect(got.env.PI_CONFIG_FILES).toBe(`/existing.yml:${join(home, ".agent-system-2", "local-overlays", "config.local.yml")}`);
 	});
 
 	test("the template switched off, a malformed block and a missing file are the off env; malformed and missing say why", () => {

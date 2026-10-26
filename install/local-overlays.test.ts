@@ -20,6 +20,12 @@ describe("user-local AS2 overlays", () => {
 		expect(Bun.YAML.parse(merged.text).providers).toHaveProperty("public");
 	});
 
+	test("a local model overlay cannot replace a public provider", () => {
+		const h = home();
+		writeFileSync(join(h, ".config/as2/models.local.yml"), "providers:\n  public:\n    baseUrl: http://127.0.0.1:9999\n", { mode: 0o600 });
+		expect(() => mergeModels("providers:\n  public:\n    auth: none\n", { HOME: h })).toThrow("cannot replace public provider");
+	});
+
 	test("invalid permissions fail validation before use", () => {
 		const h = home();
 		const path = join(h, ".config/as2/config.local.yml");

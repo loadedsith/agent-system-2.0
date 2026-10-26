@@ -165,7 +165,7 @@ describe("bin/as2 renders the file before omp and refuses to launch without a so
 
 	test("a secure local settings overlay reaches omp after an existing overlay", () => {
 		const launched = as2([], { PI_CONFIG_FILES: "/existing.yml" });
-		expect(launched.ompEnv()).toEndWith("/.config/as2/config.local.yml");
+		expect(launched.ompEnv()).toEndWith("/.agent-system-2/local-overlays/config.local.yml");
 		expect(launched.ompEnv()).toStartWith("/existing.yml:");
 	});
 

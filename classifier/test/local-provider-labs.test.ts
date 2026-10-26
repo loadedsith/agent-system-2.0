@@ -10,6 +10,7 @@ describe("user-local provider labs", () => {
 		expect(parseProviderLabs("providers:\n  private-gateway: openai\n")).toEqual({ "private-gateway": "openai" });
 		for (const text of [
 			"providers:\n  private-gateway: other\n",
+			"providers:\n  private-gateway: constructor\n",
 			"providers:\n  Bad: openai\n",
 			"providers:\n  anthropic: kimi\n",
 			"extra: true\nproviders: {}\n",
@@ -25,7 +26,7 @@ describe("user-local provider labs", () => {
 		expect(() => secureLocalFile(file)).toThrow("0600");
 		const link = join(root, "link.yml");
 		symlinkSync(file, link);
-		expect(() => secureLocalFile(link)).toThrow("regular file");
+		expect(() => secureLocalFile(link)).toThrow("securely");
 	});
 
 	test("labOf reads the local map and built-ins still win", () => {
@@ -38,8 +39,11 @@ describe("user-local provider labs", () => {
 		try {
 			expect(labOf("private-gateway/model")).toBe("openai");
 			expect(labOf("anthropic/model")).toBe("anthropic");
-		} finally {
-			if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
-		}
+		} finally { if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome; }
+	});
+
+	test("relative XDG_CONFIG_HOME is ignored", () => {
+		const home = tmp("xdg-home");
+		expect(localConfigPath("config.local.yml", { HOME: home, XDG_CONFIG_HOME: "relative" })).toBe(join(home, ".config", "as2", "config.local.yml"));
 	});
 });

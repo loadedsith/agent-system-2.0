@@ -75,12 +75,12 @@ REPO="$(cd -P "$(dirname "$self")/.." && pwd -P)"
 AGENT_DIR="$HOME/.omp/profiles/$PROFILE_NAME/agent"
 CONFIG="$AGENT_DIR/config.yml"
 PROMPT="$HOME/.agent-system-2/orchestrator/system.md"
-LOCAL_CONFIG="$HOME/.config/as2/config.local.yml"
+LOCAL_CONFIG_DIR="$HOME/.agent-system-2/local-overlays"
 
 config_words() {
-	[ -e "$LOCAL_CONFIG" ] || return 0
-	bun "$REPO/install/local-overlays.ts" validate >/dev/null || exit 2
-	value="$LOCAL_CONFIG"
+	[ -f "$REPO/install/local-overlays.ts" ] || return 0
+	value="$(bun "$REPO/install/local-overlays.ts" snapshot-config "$LOCAL_CONFIG_DIR")" || exit 2
+	[ -n "$value" ] || return 0
 	[ -z "${PI_CONFIG_FILES-}" ] || value="$PI_CONFIG_FILES:$value"
 	printf 'PI_CONFIG_FILES=%s ' "$(quote "$value")"
 }
