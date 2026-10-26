@@ -746,6 +746,8 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(run.preflight).toContain("probe:");
 		await until("the settle", () => w.ledger.slice(slice!)?.state === "done");
 		expect(w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: ./a.test.ts 1/0; ${join(w.runs, runId!)}`);
+		// The ledger settles before result.json is published and the run lock is released.
+		await until(`runner ${pid} gone`, () => !alive(Number(pid)));
 		expect(JSON.parse(readFileSync(join(w.runs, runId!, "result.json"), "utf8"))).toMatchObject({ runId, verdict: "green", sha: fx.head.green });
 		for (const f of ["full.xml", "full.log", "solo-1.xml", "solo-1.log"]) expect(existsSync(join(w.runs, runId!, f))).toBe(true);
 		expect(heldMessages(w, wl)).toEqual([]);
