@@ -448,9 +448,9 @@ describe("Fix 2: the tick's notices are pushed from their own queue, and confirm
 describe("Anthropic weekly advisory reaches the actual wake read and poll delivery path", () => {
 	const now = Date.parse("2026-10-27T10:00:00.000Z");
 	const reset = now + 3 * 86_400_000;
-	function poll(path: string, used = 0.70): void {
+	function poll(path: string, used = 0.70, resetsAt = reset): void {
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, JSON.stringify({ t: now / 1000, limits: [{ provider: "anthropic", windowId: "7d", tier: null, usedFraction: used, resetsAt: reset }] }) + "\n");
+		writeFileSync(path, JSON.stringify({ t: now / 1000, limits: [{ provider: "anthropic", windowId: "7d", tier: null, usedFraction: used, resetsAt }] }) + "\n");
 	}
 	const weeklyMessages = (t: { s(): SurfaceSession }) => t.s().ledger().db.query<MessageRow, [string]>("SELECT * FROM messages WHERE workload_id = ? AND body LIKE 'notice: Anthropic 7-day meter %'").all(STANDING_WORKLOAD_ID);
 
@@ -496,6 +496,29 @@ describe("Anthropic weekly advisory reaches the actual wake read and poll delive
 			expect(weeklyMessages(t)).toHaveLength(1);
 			expect(weeklyMessages(t)[0]!.state).toBe("delivered");
 		}
+	});
+
+	test("a finite invalid weekly reset leaves existing needs-you visible in the actual pushed wake without a quota notice", async () => {
+		const t = surface();
+		t.s().now = () => new Date(now).toISOString();
+		poll(t.e.AS2_HEADROOM_POLLS!, 0.72, now * 1e6);
+		const l = Ledger.open(t.e.AGENT_SYSTEM_LEDGER_DB!, { backup: false, backupOnOpen: false });
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "Keep this decision visible", stakes: "normal", mode: "user-driven" });
+		const sl = l.addSlice({ by: SURFACE_BY, workloadId: wl, task: "choose", doneCondition: "decision recorded", inputs: "question" });
+		const question = l.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which release should remain visible?", options: ["current", "next"] });
+		l.close();
+		await t.start();
+		t.fire();
+		const wakes = t.of("surface-wake");
+		expect(wakes).toHaveLength(1);
+		const content = wakes[0]!.message.content;
+		expect(content).toContain("(wake: session-start)");
+		expect(content).toContain("needs you");
+		expect(content).toContain(question);
+		expect(content).toContain("Which release should remain visible?");
+		expect(content).not.toContain("could not be rendered");
+		expect(content).not.toContain("Anthropic 7-day meter");
+		expect(weeklyMessages(t)).toEqual([]);
 	});
 
 	test("missing injected path and missing injected HOME default never read an ambient quota fixture", async () => {

@@ -17,6 +17,8 @@ At a fresh observation of at least 70% usage on the shared Anthropic weekly mete
 
 Deduplication is durable across polls, usage dips, delivery states and restarts: the sent notice remains the marker, and a ledger transaction checks all message states before enqueueing. Reset timestamps within 60 seconds are treated as the same window to tolerate polling jitter; a later weekly window can warn again. The warning is based on the newest fresh, non-future, unexpired shared meter observation with a known reset. Missing, stale or invalid data does not generate a warning.
 
+A warning reset must be representable as a JavaScript Date. Malformed finite reset values outside that range cannot generate a warning or interrupt existing needs-you rendering; the snapshot check does not change dispatch admission.
+
 Warning delivery depends on the orchestrator surface running and receiving a fresh qualifying observation. If it is stopped during that time, it can notify on a later fresh qualifying poll after restart; it is not an independent background watcher and does not promise a warning while the surface is stopped.
 
 ## Rollback

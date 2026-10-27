@@ -38,6 +38,8 @@ const UNIT_MS: Readonly<Record<string, number>> = { m: 60_000, h: 3_600_000, d: 
 const METERS: Readonly<Record<string, true>> = { chat: true };
 const MIN_MS = 60_000;
 const WEEK_MS = 7 * 24 * 60 * MIN_MS;
+/** Inclusive ECMAScript Date timestamp bound, checked numerically at the advisory snapshot boundary. */
+const MAX_DATE_MS = 8_640_000_000_000_000;
 
 /** Length in ms of a window named like `5h` or `7d`; null when the id is not of that shape. */
 function windowMs(windowId: string): number | null {
@@ -70,7 +72,7 @@ export interface HeadroomDecision {
 export interface Headroom {
 	/** Base refusal, or exceptional retention against ordered configured budget comparators. */
 	decisionFor(selector: string, comparators?: readonly string[]): HeadroomDecision;
-	/** Newest fresh, non-future shared Anthropic week with valid usage and an unexpired known reset. */
+	/** Newest fresh, non-future shared Anthropic week with valid usage and an unexpired, Date-representable reset. */
 	anthropicWeek: { used: number; resetsAt: number } | null;
 	/** Why nothing can be out (fail-open), or null when the polls were read. */
 	note: string | null;
@@ -99,6 +101,7 @@ function parsePoll(line: string, now: number): Poll | null {
 			// Snapshot identity is strict even though legacy admission normalizes absent/invalid tiers to shared.
 			if (provider === "anthropic" && tier === null && windowMs(windowId) === WEEK_MS
 				&& usedFraction >= 0 && usedFraction <= 1 && isNum(resetsAt) && resetsAt > now
+				&& Math.abs(resetsAt) <= MAX_DATE_MS
 				&& (anthropicWeek === null || usedFraction > anthropicWeek.used
 					|| (usedFraction === anthropicWeek.used && resetsAt > anthropicWeek.resetsAt))) {
 				anthropicWeek = { used: usedFraction, resetsAt };

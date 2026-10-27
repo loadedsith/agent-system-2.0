@@ -255,6 +255,29 @@ describe("shared Anthropic weekly snapshot", () => {
 		expect(at([poll(0, [...invalid, weekly])]).anthropicWeek).toEqual({ used: 0.7, resetsAt: weekly.resetsAt });
 	});
 
+	for (const resetsAt of [8_640_000_000_000_001, NOW * 1e6]) {
+		for (const usedFraction of [0.70, 0.72, 1]) {
+			test(`finite out-of-Date-range reset ${resetsAt} at ${usedFraction} usage cannot supply a snapshot or change admission`, () => {
+				const weekly = { ...lim("anthropic", "7d", usedFraction, 5000), resetsAt };
+				const h = at([poll(0, [weekly])]);
+				expect(h.anthropicWeek).toBeNull();
+				expect(h.note).toBeNull();
+				expect(h.decisionFor(OPUS)).toEqual({
+					out: usedFraction === 1 ? "anthropic 7d 1.00 used, quota exhausted" : null,
+					retained: null,
+				});
+			});
+		}
+	}
+
+	test("the Date maximum reset remains valid and an invalid higher-use row cannot displace it", () => {
+		const weekly = { ...lim("anthropic", "7d", 0.70, 5000), resetsAt: 8_640_000_000_000_000 };
+		const invalid = { ...weekly, usedFraction: 0.99, resetsAt: NOW * 1e6 };
+		for (const limits of [[weekly], [weekly, invalid], [invalid, weekly]]) {
+			expect(at([poll(0, limits)]).anthropicWeek).toEqual({ used: 0.70, resetsAt: weekly.resetsAt });
+		}
+	});
+
 	test("malformed or missing tier identity cannot masquerade as a shared weekly meter", () => {
 		const weekly = lim("anthropic", "7d", 0.7, 5000);
 		for (const tier of [undefined, "", 7, {}, []]) {
