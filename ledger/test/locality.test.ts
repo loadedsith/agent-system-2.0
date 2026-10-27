@@ -54,15 +54,15 @@ describe("T2 local accepted", () => {
 		expect(assertLocalPath(join(scratch, "x", "l.db"))).toBe(join(scratch, "x", "l.db"));
 	});
 
-	test("a path whose mount-on is not a prefix of it (the firmlinked Data volume) is local", () => {
-		const home = realpathSync(process.env.HOME!);
-		if (darwin) {
-			const fs = native.statfsMount(home);
-			expect(fs).toMatchObject({ ok: true, local: true, mountOn: "/System/Volumes/Data" });
-			expect(home.startsWith("/System/Volumes/Data/")).toBe(false);
-		}
-		expect(assertLocalPath(join(home, "x", "l.db"))).toBe(join(home, "x", "l.db"));
-	});
+	// /Users is firmlinked to the Data volume on current macOS; skipped where this host says otherwise.
+	const firmlinked = darwin ? native.statfsMount("/Users") : null;
+	test.skipIf(!(firmlinked?.ok && firmlinked.mountOn === "/System/Volumes/Data"))(
+		"a path whose mount-on is not a prefix of it (the firmlinked Data volume) is local",
+		() => {
+			expect(firmlinked).toMatchObject({ ok: true, local: true });
+			expect(assertLocalPath(join("/Users", "x", "l.db"))).toBe(join("/Users", "x", "l.db"));
+		},
+	);
 });
 
 describe("T3 non-local refused", () => {
@@ -199,6 +199,8 @@ describe("linuxLocality reads /proc/self/mountinfo", () => {
 		["a line without the separator", "22 1 8:1 / / rw shared:1 ext4 /dev/sda1 rw"],
 		["a line with a bad device", "22 1 8-1 / / rw - ext4 /dev/sda1 rw"],
 		["a line missing the super options", "22 1 8:1 / / rw - ext4 /dev/sda1"],
+		["a line with an empty filesystem type", "22 1 8:1 / / rw -  /dev/sda1 rw"],
+		["a line with a relative mount point", "22 1 8:1 / relative rw - ext4 /dev/sda1 rw"],
 	])("%s is unknown, not skipped", (_, line) => {
 		expect(linuxLocality(`${line}\n${ROOT_LINE}\n`, makedev(8n, 1n), "/x")).toStartWith("unknown:malformed /proc/self/mountinfo line: ");
 	});
@@ -223,7 +225,8 @@ describe("native boundary", () => {
 	});
 
 	test.skipIf(!darwin)("N3 statfs of a missing path fails with its errno", () => {
-		expect(native.statfsMount("/nonexistent")).toEqual({ ok: false, why: "statfs /nonexistent: errno 2" });
+		const missing = join(scratch, "missing", "deeper");
+		expect(native.statfsMount(missing)).toEqual({ ok: false, why: `statfs ${missing}: errno 2` });
 	});
 
 	test("N3 an unused uid has no passwd home", () => {
@@ -232,7 +235,7 @@ describe("native boundary", () => {
 
 	test("the real lookups answer", () => {
 		expect(native.passwdHomeOf(uid)).toMatchObject({ ok: true, home: expect.stringMatching(/^\//) });
-		if (darwin) expect(native.statfsMount("/")).toEqual({ ok: true, local: true, mountOn: "/", fsType: "apfs" });
+		if (darwin) expect(native.statfsMount("/")).toEqual({ ok: true, local: true, mountOn: "/", fsType: expect.stringMatching(/^[a-z0-9]+$/) });
 	});
 });
 

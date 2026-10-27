@@ -220,7 +220,7 @@ function majorMinor(dev: bigint): string {
  * `id parent major:minor root mount-point options [optional fields] - fstype source super-options`.
  * The entries of the path's own device are the candidates: one device is one superblock, so a hidden
  * or bind-mounted entry of it has the same type, and a mount hidden under another one is a different
- * device. A malformed line refuses (unknown), it is never skipped.
+ * device. A malformed line (an empty field, a relative mount point) refuses (unknown), it is never skipped.
  */
 export function linuxLocality(mountinfo: string, dev: bigint, path: string): string {
 	const device = majorMinor(dev);
@@ -229,7 +229,7 @@ export function linuxLocality(mountinfo: string, dev: bigint, path: string): str
 		if (line === "") continue;
 		const f = line.split(" ");
 		const dash = f.indexOf("-", 6);
-		if (!/^\d+$/.test(f[0] ?? "") || !/^\d+$/.test(f[1] ?? "") || !/^\d+:\d+$/.test(f[2] ?? "") || dash < 0 || f.length !== dash + 4) {
+		if (f.includes("") || !/^\d+$/.test(f[0] ?? "") || !/^\d+$/.test(f[1] ?? "") || !/^\d+:\d+$/.test(f[2] ?? "") || !(f[4] ?? "").startsWith("/") || dash < 0 || f.length !== dash + 4) {
 			return `unknown:malformed /proc/self/mountinfo line: ${line}`;
 		}
 		if (f[2] !== device) continue;
