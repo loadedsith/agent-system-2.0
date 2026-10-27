@@ -24,8 +24,8 @@ import {
 } from "../src/test-run";
 import { landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT } from "../scripts/test-runner";
-import { parseRunnerPreflight } from "../src/main-state";
+import { admitMain, citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT } from "../scripts/test-runner";
+import { mainResults, mainVerdicts, parseRunnerPreflight } from "../src/main-state";
 import { alive, tmp, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
 
@@ -108,7 +108,7 @@ const GATE_RED = `import { test } from "bun:test";
 test("refuses a forged approve", () => { throw new Error("the gate let it through"); });
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11, belief95: 12, belief90: 13, belief80: 14 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -124,6 +124,10 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	loud: { "loud.test.ts": HANG_LOUD },
 	// PLAN wl-mvq4edbaf13vnk D4: a changed .ts that does not transpile beside a passing test, for the fast run's parse check.
 	parse: { "a.test.ts": PASS("a"), "lib.ts": "export const x = ;\n" },
+	// xa.test.ts plus nineteen files: exactly 95% or 90% execute a case.
+	belief95: Object.fromEntries(Array.from({ length: 19 }, (_, i) => [`belief-${i}.test.ts`, i === 0 ? SKIPPED("skipped") : PASS(`belief ${i}`)])),
+	belief90: Object.fromEntries(Array.from({ length: 19 }, (_, i) => [`belief-${i}.test.ts`, i < 2 ? SKIPPED("skipped") : PASS(`belief ${i}`)])),
+	belief80: { "a.test.ts": PASS("one") + '\ntest("two", () => {});\ntest("three", () => {});\n' },
 };
 
 interface Fixture {
@@ -176,6 +180,7 @@ const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1 $2" = "pr list" ] && [ -f "$dir/open-prs.json" ]; then cat "$dir/open-prs.json"; exit 0; fi
 if [ "$1" = api ] && [ "$2" = -X ]; then
 	st=""
 	for a in "$@"; do case "$a" in state=*) st="\${a#state=}" ;; esac; done
@@ -2728,5 +2733,200 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		expect([...citedRuns(w.ledger.entries(STANDING_WORKLOAD_ID), now)].sort()).toEqual(["tr-boundary", "tr-expired", "tr-oldred", "tr-recentred"]);
 		entry(landFirstNoticeBody(OWNER_REPO, { event: "stop-cleared", why: "fixed" }), 0, MERGE_TRAIN_BY);
 		expect([...citedRuns(w.ledger.entries(STANDING_WORKLOAD_ID), now)].sort()).toEqual(["tr-boundary", "tr-recentred"]);
+	});
+});
+
+describe("land-first main D5 (R13, R14)", () => {
+	function mainWorld() {
+		const w = world();
+		landFirst(w.ledger, OWNER_REPO, true);
+		return w;
+	}
+	function admit(w: World, sha: string) {
+		const db = lockDbOf(w);
+		try {
+			return admitMain(w.ledger, db, w.runs, OWNER_REPO, sha, MERGE_TRAIN_BY);
+		} finally {
+			db.close();
+		}
+	}
+	function mainRequest(w: World, sha: string): string {
+		const a = admit(w, sha);
+		if (a.action !== "admitted") throw new Error(a.line);
+		return a.runId;
+	}
+	function api(w: World, path: string, value: unknown) {
+		mkdirSync(join(w.root, "api"), { recursive: true });
+		writeFileSync(join(w.root, "api", path.replaceAll("/", "_")), JSON.stringify(value));
+	}
+	const calls = (w: World) => existsSync(join(w.root, "gh.log")) ? readFileSync(join(w.root, "gh.log"), "utf8") : "";
+	function openSuccess(w: World) {
+		api(w, `repos/${OWNER_REPO}/commits/${fx.head.green}/statuses`, [{ context: "as2/full-suite", state: "success", description: "fast check green" }]);
+		writeFileSync(join(w.root, "open-prs.json"), JSON.stringify([{ number: 1, headRefOid: fx.head.green }]));
+	}
+	test("green main executes its requested commit, publishes believable verdict before GitHub, and never completes a slice", async () => {
+		const w = mainWorld();
+		const id = mainRequest(w, fx.head.green);
+		arm(w, id, "main-published");
+		const p = spawnRun(w, id);
+		try {
+			await reached(w, id, "main-published");
+			const result = await resultOf(w, STANDING_WORKLOAD_ID, id);
+			expect(result).toMatchObject({ main: true, scope: "full", host: "mac", verdict: "green", exec: { files: 2, tests: 2, treeFiles: 2 }, base: null, mergeBase: null });
+			expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(result.sha)?.verdict).toBe("green");
+			expect(w.ledger.slice(testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).find((r) => r.request.runId === id)!.request.slice)).toBeNull();
+			expect(calls(w)).toBe("");
+			// A later main tip and missing PR ref do not make an immutable main target stale.
+			g(w.root, "--git-dir", w.origin, "update-ref", "refs/heads/main", fx.head.red);
+		} finally {
+			go(w, id, "main-published");
+		}
+		expect(await p.exited).toBe(0);
+		expect(calls(w)).toContain("context=as2/main-full");
+		expect(calls(w)).not.toContain("context=as2/full-suite");
+		expect(calls(w)).not.toContain("pr view 0");
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID).some((e) => e.body.startsWith("verifier-stalled:"))).toBe(true);
+		expect(admit(w, fx.head.green).action).toBe("verdict");
+	});
+	for (const scenario of ["red", "skipped", "exit"] as const) {
+		test(`${scenario} main persists verdict/facts before revoking open successes`, async () => {
+			const w = mainWorld();
+			openSuccess(w);
+			const id = mainRequest(w, fx.head[scenario]);
+			arm(w, id, "main-published");
+			const p = spawnRun(w, id);
+			try {
+				await reached(w, id, "main-published");
+				const result = await resultOf(w, STANDING_WORKLOAD_ID, id);
+				expect(result.main).toBe(true);
+				const verdict = mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(result.sha);
+				expect(verdict?.verdict ?? null).toBe(scenario === "exit" ? null : scenario === "skipped" ? "implausible" : "red");
+				expect(w.ledger.entries(STANDING_WORKLOAD_ID).some((e) => e.body.startsWith("main-red:"))).toBe(scenario !== "exit");
+				if (scenario !== "exit") {
+					const body = w.ledger.entries(STANDING_WORKLOAD_ID).find((e) => e.body.startsWith("main-red:"))!.body;
+					const facts = JSON.parse(body.slice(`main-red: ${OWNER_REPO} `.length));
+					expect(facts).toMatchObject({ repo: OWNER_REPO, sha: result.sha, runId: id, verdict: scenario === "red" ? "red" : "implausible" });
+					expect(facts.suspects).toContain(result.sha);
+					if (scenario === "red") {
+						expect(facts.failing).toEqual(["red.test.ts"]);
+						expect(facts.attribution).toContainEqual({ sha: result.sha, files: ["red.test.ts"] });
+					}
+				}
+				if (scenario === "red") {
+					expect(result.solo.map((s) => s.file)).toEqual(["./red.test.ts"]);
+					expect(subsOf(w, id)).not.toContain("base-prepare");
+				}
+				expect(calls(w)).toBe("");
+			} finally {
+				go(w, id, "main-published");
+			}
+			expect(await p.exited).toBe(0);
+			expect(calls(w)).toContain(`statuses/${fx.head.green} -f state=failure -f context=as2/full-suite`);
+			expect(calls(w)).toContain("context=as2/main-full");
+		});
+	}
+	test("main preflight refusal stays inconclusive and revokes; GitHub failures are durable without erasing the result", async () => {
+		const w = mainWorld();
+		openSuccess(w);
+		chmodSync(w.libexec, 0o700);
+		writeFileSync(join(w.root, "status-fails"), "");
+		const id = mainRequest(w, fx.main);
+		expect(await spawnRun(w, id).exited).toBe(0);
+		const result = await resultOf(w, STANDING_WORKLOAD_ID, id);
+		expect(result).toMatchObject({ main: true, verdict: "error", full: null });
+		expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).has(fx.main)).toBe(false);
+		expect(marks(w, id, "spawn-full")).toEqual([]);
+		expect(calls(w)).toContain("state=failure -f context=as2/full-suite");
+		expect(calls(w)).toContain("state=error -f context=as2/main-full");
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("main-publication:")).some((e) => e.body.includes("not posted") && e.body.includes("HTTP 422"))).toBe(true);
+	});
+	for (const [scenario, expected] of [["belief95", "green"], ["belief90", "implausible"], ["belief80", "green"]] as const) {
+		test(`belief threshold ${scenario} executes the actual main path`, async () => {
+			const w = mainWorld();
+			if (scenario === "belief80") mainRun(w.ledger, "tr-baseline", fx.main, "green", { exec: { files: 1, tests: 5, treeFiles: 1 } });
+			const id = mainRequest(w, fx.head[scenario]);
+			expect(await spawnRun(w, id).exited).toBe(0);
+			const result = await resultOf(w, STANDING_WORKLOAD_ID, id);
+			expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(result.sha)?.verdict).toBe(expected);
+			expect(result.exec).toEqual(scenario === "belief80" ? { files: 2, tests: 4, treeFiles: 2 } : { files: scenario === "belief95" ? 19 : 18, tests: scenario === "belief95" ? 19 : 18, treeFiles: 20 });
+		});
+	}
+	test("missing profile settles main as error before revocation and never invokes a nonexistent slice", async () => {
+		const w = mainWorld();
+		openSuccess(w);
+		const id = mainRequest(w, fx.main);
+		expect(await spawnRun(w, id, { AGENT_SYSTEM_TEST_RUNNER_CONFIG: join(w.root, "missing.yml") }).exited).toBe(0);
+		expect(await resultOf(w, STANDING_WORKLOAD_ID, id)).toMatchObject({ main: true, verdict: "error", reason: expect.stringContaining("missing.yml") });
+		expect(calls(w)).toContain("state=failure -f context=as2/full-suite");
+		expect(calls(w)).toContain("state=error -f context=as2/main-full");
+	});
+	test("a main publication failure still revokes, preserving the local error while the ledger is unavailable", async () => {
+		const w = mainWorld();
+		openSuccess(w);
+		const id = mainRequest(w, fx.main);
+		arm(w, id, "result");
+		const p = spawnRun(w, id, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "1200" });
+		const held = new Database(w.ledger.db.filename);
+		try {
+			await reached(w, id, "result");
+			held.exec("BEGIN IMMEDIATE");
+			go(w, id, "result");
+			expect(await p.exited).toBe(START_EXIT.failed);
+			expect(JSON.parse(readFileSync(join(w.runs, id, "result.json"), "utf8"))).toMatchObject({ main: true, verdict: "error", reason: expect.stringContaining("result publication failed") });
+			expect(calls(w)).toContain("state=failure -f context=as2/full-suite");
+			expect(calls(w)).toContain("state=error -f context=as2/main-full");
+			expect(runnerLog(w, id)).toContain("result publication failed");
+		} finally {
+			if (held.inTransaction) held.exec("ROLLBACK");
+			held.close();
+			go(w, id, "result");
+			await p.exited;
+		}
+		expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).has(fx.main)).toBe(false);
+	});
+	test("the prior green test count is an independent belief boundary", async () => {
+		const w = mainWorld();
+		mainRun(w.ledger, "tr-baseline", fx.main, "green", { exec: { files: 1, treeFiles: 1, tests: 3 } });
+		const id = mainRequest(w, fx.head.green);
+		expect(await spawnRun(w, id).exited).toBe(0);
+		expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(fx.head.green)?.verdict).toBe("implausible");
+	});
+	test("main takes the Mac before waiting PRs; coalesces pending targets without cancelling active main", async () => {
+		const w = mainWorld();
+		const owner = workload(w);
+		const prId = request(w, owner.wl, owner.slice, PR.green, fx.head.green, 1000);
+		const db = lockDbOf(w);
+		db.query("INSERT INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(prId, owner.wl, Date.now() - 1000);
+		db.close();
+		const id = mainRequest(w, fx.main);
+		arm(w, id, "phase-full");
+		const active = spawnRun(w, id);
+		await reached(w, id, "phase-full");
+		expect(admit(w, fx.head.red).action).toBe("pending");
+		expect(admit(w, fx.head.green).action).toBe("pending");
+		expect(admit(w, fx.head.green).action).toBe("pending-same");
+		expect(admit(w, fx.main).action).toBe("active");
+		const pr = spawnRun(w, prId);
+		arm(w, id, "main-published");
+		go(w, id, "phase-full");
+		await reached(w, id, "main-published");
+		expect(marks(w, prId, "acquired")).toEqual([]);
+		go(w, id, "main-published");
+		expect(await active.exited).toBe(0);
+		const next = await until("pending main admission", () => testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).find((r) => r.request.sha === fx.head.green) ?? null);
+		expect((await resultOf(w, STANDING_WORKLOAD_ID, next.request.runId)).verdict).toBe("green");
+		expect(testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).some((r) => r.request.sha === fx.head.red)).toBe(false);
+		expect(await pr.exited).toBe(0);
+		expect((await resultOf(w, owner.wl, prId)).verdict).toBe("green");
+		expect(w.ledger.slice(owner.slice)?.state).toBe("done");
+	});
+	test("three inconclusive attempts refuse another admission", () => {
+		const w = mainWorld();
+		for (let i = 0; i < 3; i++) {
+			const id = mainRequest(w, fx.head.exit);
+			const q = testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).find((r) => r.request.runId === id)!.request;
+			w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: testRunBody({ ...runnerDiedRun(q, null), main: true }) });
+		}
+		expect(() => admit(w, fx.head.exit)).toThrow("spent attempt block");
 	});
 });

@@ -484,10 +484,21 @@ export function diedRun(request: TestRequested, runDir: string | null, reason = 
 
 /** After a reservation, a run that cannot proceed (no runner spawned, no profile to run under) gets its `error` result, while it still owns its request. */
 function recordError(ledger: Ledger, wl: string, request: TestRequested, runDir: string, reason: string): void {
-	ledger.write(() => {
-		if (!ownsRequest(testRuns(ledger.entries(wl)), request.runId)) return;
+	const written = ledger.write(() => {
+		if (!ownsRequest(testRuns(ledger.entries(wl)), request.runId)) return false;
+		const prior = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId)?.results[0];
+		if (request.main !== undefined && prior !== undefined) return false;
 		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sliceOf(request), kind: "assumption", body: testRunBody(diedRun(request, runDir, reason)) });
+		return true;
 	});
+	if (written && request.main !== undefined) {
+		const log = (s: string) => {
+			process.stdout.write(`${s}\n`);
+			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body: `main-publication: ${request.runId} ${s.replace(/\s+/g, " ")}` });
+		};
+		revokeOpen(realGh, request.main.repo, `main ${request.sha.slice(0, 7)} error: ${reason}`, log);
+		postStatus(realGh, request.main.repo, "error", request.sha, `main full error, run ${request.runId}`, log, MAIN_FULL_STATUS);
+	}
 }
 
 // ---- GitHub: the runner's one seam -------------------------------------------------------------------
@@ -613,12 +624,16 @@ function gitSync(gitDir: string, args: string[], env: Record<string, string>, op
 }
 
 const MODULE_SOURCE = /\.(?:[cm]?[jt]sx?|sql)$/;
+export interface CommitTree {
+	files: string[];
+	read: ReadFile;
+}
 /**
  * A commit's tracked files and a reader over their contents (`ReadFile`, null for a path the tree does not hold), from the
  * git dir `gitDir`: one `ls-tree`, then, with `prefetch`, every module source (and `.sql`) in one `cat-file --batch`, the
  * rest read on demand. The fast set reads every module of the tree (its import graph); the base side reads one file.
  */
-export function treeAt(gitDir: string, commit: string, env: Record<string, string>, prefetch: boolean): { files: string[]; read: ReadFile } {
+export function treeAt(gitDir: string, commit: string, env: Record<string, string>, prefetch: boolean): CommitTree {
 	const blobs = new Map<string, string>();
 	for (const line of gitSync(gitDir, ["ls-tree", "-r", "-z", "--full-tree", commit], env).toString("utf8").split("\0")) {
 		const m = /^\d+ blob ([0-9a-f]{40})\t(.+)$/s.exec(line);
@@ -988,6 +1003,31 @@ export type MainAdmission =
 	| { action: "verdict" | "active" | "pending-same" | "pending"; line: string }
 	| { action: "admitted"; runId: string; line: string };
 
+/** Durable regression facts beside the main TestRun; not the holder's issue-url `main-red:` row. */
+export interface MainRedFacts {
+	repo: string;
+	sha: string;
+	runId: string;
+	verdict: "red" | "implausible";
+	suspects: string[];
+	failing: string[];
+	attribution: { sha: string; files: string[] }[];
+}
+export function mainRedFactsBody(facts: MainRedFacts): string {
+	return `main-red: ${facts.repo.toLowerCase()} ${JSON.stringify(facts)}`;
+}
+
+/**
+ * D5/D14 integration seam: a green verdict is durable, but no verified root or tag has moved here.
+ * The verifier slice replaces this body with atomic root/tag promotion; until then the stall is explicit and durable.
+ */
+export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: string) => void): { ok: false; reason: string } {
+	const reason = "verified-root promotion is not installed; run the verifier promotion step";
+	ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `verifier-stalled: ${repo.toLowerCase()} ${sha} ${reason}` });
+	log(`verifier-stalled: ${sha}: ${reason}`);
+	return { ok: false, reason };
+}
+
 /**
  * D5's main request at `sha` of `repo`, in one ledger transaction on the standing workload: nothing when `sha` has a verdict; refused
  * (Fail, refused) when its attempt block is exhausted (`attemptBlock`, reopened by Jo's `main-retry:`); every main request of the
@@ -998,13 +1038,14 @@ export type MainAdmission =
 export function admitMain(ledger: Ledger, lockDb: Database, root: string, repo: string, sha: string, by: string): MainAdmission {
 	if (ledger.workload(STANDING_WORKLOAD_ID) === null) throw new Fail(`no standing workload ${STANDING_WORKLOAD_ID}: a main run is recorded there`, START_EXIT.failed);
 	const want = repo.toLowerCase();
-	return ledger.write((): MainAdmission => {
+	const admission = ledger.write((): MainAdmission | Fail => {
 		const entries = ledger.entries(STANDING_WORKLOAD_ID);
 		const results = mainResults(entries);
 		const verdict = mainVerdicts(results).get(sha);
-		if (verdict !== undefined) return { action: "verdict", line: `main ${sha} has its verdict ${verdict.verdict} (run ${verdict.runId}); nothing requested` };
-		const block = attemptBlock(sha, results, mainRetries(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo));
-		if (block.exhausted) throw new Fail(`main ${sha} has spent attempt block ${block.block} (${block.attempts} inconclusive runs): fix the runner, then Jo says main-retry ${repo}`, START_EXIT.refused);
+		if (verdict !== undefined) {
+			busyLoop(() => lockDb.query("DELETE FROM main_pending WHERE repo = ? AND sha = ?").run(want, sha));
+			return { action: "verdict", line: `main ${sha} has its verdict ${verdict.verdict} (run ${verdict.runId}); nothing requested` };
+		}
 		const now = Date.parse(ledger.now());
 		let active: RunRecord | null = null;
 		for (const rec of testRuns(entries)) {
@@ -1012,6 +1053,8 @@ export function admitMain(ledger: Ledger, lockDb: Database, root: string, repo: 
 			if (recordLive(rec, heartbeatOf(root, rec.request.runId), now)) active = rec;
 			else ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: testRunBody(diedRun(rec.request, runDirOf(root, rec.request.runId))) });
 		}
+		const block = attemptBlock(sha, mainResults(ledger.entries(STANDING_WORKLOAD_ID)), mainRetries(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo));
+		if (block.exhausted) return new Fail(`main ${sha} has spent attempt block ${block.block} (${block.attempts} inconclusive runs): fix the runner, then Jo says main-retry ${repo}`, START_EXIT.refused);
 		if (active !== null) {
 			if (active.request.sha === sha) return { action: "active", line: `main ${sha} is the active main run ${active.request.runId}; nothing requested` };
 			const pending = busyLoop(() => lockDb.query<{ sha: string }, [string]>("SELECT sha FROM main_pending WHERE repo = ?").get(want));
@@ -1022,9 +1065,11 @@ export function admitMain(ledger: Ledger, lockDb: Database, root: string, repo: 
 		const runId = makeRunId(Date.now(), Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => (b % 36).toString(36)).join(""));
 		const request: TestRequested = { runId, pr: 0, sha, slice: `sl-main-${runId.slice(3)}`, by, main: { repo } };
 		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: testRequestedBody(request) });
-		busyLoop(() => lockDb.query("DELETE FROM main_pending WHERE repo = ? AND sha = ?").run(want, sha));
+		busyLoop(() => lockDb.query("DELETE FROM main_pending WHERE repo = ?").run(want));
 		return { action: "admitted", runId, line: `main ${sha} admitted as run ${runId}` };
 	});
+	if (admission instanceof Fail) throw admission;
+	return admission;
 }
 
 /**
@@ -1420,6 +1465,10 @@ class Runner {
 	private source: { ok: true; sha: string } | { ok: false; error: string } = { ok: false, error: "the install was not read" };
 	/** D5: this process wrote its one `runner-preflight:` row (or logged why it could not). */
 	private preflightRecorded = false;
+	private mainExec: ExecCounts | null = null;
+	private mainTree: CommitTree | null = null;
+	private mainSuspects: string[] = [];
+	private mainDiffs = new Map<string, string[]>();
 	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
 	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
@@ -1533,6 +1582,19 @@ class Runner {
 	 */
 	private queueBlocker(): string | null {
 		const rows = this.lockDb.query<QueueRow, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all();
+		// Priority comes from the durable request, not a second queue flag/schema that could drift.
+		const standing = testRuns(this.ledger.entries(STANDING_WORKLOAD_ID));
+		for (const row of rows) row.main = standing.some((r) => r.request.runId === row.runId && r.request.main !== undefined);
+		// An admitted main process may not have registered its queue row yet. Reserve its priority now so a waiting PR
+		// cannot slip into the Mac slot between main settlement and its successor's process startup.
+		if (this.request.main === undefined) {
+			for (const rec of standing) {
+				if (rec.request.main === undefined || rows.some((r) => r.runId === rec.request.runId)) continue;
+				if (recordLive(rec, heartbeatOf(this.root, rec.request.runId), Date.now())) {
+					rows.push({ runId: rec.request.runId, workloadId: STANDING_WORKLOAD_ID, requestedAt: Date.parse(rec.request.createdAt), main: true });
+				}
+			}
+		}
 		const records = new Map<string, RunRecord[]>();
 		const now = Date.now();
 		const { blocker, dead } = queueAhead(rows, this.id, (q) => {
@@ -1837,21 +1899,39 @@ class Runner {
 		};
 		const { request: q } = this;
 		await git([...NETWORK, "clone", "-q", "--no-checkout", this.url, "."], "git clone");
-		await git([...NETWORK, "fetch", "-q", "origin", `+refs/pull/${q.pr}/head:refs/remotes/origin/pr/${q.pr}`, "+refs/heads/main:refs/remotes/origin/main"], "git fetch");
-		this.f.fetchedSha = await git([...NO_HOOKS, "rev-parse", "--verify", `refs/remotes/origin/pr/${q.pr}^{commit}`], "reading the PR head");
+		if (q.main !== undefined) {
+			await git([...NETWORK, "fetch", "-q", "origin", q.sha], "fetching the requested main commit");
+			this.f.fetchedSha = await git([...NO_HOOKS, "rev-parse", "--verify", "FETCH_HEAD^{commit}"], "reading the requested main commit");
+		} else {
+			await git([...NETWORK, "fetch", "-q", "origin", `+refs/pull/${q.pr}/head:refs/remotes/origin/pr/${q.pr}`, "+refs/heads/main:refs/remotes/origin/main"], "git fetch");
+			this.f.fetchedSha = await git([...NO_HOOKS, "rev-parse", "--verify", `refs/remotes/origin/pr/${q.pr}^{commit}`], "reading the PR head");
+		}
 		if (this.f.fetchedSha !== q.sha) return null;
 		await git([...NO_HOOKS, "checkout", "-q", "--detach", q.sha], "git checkout");
 		this.f.headAtStart = await git([...NO_HOOKS, "rev-parse", "HEAD"], "reading HEAD");
-		this.f.base = await git([...NO_HOOKS, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], "reading origin/main");
-		this.f.mergeBase = await git([...NO_HOOKS, "merge-base", q.sha, "refs/remotes/origin/main"], "git merge-base");
-		const diff = await run(["git", ...NO_HOOKS, "diff", "--name-only", "-z", "--diff-filter=AMR", this.f.mergeBase, q.sha], { cwd: repo, env, timeoutMs: 120_000 });
-		if (diff.code !== 0) throw new Stop(`git diff failed: ${diff.err.split("\n").at(-1) || `exit ${diff.code}`}`);
-		const changed = changedTestFiles(diff.out);
+		let changed: string[] = [];
+		if (q.main !== undefined) {
+			this.mainTree = treeAt(join(repo, ".git"), q.sha, env, false);
+			const verdicts = mainVerdicts(mainResults(this.ledger.entries(STANDING_WORKLOAD_ID)));
+			const chain = (await git([...NO_HOOKS, "rev-list", "--first-parent", `--max-count=${CHAIN_MAX}`, q.sha], "reading main suspects")).split("\n");
+			for (const sha of chain) {
+				if (verdicts.get(sha)?.verdict === "green") break;
+				this.mainSuspects.unshift(sha);
+				const diff = await git([...NO_HOOKS, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", sha], "reading suspect changes");
+				this.mainDiffs.set(sha, diff.split("\0").filter(Boolean));
+			}
+		} else {
+			this.f.base = await git([...NO_HOOKS, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"], "reading origin/main");
+			this.f.mergeBase = await git([...NO_HOOKS, "merge-base", q.sha, "refs/remotes/origin/main"], "git merge-base");
+			const diff = await run(["git", ...NO_HOOKS, "diff", "--name-only", "-z", "--diff-filter=AMR", this.f.mergeBase, q.sha], { cwd: repo, env, timeoutMs: 120_000 });
+			if (diff.code !== 0) throw new Stop(`git diff failed: ${diff.err.split("\n").at(-1) || `exit ${diff.code}`}`);
+			changed = changedTestFiles(diff.out);
+		}
 		await git([...NO_HOOKS, "remote", "remove", "origin"], "git remote remove");
 		// The tested commit as a branch, so the bundle carries it whatever HEAD's handling.
-		await git([...NO_HOOKS, "update-ref", `refs/heads/as2-tested-pr-${q.pr}`, q.sha], "naming the tested commit");
-		// The trusted base for `migration-items check`: origin/main's sha as a tag the clone keeps (overwrites any fetched tag of that name).
-		await git([...NO_HOOKS, "update-ref", "refs/tags/as2-trusted-main", this.f.base], "tagging the trusted base");
+		await git([...NO_HOOKS, "update-ref", q.main !== undefined ? "refs/heads/as2-tested-main" : `refs/heads/as2-tested-pr-${q.pr}`, q.sha], "naming the tested commit");
+		// Main has no comparison base; its migration check uses the requested main commit itself.
+		await git([...NO_HOOKS, "update-ref", "refs/tags/as2-trusted-main", this.f.base ?? q.sha], "tagging the trusted base");
 		const bundle = join(this.stage, "repo.bundle");
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
@@ -1971,7 +2051,13 @@ class Runner {
 	 * admission recorded a `fast-plan:` of scope fast takes `fastBody` instead (D4); a plan of scope full runs these steps.
 	 */
 	async body(): Promise<void> {
-		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
+		if (this.request.main !== undefined) {
+			const repo = this.request.main.repo;
+			if (!this.config.repos.some((r) => r.origin.toLowerCase() === repo.toLowerCase())) throw new Stop(`the test runner does not serve main repository ${repo}`);
+			this.ownerRepo = repo;
+			this.repo = REPO_ROOT;
+			this.url = process.env.AGENT_SYSTEM_TEST_RUNNER_ORIGIN || `https://github.com/${repo}.git`;
+		} else ({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
 		const fastPlan = fastPlanOf(this.ledger.entries(this.wl), this.id);
 		if (fastPlan?.scope === "fast") return this.fastBody(fastPlan);
 		await this.acquire();
@@ -1984,6 +2070,11 @@ class Runner {
 		const full = await this.part({ sub: "full" });
 		this.f.full = full.result;
 		this.f.fullTimedOut = full.timedOut;
+		if (this.request.main !== undefined && full.junit !== null) {
+			const counted = execOf(full.junit, this.mainTree!.files.filter(isBunTestFile));
+			if (counted.ok) this.mainExec = counted.exec;
+			else this.f.error = `main executed counts could not be read from full.xml: ${counted.error}`;
+		}
 		await this.sweep("full");
 		const plan = soloPlan({ full: full.result, timedOut: full.timedOut, changed, executed: full.junit === null ? [] : executedFiles(full.junit) });
 		if (plan.stop) this.log("full part timed out: no solo or base parts");
@@ -1993,7 +2084,7 @@ class Runner {
 				this.f.solo.push({ file, ...(await this.part({ sub: "solo", file })).result });
 				await this.sweep(file);
 			}
-			await this.baseRuns();
+			if (this.request.main === undefined) await this.baseRuns();
 		}
 		await this.headRecheck();
 	}
@@ -2016,7 +2107,7 @@ class Runner {
 		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
 		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
-		this.f.headAtEnd = await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
+		this.f.headAtEnd = this.request.main !== undefined ? this.f.fetchedSha : await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
 	}
 
 	/**
@@ -2134,15 +2225,31 @@ class Runner {
 		// use nested savepoints. Only the publication loop below retries either database.
 		const write = (lockMine: boolean) => this.ledger.db.transaction(() => {
 			const owner = lockMine && !this.superseded && ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
-			const facts: RunFacts = { ...this.f, owner, sliceState: this.ledger.slice(this.request.slice)?.state ?? null };
+			const facts: RunFacts = { ...this.f, owner, sliceState: this.request.main === undefined ? this.ledger.slice(this.request.slice)?.state ?? null : null };
 			const decided = this.fast === null ? decideRun(facts) : fastDecision(facts, this.fast);
 			// A run displaced from the lock says so; decideRun's reason alone speaks only of the request.
 			const lost = this.superseded ?? (lockMine ? null : `the lock row holds ${lockRow(this.lockDb)?.runId ?? "no run"}`);
 			const decision = decided.verdict === "superseded" && lost ? { ...decided, reason: `${lost}; ${decided.reason}` } : decided;
 			const built = buildTestRun(this.request, facts, decision, { base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight });
 			// A fast run's row says scope fast, where it ran, and its executed counts (D4).
-			const run: TestRun = this.fast === null ? built : { ...built, scope: "fast", host: this.fast.host, exec: this.fast.exec };
-			this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, kind: "assumption", body: testRunBody(run) });
+			const run: TestRun = this.request.main !== undefined ? { ...built, main: true, scope: "full", host: "mac", exec: this.mainExec }
+				: this.fast === null ? built : { ...built, scope: "fast", host: this.fast.host, exec: this.fast.exec };
+			// Exactly one settle per request, including a duplicate detached process after the first process settled.
+			const prior = testRuns(this.ledger.entries(this.wl)).find((r) => r.request.runId === this.id)?.results[0];
+			if (this.request.main !== undefined && prior !== undefined) return { run: prior, settled: null };
+			this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: sliceOf(this.request), kind: "assumption", body: testRunBody(run) });
+			if (this.request.main !== undefined) {
+				const verdict = mainVerdicts(mainResults(this.ledger.entries(this.wl))).get(run.sha);
+				if (verdict?.runId === run.runId && verdict.verdict !== "green") {
+					const failing = [...new Set(run.failures.map((f) => f.name.split(" > ")[0]!.replace(/^\.\//, "")))];
+					const facts: MainRedFacts = {
+						repo: this.ownerRepo, sha: run.sha, runId: run.runId, verdict: verdict.verdict, suspects: this.mainSuspects,
+						failing, attribution: this.mainTree === null ? [] : attribute(this.mainSuspects, failing, this.mainDiffs, this.mainTree),
+					};
+					this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, kind: "assumption", body: mainRedFactsBody(facts) });
+				}
+				return { run, settled: null };
+			}
 			// decision.settle holds only for an owner whose slice this transaction read as open. The
 			// completion is a nested write (a savepoint): a refusal rolls back only itself, and the
 			// `test-run:` entry still commits.
@@ -2240,10 +2347,31 @@ class Runner {
 				const built = buildTestRun(this.request, this.f, { verdict: "error", outcome: "error", reason, settle: false }, {
 					base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight,
 				});
-				const run: TestRun = this.fast === null ? built : { ...built, scope: "fast", host: this.fast.host, exec: this.fast.exec };
+				const run: TestRun = this.request.main !== undefined ? { ...built, main: true, exec: this.mainExec }
+					: this.fast === null ? built : { ...built, scope: "fast", host: this.fast.host, exec: this.fast.exec };
 				this.log(`test-run error: ${reason}`);
 				this.writeResult(run);
+				if (this.request.main !== undefined) {
+					// The ledger is unavailable: result.json and runner.log retain the error, and the tick reaps the request.
+					// Revocation must not depend on a working ledger or on another logging write succeeding.
+					const log = (s: string) => this.log(s);
+					revokeOpen(realGh, this.request.main.repo, `main ${run.sha.slice(0, 7)} publication error, run ${run.runId}: ${reason}`, log);
+					postStatus(realGh, this.request.main.repo, "error", run.sha, `main full publication error, run ${run.runId}`, log, MAIN_FULL_STATUS);
+				}
 				return START_EXIT.failed;
+			}
+			if (this.request.main !== undefined) {
+				await hook(this.id, "main-published", {}, this.postSweepDeadline);
+				const log = (s: string) => {
+					this.log(s);
+					this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, kind: "assumption", body: `main-publication: ${this.id} ${s.replace(/\s+/g, " ")}` });
+				};
+				const verdict = mainVerdicts(mainResults(this.ledger.entries(this.wl))).get(run.sha);
+				if (verdict?.verdict === "green") promoteMain(this.ledger, this.ownerRepo, run.sha, log);
+				else revokeOpen(realGh, this.ownerRepo, `main ${run.sha.slice(0, 7)} ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log);
+				const state = verdict?.verdict === "green" ? "success" : verdict !== undefined ? "failure" : "error";
+				postStatus(realGh, this.ownerRepo, state, run.sha, `main full ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log, MAIN_FULL_STATUS);
+				return 0;
 			}
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check). On a land-first
 			// repository (a `fast-plan:` in the admission) the gate decides the state (D4); else today's mapping. Neither throws.
@@ -2261,6 +2389,27 @@ class Runner {
 			// The run lock goes even when a refresh helper this run started may outlive it (installCheck's `live`):
 			// releasing it proves nothing about that helper. Refreshes are serialised by the helper's own lockf lock
 			// on refresh.d/lock, which the next run's refresh waits on (exit 69, lock, while the old helper holds it).
+			if (this.request.main !== undefined) {
+				try {
+					// Admit before releasing the Mac: waiting PRs see the durable successor even before its process queues.
+					const pending = this.lockDb.query<{ sha: string }, [string]>("SELECT sha FROM main_pending WHERE repo = ?").get(this.request.main.repo.toLowerCase());
+					if (pending !== null) {
+						const a = admitMain(this.ledger, this.lockDb, this.root, this.request.main.repo, pending.sha, MERGE_TRAIN_BY);
+						if (a.action === "admitted") {
+							try {
+								spawnRunner(runDirOf(this.root, a.runId), a.runId);
+							} catch (e) {
+								recordError(this.ledger, this.wl, findRequest(this.ledger, a.runId)!.request, runDirOf(this.root, a.runId), `the pending main runner did not start: ${errText(e)}`);
+								throw e;
+							}
+						}
+					}
+				} catch (e) {
+					const reason = `pending main admission failed: ${errText(e)}; the tick must request the tip again`;
+					this.log(reason);
+					this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, kind: "assumption", body: `main-publication: ${this.id} ${reason}` });
+				}
+			}
 			if (this.held) {
 				this.lockDb.exec("PRAGMA busy_timeout = 100");
 				try {
@@ -2281,6 +2430,7 @@ async function cmdRun(runId: string): Promise<number> {
 	const ledger = openLedger();
 	const found = findRequest(ledger, runId);
 	if (!found) throw new Fail(`no test-requested: for ${runId}`, START_EXIT.failed);
+	if (found.request.main !== undefined && testRuns(ledger.entries(found.workloadId)).find((r) => r.request.runId === runId)?.results.length) return START_EXIT.ok;
 	const w: WorkloadStatusRow | null = ledger.workload(found.workloadId);
 	if (!w) throw new Fail(`no workload ${found.workloadId}`, START_EXIT.failed);
 	let config: TestRunnerConfig;

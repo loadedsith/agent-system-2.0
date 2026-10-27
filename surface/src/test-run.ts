@@ -750,6 +750,8 @@ export interface QueueRow {
 	runId: string;
 	workloadId: string;
 	requestedAt: number;
+	/** Main requests take the Mac before waiting PRs; absent on old queue rows. */
+	main?: boolean;
 }
 
 /**
@@ -767,7 +769,7 @@ export function queueWaiterLive(rec: RunRecord | undefined, heartbeatAtMs: numbe
  */
 export function queueAhead(rows: readonly QueueRow[], selfId: string, live: (row: QueueRow) => boolean): { blocker: string | null; dead: string[] } {
 	need(rows.some((r) => r.runId === selfId), `${selfId} is not in the queue`);
-	const ordered = [...rows].sort((a, b) => a.requestedAt - b.requestedAt || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
+	const ordered = [...rows].sort((a, b) => Number(b.main ?? false) - Number(a.main ?? false) || a.requestedAt - b.requestedAt || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
 	const dead: string[] = [];
 	for (const row of ordered) {
 		if (row.runId === selfId) break;
