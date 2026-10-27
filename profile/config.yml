@@ -291,7 +291,7 @@ testRunner:
   fullCapMin: 20
   soloCapMin: 10
   reportCapMb: 50
-  queueMaxMin: 60
+  queueMaxMin: 1440
   # Workers for the PR's full part (workload wl-mvg2kzuvwngdmo): over 1, test-exec runs it as
   # `bun test --parallel=<n>` (an integer of 1 or more; absent means 1). Base reruns (`base-full`)
   # stay serial whatever this says. surface/scripts/test-run-waits.ts reads each run's `full workers`

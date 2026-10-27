@@ -667,6 +667,8 @@ class Runner {
 		const waitStart = Date.now();
 		const pollMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_POLL_MS", 2_000);
 		mkdirSync(this.stageRoot, { recursive: true });
+		// A merge train's run never ends on the wait cap (`queuedTooLong`); membership only grows while a train is open, so it is read once.
+		const train = trainPrs(this.ledger.entries(this.wl), this.ledger.instructions(this.wl)).length > 0;
 		try {
 			for (;;) {
 				let took: { displaced: string | null } | null = null;
@@ -695,7 +697,7 @@ class Runner {
 					this.beat();
 					return;
 				}
-				if (queuedTooLong(waitStart, Date.now(), this.config)) throw new Stop("queued too long");
+				if (queuedTooLong(waitStart, Date.now(), this.config, train)) throw new Stop("queued too long");
 				hookMark(this.id, "queued");
 				await Bun.sleep(pollMs);
 			}

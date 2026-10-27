@@ -644,6 +644,43 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect((await admitted(w, other, B)).verdict).toBe("stale");
 		expect(ghCalls().slice(before).filter((c) => c.endsWith("--json state"))).toEqual([]);
 	});
+
+	// jo-issues #213: a merge train's run never ends on the lock-wait cap; a dead holder is caught by lockHolderStale, not by the cap.
+	test("train: a merge train's run waits past queueMaxMin behind a live holder without ending queued too long, then takes the lock once it is free and settles", async () => {
+		const w = world({ queueMaxMin: 0.01 });
+		const { wl, slice } = workload(w);
+		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
+		joTrains(w, wl, [A]);
+		const capMs = 0.01 * 60_000;
+		const db = lockDbOf(w);
+		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000);
+		const kids: Child[] = [];
+		try {
+			// Requested at a sha the PR head is not, so once it holds the lock it ends stale quickly.
+			const runId = request(w, wl, slice, A, fx.main);
+			const child = spawnRun(w, runId);
+			kids.push(child);
+			const first = (await until("the first queued poll", () => marks(w, runId, "queued")[0]))!.at as number;
+			// The run's wait began before its first queued mark, so a mark past first + the cap is past the cap; three caps is well past it.
+			await until("three queued polls past three caps", () => {
+				const s = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)?.results[0];
+				if (s) throw new Error(`the train run settled while the holder was live: ${s.verdict} ${s.reason ?? ""}\n--- runner.log ---\n${runnerLog(w, runId)}`);
+				return marks(w, runId, "queued").filter((m) => (m.at as number) > first + 3 * capMs).length >= 3;
+			});
+			expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toEqual([]);
+			expect(queueRows(w).map((q) => q.runId)).toEqual([runId]);
+			expect(lockRow(db)!.runId).toBe("tr-otherholder");
+			db.query("DELETE FROM lock").run();
+			const run = await resultOf(w, wl, runId);
+			expect(run.reason).not.toBe("queued too long");
+			expect(run.verdict).toBe("stale");
+			expect(marks(w, runId, "acquired")).toHaveLength(1);
+			await child.exited;
+		} finally {
+			await reap(kids);
+			db.close();
+		}
+	});
 });
 
 describe("start: the reservation (§ 2.2 step 3)", () => {
