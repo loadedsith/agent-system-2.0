@@ -18,10 +18,11 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     followed to its target, then the not-yet-existing rest), so a symlink into a synced folder, a
     synced folder that is itself a symlink, a symlinked `$HOME`, and an existing or dangling
     database symlink are all refused ("… is inside …, a synced folder");
-  - any path whose mount is not local: on macOS, the mount entry for the path's mount point
-    (from `df -P` then `/sbin/mount`) must carry the `local` flag; on Linux, the `/proc/mounts`
-    filesystem type must not be a network type (`nfs`, `cifs`, `smbfs`, `sshfs`, and the rest
-    listed in `locality.ts`). A mount that cannot be determined is refused too.
+  - any path whose mount is not local, judged on the nearest existing ancestor in process (no
+    child process): on macOS, native `statfs` must report the `MNT_LOCAL` flag; on Linux, the
+    `/proc/self/mountinfo` entries of the path's device (`major:minor` of its `st_dev`) must not
+    carry a network filesystem type (`nfs`, `cifs`, `smbfs`, `fuse.sshfs`, and the rest listed in
+    `locality.ts`). A mount that cannot be determined is refused too.
 
   The module then opens the canonical path, so what was checked is what is opened
   (`Ledger#path` is that canonical path).
