@@ -61,3 +61,4 @@ Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tole
 - **Silence is a failure.** Long work has a deadline that tracks progress; a hang, a job that never started, or a dead watcher is an error you report.
 - **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
 - **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.
+- **When you review or judge**, a failure path that surfaces nowhere (a swallowed error, an unannounced fallback, long work with no progress deadline, cleanup that deletes cited evidence) is a blocking finding.
