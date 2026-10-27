@@ -23,10 +23,10 @@
 import { parseHandSpawn } from "../../classifier/src/lab";
 import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import {
-	type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard, parseTrainFix,
-	planFirst, planSlice, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
+	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard,
+	parseTrainFix, planFirst, planSlice, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
-import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
+import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type SliceRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
 import { askJo, raisedId, type TrainSignoffFact } from "../../gates/src/rulings";
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
@@ -1139,9 +1139,13 @@ export interface TrainRetries {
 /**
  * Why the tick wakes train `wl` (D10 step 1), or empty when nothing is actionable: a `train:` entry (the open, or Jo's append),
  * a `train-board:` (`#n boarded`, PLAN wl-mvbjiettjrfpxc D3)
- * or a task settle written after the train's last lane exit, a PR no lane has given its disposition slice since one exited,
- * a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last pass), or Jo's answer to (or
- * withdrawal of) the tick's own alert question (D9) after the last exit: no lane raised that question, so no resume follows it.
+ * or a task settle written after the train's last ready lane exit (`lastReadyExit`), a PR no lane has worked since one exited
+ * (`#<n> not yet worked`: no disposition slice, or a slice the tick added that `trainLaneWorked` says no lane of the train has
+ * worked), a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last ready exit), Jo's answer to
+ * (or withdrawal of) the tick's own alert question (D9) after the last ready exit: no lane raised that question, so no resume
+ * follows it, and Jo's answer to (or withdrawal of) a question the train's lane raised whose instruction no ready lane's first
+ * prompt carried yet (`consumedByReady`, PLAN wl-mvpsrr4tr0p1xc D2). A lane that never got ready swallows nothing: the
+ * cutoffs read `lastReadyExit`, so the work that woke it wakes the train again (bounded by `trainLaunchFailures`).
  * After a lane exit, also every PR `trainRetries` lists: a passed-over PR whose retry is due, and a head the train has not seen;
  * a PR in `heldPassOvers` (passed over for main's protection while its episode is open, PLAN wl-mvbjiettjrfpxc D6) waits instead;
  * and every held PR whose hold has ended (`expiredHolds`, `hold-expired`; `stakesOf` is the tick's current `prStakes`).
@@ -1152,10 +1156,11 @@ export function actionable(
 ): string[] {
 	const control = controlOf(ledger, wl);
 	const exit = control.filter((c) => c.prefix === "lane-exit").at(-1) ?? null;
-	const lastExit = exit?.createdAt ?? null;
+	const lastExit = lastReadyExit(control);
 	const after = (at: string) => lastExit === null || at > lastExit;
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
+	const questions = ledger.questions(wl);
 	const out: string[] = [];
 	for (const b of trainBindings(entries, instructions)) {
 		if (!after(b.createdAt)) continue;
@@ -1168,19 +1173,75 @@ export function actionable(
 	}
 	const prs = trainPrs(entries, instructions);
 	if (exit !== null) {
-		const slices = new Set(ledger.slices(wl).map((s) => s.id));
-		for (const n of prs) if (!slices.has(trainSliceId(wl, n))) out.push(`#${n} not yet worked`);
+		const slices = new Map(ledger.slices(wl).map((s) => [s.id, s]));
+		for (const n of prs) {
+			const sl = slices.get(trainSliceId(wl, n));
+			if (!sl || (sl.created_by === MERGE_TRAIN_BY && !trainLaneWorked(wl, sl, control, entries, questions))) out.push(`#${n} not yet worked`);
+		}
 		const r = trainRetries(ledger, wl, heads);
 		for (const p of r.passedOver) if (!heldPassOvers.has(p.pr)) out.push(`#${p.pr} passed over ${p.count}x (train-error:), retry due`);
 		for (const h of r.untested) out.push(`#${h.pr} head ${h.sha} untested by the train${h.woken > 0 ? ` after ${h.woken} wake(s), retry due` : ""}`);
 		for (const h of expiredHolds(ledger, wl, stakesOf)) out.push(`#${h.pr} hold-expired (${h.holdId})`);
 	}
 	for (const n of mergedDeps) if (prs.includes(n)) out.push(`#${n}'s dependency merged`);
-	for (const q of ledger.questions(wl)) {
+	for (const q of questions) {
 		const n = q.created_by === MERGE_TRAIN_BY && q.state !== "open" ? trainSlicePr(q.slice_id, wl) : null;
 		if (n !== null && after(q.changed_at)) out.push(`alert ${q.id} on #${n} ${q.state}`);
 	}
+	const lane = trainLanePattern(wl);
+	for (const q of questions) {
+		if (q.state === "open" || !lane.test(q.created_by) || q.resolved_by === null) continue;
+		const ins = instructions.find((i) => i.id === q.resolved_by);
+		if (ins && !consumedByReady(control, ins.created_at)) out.push(`question ${q.id} ${q.state}, not yet resumed`);
+	}
 	return out;
+}
+
+/**
+ * D2 (PLAN wl-mvpsrr4tr0p1xc): the lanes that never got their first prompt: a runner launch (a `launch:` attempt whose cause is
+ * not `interactive`) with no `lane-ready:`. A lane Jo ran by hand (`cause interactive`) or one no `launch:` names had no
+ * readiness step, so it is never one of them.
+ */
+function neverReadyLanes(control: readonly ControlEntry[]): Set<string> {
+	const ready = new Set(control.flatMap((c) => (c.prefix === "lane-ready" && c.laneId !== null ? [c.laneId] : [])));
+	return new Set(attempts(control).flatMap((a) => (a.cause?.kind !== "interactive" && !ready.has(a.laneId) ? [a.laneId] : [])));
+}
+
+/**
+ * D2 (PLAN wl-mvpsrr4tr0p1xc): the time of the newest `lane-exit:` of a lane that got its first prompt (not `neverReadyLanes`),
+ * or null. The train's "since the last lane exit" cutoffs read it, so a launch that never got ready swallows no work.
+ */
+export function lastReadyExit(control: readonly ControlEntry[]): string | null {
+	const never = neverReadyLanes(control);
+	return control.filter((c) => c.prefix === "lane-exit" && c.laneId !== null && !never.has(c.laneId)).at(-1)?.createdAt ?? null;
+}
+
+/** The `lane-exit:` outcomes by which a ready lane ended its pass by its own word (D2's `#<n> not yet worked` rule). */
+const OWN_WORD_ENDS: readonly string[] = ["parked", "released", "completed"];
+
+/**
+ * D2 (PLAN wl-mvpsrr4tr0p1xc): whether train `wl`'s own lanes worked slice `sl` (one the tick added to carry an alert) since it
+ * was added: one of the train's lanes (`lane-<wl without wl->-<n>`; machinery writers do not count) wrote an entry or a question
+ * on it or last changed its state, or a lane that got its first prompt (not `neverReadyLanes`) ended its pass by its own word
+ * (its `released-open:`, or a `lane-exit:` outcome parked, released or completed). Readiness alone, a crash, or an `open-work`
+ * exit with no `released-open:` is no work: the PR stays `not yet worked`.
+ */
+function trainLaneWorked(wl: string, sl: SliceRow, control: readonly ControlEntry[], entries: readonly EntryRow[], questions: readonly QuestionRow[]): boolean {
+	const since = sl.created_at;
+	const lane = trainLanePattern(wl);
+	if (lane.test(sl.changed_by) && sl.changed_at >= since) return true;
+	if (entries.some((e) => e.slice_id === sl.id && lane.test(e.created_by) && e.created_at >= since)) return true;
+	if (questions.some((q) => q.slice_id === sl.id && lane.test(q.created_by) && q.created_at >= since)) return true;
+	const never = neverReadyLanes(control);
+	return control.some((c) => {
+		if (c.laneId === null || never.has(c.laneId) || c.createdAt < since) return false;
+		return c.prefix === "released-open" || (c.prefix === "lane-exit" && OWN_WORD_ENDS.includes(laneExit([c], c.laneId)?.outcome ?? ""));
+	});
+}
+
+/** The ids of train `wl`'s own lanes, `lane-<wl without wl->-<n>` (`reserveLane`'s numbering); machinery writers never match. */
+function trainLanePattern(wl: string): RegExp {
+	return new RegExp(`^lane-${wl.replace(/^wl-/, "")}-[1-9]\\d*$`);
 }
 
 /**
@@ -1542,13 +1603,13 @@ export interface TrainAlert {
 	q: QuestionRow;
 	pr: number;
 	options: string[];
-	/** `failed twice` (the tick's retry / skip / stop) or `production merge` (the lane's merged / skip / stop). */
+	/** `failed twice` (the tick's retry / skip / stop), `production merge` (the lane's merged / skip / stop) or `launch limit` (the tick's relaunch / stop, D4). */
 	reason: string;
 	record: AlertRecord;
 }
 
 export function trainAlertReason(options: readonly string[]): string {
-	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : "question";
+	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : options.includes("relaunch") ? "launch limit" : "question";
 }
 
 /**
@@ -2125,4 +2186,157 @@ export function protectionPassOvers(ledger: Ledger, wl: string): Set<number> {
 		if (protection && !(sl && (sl.state === "done" || sl.state === "cancelled"))) out.add(n);
 	}
 	return out;
+}
+
+// ---- the train's own lane outside the cap (PLAN wl-mvpsrr4tr0p1xc D2, D4) -------------------------------------------
+
+const READY_AT_RE = /^at (\S+)$/;
+
+/**
+ * D2: the newest prompt row cut on a workload: the time the newest `lane-ready: <laneId> at <iso>` of a lane some `launch:`
+ * attempt named carries (the runner takes it before `promptFor` reads the rows), or that entry's own time when its body
+ * names none; null when no launched lane ever got ready.
+ */
+export function lastReadyAt(control: readonly ControlEntry[]): string | null {
+	const launched = new Set(attempts(control).map((a) => a.laneId));
+	let out: string | null = null;
+	for (const c of control) {
+		if (c.prefix !== "lane-ready" || c.laneId === null || !launched.has(c.laneId)) continue;
+		const at = READY_AT_RE.exec(c.rest)?.[1] ?? c.createdAt;
+		if (out === null || at > out) out = at;
+	}
+	return out;
+}
+
+/**
+ * D2's consumption rule for a cap-exempt train, one rule for every cause: the resolution whose instruction was written at
+ * `instructionAt` is consumed when some launched lane wrote a `lane-ready:` whose time is later (strict, `lastReadyAt`), so
+ * it was in that lane's first prompt. Naming it in a `launch: … cause resume` consumes nothing: a launch that never gets ready
+ * leaves it to wake the train again (bounded by `trainLaunchFailures`). `launchable` applies it to a cap-exempt workload's
+ * resolutions; the tick's `actionable` reads it for an answered or withdrawn lane question.
+ */
+export function consumedByReady(control: readonly ControlEntry[], instructionAt: string): boolean {
+	const cut = lastReadyAt(control);
+	return cut !== null && instructionAt < cut;
+}
+
+/** D4: this many consecutive train launches that never got ready stop every launch path (PR #308's `RETRY_LIMIT` number, not an import). */
+export const TRAIN_LAUNCH_LIMIT = 3;
+/** D4: the options of Jo's NOW question at the limit: `relaunch` resets the count, `stop` leaves it. Not `retry` (`twiceFailed` reads that). */
+export const TRAIN_LAUNCH_OPTIONS: readonly string[] = ["relaunch", "stop"];
+
+/** What `trainLaunchFailures` reads: the train's rows and its holder now. */
+export interface TrainLaunchRows {
+	entries: readonly EntryRow[];
+	instructions: readonly InstructionRow[];
+	questions: readonly QuestionRow[];
+	holder: string | null;
+	holderLeaseUntil: string | null;
+	now: string;
+}
+
+/** The consecutive failed launches since the newest reset (D4), oldest first. */
+export interface TrainLaunchFailures {
+	count: number;
+	/** The counted attempts' lane ids. */
+	lanes: string[];
+	/** One line per counted attempt: `<laneId> (<launch time>): <why it ended without readiness>`. */
+	failures: string[];
+	/** The oldest and newest counted attempt's `launch:` time; null when none is counted. */
+	first: string | null;
+	last: string | null;
+}
+
+/**
+ * D4: the train's `launch:` attempts after the newest reset, walked newest first, counting each that has no `lane-ready:` and
+ * has ended: it has a `launch-failed:` or a `lane-exit: … outcome never-ready`, or a later attempt exists, or it is the newest
+ * attempt and the workload is no longer held by it under a live lease (a starter or runner that died before readiness without
+ * finalizing). The walk stops at an attempt whose lane wrote `lane-ready:` and at a by-hand attempt (`cause interactive`: Jo's
+ * session gets its first prompt from a file and has no runner readiness step, so it is never a failed launch, as
+ * `neverReadyLanes` reads it); the newest attempt still held under a live lease and not ready is in flight and not counted. A
+ * reset is Jo's `launch-requested: by jo`, Jo's `relaunch` answer to the D4 question (the tick's, options
+ * `TRAIN_LAUNCH_OPTIONS`) or a `train:` binding; an attempt counts only when written after it (entry order on a tie with an
+ * entry, the attempt on a tie with an answer). Pure: pass the rows one read took.
+ */
+export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures {
+	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.holder));
+	const order = new Map(control.map((c, i) => [c.id, i]));
+	const resets: { at: string; index: number | null }[] = [];
+	for (const c of control) {
+		if (c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo\b/.test(c.rest)) resets.push({ at: c.createdAt, index: order.get(c.id)! });
+	}
+	for (const b of prBindings(rows.entries, rows.instructions, ["train"])) {
+		const index = order.get(b.entryId);
+		if (index !== undefined) resets.push({ at: b.createdAt, index });
+	}
+	for (const q of rows.questions) {
+		if (q.created_by !== MERGE_TRAIN_BY || !(JSON.parse(q.options) as string[]).includes("relaunch")) continue;
+		const ins = joAnswer(q, rows.instructions, "relaunch");
+		if (ins) resets.push({ at: ins.created_at, index: null });
+	}
+	const reset = resets.reduce<{ at: string; index: number | null } | null>((a, r) => (a === null || r.at > a.at || (r.at === a.at && (r.index ?? Infinity) > (a.index ?? Infinity)) ? r : a), null);
+	const list = attempts(control).filter((a) => reset === null || a.createdAt > reset.at || (a.createdAt === reset.at && (reset.index === null || order.get(a.entryId)! > reset.index)));
+	const counted: { laneId: string; at: string; line: string }[] = [];
+	const live = heldLive({ holder: rows.holder, holder_lease_until: rows.holderLeaseUntil }, rows.now);
+	for (let i = list.length - 1; i >= 0; i--) {
+		const a = list[i]!;
+		if (a.cause?.kind === "interactive" || control.some((c) => c.prefix === "lane-ready" && c.laneId === a.laneId)) break;
+		const failed = control.find((c) => c.prefix === "launch-failed" && c.laneId === a.laneId);
+		const exit = laneExit(control, a.laneId);
+		const next = list[i + 1];
+		const why = failed ? `launch-failed: ${failed.rest}`
+			: exit?.outcome === "never-ready" ? "lane-exit: outcome never-ready"
+			: next ? `no lane-ready:, superseded by ${next.laneId}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`
+			: rows.holder === a.laneId && live ? null
+			: `no lane-ready:, ${rows.holder === a.laneId ? "its lease lapsed" : `the workload is held by ${rows.holder ?? "no one"}`}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`;
+		if (why !== null) counted.unshift({ laneId: a.laneId, at: a.createdAt, line: `${a.laneId} (${a.createdAt}): ${why}` });
+	}
+	return {
+		count: counted.length,
+		lanes: counted.map((c) => c.laneId),
+		failures: counted.map((c) => c.line),
+		first: counted[0]?.at ?? null,
+		last: counted.at(-1)?.at ?? null,
+	};
+}
+
+/** D4's question body: the count, the time span and lanes, what each answer does, then each failure line. */
+export function trainLaunchLimitBody(wl: string, f: TrainLaunchFailures): string {
+	return [
+		`merge train ${wl}: ${f.count} consecutive launches never got ready, ${f.first} to ${f.last} (lanes ${f.lanes.join(", ")}); ` +
+			"nothing launches the train until you answer. relaunch resets the count and the next tick pass relaunches it; " +
+			"stop leaves it stopped until your launch word or a train word.",
+		"",
+		...f.failures.map((line) => `- ${line}`),
+	].join("\n");
+}
+
+/**
+ * D4 (PLAN wl-mvpsrr4tr0p1xc), the tick's side, in one transaction: at the limit (`trainLaunchFailures` counts
+ * TRAIN_LAUNCH_LIMIT), Jo's NOW question, once per episode: unless a D4 question (the tick's, options TRAIN_LAUNCH_OPTIONS)
+ * open or resolved was created at or after the episode's first counted attempt, `askJo(…, now: "incident")` on the slice of
+ * the train's first non-terminal PR in `trainPrs` order (added as the tick when no lane added it), so its needs-you line is
+ * `NOW (incident)` and on fire, and the alert ladder files its jo-issues issue. Returns the question id, null when none is
+ * owed, or `{ noSlice }` when the train has no non-terminal PR to carry it.
+ */
+export function raiseLaunchLimit(ledger: Ledger, wl: string): string | { noSlice: true } | null {
+	return ledger.write(() => {
+		const w = ledger.workload(wl);
+		if (!w) return null;
+		const questions = ledger.questions(wl);
+		const instructions = ledger.instructions(wl);
+		const entries = ledger.entries(wl);
+		const f = trainLaunchFailures({ entries, instructions, questions, holder: w.holder, holderLeaseUntil: w.holder_lease_until, now: ledger.now() });
+		if (f.count < TRAIN_LAUNCH_LIMIT || f.first === null) return null;
+		const asked = questions.some((q) => q.created_by === MERGE_TRAIN_BY && (JSON.parse(q.options) as string[]).includes("relaunch") && q.created_at >= f.first!);
+		if (asked) return null;
+		const pr = trainPrs(entries, instructions).find((n) => {
+			const sl = ledger.slice(trainSliceId(wl, n));
+			return !(sl && (sl.state === "done" || sl.state === "cancelled"));
+		});
+		if (pr === undefined) return { noSlice: true };
+		const sl = ensurePrSlice(ledger, wl, pr);
+		const r = askJo(ledger, { by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: trainLaunchLimitBody(wl, f), options: [...TRAIN_LAUNCH_OPTIONS], now: "incident" }, { asker: "train" });
+		return raisedId(r, `the launch limit question of ${wl}`);
+	});
 }

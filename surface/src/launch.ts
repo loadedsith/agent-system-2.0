@@ -11,7 +11,7 @@
 // forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
 import { basename, dirname, isAbsolute, join } from "node:path";
 import {
-	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
+	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
@@ -19,6 +19,7 @@ import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
+import { consumedByReady, openTrains } from "./merge-train";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -86,6 +87,7 @@ export const CONTROL_PREFIXES = [
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
+	"withdrawn",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
 	"queued",
@@ -170,6 +172,9 @@ export const DAILY_REPORT_BY = "daily-report";
  * `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>` on a train makes PR n a member as Jo's
  * `train:` does (`trainBindings`; `boundPrs` admits it); `train-board-skip:`, `train-notice:` and `train-autoboard: on <iso>`
  * (the cutover) are its records on the standing workload. A lane-written copy of any of them is dropped here.
+ * `withdrawn: <instruction id>` is the surface's alone: Jo's `withdraw <wl-…>` (surface/src/input.ts, PLAN wl-mv8s939084z1ts D3),
+ * on that workload, naming Jo's instruction written first in the same transaction; `withdrawnBy` reads it, the close takes it in
+ * place of a receipt (D4), and the predicate refuses every launch on it (`withdrawn`, D6).
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -224,6 +229,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-board-skip": [MERGE_TRAIN_BY],
 	"train-notice": [MERGE_TRAIN_BY],
 	"train-autoboard": [MERGE_TRAIN_BY],
+	withdrawn: [SURFACE_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
@@ -465,7 +471,7 @@ export function instructionLine(i: InstructionRow): string {
  * `launchable` never returns them.
  */
 export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}` | `queued: position ${number}`;
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
+export type LaunchReason = "closed" | "standing" | "due" | "withdrawn" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -478,37 +484,58 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
  * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
  * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
- * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). A workload
- * priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause `priority <exit id>`,
- * after first, request and resume; any later launch attempt ends that state, so it is consumed once.
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). `withdrawn`
+ * is Jo's standing `withdraw <wl>` (`withdrawnBy`, PLAN wl-mv8s939084z1ts D6): checked right after
+ * the closed/standing/due checks, before the user-driven return, the live holder and any
+ * `launch-requested:`, so nothing launches on a withdrawn workload and the tick sees it in either mode.
+ * `capExempt` (an open merge train, PLAN wl-mvpsrr4tr0p1xc D1) skips only the `cap` refusal, and its
+ * resolutions are consumed by D2's rule (`consumedByReady`: a ready lane's first prompt carried them),
+ * not by a `launch:` attempt naming them.
+ * A workload priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause
+ * `priority <exit id>`, after first, request and resume; any later launch attempt ends that state, so it
+ * is consumed once.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	capExempt = false, withdrawn = false,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
+	if (withdrawn) return { launch: false, reason: "withdrawn" };
 	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
 	if (receipt !== null && !req) return { launch: false, reason: "awaiting-close" };
-	if (liveLanes >= cap) return { launch: false, reason: "cap" };
+	if (!capExempt && liveLanes >= cap) return { launch: false, reason: "cap" };
 	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
-	const res = resolved.filter((r) => !consumed.has(r.instructionId));
+	const res = resolved.filter((r) => (capExempt ? !consumedByReady(control, r.createdAt) : !consumed.has(r.instructionId)));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
 	const paused = priorityPausedOf(control);
 	if (paused !== null) return { launch: true, cause: { kind: "priority", exitId: paused.exitId } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
-/** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
+/** The predicate over the rows a launch decision reads (`launchRowsFor`): the surface's run and `reserveLane`'s. */
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return launchable(
+		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		rows.capExempt, withdrawnBy(rows.entries, rows.instructions) !== null,
+	);
+}
+
+/**
+ * The one way the surface reads a launch decision's rows (PLAN wl-mvpsrr4tr0p1xc D1): `Ledger.launchRows` with the open merge
+ * trains (`openTrains`) as the cap-exempt set, so a train's lane is never counted in `liveLanes` and a train's own rows say
+ * `capExempt`. The starter's reservation passes the same set to `reserveLane`, evaluated inside its transaction.
+ */
+export function launchRowsFor(ledger: Ledger, workloadId: string, cap: number): ReserveRows | null {
+	return ledger.launchRows(workloadId, cap, { capExempt: new Set(openTrains(ledger)) });
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
@@ -517,22 +544,25 @@ export function decideLaunch(rows: ReserveRows): ReserveVerdict {
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
-export type InteractiveReason = "closed" | "standing" | "due" | "autonomous" | "held";
+export type InteractiveReason = "closed" | "standing" | "due" | "withdrawn" | "autonomous" | "held";
 
 /**
  * The interactive policy (decision 8): Jo's `as2 lane <wl>` is the authority, so the cap and the
  * cause rules do not apply; refused on an autonomous workload and while any holder's lease is live.
+ * A workload Jo withdrew (`withdrawn`, PLAN wl-mv8s939084z1ts D6) is refused after the closed/standing/due
+ * checks, so no lease is taken on it by hand either.
  */
-export function interactiveVerdict(w: WorkloadRow, now: string): { launch: true } | { launch: false; reason: InteractiveReason } {
+export function interactiveVerdict(w: WorkloadRow, now: string, withdrawn = false): { launch: true } | { launch: false; reason: InteractiveReason } {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
+	if (withdrawn) return { launch: false, reason: "withdrawn" };
 	if (w.mode !== "user-driven") return { launch: false, reason: "autonomous" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	return { launch: true };
 }
 export function decideInteractive(rows: ReserveRows): ReserveVerdict {
-	const v = interactiveVerdict(rows.workload, rows.now);
+	const v = interactiveVerdict(rows.workload, rows.now, withdrawnBy(rows.entries, rows.instructions) !== null);
 	return v.launch ? { launch: true, cause: "interactive" } : v;
 }
 
@@ -1178,6 +1208,38 @@ export function supersededBy(entries: readonly EntryRow[], instructions: readonl
 		const ins = instructions.find((x) => x.id === m[2]);
 		if (ins && ins.workload_id === on && ins.kind === "instruction" && ins.author === "jo" && ins.created_by === SURFACE_BY && ins.body === supersedeInstructionBody(on, m[1]!)) {
 			return { by: m[1]!, instructionId: ins.id };
+		}
+	}
+	return null;
+}
+
+/** Jo's words for `withdraw <wl-…>` (PLAN wl-mv8s939084z1ts D3): the instruction body on the workload that `withdrawn:` names. */
+export function withdrawInstructionBody(workloadId: string): string {
+	return `withdraw ${workloadId}`;
+}
+/** `withdrawn: <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
+export function withdrawnBody(instructionId: string): string {
+	return `withdrawn: ${instructionId}`;
+}
+
+/**
+ * Jo's standing word that this workload is withdrawn (D3), or null: the newest `withdrawn: <instruction id>`
+ * the surface wrote (`controlEntries` drops every other writer) whose instruction is among `instructions`,
+ * on the entry's workload, kind `instruction`, authored by jo and written by the surface, with the body
+ * `withdraw <wl>`. Pass the workload's entries and its instructions. As with `supersededBy`, a lane cannot
+ * write either row as the surface; an entry naming any other instruction counts for nothing.
+ */
+export function withdrawnBy(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { instructionId: string } | null {
+	const control = controlEntries(entries);
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "withdrawn") continue;
+		const m = /^(\S+)$/.exec(c.rest);
+		const on = entries.find((e) => e.id === c.id)?.workload_id;
+		if (!m || on === undefined) continue;
+		const ins = instructions.find((x) => x.id === m[1]);
+		if (ins && ins.workload_id === on && ins.kind === "instruction" && ins.author === "jo" && ins.created_by === SURFACE_BY && ins.body === withdrawInstructionBody(on)) {
+			return { instructionId: ins.id };
 		}
 	}
 	return null;

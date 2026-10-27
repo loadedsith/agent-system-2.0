@@ -7,14 +7,15 @@ import { rmSync } from "node:fs";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger } from "../../ledger/src/index";
 import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
-import { controlEntries, doneBody, laneExitBody, laneStartedBody, launchRequestedBody, PRECLAIM_LEASE_MS, STARTER_EXIT } from "../src/launch";
+import { controlEntries, doneBody, laneCap, laneExitBody, laneStartedBody, launchFailedBody, launchRequestedBody, PRECLAIM_LEASE_MS, STARTER_EXIT } from "../src/launch";
+import { applyTrain, interpret } from "../src/input";
 import type { PidState } from "../src/omp-probe";
 import type { RankConfig } from "../src/rank-launch";
 import { releasedOpenBody } from "../src/turn-end";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 // A namespace import, as lane-script.test.ts does: a name lane.ts does not export fails only the test that calls it.
 import * as laneScript from "../scripts/lane";
-import { LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, settleDrains, sh, tempLedger } from "./helpers";
+import { LANE_SCRIPT, laneIdOf, laneRoot, type LaneRoot, settleDrains, sh, tempLedger, tmp } from "./helpers";
 
 const SHOW: RankConfig = { mode: "show", parallelBudgetUsd: 0 };
 const OMP_START = "Mon Oct 20 11:00:00 2026";
@@ -263,5 +264,188 @@ describe("T2b: a spawn whose reservation another starter took spawns nothing", (
 		expect(laneScript.reserve(l, wl, "lane-runner", false, SHOW, p.probeFor)).toEqual({ ok: false, reason: `held: ${laneA} still running (omp pid ${ompPid(4)})` });
 		expect(l.workload(wl)!.holder).toBe(laneA);
 		expect(launches(l, wl)).toHaveLength(4);
+	});
+});
+
+// ---- PLAN wl-mvpsrr4tr0p1xc: the train's lane outside the cap (D1), one train lane at a time (D3), the launch limit (D4) ----
+
+/** A merge train on `l` as Jo's `train <pr>` word opens it (its own temp checkout, so two trains never share a PR's repo). */
+function openTrainOn(l: Ledger, pr: number, repo = tmp("train-repo")): string {
+	const cmd = interpret(l, `train ${pr}`);
+	if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+	return applyTrain(l, cmd, repo).workloadId;
+}
+/** A train attempt that failed before readiness: reserved, `launch-failed:` and released, as the starter's failure path leaves it. */
+function failedLaunch(l: Ledger, wl: string): string {
+	const r = l.reserveLane(wl, { by: LANE_STARTER_BY, cap: 3, leaseMs: 60_000, requestedBy: "test", decide: () => ({ launch: true, cause: "first" }) });
+	if (!r.ok) throw new Error(r.reason);
+	l.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: launchFailedBody(r.laneId, "spawn", "omp exited 1") });
+	l.releaseWorkload(wl, { by: LANE_STARTER_BY, holder: r.laneId });
+	return r.laneId;
+}
+const joRequest = (l: Ledger, wl: string) => l.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", l.now()) });
+const limitReason = (lanes: string[]) => `not-launchable: train launch limit: 3 consecutive failed launches (${lanes.join(", ")})`;
+
+describe("D1: the open train's lane is outside the lane cap", () => {
+	test("with the cap full of ordinary lanes the train is admitted, and its live lane takes no slot from an ordinary workload", () => {
+		const { ledger: l } = tempLedger();
+		const gone = fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor;
+		const busy = Array.from({ length: laneCap(process.env) }, (_, i) => {
+			const wl = l.openWorkload({ by: SURFACE_BY, brief: `busy ${i}`, stakes: "normal", mode: "autonomous" });
+			attempt(l, wl, 1, false);
+			return wl;
+		});
+		const next = l.openWorkload({ by: SURFACE_BY, brief: "next", stakes: "normal", mode: "autonomous" });
+		expect(laneScript.reserve(l, next, "test", false, SHOW, gone)).toEqual({ ok: false, reason: "cap" });
+		const train = openTrainOn(l, 101);
+		expect(laneScript.reserve(l, train, "test", false, SHOW, gone)).toMatchObject({ ok: true, laneId: laneIdOf(train, 1) });
+		expect(l.workload(train)!.holder).toBe(laneIdOf(train, 1));
+		// one ordinary lane ends: its slot goes to the next ordinary workload although the train's lane is live
+		l.releaseWorkload(busy[0]!, { by: LANE_STARTER_BY, holder: laneIdOf(busy[0]!, 1) });
+		expect(laneScript.reserve(l, next, "test", false, SHOW, gone)).toMatchObject({ ok: true, laneId: laneIdOf(next, 1) });
+	});
+});
+
+describe("D3: never two train lanes at once", () => {
+	const owns = { owns: () => true };
+
+	test("at reservation, both policies: another train's live pre-claim, then its pending attempt, holds the train (`held: train lane …`), nothing written; its launch-failed: frees it", () => {
+		const { ledger: l } = tempLedger();
+		ensureStandingWorkload(l);
+		const a = openTrainOn(l, 101);
+		const b = openTrainOn(l, 102);
+		// the interactive policy (`as2 lane <wl>`) runs on a user-driven workload: a train Jo flipped
+		const byHand = openTrainOn(l, 103);
+		l.flipMode(byHand, { by: SURFACE_BY, mode: "user-driven", author: "jo", channel: "surface" });
+		const gone = fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor;
+		expect(laneScript.reserve(l, a, "tick", false, SHOW, gone)).toMatchObject({ ok: true, laneId: laneIdOf(a, 1) });
+		const laneA = laneIdOf(a, 1);
+		const held = { ok: false, reason: `held: train lane ${laneA} live on ${a}` };
+		const before = l.entries(b).length;
+		const shown = l.entries(STANDING_WORKLOAD_ID).length;
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, gone)).toEqual(held);
+		expect(laneScript.reserve(l, byHand, "jo", true, SHOW, gone)).toEqual(held);
+		expect(l.entries(b).length).toBe(before);
+		expect(l.entries(byHand).filter((e) => e.body.startsWith("launch: "))).toEqual([]);
+		// no pick snapshot for the refused interactive start
+		expect(l.entries(STANDING_WORKLOAD_ID).length).toBe(shown);
+		expect(l.workload(b)!.holder).toBeNull();
+		expect(l.workload(byHand)!.holder).toBeNull();
+		// A's starter let go before any lane-started: the attempt is pending until its pre-claim window ends
+		l.releaseWorkload(a, { by: LANE_STARTER_BY, holder: laneA });
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, gone)).toEqual(held);
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: a, kind: "assumption", body: launchFailedBody(laneA, "spawn", "omp exited 1") });
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, gone)).toMatchObject({ ok: true, laneId: laneIdOf(b, 1) });
+	});
+
+	test("at reservation: a released train lane whose runner still lives holds another train, probed inside the transaction; an ordinary workload is never held by it", () => {
+		const { ledger: l } = tempLedger();
+		const a = openTrainOn(l, 101);
+		const b = openTrainOn(l, 102);
+		const ordinary = l.openWorkload({ by: SURFACE_BY, brief: "ordinary", stakes: "normal", mode: "autonomous" });
+		const laneA = attempt(l, a, 1, false);
+		l.releaseWorkload(a, { by: laneA, holder: laneA });
+		const live = fakeProbe(l, { omp: "gone", runner: "same" });
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, live.probeFor)).toEqual({ ok: false, reason: `held: train lane ${laneA} live on ${a}` });
+		expect(live.calls.map((c) => [c.laneId, c.what])).toEqual([[laneA, "omp"], [laneA, "runner"]]);
+		expect(live.calls.every((c) => c.inTransaction)).toBe(true);
+		expect(laneScript.reserve(l, ordinary, "tick", false, SHOW, live.probeFor)).toMatchObject({ ok: true, laneId: laneIdOf(ordinary, 1) });
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor)).toMatchObject({ ok: true, laneId: laneIdOf(b, 1) });
+	});
+
+	test("at spawn: train A's pre-claim lapsed, train B reserved and started meanwhile; A's spawn write refuses (held, stage reserve) and spawns nothing until B's lane is gone", () => {
+		const { ledger: l, path } = tempLedger();
+		const a = openTrainOn(l, 101);
+		const b = openTrainOn(l, 102);
+		const gone = fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor;
+		const past = new Date(Date.now() - PRECLAIM_LEASE_MS - 60_000).toISOString();
+		const old = Ledger.open(path, { backup: false, backupOnOpen: false, clock: () => past });
+		expect(laneScript.reserve(old, a, "tick", false, SHOW, gone)).toMatchObject({ ok: true, laneId: laneIdOf(a, 1) });
+		old.close();
+		const laneA = laneIdOf(a, 1);
+		const laneB = laneIdOf(b, 1);
+		expect(laneScript.reserve(l, b, "tick", false, SHOW, gone)).toMatchObject({ ok: true, laneId: laneB });
+		expect(laneScript.startAsOwner(l, owns, () => {
+			const c = laneScript.spawnIfReserved(l, b, laneB, null, () => "omp-B", gone);
+			started(l, b, laneB, 1);
+			return c;
+		})).toBe("omp-B");
+		const spawned: string[] = [];
+		const spawnA = (probeFor: (laneId: string) => laneScript.RunnerProbe) => {
+			try {
+				return laneScript.startAsOwner(l, owns, () => laneScript.spawnIfReserved(l, a, laneA, null, () => {
+					spawned.push(laneA);
+					return "omp-A";
+				}, probeFor));
+			} catch (e) {
+				return e;
+			}
+		};
+		// B's pre-claim lease is live
+		expect(spawnA(gone)).toMatchObject({ stage: "reserve", code: STARTER_EXIT.held, message: expect.stringContaining(`held: train lane ${laneB} live on ${b}`) });
+		// B released, its runner still alive: the probe holds A
+		l.releaseWorkload(b, { by: laneB, holder: laneB });
+		expect(spawnA(fakeProbe(l, { omp: "same", runner: "gone" }).probeFor)).toMatchObject({ stage: "reserve", code: STARTER_EXIT.held });
+		expect(spawned).toEqual([]);
+		expect(spawnA(gone)).toBe("omp-A");
+		expect(spawned).toEqual([laneA]);
+	});
+});
+
+describe("D4: the train launch limit binds the reservation", () => {
+	test("after three consecutive failed launches every cause is refused `not-launchable: train launch limit…`, nothing written; Jo's fresh launch word resets the count", () => {
+		const { ledger: l } = tempLedger();
+		const t = openTrainOn(l, 101);
+		const gone = fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor;
+		const lanes = [failedLaunch(l, t), failedLaunch(l, t)];
+		request(l, t);
+		// two failures: still admitted
+		const third = laneScript.reserve(l, t, "tick", false, SHOW, gone);
+		expect(third).toMatchObject({ ok: true, laneId: laneIdOf(t, 3) });
+		l.recordEntry({ by: LANE_STARTER_BY, workloadId: t, kind: "assumption", body: launchFailedBody(laneIdOf(t, 3), "spawn", "omp exited 1") });
+		l.releaseWorkload(t, { by: LANE_STARTER_BY, holder: laneIdOf(t, 3) });
+		lanes.push(laneIdOf(t, 3));
+		request(l, t);
+		const n = l.entries(t).length;
+		expect(laneScript.reserve(l, t, "tick", false, SHOW, gone)).toEqual({ ok: false, reason: limitReason(lanes) });
+		// the interactive policy on the train Jo flipped to user-driven: the same refusal
+		l.flipMode(t, { by: SURFACE_BY, mode: "user-driven", author: "jo", channel: "surface" });
+		expect(laneScript.reserve(l, t, "jo", true, SHOW, gone)).toEqual({ ok: false, reason: limitReason(lanes) });
+		l.flipMode(t, { by: SURFACE_BY, mode: "autonomous", author: "jo", channel: "surface" });
+		expect(l.entries(t).length).toBe(n);
+		expect(l.workload(t)!.holder).toBeNull();
+		joRequest(l, t);
+		const r = laneScript.reserve(l, t, "lane-runner", false, SHOW, gone);
+		expect(r).toMatchObject({ ok: true, laneId: laneIdOf(t, 4) });
+		expect(r.ok && r.cause).toStartWith("request ");
+	});
+
+	test("an ordinary workload has no launch limit", () => {
+		const { ledger: l } = tempLedger();
+		const wl = l.openWorkload({ by: SURFACE_BY, brief: "ordinary", stakes: "normal", mode: "autonomous" });
+		for (let i = 0; i < 4; i++) failedLaunch(l, wl);
+		request(l, wl);
+		expect(laneScript.reserve(l, wl, "tick", false, SHOW, fakeProbe(l, { omp: "gone", runner: "gone" }).probeFor)).toMatchObject({ ok: true, laneId: laneIdOf(wl, 5) });
+	});
+
+	test("`lane.ts launch` at the limit: exit 10 (not-launchable) naming the limit and the lanes, nothing written", () => {
+		const r = laneRoot();
+		roots.push(r);
+		const l = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		const t = openTrainOn(l, 101, r.repo);
+		const lanes = [failedLaunch(l, t), failedLaunch(l, t), failedLaunch(l, t)];
+		request(l, t);
+		const entries = l.entries(t).length;
+		l.close();
+		const x = sh(["bun", LANE_SCRIPT, "launch", t, "--requested-by", "lane-runner"], r.repo, r.env);
+		const after = Ledger.open(r.ledgerPath, { backup: false, backupOnOpen: false });
+		try {
+			expect(x.err).toContain(limitReason(lanes));
+			expect(x.code).toBe(STARTER_EXIT["not-launchable"]!);
+			expect(after.entries(t).length).toBe(entries);
+			expect(after.workload(t)!.holder).toBeNull();
+		} finally {
+			after.close();
+		}
 	});
 });

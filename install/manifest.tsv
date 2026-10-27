@@ -16,12 +16,15 @@ ledger/SCHEMA.md	doc	-
 ledger/schema.sql	ledger-schema	{ledger_db}
 ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
+ledger/src/native.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
 ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
+ledger/test/locality.test.ts	test	-
+ledger/test/no-spawn.test.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
@@ -1146,6 +1149,7 @@ surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
 surface/test/train-world.ts	test	-
 surface/test/train-escalation.test.ts	test	-
+surface/test/train-live.test.ts	test	-
 surface/test/train-signoff.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-

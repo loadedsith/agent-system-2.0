@@ -18,8 +18,8 @@ import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import * as as2test from "../src/as2test";
 import {
-	bundleInputs, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision, preflightProbes,
-	probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
+	bundleInputs, CAPTURE_MS, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision,
+	preflightProbes, probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp } from "./helpers";
@@ -118,7 +118,7 @@ interface Box {
 }
 
 /** A tmp as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b). */
-function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; script?: string } = {}): Box {
+function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } = {}): Box {
 	const base = dir(tag);
 	const root = join(base, "root");
 	for (const d of ["stage", "runs", "locks"]) mkdirSync(join(root, d), { recursive: true });
@@ -129,7 +129,7 @@ function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number
 	mkdirSync(bin);
 	writeFileSync(join(bin, "sudo"), FAKE_SUDO, { mode: 0o755 });
 	const exec = join(base, "exec");
-	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: opts.script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: opts.killGraceMs ?? 500, sweepLockWaitMs: opts.sweepLockWaitMs }), { mode: 0o755 });
+	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: opts.script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: opts.killGraceMs ?? 500, sweepLockWaitMs: opts.sweepLockWaitMs, captureMs: opts.captureMs }), { mode: 0o755 });
 	return { root, exec, bin, hooks };
 }
 
@@ -204,6 +204,25 @@ function prepared(b: Box, runId: string, files: Record<string, string>, caps?: R
 	return sha;
 }
 
+// ---- the stuck capture's file (PLAN wl-mvq4edh02r5z40 D5) ----------------------------------------------------
+
+/** `<part>.stuck.log` split at its `== <n>. … ==` headings: section number → body. */
+function stuckSections(text: string): Record<string, string> {
+	const parts = text.split(/^== (\d)\. .* ==$/m);
+	const out: Record<string, string> = {};
+	for (let i = 1; i < parts.length; i += 2) out[parts[i]!] = parts[i + 1]!;
+	return out;
+}
+/** The pids section 1 lists: the first column of each row, from ps or from its pgrep fallback. */
+const treePids = (section: string): number[] => section.split("\n").flatMap((l) => /^(\d+)\s/.exec(l)?.slice(1).map(Number) ?? []);
+/** Every capture tool the file names: the `[pid <n>,` of each tool block, and the groups a cut killed. */
+function capturePids(text: string): number[] {
+	const killed = /^killed capture groups(?: still running)?: (.*)$/m.exec(text)?.[1] ?? "";
+	return [...[...text.matchAll(/\[pid (\d+),/g)].map((m) => Number(m[1])), ...killed.split(" ").filter((s) => /^\d+$/.test(s)).map(Number)];
+}
+/** What a capture may leave in the work dir besides its file: its cap dir or a sample report. */
+const captureLeftovers = (work: string): string[] => readdirSync(work).filter((n) => n.includes(".stuck-") || n.startsWith("sample-"));
+
 // ---- the wrapper's argv checks ---------------------------------------------------------------------------
 
 describe("the wrapper refuses bad argv", () => {
@@ -226,7 +245,7 @@ describe("the wrapper refuses bad argv", () => {
 	test("wrong arity is refused for every subcommand", () => {
 		for (const args of [["full"], ["full", "tr-a1", "x"], ["sweep", "tr-a1", "x"], ["prepare", "tr-a1"], ["prepare", "tr-a1", "a".repeat(40), "x"], ["solo", "tr-a1"],
 			["solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["cleanup", "tr-a1"], ["cleanup", "tr-a1", "tr-b", "tr-c"], ["probe", "tr-a1"], ["bogus", "tr-a1"],
-			["base-prepare", "tr-a1"], ["base-full", "tr-a1", "x"], ["base-solo", "tr-a1"], ["base-solo", "tr-a1", "./a.test.ts", "./b.test.ts"]]) {
+			["base-prepare", "tr-a1"], ["base-solo", "tr-a1"], ["base-solo", "tr-a1", "./a.test.ts", "./b.test.ts"]]) {
 			const r = raw(b, args);
 			expect({ args, exit: r.exit }).toEqual({ args, exit: WRAPPER_EXIT.refused });
 		}
@@ -242,6 +261,21 @@ describe("the wrapper refuses bad argv", () => {
 		const r = Bun.spawnSync([BUN, SCRIPT, "full", "tr-a1"], { env: { PATH: SYS_PATH }, stderr: "pipe" });
 		expect(r.exitCode).toBe(WRAPPER_EXIT.refused);
 	});
+
+	test("base-full is gone (PLAN wl-mvq4edh02r5z40 D3): the wrapper and test-exec both refuse it as an unknown subcommand", () => {
+		const nb = box("no-base-full");
+		const sha = prepared(nb, "tr-nb1", { "a.test.ts": OK_TEST });
+		expect(call(nb, { sub: "base-prepare", runId: "tr-nb1", sha }).exit).toBe(WRAPPER_EXIT.ok);
+		const wrapped = raw(nb, ["base-full", "tr-nb1"]);
+		expect(wrapped.exit).toBe(WRAPPER_EXIT.refused);
+		expect(wrapped.stderr).toContain("unknown subcommand");
+		const direct = Bun.spawnSync([BUN, SCRIPT, "base-full", "tr-nb1"], {
+			env: { PATH: SYS_PATH, AS2TEST_EXEC_CONFIG: JSON.stringify(execConfigOf({ root: nb.root, bun: BUN, script: SCRIPT, sweepScope: "groups" })) }, stderr: "pipe",
+		});
+		expect(direct.exitCode).toBe(WRAPPER_EXIT.refused);
+		expect(direct.stderr.toString()).toContain("unknown subcommand base-full");
+		expect(readdirSync(workOf(nb, "tr-nb1")).filter((n) => n.startsWith("base-full"))).toEqual([]);
+	});
 });
 
 describe("fencing on <stage>/current", () => {
@@ -251,7 +285,7 @@ describe("fencing on <stage>/current", () => {
 		setCurrent(b, "tr-other");
 		const calls: WrapperCall[] = [
 			{ sub: "prepare", runId: "tr-mine", sha }, { sub: "full", runId: "tr-mine" }, { sub: "solo", runId: "tr-mine", file: "./a.test.ts" },
-			{ sub: "base-prepare", runId: "tr-mine", sha }, { sub: "base-full", runId: "tr-mine" }, { sub: "base-solo", runId: "tr-mine", file: "./a.test.ts" },
+			{ sub: "base-prepare", runId: "tr-mine", sha }, { sub: "base-solo", runId: "tr-mine", file: "./a.test.ts" },
 			{ sub: "sweep", runId: "tr-mine" }, { sub: "cleanup", runId: "tr-mine", oldRunId: "tr-old" }, { sub: "probe", runId: "tr-mine", paths: ["/tmp"] },
 		];
 		for (const c of calls) {
@@ -409,24 +443,22 @@ describe("prepare, full and solo", () => {
 		expect(readFileSync(join(work, "solo-2.xml"), "utf8")).toContain('name="bad"');
 	});
 
-	test("PLAN wl-mv8s8srodefytc rev 17.1 D8: base-prepare clones the same bundle into runs/<id>/base once; base-full and base-solo run there and report beside the PR's", () => {
+	test("PLAN wl-mv8s8srodefytc rev 17.1 D8: base-prepare clones the same bundle into runs/<id>/base once; base-solo runs there and reports beside the PR's", () => {
 		const b = box("base");
 		const sha = prepared(b, "tr-b1", { "a.test.ts": OK_TEST, "b_spec.ts": `import { expect, test } from "bun:test";\ntest("bad", () => { expect(1).toBe(2); });\n` });
 		const work = workOf(b, "tr-b1");
 		// nothing runs on base before base-prepare
-		expect(call(b, { sub: "base-full", runId: "tr-b1" }).exit).toBe(WRAPPER_EXIT.refused);
+		expect(call(b, { sub: "base-solo", runId: "tr-b1", file: "./b_spec.ts" }).exit).toBe(WRAPPER_EXIT.refused);
 		expect(call(b, { sub: "base-prepare", runId: "tr-b1", sha }).exit).toBe(WRAPPER_EXIT.ok);
 		expect(git(join(work, "base", "repo"), "rev-parse", "HEAD")).toBe(sha);
 		expect(git(join(work, "base", "repo"), "remote")).toBe("");
 		// a second base-prepare, or one over a base dir the PR's tests planted, is refused
 		expect(call(b, { sub: "base-prepare", runId: "tr-b1", sha }).exit).toBe(WRAPPER_EXIT.refused);
-		expect(call(b, { sub: "base-full", runId: "tr-b1" }).exit).toBe(1);
-		expect(readFileSync(join(work, "base-full.xml"), "utf8")).toContain('name="bad"');
-		expect(existsSync(join(work, "full.xml"))).toBe(false);
 		const s = call(b, { sub: "base-solo", runId: "tr-b1", file: "./b_spec.ts" });
 		expect(s.exit).toBe(1);
 		expect(s.stdout).toStartWith("part base-solo-1\n");
 		expect(readFileSync(join(work, "base-solo-1.xml"), "utf8")).toContain('name="bad"');
+		expect(existsSync(join(work, "solo-1.xml"))).toBe(false);
 		// a file base lacks is refused, never run
 		expect(call(b, { sub: "base-solo", runId: "tr-b1", file: "./c.test.ts" }).exit).toBe(WRAPPER_EXIT.refused);
 	});
@@ -476,18 +508,35 @@ describe("prepare, full and solo", () => {
 		expect(env.GIT_CONFIG_NOSYSTEM).toBe("1");
 	});
 
-	test("the cap kills the part's whole group and exits timeout", async () => {
+	test("PLAN wl-mvq4edh02r5z40 D5: at the cap full.stuck.log gets all four sections with the stuck process in the tree, then the whole group is killed and the part exits timeout naming the cap", async () => {
 		const b = box("cap");
 		prepared(b, "tr-c1", { "slow.test.ts": SLOW_TEST }, { fullCapMin: 0.04, soloCapMin: 0.04 });
 		const t0 = Date.now();
 		const r = call(b, { sub: "full", runId: "tr-c1" });
 		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
-		expect(r.stderr).toContain("timeout");
-		expect(Date.now() - t0).toBeLessThan(15_000);
-		const pid = Number(readFileSync(join(workOf(b, "tr-c1"), "slow.pid"), "utf8"));
+		expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
+		expect(Date.now() - t0).toBeLessThan(2_400 + CAPTURE_MS + 500 + 5_000);
+		const work = workOf(b, "tr-c1");
+		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
 		pids.push(pid);
 		expect(await until(() => !alive(pid), 3_000)).toBe(true);
-	}, 30_000);
+		const leader = Number(readFileSync(join(work, "groups"), "utf8").trim());
+		const text = readFileSync(join(work, "full.stuck.log"), "utf8");
+		const s = stuckSections(text);
+		expect(Object.keys(s)).toEqual(["1", "2", "3", "4"]);
+		// The bun test process (the group's leader) and the sleep it started.
+		expect(treePids(s["1"]!)).toEqual(expect.arrayContaining([leader, pid]));
+		// sample ran for the bun process: its report, or (where sample is refused) its exit and stderr.
+		expect(s["2"]).toContain(`$ /usr/bin/sample ${leader} 3 -mayDie -file `);
+		expect(s["2"]).toMatch(/report \(first \d+ bytes at most\):\n|\[pid \w+, (exit [1-9]\d*|signal \w+|not run: \w+), \d+ ms\]/);
+		for (const p of [leader, pid]) expect(s["3"]).toContain(`$ /usr/sbin/lsof -nP -p ${p} `);
+		expect(s["4"]).toContain("slow.test.ts");
+		expect(text).not.toContain("capture cut");
+		expect(captureLeftovers(work)).toEqual([]);
+		const tools = capturePids(text);
+		expect(tools.length).toBeGreaterThan(0);
+		expect(tools.filter(alive)).toEqual([]);
+	}, 60_000);
 
 	test("full and solo refuse without the runner's caps file", () => {
 		const b = box("caps");
@@ -529,17 +578,13 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		expect(result.failures.map((f) => f.name)).toEqual(["s3.test.ts > sleeps 3"]);
 	}, 60_000);
 
-	test("with fullWorkers 3 the PR full part uses several workers and base-full one; no key, or 1, runs on one; a malformed value is refused", () => {
+	test("with fullWorkers 3 the PR full part uses several workers; no key, or 1, runs on one; a malformed value is refused", () => {
 		const b = box("ser");
 		const files = { "q1.test.ts": sleeper("1", 300), "q2.test.ts": sleeper("2", 300), "q3.test.ts": sleeper("3", 300) };
-		const sha = prepared(b, "tr-ser1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 3 });
+		prepared(b, "tr-ser1", files, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 3 });
 		const work = workOf(b, "tr-ser1");
 		expect(call(b, { sub: "full", runId: "tr-ser1" }).exit).toBe(0);
 		expect(runners(work).size).toBeGreaterThan(1);
-		expect(call(b, { sub: "base-prepare", runId: "tr-ser1", sha }).exit).toBe(WRAPPER_EXIT.ok);
-		expect(call(b, { sub: "base-full", runId: "tr-ser1" }).exit).toBe(0);
-		expect(runners(join(work, "base")).size).toBe(1);
-		expect(readFileSync(join(work, "base-full.xml"), "utf8")).toContain('name="sleeps 3"');
 
 		for (const [runId, caps] of [["tr-ser2", undefined], ["tr-ser3", { fullCapMin: 1, soloCapMin: 1, fullWorkers: 1 }]] as const) {
 			prepared(b, runId, files, caps);
@@ -556,14 +601,14 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		}
 	}, 120_000);
 
-	test("a parallel full part past its cap exits timeout, and after the sweep no worker and no worker's child is alive", async () => {
+	test("a parallel full part past its cap exits timeout with every worker in its stuck capture's tree, and after the sweep no worker and no worker's child is alive", async () => {
 		const b = box("parcap");
 		const hang = (name: string) =>
 			`import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("hangs ${name}", async () => {\n\twriteFileSync("../pid-${name}", String(process.pid));\n\tconst c = Bun.spawn(["/bin/sleep", "300"]);\n\twriteFileSync("../child-${name}", String(c.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
 		prepared(b, "tr-pc1", { "h1.test.ts": hang("1"), "h2.test.ts": hang("2"), "h3.test.ts": hang("3") }, { fullCapMin: 0.08, soloCapMin: 0.08, fullWorkers: 3 });
 		const r = call(b, { sub: "full", runId: "tr-pc1" });
 		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
-		expect(r.stderr).toContain("timeout");
+		expect(r.stderr).toContain("timeout: the part passed its cap of 4800 ms");
 		const work = workOf(b, "tr-pc1");
 		const workers = [...runners(work)];
 		const children = readdirSync(work).filter((n) => n.startsWith("child-")).map((n) => Number(readFileSync(join(work, n), "utf8")));
@@ -571,10 +616,167 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		// Every file had started on its own worker before the cap fired.
 		expect(workers).toHaveLength(3);
 		expect(children).toHaveLength(3);
+		const capture = stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8"));
+		expect(treePids(capture["1"]!)).toEqual(expect.arrayContaining([...workers, ...children]));
+		for (const w of workers) expect(capture["2"]).toContain(`$ /usr/bin/sample ${w} 3 -mayDie -file `);
 		const s = call(b, { sub: "sweep", runId: "tr-pc1" });
 		expect(s.stderr).toBe("");
 		expect(s.exit).toBe(WRAPPER_EXIT.ok);
 		expect(await until(() => [...workers, ...children].every((pid) => !alive(pid)), 3_000)).toBe(true);
+	}, 90_000);
+});
+
+// ---- the stuck capture at the cap (PLAN wl-mvq4edh02r5z40 revision 3, D5) ---------------------------------------
+
+describe("the stuck capture at the cap: bounded, safe reads, never blocks the kill", () => {
+	const CAPS = { fullCapMin: 0.04, soloCapMin: 0.04 };
+	const TIMEOUT_LINE = "timeout: the part passed its cap of 2400 ms; its group was killed";
+	/** A test file that runs `body`, records its pid in ../slow.pid, then hangs past any cap. */
+	const hangAfter = (body: string) =>
+		`import { test } from "bun:test";\nimport { symlinkSync, unlinkSync, writeFileSync } from "node:fs";\ntest("hangs", async () => {\n\t${body}\n\twriteFileSync("../slow.pid", String(process.pid));\n\tawait new Promise(() => {});\n}, 600_000);\n`;
+
+	test("a capture held on the stuck-capture hook is cut at captureMs: the wrapper exits timeout before the hook is released, within cap + captureMs + grace + slack, leaving no capture child, cap dir or sample report", async () => {
+		const b = box("cut", { captureMs: 2_000 });
+		prepared(b, "tr-cut1", { "slow.test.ts": SLOW_TEST }, CAPS);
+		const hook = join(b.hooks, "tr-cut1.stuck-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const p = spawnCall(b, { sub: "full", runId: "tr-cut1" });
+		try {
+			expect(await until(() => p.exitCode !== null, 2_400 + 2_000 + 500 + 5_000)).toBe(true);
+			expect(existsSync(`${hook}.reached`)).toBe(true);
+			expect(existsSync(`${hook}.go`)).toBe(false);
+			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
+			const work = workOf(b, "tr-cut1");
+			const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
+			pids.push(pid);
+			expect(await until(() => !alive(pid), 3_000)).toBe(true);
+			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
+			const cutAt = Number(/^capture cut at (\d+) ms$/m.exec(text)?.[1]);
+			expect(cutAt).toBeGreaterThanOrEqual(2_000);
+			expect(cutAt).toBeLessThan(3_000);
+			// The tree was written before the hold; nothing after the cut was.
+			expect(Object.keys(stuckSections(text))).toEqual(["1"]);
+			expect(captureLeftovers(work)).toEqual([]);
+			const tools = capturePids(text);
+			expect(await until(() => tools.every((t) => !alive(t)), 2_000)).toBe(true);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+	}, 60_000);
+
+	test("a cap dir filled by a same-account process with 20,000 entries never delays the kill: the group dies within captureMs + grace + slack of the capture's start, the file says the dir was left for after the kill, and the wrapper removes it before it exits timeout", async () => {
+		const captureMs = 2_500;
+		const b = box("fill", { captureMs });
+		prepared(b, "tr-fill1", { "slow.test.ts": SLOW_TEST }, CAPS);
+		const hook = join(b.hooks, "tr-fill1.stuck-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const t0 = Date.now();
+		const p = spawnCall(b, { sub: "full", runId: "tr-fill1" });
+		try {
+			expect(await until(() => existsSync(`${hook}.reached`), 2_400 + 5_000)).toBe(true);
+			// The capture started before its hook was reached, so its deadline is at or before `at + captureMs`.
+			const { at } = JSON.parse(readFileSync(`${hook}.reached`, "utf8")) as { at: number };
+			const work = workOf(b, "tr-fill1");
+			const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
+			pids.push(pid);
+			const capDirs = readdirSync(work).filter((n) => n.startsWith("full.stuck-"));
+			expect(capDirs).toHaveLength(1);
+			const capDir = join(work, capDirs[0]!);
+			// Empty directories: cheap to plant (under 1 s here) and dear to remove recursively (about 2 s for 20,000),
+			// so a recursive removal before the kill would push the kill past the bound below.
+			for (let i = 0; i < 20_000; i++) mkdirSync(join(capDir, `planted-${i}`));
+			// All planted before the deadline (and before the 3 s sample ends), so the cut meets every entry.
+			expect(Date.now()).toBeLessThan(at + captureMs);
+			expect(await until(() => !alive(pid), at + captureMs + 500 + 1_000 - Date.now())).toBe(true);
+			expect(await until(() => p.exitCode !== null, 2_400 + captureMs + 500 + 8_000 - (Date.now() - t0))).toBe(true);
+			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
+			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
+			expect(text).toMatch(/^capture cut at \d+ ms$/m);
+			expect(text).toContain("cap dir not empty: left for after the kill\n");
+			expect(text).not.toContain("not removed after the kill");
+			expect(existsSync(capDir)).toBe(false);
+			expect(captureLeftovers(work)).toEqual([]);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+	}, 60_000);
+
+	test("a sample report or the part log replaced by a FIFO or a symlink is refused, never followed or blocked on, and the wrapper still exits timeout within the bound", async () => {
+		const b = box("swap");
+		const secret = join(dir("swap-outside"), "secret.txt");
+		writeFileSync(secret, "SECRET-CONTENT\n");
+		for (const how of ["fifo", "symlink"] as const) {
+			const runId = how === "fifo" ? "tr-sw1" : "tr-sw2";
+			const swap = how === "fifo" ? `Bun.spawnSync(["/usr/bin/mkfifo", "../full.log"]);` : `symlinkSync(${JSON.stringify(secret)}, "../full.log");`;
+			prepared(b, runId, { "swap.test.ts": hangAfter(`unlinkSync("../full.log");\n\t${swap}`) }, CAPS);
+			const hook = join(b.hooks, `${runId}.stuck-sample-read`);
+			writeFileSync(`${hook}.pause`, "");
+			const t0 = Date.now();
+			const p = spawnCall(b, { sub: "full", runId });
+			expect(await until(() => existsSync(`${hook}.reached`), 2_400 + CAPTURE_MS)).toBe(true);
+			const { report } = JSON.parse(readFileSync(`${hook}.reached`, "utf8")) as { report: string };
+			rmSync(report, { force: true });
+			if (how === "fifo") expect(Bun.spawnSync(["/usr/bin/mkfifo", report]).exitCode).toBe(0);
+			else symlinkSync(secret, report);
+			writeFileSync(`${hook}.go`, "");
+			expect(await until(() => p.exitCode !== null, 2_400 + CAPTURE_MS + 500 + 5_000 - (Date.now() - t0))).toBe(true);
+			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
+			const work = workOf(b, runId);
+			pids.push(Number(readFileSync(join(work, "slow.pid"), "utf8")));
+			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
+			expect(text).not.toContain("capture cut");
+			expect(text).not.toContain("SECRET-CONTENT");
+			const s = stuckSections(text);
+			const refusal = how === "fifo" ? "is a FIFO, not a regular file" : "open failed: ELOOP";
+			expect(s["2"]).toContain(`report refused: ${report}`);
+			expect(s["2"]).toContain(refusal);
+			expect(s["4"]).toContain(`refused: ${join(work, "full.log")}`);
+			expect(s["4"]).toContain(refusal);
+			expect(captureLeftovers(work)).toEqual([]);
+		}
+	}, 120_000);
+
+	test("a full.stuck.log already there (a file or a symlink) skips the capture with one stderr line, writes through neither, and the part still exits timeout naming the cap", () => {
+		const b = box("planted");
+		const target = join(dir("planted-outside"), "target.txt");
+		writeFileSync(target, "untouched\n");
+		for (const how of ["file", "symlink"] as const) {
+			const runId = how === "file" ? "tr-pl1" : "tr-pl2";
+			const plant = how === "file" ? `writeFileSync("../full.stuck.log", "planted\\n");` : `symlinkSync(${JSON.stringify(target)}, "../full.stuck.log");`;
+			prepared(b, runId, { "plant.test.ts": hangAfter(plant) }, CAPS);
+			const r = call(b, { sub: "full", runId });
+			expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+			expect(r.stderr).toContain(TIMEOUT_LINE);
+			expect(r.stderr).toContain(`stuck capture skipped: cannot create ${join(workOf(b, runId), "full.stuck.log")}`);
+			const work = workOf(b, runId);
+			pids.push(Number(readFileSync(join(work, "slow.pid"), "utf8")));
+			if (how === "file") expect(readFileSync(join(work, "full.stuck.log"), "utf8")).toBe("planted\n");
+			else expect(lstatSync(join(work, "full.stuck.log")).isSymbolicLink()).toBe(true);
+			expect(readFileSync(target, "utf8")).toBe("untouched\n");
+			expect(captureLeftovers(work)).toEqual([]);
+		}
+	}, 60_000);
+
+	test("a solo part at its cap writes solo-1.stuck.log beside solo-1.log", async () => {
+		const b = box("solocap");
+		prepared(b, "tr-sc1", { "slow.test.ts": SLOW_TEST }, CAPS);
+		const r = call(b, { sub: "solo", runId: "tr-sc1", file: "./slow.test.ts" });
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stdout).toStartWith("part solo-1\n");
+		expect(r.stderr).toContain(TIMEOUT_LINE);
+		const work = workOf(b, "tr-sc1");
+		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
+		pids.push(pid);
+		const text = readFileSync(join(work, "solo-1.stuck.log"), "utf8");
+		expect(Object.keys(stuckSections(text))).toEqual(["1", "2", "3", "4"]);
+		expect(treePids(stuckSections(text)["1"]!)).toContain(pid);
+		expect(text).toContain(`== 4. last 200 lines of ${join(work, "solo-1.log")} (`);
+		expect(existsSync(join(work, "full.stuck.log"))).toBe(false);
+		expect(captureLeftovers(work)).toEqual([]);
+		expect(await until(() => !alive(pid), 3_000)).toBe(true);
 	}, 60_000);
 });
 
@@ -668,12 +870,13 @@ describe("sweep", () => {
 		const argvUses = text.split("\n").flatMap((l, i) => (/"\$@"/.test(l) ? [i] : []));
 		expect(argvUses).toEqual([execLine + 2]);
 		expect(text).toContain(`'/usr/local/libexec/as2test/bun' '/usr/local/libexec/as2test/test-exec.js' "$@"`);
-		for (const extra of [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }]) {
+		for (const extra of [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }]) {
 			expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid", ...extra })).toThrow(WrapperRenderError);
 		}
 		expect(() => renderExecWrapper({ root: "r", bun: "/b", script: "/s", sweepScope: "uid" })).toThrow(WrapperRenderError);
 		expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "all" as SweepScope })).toThrow(WrapperRenderError);
-		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({ killGraceMs: 10_000, sweepLockWaitMs: 60_000, hooks: null });
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({ killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null });
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", captureMs: 1_500 }).captureMs).toBe(1_500);
 	});
 });
 

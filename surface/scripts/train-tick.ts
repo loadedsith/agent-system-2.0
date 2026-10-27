@@ -21,12 +21,19 @@
 //     with `launch-requested: by merge-train` once per task and again only after a runner result newer than its last launch, so
 //     an owner waiting on its run is not relaunched.
 //  4. Wakes (D10 step 1). A train `actionable` (a new `train:`, a settle, an unworked PR, a dependency merged on GitHub since the
-//     last lane exit, Jo's answer to an alert, a passed-over PR whose retry wait has passed, a returned PR's head the train
-//     has not worked, from step 1's views, or a held PR whose hold has ended, `hold-expired`, PLAN wl-mvfkv7llkp7nk0 § 3) and not
-//     held live gets `launch-requested: by merge-train` and the launcher. A head's wake is recorded (`train-head-woken:`) when the
-//     tick requested a lane for it (wrote the request, or its launcher served a pending one), once per request, whichever starter
-//     serves it; the head stays due under the pass-over backoff until the train works it (`trainRetries`). An ended hold's wake
-//     is recorded at the same request boundary (`train-wake: pr <n> hold <entry id>`), which consumes that hold's expiry.
+//     last ready lane exit, Jo's answer to an alert or to a question the train's lane raised and no ready lane has carried yet,
+//     a passed-over PR whose retry wait has passed, a returned PR's head the train has not worked, from step 1's views, or a
+//     held PR whose hold has ended, `hold-expired`, PLAN wl-mvfkv7llkp7nk0 § 3) and not held live gets the launcher: on its own
+//     cause when it has one (`first`, a pending request, an unconsumed resolution, PLAN wl-mvpsrr4tr0p1xc D2), so the attempt
+//     names and consumes it, else, only when its verdict reads `died-not-relaunched`, after `launch-requested: by merge-train`;
+//     any other refusal read at request time (`held` by a lane another path started since the wake read, `awaiting-close`, …)
+//     gets no request and no launcher, one log line (review r1 F2). A head's wake is recorded (`train-head-woken:`) when
+//     the tick requested a lane for it (wrote the request, or its launcher served a pending one or the train's own cause), once
+//     per request, whichever starter serves it; the head stays due under the pass-over backoff until the train works it
+//     (`trainRetries`). An ended hold's wake is recorded at the same request boundary (`train-wake: pr <n> hold <entry id>`),
+//     which consumes that hold's expiry. At the launch limit (D4: TRAIN_LAUNCH_LIMIT consecutive launches that never got ready,
+//     `trainLaunchFailures`) a train gets no request and no launcher, one log line, and Jo's NOW (incident) question once per
+//     episode (`raiseLaunchLimit`, relaunch / stop, on the slice of its first non-terminal PR, so step 5 files its issue).
 //     An open question never stops the tick: every pass settles, delivers and wakes on every PR.
 //     Steps 3 and 4 request nothing for a workload stopped at its ceiling (`ceilingStopped`): no row, no launcher, a log line only.
 //  5. Alerts (D9). Each question on a train slice is an alert: the production merge question the lane raises and the failed-twice
@@ -70,15 +77,14 @@
 import { defaultLedgerPath, Ledger } from "../../ledger/src/index";
 import { ceilingStopped } from "../src/ceiling";
 import { loadTestRunnerConfig } from "../src/close-entry";
-import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
+import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, launchRequestedBody, launchRowsFor, verdictOf } from "../src/launch";
 import {
 	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, everyTrain, expiredHolds,
-	forkOf, forkTaskAlert, ghCompare, isTrainOrFix, type Landing, landingReady, MAIN_RED_WINDOW_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains,
-	ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseTwiceFailed,
-	settleTasks, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions,
-	trainAlertBody,
-	trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId,
-	trainSlicePr, type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
+	forkOf, forkTaskAlert, ghCompare, isTrainOrFix, type Landing, landingReady, lastReadyExit, MAIN_RED_WINDOW_MS, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains,
+	ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS, protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseLaunchLimit,
+	raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS, type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs,
+	trainAlertActions, trainAlertBody, trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, TRAIN_LAUNCH_LIMIT,
+	trainLaunchFailures, trainPrs, trainPushesOf, trainRetries, trainSliceId, trainSlicePr, type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
@@ -159,11 +165,20 @@ export function tick(d: TickDeps): string[] {
 		say(`${wl}: ${body}`);
 	};
 	/**
-	 * Write `launch-requested: by merge-train` unless one is unconsumed already, then run the launcher: its exit code, whether this
-	 * call wrote the request, and the id of the request now pending. Null, with nothing written and no launcher, when the workload
-	 * is stopped at its ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3).
+	 * Run the launcher for `wl`, after writing `launch-requested: by merge-train` unless one is unconsumed already. On an open
+	 * train (cap-exempt, PLAN wl-mvpsrr4tr0p1xc D2) the verdict (`launchRowsFor` + `verdictOf`) is read first: when the train's
+	 * own cause admits it (`first`, an unconsumed resolution) the launcher runs with no request, so the attempt names and
+	 * consumes that cause; only `died-not-relaunched` gets the request; any other refusal (`held` by a lane another path
+	 * launched since step 4 read the train, `awaiting-close`, `user-driven`, …) writes nothing and runs no launcher, so no
+	 * request outlives that lane to wake an idle train (review r1 F2). The pending-request lookup, the verdict read and the
+	 * request's insert are one write transaction (BEGIN IMMEDIATE), so no other starter's reservation lands between the read
+	 * and the insert (review r2 F5); the launcher runs after it commits, as it takes its own reservation transaction. Returns
+	 * the launcher's exit code, whether this call wrote the request, the id of the request now pending (null when the train's
+	 * own cause was launched) and the workload's entry count before the launch. Null, with nothing written and no launcher,
+	 * when the workload is stopped at its ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3) or the train's verdict refuses
+	 * with another reason; one line says which.
 	 */
-	const request = (wl: string, reason: string): { code: number; wrote: boolean; requestId: string } | null => {
+	const request = (wl: string, reason: string): { code: number; wrote: boolean; requestId: string | null; before: number } | null => {
 		const entries = ledger.entries(wl);
 		const w = ledger.workload(wl);
 		const control = controlEntries(entries, holdersOf(entries, w?.holder ?? null, ledger.holders(wl)));
@@ -172,12 +187,27 @@ export function tick(d: TickDeps): string[] {
 			say(`${wl}: launch (${reason}) not requested: stopped at its ceiling usd ${stopped.spend.usd} of ${stopped.ceiling.usd}`);
 			return null;
 		}
-		const consumed = consumedIds(attempts(control));
-		const pending = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
-		const requestId = pending?.id ?? ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) });
+		const decided = ledger.write((): { wrote: boolean; requestId: string | null } | { refused: string } => {
+			// re-read inside the transaction: the rows read above may predate another starter's reservation
+			const fresh = ledger.entries(wl);
+			const freshControl = controlEntries(fresh, holdersOf(fresh, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
+			const consumed = consumedIds(attempts(freshControl));
+			const pending = freshControl.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
+			if (pending !== undefined) return { wrote: false, requestId: pending.id };
+			const rows = launchRowsFor(ledger, wl, laneCap(process.env));
+			const verdict = rows !== null && rows.capExempt ? verdictOf(rows) : null;
+			if (verdict !== null && !verdict.launch && verdict.reason !== "died-not-relaunched") return { refused: verdict.reason };
+			if (verdict !== null && verdict.launch) return { wrote: false, requestId: null };
+			return { wrote: true, requestId: ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) }) };
+		});
+		if ("refused" in decided) {
+			say(`${wl}: launch (${reason}) not requested: ${decided.refused}`);
+			return null;
+		}
+		const before = ledger.entries(wl).length;
 		const r = d.launch(wl);
 		say(`${wl}: launch (${reason}): exit ${r.code}: ${r.line}`);
-		return { code: r.code, wrote: pending === undefined, requestId };
+		return { code: r.code, before, ...decided };
 	};
 
 	// 1-2. Facts and settles, per train.
@@ -239,8 +269,8 @@ export function tick(d: TickDeps): string[] {
 				const q = raiseTwiceFailed(ledger, wl, due);
 				if (q) say(`${wl}: #${due.pr} failed twice (${due.task.id}): alert question ${q}`);
 			}
-			// A dependency merged since the train's last lane exit wakes it (actionable's mergedDeps).
-			const lastExit = controlEntries(ledger.entries(wl)).filter((c) => c.prefix === "lane-exit").at(-1)?.createdAt ?? null;
+			// A dependency merged since the train's last ready lane exit wakes it (actionable's mergedDeps; a never-ready exit cuts nothing, D2).
+			const lastExit = lastReadyExit(controlEntries(ledger.entries(wl)));
 			const merged = new Map<number, string | null>();
 			for (const [n, v] of facts.views) {
 				for (const dep of bodyDeps(v.body)) {
@@ -347,22 +377,35 @@ export function tick(d: TickDeps): string[] {
 		const why = actionable(ledger, wl, facts?.mergedDeps ?? [], heads, held, stakesOf);
 		const cleared = notices.wake.get(wl);
 		if (cleared !== undefined) why.push(cleared);
+		// D4: at the limit nothing is requested and nothing launched; Jo hears it once per episode, NOW.
+		const failures = trainLaunchFailures({
+			entries: ledger.entries(wl), instructions: ledger.instructions(wl), questions: ledger.questions(wl), holder: w.holder, holderLeaseUntil: w.holder_lease_until, now: ledger.now(),
+		});
+		if (failures.count >= TRAIN_LAUNCH_LIMIT) {
+			if (why.length > 0) say(`${wl}: launch (${why.join("; ")}) not requested: train launch limit: ${failures.count} consecutive failed launches (${failures.lanes.join(", ")})`);
+			const q = raiseLaunchLimit(ledger, wl);
+			if (typeof q === "string") say(`${wl}: launch limit question ${q} (NOW incident)`);
+			else if (q !== null) say(`${wl}: launch limit reached and no PR on the train is open to carry the question`);
+			continue;
+		}
 		// A head the train has not worked: one wake per request the tick made for it, whichever starter serves the request, so a
 		// request refused here and served by another starter still counts. A request still pending when the head is due again is
 		// the same wake, not a second (PLAN wl-mvgn310dpi5gcg D1); the head stays retried under the backoff (`trainRetries`).
 		// An expired hold is consumed by a new or pending request, even if the capped launcher leaves it for the drain to serve.
-		// A ceiling refusal writes no request and consumes neither a head wake nor a hold's expiry.
+		// A launch on the train's own cause (no request) counts only when the launcher started it. A ceiling refusal, and a
+		// verdict refusal other than `died-not-relaunched` read in `request()`, write no request and consume neither a head wake
+		// nor a hold's expiry.
 		const r = why.length > 0 ? request(wl, why.join("; ")) : null;
 		if (r && (r.wrote || r.code === 0)) {
 			const after = ledger.entries(wl);
-			const from = after.findIndex((e) => e.id === r.requestId);
+			const from = r.requestId === null ? r.before : after.findIndex((e) => e.id === r.requestId);
 			for (const h of untested) {
 				const body = trainHeadWokenBody(h.pr, h.sha);
 				if (after.some((e, i) => i >= from && e.created_by === MERGE_TRAIN_BY && e.kind === "assumption" && e.body === body)) continue;
 				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 			}
 		}
-		if (r) for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
+		if (r && (r.requestId !== null || r.code === 0)) for (const h of expired) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainWakeBody(h.pr, h.holdId) });
 	}
 
 	// 5. Alerts.

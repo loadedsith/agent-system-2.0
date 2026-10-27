@@ -758,7 +758,7 @@ export default function laneToolsRow(pi: SurfaceAPI, env: Record<string, string 
 		loadMode: "essential",
 		label: "Run Full Test Suite",
 		description:
-			"Run this workload's full test suite outside the fence at an open PR's head, then each changed test file alone. Call it after the last push, with the PR number; it returns the run's line at once and the result arrives later as an aside (verdict, counts, failures). " +
+			"Run this workload's full test suite outside the fence at an open PR's head. A full part that times out ends the run as an error; after an all-pass part only changed test files with no executed case run alone, and after a red only the failing files outside gates/test/ run alone, as a diagnostic that never turns a red green. Call it after the last push, with the PR number; it returns the run's line at once and the result arrives later as an aside (verdict, counts, failures). " +
 			"Without `slice` the runner adds the full-suite slice; with it, the slice must be open on this workload. A green completes that slice; a red, stale or error leaves it open: fix, push, and call again with the slice. " +
 			"Never complete that slice yourself. While a run is live, work on something else or `sleep 60` in bash; never park or release.",
 		parameters: z.object({

@@ -66,23 +66,22 @@ Any other message from Jo gets no read, and a short answer is the common case: a
 such as `approve` or `withdraw`, `approve <id>`, a stakes or mode word, or numbered answers to
 the `#n` lines under *needs you* (`1 approve`, `1 approve, 2 deny`, or one per line), each its
 own row. A bare word that fits more than one line is refused with "which one?" and applies
-nothing. Two words settle a stuck row and always name it. `cancel-slice sl-…` cancels an open or
-paused slice of an open workload and withdraws its open questions, so a lane parked on them is
-relaunched when none is running. It refuses a done or cancelled slice, a closed workload, the
-standing slice, and a slice whose test run is still live. `supersede wl-A wl-B` records that B
-supersedes A. A's close
-then takes it in place of a `done-because:` receipt, provided no PR of A is open and no bound
-branch carries unmerged commits. It refuses when A is not open, B does not exist, or A is B.
-Both refuse with the reason and are never read as prose. A paste of several lines is one
-command per line, applied all-or-nothing; its receipt
-names each plain-words run between the commands (`lines 4–6 → an instruction for you, one row:
-…`), and you record each such run as one row with `orchestrator_record_instruction`, those lines
-as Jo's words. A refused paste applied nothing and Jo pastes it again: record nothing from it.
-After an
-answer is applied or recorded, the receipt is already in your context and no read follows: the
-surface's "Applied from the surface" line is the receipt for a word it applied, and the tool's
-result is the receipt for a row you wrote with `orchestrator_record_instruction`. Cite it; do
-not read the ledger to confirm it.
+nothing. Two words settle a stuck row and always name it; `cancel-slice`, `supersede` and
+`withdraw wl-…` refuse with the reason, never read as prose. `cancel-slice sl-…` cancels an
+open or paused slice and withdraws its questions, relaunching a lane parked on them when none
+runs; it refuses a done or cancelled slice, a closed workload, the standing slice, or a live
+test run. `supersede wl-A wl-B` (B
+supersedes A) lets A close with no `done-because:` receipt; it refuses when A is not open, B does
+not exist, or A is B. `withdraw wl-…` closes the workload at once with no `done-because:`
+receipt (`withdraw q-…` still answers a question); it refuses one not open, the standing one, a
+scheduled row, or one with a live slice, an open question or a live lease. On a repo
+the test runner serves, either close needs no open PR and no unmerged branch commits; the
+tick retries a refused close. A paste is one command per line, applied
+all-or-nothing; its receipt names each plain-words run (`lines 4–6 → an instruction for you, one
+row: …`), which you record as one row with `orchestrator_record_instruction`, those lines as
+Jo's words. Record nothing from a refused paste. An applied or recorded
+answer's receipt (the surface's "Applied from the surface" line, or the tool's result) is
+already in your context: cite it; do not read the ledger to confirm it.
 
 Open a reply with *needs you* only when the surface injected needs-you lines into this turn's
 context: the wake render, or the "needs you (new since your last turn)" block. A turn with
@@ -267,6 +266,17 @@ into the brief you open it with, with its ctx session id;
 otherwise put the line "ctx: no prior hits" there. At workload close the machinery renders one
 decision-log entry from the ledger (what changed, decisions made and why, dead ends, heads-up)
 in the shared filename scheme with your name in the author slot; you do not write it by hand.
+
+## Fault tolerance
+
+Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md`):
+fail loudly to operators and gracefully to users; fail obviously (what broke, where, the evidence,
+the next step); recover by restart from one durable store; bound every retry in one layer, then
+escalate; silence is a failure (deadlines track progress); recovery never destroys the evidence;
+one failure never hides another. Every brief you open carries a "How it fails" section: the
+errors the work can hit, where each one surfaces, and the recovery step for each. When you read a
+plan or a review for Jo, a failure path that surfaces nowhere (a swallowed error, a fallback that
+does not announce itself, long work with no deadline) is a blocking finding; say so in your reply.
 
 ## Trivial asks
 
