@@ -1014,8 +1014,51 @@ function callFields(cp: typeof childProcess) {
 			return bunFields(Bun.spawnSync(a));
 		}),
 		functionOption: counted((hit) => bunFields(Bun.spawnSync(["/bin/echo", "f"], { onExit: () => hit() }))),
+		// Review r3: an accessor on Object.prototype under a {} options object, and an env array with an enumerable named getter
+		// (bun enumerates an env object's own keys and gets each value, so this one runs).
+		protoCwdGetter: counted((hit) => {
+			Object.defineProperty(Object.prototype, "cwd", { configurable: true, get: () => (hit(), "/") });
+			try {
+				return bunFields(Bun.spawnSync(["/usr/bin/true"], {}));
+			} finally {
+				delete (Object.prototype as Record<string, unknown>).cwd;
+			}
+		}),
+		envArrayGetter: counted((hit) => {
+			const env: string[] = [];
+			Object.defineProperty(env, "AS2TEST_E", { enumerable: true, get: () => (hit(), "e") });
+			return bunFields(Bun.spawnSync(["/usr/bin/env"], { env: env as unknown as Record<string, string> }));
+		}),
 		plainOptions: bunFields(Bun.spawnSync(["/bin/cat"], { cwd: "/", env: { PATH: "/bin" }, stdin: Buffer.from("in"), stdout: "pipe", stderr: "pipe" })),
 	};
+}
+
+/**
+ * Review r3's two getter shapes outside the options' own data, each running onGet inside its getter: "proto-cwd" defines a `cwd`
+ * accessor on Object.prototype (removed before this returns) and calls Bun.spawnSync(argv, {}); "env-array" passes an env that is
+ * an array with an enumerable named getter. Returns the call's exit and how often the getter ran. Its source is copied into
+ * fixtures, so it names no import.
+ */
+function r3GetterCall(shape: "proto-cwd" | "env-array", argv: string[], onGet: () => void) {
+	let hits = 0;
+	const get = () => {
+		hits++;
+		onGet();
+		return shape === "proto-cwd" ? "/" : "e";
+	};
+	if (shape === "env-array") {
+		const env: string[] = [];
+		Object.defineProperty(env, "AS2TEST_E", { enumerable: true, get });
+		const r = Bun.spawnSync(argv, { env: env as unknown as Record<string, string> });
+		return { exitCode: r.exitCode, hits };
+	}
+	Object.defineProperty(Object.prototype, "cwd", { configurable: true, get });
+	try {
+		const r = Bun.spawnSync(argv, {});
+		return { exitCode: r.exitCode, hits };
+	} finally {
+		delete (Object.prototype as Record<string, unknown>).cwd;
+	}
 }
 
 /**
@@ -1027,6 +1070,7 @@ const QUAL_TEST = `import { test } from "bun:test";
 import * as cp from "node:child_process";
 import { appendFileSync } from "node:fs";
 const callFields = ${callFields.toString()};
+const r3GetterCall = ${r3GetterCall.toString()};
 const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
 const idle = (ms = 1_000) => Bun.sleep(ms);
 // A real hot computation on the real clock: the detector samples this process's CPU over real 250 ms ticks, so no fake time.
@@ -1071,6 +1115,11 @@ test("qualifies", async () => {
 		spin(1_200);
 		return "/bin";
 	} } }).exitCode);
+	// Review r3: an env array with an enumerable named getter (bun runs it), and an Object.prototype accessor beside a {} options
+	// object (bun 1.3.14 stops its option lookups before Object.prototype, so this getter does not run: the call is unpublished
+	// because Object.prototype is not clean): both unpublished throughout.
+	await phase("env-array-getter", "", () => r3GetterCall("env-array", ["/bin/sleep", "1"], () => spin(1_200)));
+	await phase("proto-cwd-getter", "", () => r3GetterCall("proto-cwd", ["/bin/sleep", "2"], () => spin(1_200)));
 	await phase("fields", null, () => callFields(cp));
 	// A nested call from inside the call's own argv accessor (read by spawnSync itself): neither the outer head nor the nested
 	// sh publishes, so both read the same, earlier marker line.
@@ -1118,7 +1167,7 @@ test("qualifies", async () => {
 `;
 
 describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
-	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter unpublished (during the getter and the call), publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter (an env array's included) or that meets an Object.prototype accessor unpublished (during the getter and the call), publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
 		const b = box("stuck-qual", DETECT);
 		prepared(b, "tr-sq1", {
 			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
@@ -1164,6 +1213,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(byName["bun-options"]!.out).toBe(0);
 		expect(byName["node-options"]!.out).toBe(0);
 		expect([byName["argv-getter"]!.out, byName["cwd-getter"]!.out, byName["env-getter"]!.out]).toEqual([0, 0, 0]);
+		// The same exit and getter count as the unwrapped shapes here (bun runs the env array's getter once, never the inherited one).
+		expect([byName["proto-cwd-getter"]!.out, byName["env-array-getter"]!.out]).toEqual([r3GetterCall("proto-cwd", ["/usr/bin/true"], () => {}), r3GetterCall("env-array", ["/usr/bin/true"], () => {})]);
 		expect(byName["node-spawnSync"]!.out).toBe(0);
 		expect(byName["node-execSync"]!.out).toBe("slept\n");
 		expect(byName["node-execFileSync"]!.out).toBe("");
@@ -1175,7 +1226,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		// The accessor, proxy and nested shapes really ran test code (once per getter, a one-shot throw surfacing), so equality
 		// above means the wrapper invoked none of it itself and swallowed none of its errors.
 		expect([plain.argv0Getter.hits, plain.cmdGetter.hits, plain.argv0Throws.hits, plain.cmdThrows.hits, plain.nestedBun.hits, plain.nestedNode.hits]).toEqual([1, 1, 1, 1, 1, 1]);
-		expect([plain.laterArgvGetter.hits, plain.cwdGetter.hits, plain.envGetter.hits]).toEqual([1, 1, 1]);
+		expect([plain.laterArgvGetter.hits, plain.cwdGetter.hits, plain.envGetter.hits, plain.envArrayGetter.hits]).toEqual([1, 1, 1, 1]);
+		expect([plain.envArrayGetter.out.stdout, plain.protoCwdGetter.out.exitCode]).toEqual(["AS2TEST_E=e\n", 0]);
 		expect([plain.laterArgvGetter.out.stdout, plain.cwdGetter.out.stdout, plain.envGetter.out.stdout, plain.plainOptions.stdout]).toEqual(["l0 l2\n", "/\n", "AS2TEST_E=e\n", "in"]);
 		expect([plain.argv0Throws.out.message, plain.cmdThrows.out.message]).toEqual(["as2test one-shot getter", "as2test one-shot getter"]);
 		expect(plain.proxyOptions.hits).toBeGreaterThan(0);
@@ -1437,6 +1489,26 @@ test("c", () => {
 }, 60_000);
 `,
 			},
+			// Review r3: the same healthy getter outside the options' own data, run through r3GetterCall with argv ["/usr/bin/true"]:
+			// a `cwd` accessor on Object.prototype under a {} options object, and an env array with an enumerable named getter. A
+			// real 3 s idle after the call keeps the part alive for the trace's 10 real-clock ticks when the getter does not run (the
+			// detector samples the real process over real 250 ms ticks, so fake timers cannot stand in).
+			...Object.fromEntries((["proto-cwd", "env-array"] as const).map((shape) => [`${shape}-getter`, {
+				"c.test.ts": `import { test } from "bun:test";
+import { writeFileSync } from "node:fs";
+const r3GetterCall = ${r3GetterCall.toString()};
+test("c", async () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const out = r3GetterCall("${shape}", ["/usr/bin/true"], () => {
+		Bun.spawn(["/usr/bin/true"]);
+		const end = Date.now() + ${DETECT.detectPersistMs + 3 * DETECT.detectTickMs};
+		while (Date.now() < end) {}
+	});
+	writeFileSync("../out.json", JSON.stringify(out));
+	await Bun.sleep(3_000);
+}, 60_000);
+`,
+			}])),
 		};
 		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
 		let all: Promise<Record<string, Done>> | null = null;
@@ -1485,6 +1557,20 @@ test("c", () => {
 			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
 			expect(zombieTicks.filter((t) => !activeAt(t).some((m) => m.pid === w)).length).toBeGreaterThanOrEqual(5);
 		}, 90_000);
+
+		for (const shape of ["proto-cwd", "env-array"] as const) {
+			const what = shape === "proto-cwd" ? "Bun.spawnSync(['/usr/bin/true'], {}) beside an Object.prototype cwd getter" : "Bun.spawnSync(['/usr/bin/true'], { env: <array with an enumerable named getter> })";
+			test(`${what} whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker`, async () => {
+				const { trace, w, work } = await settled(`${shape}-getter`);
+				const out = JSON.parse(readFileSync(join(work, "out.json"), "utf8")) as { exitCode: number; hits: number };
+				expect(out).toEqual(r3GetterCall(shape, ["/usr/bin/true"], () => {}));
+				const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
+				expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
+				// bun 1.3.14 runs the env array's getter; it stops its option lookups before Object.prototype, so the inherited
+				// getter runs only if a later bun reads it, and then it must meet no marker either.
+				expect(zombieTicks.length).toBeGreaterThanOrEqual(out.hits > 0 ? 5 : 0);
+			}, 90_000);
+		}
 
 		test("a long async test", async () => {
 			const { trace, w } = await settled("long-async");

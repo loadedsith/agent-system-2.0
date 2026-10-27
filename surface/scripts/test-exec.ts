@@ -729,11 +729,14 @@ const STUCK_PRELOAD = String.raw`// agent-system 2.0 test runner: the stuck-work
 // exactly the call. The call returns or throws exactly what it would have; the wrapper's own fs and ffi errors only stop
 // publication (a missed detection, never a false one). It publishes only a call whose every input is plain data, so a held
 // marker means the native call itself is running, never test code the call runs while it reads its arguments (review r2
-// finding 1): argv a dense, non-proxy array of own data strings; options, when given, a non-proxy object with prototype
-// Object.prototype or null whose own properties are all data properties holding a primitive, bytes (an ArrayBuffer or a view),
-// a dense array of those (stdio; node puts its input Buffer there), or for env a plain object of own data primitives. A
-// function, a getter, a hole, a proxy or any other object runs the call unpublished. It reads only descriptors, through
-// functions bound at load, so no getter, proxy trap or replaced builtin runs here.
+// finding 1, r3): argv (or cmd) a dense, non-proxy array of own data strings; options, when given, a non-proxy, non-array object
+// with prototype Object.prototype or null whose own properties are all data properties holding, per key: for env a primitive or
+// such an object whose own properties are all data primitives (bun gets each own value); for stdio a primitive or a dense
+// array of primitives and bytes (an ArrayBuffer or a view; node puts its input Buffer there); for stdin, stdout and stderr a
+// primitive or bytes; for any other key a primitive. An object with prototype Object.prototype also needs Object.prototype
+// clean at the call: no accessor on it but the __proto__ it had at load. A function, a getter, a hole, a proxy or any other
+// object runs the call unpublished. It reads only descriptors, through functions bound at load, so no getter, proxy trap or
+// replaced builtin runs here.
 import fs from "node:fs";
 import { types } from "node:util";
 import { dlopen, FFIType } from "bun:ffi";
@@ -777,6 +780,13 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 			const d = ownDescriptor(o, key);
 			return d !== undefined && hasOwn(d, "value") ? d.value : undefined;
 		};
+		// The get and set of o's own accessor property key (a fresh descriptor's own fields), or null when key is no own accessor.
+		const accessorOf = (o, key) => {
+			const d = ownDescriptor(o, key);
+			return d !== undefined && hasOwn(d, "get") ? { get: d.get, set: d.set } : null;
+		};
+		// Object.prototype's __proto__ accessor at load: the one accessor a clean Object.prototype keeps.
+		const PROTO_ACCESSOR = accessorOf(OBJECT_PROTO, "__proto__");
 		// Whether o's own property key is a data property whose value passes ok(value, key).
 		const dataPasses = (o, key, ok) => {
 			const d = ownDescriptor(o, key);
@@ -795,14 +805,44 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 			for (let i = 0; i < n; i++) if (!dataPasses(a, i, ok)) return false;
 			return true;
 		};
-		const plainObject = (o) => o !== null && typeof o === "object" && !isProxy(o) && !isArray(o) && (protoOf(o) === OBJECT_PROTO || protoOf(o) === null);
+		// Whether Object.prototype holds no accessor but the __proto__ it held at load (descriptors only). bun 1.3.14 stops its
+		// option lookups before Object.prototype (ObjectBindings.cpp, getNonIndexPropertySlotPrototypePollutionMitigation) and
+		// reads a dense array by own index and length (JSArrayIterator), so neither prototype reaches test code today; this keeps
+		// the options rule if a later bun reads Object.prototype (review r3).
+		const cleanObjectProto = () => {
+			const keys = ownKeys(OBJECT_PROTO);
+			for (let i = 0; i < keys.length; i++) {
+				const key = keys[i];
+				const d = ownDescriptor(OBJECT_PROTO, key);
+				if (d !== undefined && hasOwn(d, "value")) continue;
+				if (key !== "__proto__" || PROTO_ACCESSOR === null || d === undefined || !hasOwn(d, "get")) return false;
+				if (d.get !== PROTO_ACCESSOR.get || d.set !== PROTO_ACCESSOR.set) return false;
+			}
+			return true;
+		};
+		// A non-proxy, non-array object with prototype null, or Object.prototype while that is clean.
+		const plainObject = (o) => {
+			if (o === null || typeof o !== "object" || isProxy(o) || isArray(o)) return false;
+			const proto = protoOf(o);
+			return proto === null || (proto === OBJECT_PROTO && cleanObjectProto());
+		};
 		// Every own property of o (string and symbol keys) a data property whose value passes ok.
 		const allOwnData = (o, ok) => {
 			const keys = ownKeys(o);
 			for (let i = 0; i < keys.length; i++) if (!dataPasses(o, keys[i], ok)) return false;
 			return true;
 		};
-		const optionValue = (v, key) => element(v) || denseArray(v, element) || (key === "env" && plainObject(v) && allOwnData(v, primitive));
+		// An option's value, per key, by what bun 1.3.14 does with it (js_bun_spawn_bindings.zig): cmd is the argv; env's own
+		// keys are enumerated and each value got (JSPropertyIterator), so it must hold data primitives only; stdio is iterated by
+		// index; stdin, stdout and stderr take bytes from internal slots; every other option is read as a primitive. A primitive
+		// env or stdio is read or refused by bun without running anything (node passes env: undefined).
+		const optionValue = (v, key) => {
+			if (key === "cmd") return denseArray(v, isString);
+			if (key === "env") return primitive(v) || (plainObject(v) && allOwnData(v, primitive));
+			if (key === "stdio") return primitive(v) || denseArray(v, element);
+			if (key === "stdin" || key === "stdout" || key === "stderr") return element(v);
+			return primitive(v);
+		};
 		// The marker command of a call (argv[, options] or { cmd, ... }), or "" when any input the original reads is not plain
 		// data, or argv0 names no usable command.
 		const commandOf = (args) => {
