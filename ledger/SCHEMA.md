@@ -139,6 +139,10 @@ hand must also be a valid OMP agent id, `[A-Za-z0-9_-]{1,48}`, because the dispa
 slice id and OMP would rename anything else (SPEC-2.0.md § B9; the classifier refuses the dispatch);
 the module's generated ids always are (`sl-` plus base36 characters, 17 in 2026).
 
+The suffix calculation reduces a safely representable integer, preserving low-word entropy rather
+than rounding a 64-bit random draw through a JavaScript Number. Six base36 characters remain a
+finite random space, not a uniqueness guarantee; duplicate IDs are still refused by the file.
+
 ### `workloads`
 
 | column | meaning |
