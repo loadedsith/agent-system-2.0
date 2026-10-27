@@ -14,7 +14,7 @@
 // and pushes it to an open PR (surface/src/close-entry.ts), through the extension API's exec, never
 // the bash tool. Once the row has closed, the workload's scratch root is removed in-process
 // (`closeScratchRoot`, PLAN wl-mv5oikd5jtquww § 1.5); a failed removal is an entry, never a failed close.
-import type { InstructionRow, Ledger } from "../../ledger/src/index";
+import { type InstructionRow, type Ledger, type MessageRow, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { classify, type KindJudge, loadKindQuestion } from "../../classifier/src/classify";
 import { closeCheck, closeScratchRoot, commitCloseEntry, type EntryPublish, logDirOf, publishEntry, recordCloseReceipt, type Superseded } from "../src/close-entry";
 import { decisionLogContext, lastWorkloadOn, recordRepo, repoOf } from "../src/decision-log";
@@ -26,8 +26,9 @@ import { answerOrchestratorQuestion, inputSpent, joInput, type OrchestratorAnswe
 import { oneLiner } from "../src/render";
 import { surfaceSession } from "../src/session";
 import { inferMode, inferStakes, type JudgedSize, judgedLarge, planFirstTrigger, saidNoPlan, saidPlanIt } from "../src/stakes";
+import { parseSecurityRed, SECURITY_RED_PREFIX } from "../src/test-run";
 import {
-	CLOSE_WORKLOAD_TOOL, type Ctx, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
+	CLOSE_WORKLOAD_TOOL, type Ctx, DUE_PREFIX, IDENTITY_TOOL, MODE_WORDS, OPEN_WORKLOAD_TOOL, ORCHESTRATOR_RECIPIENT, RECORD_INSTRUCTION_TOOL, SCHEDULE_TOOL,
 	STAKES_WORDS, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult,
 } from "../src/types";
 import { triggerLaunch } from "./launch";
@@ -54,6 +55,38 @@ export interface CloseOutcome {
 	entry?: string;
 }
 
+/** How many held messages the close line lists by id, sender and body before it names the rest by id only. */
+const HELD_LISTED = 10;
+/** The longest message body the close line carries, in characters. */
+const HELD_BODY_MAX = 200;
+
+/**
+ * PLAN wl-mvbcjageg7o2yo § 2.5: inside the close transaction, ordinary held orchestrator-bound
+ * messages move to `delivered`. Trusted security reds keep their dedicated closed-workload route
+ * (`securityRedLines` / `consumeAllToOrchestrator`), so they still reach Jo before being delivered.
+ * Returns only the rows delivered here.
+ */
+function deliverHeldAtClose(ledger: Ledger, id: string): MessageRow[] {
+	const held = ledger.db.query<MessageRow, [string, string]>(
+		"SELECT * FROM messages WHERE workload_id = ?1 AND state = 'held' AND recipient = ?2 ORDER BY created_at, rowid").all(id, ORCHESTRATOR_RECIPIENT)
+		.filter((m) => !(m.created_by === TEST_RUNNER_BY && m.body.startsWith(SECURITY_RED_PREFIX) && parseSecurityRed(m.body)?.workloadId === id));
+	for (const m of held) ledger.advanceMessage(m.id, "delivered", { by: SURFACE_BY });
+	return held;
+}
+
+/** The close's one line naming the messages delivered at close: at most HELD_LISTED listed, then `+K more: <ids>`; null for none. */
+function heldDeliveredLine(held: MessageRow[]): string | null {
+	if (held.length === 0) return null;
+	const one = (m: MessageRow): string => {
+		const body = m.body.replace(/\s+/g, " ").trim();
+		return `${m.id} ${m.sender}: ${body.length > HELD_BODY_MAX ? `${body.slice(0, HELD_BODY_MAX - 1)}…` : body}`;
+	};
+	const listed = held.slice(0, HELD_LISTED).map(one);
+	const rest = held.slice(HELD_LISTED);
+	if (rest.length > 0) listed.push(`+${rest.length} more: ${rest.map((m) => m.id).join(" ")}`);
+	return `held messages delivered at close (${held.length}): ${listed.join("; ")}`;
+}
+
 /**
  * Close one workload (decision 13): the close tool's body, shared with the wake tick's auto-close
  * of a workload awaiting close. Refused — nothing written — for the standing workload, a closed
@@ -69,8 +102,10 @@ export interface CloseOutcome {
  * sit on the pin refuses too. Otherwise the decision-log entry is rendered from the ledger and
  * committed on the workload's lane branch wl/<id> through `pi.exec` (never on the checkout's
  * current branch; surface/src/close-entry.ts), then the row closes, stamped
- * `orchestrator-surface`, in one transaction with the ledger's own live-holder check and the close
- * receipt, which the entry carries and the ledger holds only once the row closes; a closed
+ * `orchestrator-surface`, in one transaction with the ledger's own live-holder check, the close
+ * receipt, which the entry carries and the ledger holds only once the row closes, and the
+ * delivery of the workload's ordinary held orchestrator-bound messages, which the result and
+ * entry name; trusted security-red signals stay held for display (a refused or failed close leaves all held). A closed
  * workload's branch is then pushed and an open PR made sure of. Past the check and the pinned
  * commit, a git or gh failure is named in the result and never blocks the close. `cwd` is the
  * repository when the workload has no `repo:` entry. Never throws for a refusal.
@@ -116,10 +151,14 @@ export async function closeWorkloadWithEntry(
 	if (entry?.refused) return refused(`${id} cannot close: ${entry.refused}`);
 	const commit = entry?.commit ?? null;
 	// The close is one transaction with its checks (Codex review S2): a lane that reserved the workload while git ran keeps it.
+	// Ordinary held orchestrator-bound messages deliver before close; trusted security-red signals retain display-owned delivery. A failed close rolls delivery back.
+	let held: MessageRow[] = [];
 	try {
-		ledger.write(() => {
+		held = ledger.write(() => {
 			if (receipt) recordCloseReceipt(ledger, id, receipt);
+			const delivered = deliverHeldAtClose(ledger, id);
 			ledger.closeWorkload(id, { by: SURFACE_BY });
+			return delivered;
 		});
 	} catch (err) {
 		const kept = entry ? ` The decision-log entry at ${entry.path} is rendered${commit === null ? ` and committed on ${entry.branch}` : ""}; it is re-rendered at the next close.` : "";
@@ -143,7 +182,9 @@ export async function closeWorkloadWithEntry(
 	if (entry?.notes.length) tail += ` Also: ${entry.notes.join("; ")}.`;
 	if (checked !== null) tail += ` Close check: ${checked}.`;
 	const scratchNote = scratch ? ` ${scratch}` : "";
-	return { closed: true, text: `Closed ${id}.${scratchNote}${tail}`, details, receipt: done, entry: `${tail.trim()}${scratchNote}` };
+	const heldLine = heldDeliveredLine(held);
+	const heldNote = heldLine ? `\n${heldLine}` : "";
+	return { closed: true, text: `Closed ${id}.${scratchNote}${tail}${heldNote}`, details, receipt: done, entry: `${tail.trim()}${scratchNote}${heldNote}` };
 }
 
 export default function workloadRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, deps: WorkloadDeps = {}): void {
