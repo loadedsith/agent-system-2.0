@@ -43,6 +43,22 @@
 //       part with `bun test --parallel=<n>` when n is over 1. Solo parts, on the PR and on base, run one file each.
 //       surface/scripts/test-run-waits.ts reads the waits, the `full workers` lines and the results back per day.
 //
+//       Land-first (PLAN wl-mvq4edbaf13vnk D4): on a land-first repository `start` posts `pending` first (a refused post refuses
+//       the request) and records `fast-plan:` in the admission's transaction: a tree carry (no run), the fast set, or the full
+//       suite by exception, which runs as above. A fast-set run holds no Mac slot for its hosted part: its preflight (the install
+//       read, no refresh), the trusted clone, the parse check over the plan's parse targets (one that does not transpile makes
+//       the run red and nothing runs), then `as2-fast.yml` dispatched on `as2-verified` (`hostedFast`); fast.xml, fast.log and
+//       fast.summary are imported into the run dir and judged (`fastExec`: a planned file with no executed test makes it red).
+//       A dispatch failure, a workflow run of other code than the tag's, or no result in fastWaitMin records `fast-fallback:
+//       <run> <reason>` and runs the same set once on the Mac (`exec fast`), under the lock with the install check, sweep and
+//       probe a full run has; the hosted run is never retried. Its `test-run:` carries scope fast and host linux or mac, and the
+//       final status, for a fast or a full plan, is the merge gate's (`postGate`; a refused post records `status-failed:`).
+//       Every run writes one `runner-preflight:` row on the standing workload after its preflight (main-state.ts D5).
+//   reap
+//       settle-only (D6, R37): every open workload's runner request with no settle and no live heartbeat gets `runner died`;
+//       it admits nothing. Prints `reaped none` or `reaped <run id>…`, exit 0; a workload it could not settle on is exit 3,
+//       after every other workload was tried.
+//
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
 // Test-only knobs (the fence's tests set them; Jo's environment never does, and none crosses the
@@ -56,6 +72,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    shared post-sweep head/result/publication deadline (default 150 s)
+//   AGENT_SYSTEM_TEST_RUNNER_FAST_WAIT_MS   how long the hosted fast check may take before the Mac fallback (default fastWaitMin)
+//   AGENT_SYSTEM_TEST_RUNNER_FAST_POLL_MS   the hosted fast check's poll (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS     how long a part's wrapper may outlive its cap before the runner sweeps (default 60 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
@@ -79,18 +97,19 @@ import {
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { FastSetError, type FastRun, type FullRun, fastSet, parseCheck, type ReadFile } from "../src/fast-set";
-import { boundPrs, holdersOf, landFirstOn, mainRetries, worktreePath } from "../src/launch";
+import { ensureStandingWorkload } from "../src/identity";
+import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, worktreePath } from "../src/launch";
 import {
 	attemptBlock, attribute, CHAIN_MAX, type ChainCommit, type GateDecision, type GateFacts, ghMainChain, mainResults, type MainState, mainState, mainVerdicts, type MainVerdictKind, mergeGate,
 	runnerPreflightBody,
 } from "../src/main-state";
-import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
+import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, type LandFirstRow, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, type ExecCounts, execOf, executedFiles, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
-	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
-	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
+	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, recordLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunDecision, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
+	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestHost, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "../src/types";
@@ -543,6 +562,8 @@ export type FastPlan = { ref: string } & (
 	| { scope: "full"; reasons: string[] }
 	| { scope: "tree"; g: string; run: string }
 );
+/** A plan that runs the fast set (D4): hosted Linux `files`, `parse` targets, `macOnly` files left for main runs. */
+export type FastSetPlan = Extract<FastPlan, { scope: "fast" }>;
 export const FAST_PLAN_PREFIX = "fast-plan:";
 export function fastPlanBody(runId: string, plan: FastPlan): string {
 	if (!RUN_ID_RE.test(runId)) throw new Error(`fast-plan: ${runId} is not a run id`);
@@ -566,11 +587,11 @@ export function parseFastPlan(body: string): { runId: string; plan: FastPlan } |
 	if (p.scope === "tree" && typeof p.g === "string" && SHA40.test(p.g) && typeof p.run === "string" && RUN_ID_RE.test(p.run)) return { runId: m[1]!, plan: { ref, scope: "tree", g: p.g, run: p.run } };
 	return null;
 }
-/** The runner's own `fast-plan:` for `runId` among a workload's entries (another writer's copy is ignored), or null. */
+/** The runner's own `fast-plan:` for `runId` among a workload's entries (`controlEntries` drops another writer's copy), or null. */
 export function fastPlanOf(entries: readonly EntryRow[], runId: string): FastPlan | null {
-	for (const e of entries) {
-		if (e.created_by !== TEST_RUNNER_BY || !e.body.startsWith(FAST_PLAN_PREFIX)) continue;
-		const p = parseFastPlan(e.body);
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== "fast-plan") continue;
+		const p = parseFastPlan(c.body);
 		if (p !== null && p.runId === runId) return p.plan;
 	}
 	return null;
@@ -877,6 +898,56 @@ export function fastExec(junit: string, files: readonly string[]): { ok: true; e
 	return { ok: true, exec: e.exec, missing: files.filter((f) => !e.perFile.has(f)) };
 }
 
+/** The hosted fast check's poll period (D4); AGENT_SYSTEM_TEST_RUNNER_FAST_POLL_MS in tests. */
+const FAST_POLL_MS = 15_000;
+
+/** `fast-fallback: <run id> <reason>` (D4, F5, F10): the hosted fast check gave no usable answer, so the set runs once on the Mac. */
+export function fastFallbackBody(runId: string, reason: string): string {
+	if (!RUN_ID_RE.test(runId)) throw new Error(`fast-fallback: ${runId} is not a run id`);
+	const why = reason.replace(/\s+/g, " ").trim();
+	if (why === "") throw new Error(`fast-fallback: ${runId} names no reason`);
+	return `fast-fallback: ${runId} ${why}`;
+}
+
+/** The hosted run's `fast.summary` (D3, `.github/workflows/as2-fast.yml`): `request <run id> sha <sha> files <n> exit <code> wall <s> s`. */
+export interface FastSummary {
+	request: string;
+	sha: string;
+	files: number;
+	exit: number;
+	wallS: number;
+}
+/** `fast.summary`'s one line read, or null when the text is not that line. */
+export function parseFastSummary(text: string): FastSummary | null {
+	const m = /^request (tr-[a-z0-9]+) sha ([0-9a-f]{40}) files (\d+) exit (\d+) wall (\d+) s$/.exec(text.trim());
+	if (!m) return null;
+	return { request: m[1]!, sha: m[2]!, files: Number(m[3]), exit: Number(m[4]), wallS: Number(m[5]) };
+}
+
+/** What the fast check found beyond its part's counts (D4, R12): parse targets that do not transpile, and planned files with no executed test. */
+export interface FastFindings {
+	parse: readonly { path: string; error: string }[];
+	missing: readonly string[];
+}
+/** The part a parse-check failure stands in for (nothing ran), so decideRun still checks the fetch, the head and the owner. */
+const NOTHING_RAN: PartResult = { pass: 0, fail: 0, skip: 0, exit: 0, ms: 0, error: null, failures: [] };
+/**
+ * The fast run's decision (D4, R12): decideRun over the run's facts, a parse-check failure standing in for the part that never ran;
+ * then a parse target that does not transpile, or a planned Linux file with no executed test, makes a green or red run red, each
+ * named in the reason. A red never settles. A superseded or stale decision stands; an error keeps its verdict with them appended.
+ */
+export function fastDecision(f: RunFacts, found: FastFindings): RunDecision {
+	const d = decideRun(found.parse.length > 0 && f.full === null ? { ...f, full: NOTHING_RAN } : f);
+	if (d.verdict === "superseded" || d.outcome === "stale") return d;
+	const parse = found.parse.length === 0 ? null : `parse check failed: ${found.parse.map((p) => `${p.path} ${p.error}`).join("; ")}`;
+	const missing = found.missing.length === 0 ? null : `no executed test in the fast set's ${found.missing.join(", ")}`;
+	const extra = [parse, missing].filter((s) => s !== null).join("; ");
+	if (extra === "") return d;
+	const reason = d.reason === null ? extra : `${d.reason}; ${extra}`;
+	if (d.outcome === "green" || d.outcome === "red") return { verdict: "red", outcome: "red", reason, settle: false };
+	return { ...d, reason };
+}
+
 /** A main run is re-requested only by the tick (D6); its queue key is moved this far ahead of every PR request, so it takes the Mac slot first (D5). */
 const MAIN_QUEUE_LEAD_MS = 1e12;
 /** Run directories a main run, a `main-red:` row or an open incident cites are kept this long, outside KEEP_RUNS (D5, R16). */
@@ -893,7 +964,9 @@ export function citedRuns(entries: readonly EntryRow[], nowMs: number): Set<stri
 	for (const r of landFirstRows(entries)) {
 		if (opened.has(r.repo)) continue;
 		const ep = stopEpisode(landFirstRows(entries, r.repo));
-		if (ep !== null) opened.set(r.repo, Date.parse(ep.raised.createdAt));
+		// StopEpisode's `raised` type narrows to never (merge-train.ts extracts one event from a two-event member); the row is a LandFirstRow.
+		const raised = ep?.raised as LandFirstRow | undefined;
+		if (raised !== undefined) opened.set(r.repo, Date.parse(raised.createdAt));
 	}
 	const since = Math.min(nowMs - CITED_KEEP_MS, ...opened.values());
 	for (const rec of testRuns(entries)) {
@@ -956,27 +1029,33 @@ export function admitMain(ledger: Ledger, lockDb: Database, root: string, repo: 
 
 /**
  * `reap` (D6, R37): every open workload's runner request with no settle and no live heartbeat (`recordLive`) settled `runner died`,
- * each workload in its own transaction that re-reads its rows. It admits nothing; none to settle is a no-op. Returns the settled run ids.
+ * each workload in its own transaction that re-reads its rows. It admits nothing; none to settle is a no-op. Returns the settled run
+ * ids and, for each workload whose transaction failed, `<wl>: <error>`; one failed workload never stops the others.
  */
-export function reap(ledger: Ledger, root: string): string[] {
+export function reap(ledger: Ledger, root: string): { settled: string[]; failed: string[] } {
 	const wls = ledger.db.query<{ workload_id: string }, [string]>(
 		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = ? AND body LIKE 'test-requested: %'",
 	).all(TEST_RUNNER_BY).map((r) => r.workload_id);
 	const settled: string[] = [];
+	const failed: string[] = [];
 	for (const wl of wls) {
-		if (ledger.workload(wl)?.status !== "open") continue;
-		settled.push(...ledger.write(() => {
-			const now = Date.parse(ledger.now());
-			const out: string[] = [];
-			for (const rec of testRuns(ledger.entries(wl))) {
-				if (rec.results.length > 0 || recordLive(rec, heartbeatOf(root, rec.request.runId), now)) continue;
-				ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sliceOf(rec.request), kind: "assumption", body: testRunBody(diedRun(rec.request, runDirOf(root, rec.request.runId))) });
-				out.push(rec.request.runId);
-			}
-			return out;
-		}));
+		try {
+			if (ledger.workload(wl)?.status !== "open") continue;
+			settled.push(...ledger.write(() => {
+				const now = Date.parse(ledger.now());
+				const out: string[] = [];
+				for (const rec of testRuns(ledger.entries(wl))) {
+					if (rec.results.length > 0 || recordLive(rec, heartbeatOf(root, rec.request.runId), now)) continue;
+					ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sliceOf(rec.request), kind: "assumption", body: testRunBody(diedRun(rec.request, runDirOf(root, rec.request.runId))) });
+					out.push(rec.request.runId);
+				}
+				return out;
+			}));
+		} catch (e) {
+			failed.push(`${wl}: ${errText(e)}`);
+		}
 	}
-	return settled;
+	return { settled, failed };
 }
 
 /**
@@ -1333,6 +1412,14 @@ class Runner {
 	private url = "";
 	/** The served repo's `owner/repo` (`servedOf`), every status post's target; empty until the run resolves it. */
 	private ownerRepo = "";
+	/** D4: this run's `fast-plan:` of scope fast with what the check found and where it ran; null for a full run. */
+	private fast: (FastFindings & { plan: FastSetPlan; host: TestHost; exec: ExecCounts | null }) | null = null;
+	/** D4: the hosted part holds no Mac slot, so its checkpoints check supersession only, never the lock row. */
+	private slotless = false;
+	/** The installed bundle's SOURCE commit as the newest install read found it, or why SOURCE did not parse (D5's row). */
+	private source: { ok: true; sha: string } | { ok: false; error: string } = { ok: false, error: "the install was not read" };
+	/** D5: this process wrote its one `runner-preflight:` row (or logged why it could not). */
+	private preflightRecorded = false;
 	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
 	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
@@ -1468,10 +1555,14 @@ class Runner {
 		}
 	}
 
-	/** Before each phase and wrapper call (§ 2.3 step 1, losing the lock): the row still holds this run, and `current` is (re)published under that check. */
+	/**
+	 * Before each phase and wrapper call (§ 2.3 step 1, losing the lock): the row still holds this run, and `current` is (re)published
+	 * under that check. A slotless phase (D4's hosted part) holds no row, so it checks only that the run was not superseded.
+	 */
 	async checkpoint(phase: string): Promise<void> {
 		await hook(this.id, `phase-${phase}`);
 		if (this.superseded) throw new Superseded(this.superseded);
+		if (this.slotless) return;
 		if (!publishIfOwner(this.lockDb, this.stageRoot, this.id)) {
 			this.lose(`the lock row holds ${lockRow(this.lockDb)?.runId ?? "no run"}`);
 			throw new Superseded(this.superseded!);
@@ -1530,11 +1621,41 @@ class Runner {
 		}
 	}
 
-	/** The install facts of the runner's own checkout (REPO_ROOT) against the install, and their verdict. */
+	/** The install facts of the runner's own checkout (REPO_ROOT) against the install, and their verdict; the SOURCE commit is kept for D5's row. */
 	private decideInstall(): { facts: InstallFacts; v: InstallVerdict } {
 		const spec = this.install;
 		const facts = readInstall({ checkout: REPO_ROOT, libexec: spec.libexec, root: this.as2root, sudoers: spec.sudoers, dscl: spec.dscl });
+		this.source = facts.source.ok ? { ok: true, sha: facts.source.source.sourceSha } : { ok: false, error: facts.source.error };
 		return { facts, v: installDecision(facts, spec.ids) };
+	}
+
+	/**
+	 * D5: this process's one `runner-preflight:` row on the standing workload, `ok` when `refusal` is null, else `refused <refusal>`,
+	 * naming the bundle's SOURCE commit (`decideInstall`) and the runner's own root (REPO_ROOT; the verified-root self-check is
+	 * sl-fast-verifier's). A SOURCE that did not parse is a refusal, its sha written as forty zeros, which names no commit. A row
+	 * that cannot be written is one runner.log line naming why; it never changes the run.
+	 */
+	private recordPreflight(refusal: string | null): void {
+		if (this.preflightRecorded) return;
+		this.preflightRecorded = true;
+		const src = this.source;
+		const reasons = [...(refusal === null ? [] : [refusal]), ...(src.ok ? [] : [`the bundle SOURCE did not parse (${src.error}), so the sha written is forty zeros`])];
+		try {
+			const body = runnerPreflightBody({ ok: reasons.length === 0, reason: reasons.length === 0 ? null : reasons.join("; "), source: src.ok ? src.sha : "0".repeat(40), root: REPO_ROOT });
+			this.ledger.write(() => {
+				ensureStandingWorkload(this.ledger);
+				this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+			});
+			this.log(body);
+		} catch (e) {
+			this.log(`runner-preflight: not recorded: ${errText(e)}`);
+		}
+	}
+
+	/** D5's row for a preflight that threw: refused with the stop's reason; a superseded run decided nothing, which is logged. */
+	private preflightThrew(e: unknown): void {
+		if (e instanceof Superseded) this.log(`runner-preflight: not recorded: the run was superseded before its preflight decided (${e.message})`);
+		else this.recordPreflight(e instanceof Stop || e instanceof Fail ? e.message : `the runner failed: ${errText(e)}`);
 	}
 
 	/**
@@ -1754,12 +1875,14 @@ class Runner {
 	 * (executedFiles reads it) and whether the call timed out (`callTimedOut`: exit 124 or the outlive sweep, PLAN wl-mvq4edh02r5z40
 	 * D0). After a timed-out call the wrapper's stuck capture `<part>.stuck.log` (D5) is imported too; a missing or refused capture
 	 * is one runner.log line and never changes the result. `base-solo` runs the file in the base clone (D8), reports `base-solo-<i>.*`.
+	 * `fast` is D4's Mac fallback: the fast set's files (`./<path>`) in one call under `fastCapMin`, reported as `fast.*`.
 	 */
-	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean }> {
+	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string } | { sub: "fast"; files: string[] }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean }> {
 		await this.checkpoint(call.sub);
-		const capMs = (call.sub === "full" ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
+		const capMs = (call.sub === "full" ? this.config.fullCapMin : call.sub === "fast" ? this.config.fastCapMin : this.config.soloCapMin) * 60_000;
 		const started = Date.now();
-		const r = await this.wrap(call.sub === "full" ? { sub: call.sub, runId: this.id } : { sub: call.sub, runId: this.id, file: call.file }, capMs);
+		const wrapped: WrapperCall = call.sub === "full" ? { sub: call.sub, runId: this.id } : call.sub === "fast" ? { sub: call.sub, runId: this.id, files: call.files } : { sub: call.sub, runId: this.id, file: call.file };
+		const r = await this.wrap(wrapped, capMs);
 		const ms = Date.now() - started;
 		if (r.code === WRAPPER_EXIT.fenced) await this.fenced(call.sub);
 		let name: string = call.sub;
@@ -1842,16 +1965,17 @@ class Runner {
 	}
 
 	/**
-	 * Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare →
-	 * the full part and its sweep → the solo parts `soloPlan` names (none after a timed-out full part), a sweep after each → base runs
-	 * (none after a timeout) → post-sweep finalization deadline → head re-check.
+	 * Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe, then the `runner-preflight:` row →
+	 * retention → trusted → prepare → the full part and its sweep → the solo parts `soloPlan` names (none after a timed-out full
+	 * part), a sweep after each → base runs (none after a timeout) → post-sweep finalization deadline → head re-check. A run whose
+	 * admission recorded a `fast-plan:` of scope fast takes `fastBody` instead (D4); a plan of scope full runs these steps.
 	 */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
+		const fastPlan = fastPlanOf(this.ledger.entries(this.wl), this.id);
+		if (fastPlan?.scope === "fast") return this.fastBody(fastPlan);
 		await this.acquire();
-		const install = await this.installCheck();
-		await this.sweep("publish");
-		await this.preflight(install);
+		await this.macPreflight();
 		await this.retention();
 		const changed = await this.trusted();
 		if (changed === null) return;
@@ -1871,10 +1995,129 @@ class Runner {
 			}
 			await this.baseRuns();
 		}
+		await this.headRecheck();
+	}
+
+	/** The Mac preflight under the lock (§ 3.1): install check (and refresh), sweep, probe; then D5's row, ok or refused with the stop's reason. */
+	private async macPreflight(): Promise<void> {
+		try {
+			const install = await this.installCheck();
+			await this.sweep("publish");
+			await this.preflight(install);
+		} catch (e) {
+			this.preflightThrew(e);
+			throw e;
+		}
+		this.recordPreflight(null);
+	}
+
+	/** The post-sweep finalization deadline, then the head re-check (§ 2.3 step 5). */
+	private async headRecheck(): Promise<void> {
 		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
 		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
 		this.f.headAtEnd = await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
+	}
+
+	/**
+	 * D4's fast run, holding no Mac slot: the preflight's install read (no refresh: the hosted check runs none of the Mac install,
+	 * so a refusal is recorded and logged and the check goes on), then D5's row → trusted → the parse check over the plan's parse
+	 * targets at the tree (one that does not transpile makes the run red and nothing runs) → the hosted check (`hosted`) → on a
+	 * dispatch failure, other workflow code or no result, the one Mac fallback (`macFast`) → the head re-check.
+	 */
+	private async fastBody(plan: FastSetPlan): Promise<void> {
+		this.fast = { plan, host: "linux", parse: [], missing: [], exec: null };
+		this.slotless = true;
+		const { v } = this.decideInstall();
+		this.f.preflight = v.ok ? v.summary : `preflight: ${v.reason}`;
+		if (!v.ok) this.log(`preflight: ${v.reason}; the hosted fast check runs none of the Mac install, so it goes on (a Mac fallback refreshes or stops on it)`);
+		this.recordPreflight(v.ok ? null : v.reason);
+		const changed = await this.trusted();
+		if (changed === null) return;
+		const tree = treeAt(join(this.stage, "repo", ".git"), this.request.sha, trustedEnv(join(this.runDir, "trusted.gitconfig")), false);
+		this.fast.parse = parseCheck(plan.parse, tree.read);
+		if (this.fast.parse.length > 0) this.log(`parse check failed: ${this.fast.parse.map((p) => `${p.path} ${p.error}`).join("; ")}; the fast set does not run`);
+		else if (plan.files.length === 0) throw new Stop(`fast-plan of ${this.id} names no Linux test file, so the fast check has nothing to run; name one in testRunner.fastSmoke (profile/config.yml)`);
+		else {
+			this.log(`parse check: ${plan.parse.length} target(s) transpile; fast set on linux: ${plan.files.join(" ")}`);
+			const fallback = await this.hosted(plan);
+			if (fallback !== null) await this.macFast(plan, fallback);
+		}
+		await this.headRecheck();
+	}
+
+	/**
+	 * The hosted fast check (D4): `hostedFast` downloads the artifact into `<run dir>/hosted`, then fast.summary, fast.xml and
+	 * fast.log are imported into the run dir under the report checks and judged. Returns null when judged, else the fallback's
+	 * reason: hostedFast's, or an artifact whose fast.summary is missing, unreadable or names another request or sha (no result).
+	 */
+	private async hosted(plan: FastSetPlan): Promise<string | null> {
+		const dir = join(this.runDir, "hosted");
+		rmSync(dir, { recursive: true, force: true });
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const waitMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FAST_WAIT_MS", this.config.fastWaitMin * 60_000);
+		const h = await hostedFast(
+			{ gh: realGh, now: () => Date.now(), sleep: (ms) => Bun.sleep(ms), log: (s) => this.log(s) },
+			{ repo: this.ownerRepo, runId: this.id, sha: this.request.sha, files: plan.files, waitMs, pollMs: msEnv("AGENT_SYSTEM_TEST_RUNNER_FAST_POLL_MS", FAST_POLL_MS), dir },
+		);
+		if (!h.ok) return h.reason;
+		const summary = importReport(dir, this.runDir, "fast.summary", this.capBytes);
+		const s = summary.text === null ? null : parseFastSummary(summary.text);
+		if (s === null) {
+			const why = summary.error ?? (summary.text === null ? "it is missing" : "it is not the summary line");
+			return `no result: workflow run ${h.workflowRunId}'s fast.summary is unusable: ${why}`;
+		}
+		if (s.request !== this.id || s.sha !== this.request.sha) {
+			return `no result: workflow run ${h.workflowRunId}'s fast.summary names request ${s.request} at ${s.sha.slice(0, 12)}, not ${this.id} at ${this.request.sha.slice(0, 12)}`;
+		}
+		const imported = importPart(dir, this.runDir, "fast", this.capBytes);
+		const timedOut = s.exit === WRAPPER_EXIT.timeout;
+		this.f.full = partResult({ ...imported, exit: s.exit, ms: s.wallS * 1000, timedOut, maxBytes: this.capBytes });
+		this.f.fullTimedOut = timedOut;
+		this.log(`fast check on linux: workflow run ${h.workflowRunId} exit ${s.exit} in ${s.wallS} s`);
+		this.judgeFast(imported.junit);
+		return null;
+	}
+
+	/**
+	 * D4's one Mac fallback: `fast-fallback: <run> <reason>` on the run's workload first (a write that fails is logged), then the lock,
+	 * the Mac preflight, prepare and the same set once through `exec fast`, and its sweep. The hosted run is never retried.
+	 */
+	private async macFast(plan: FastSetPlan, reason: string): Promise<void> {
+		this.log(`fast check falls back to the Mac once: ${reason}`);
+		try {
+			const body = fastFallbackBody(this.id, reason);
+			this.ledger.write(() => this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, kind: "assumption", body }));
+		} catch (e) {
+			this.log(`fast-fallback: not recorded: ${errText(e)}; the fallback still runs, and its test-run: says host mac`);
+		}
+		this.fast!.host = "mac";
+		this.slotless = false;
+		await this.acquire();
+		const install = await this.installCheck();
+		await this.sweep("publish");
+		await this.preflight(install);
+		await this.retention();
+		await this.prepare();
+		const r = await this.part({ sub: "fast", files: plan.files.map((f) => `./${f}`) });
+		this.f.full = r.result;
+		this.f.fullTimedOut = r.timedOut;
+		await this.sweep("fast");
+		this.judgeFast(r.junit);
+	}
+
+	/** R12 over the fast part's JUnit (`fastExec`): the executed counts, and each planned file with no executed test; counts that cannot be read are the run's error. */
+	private judgeFast(junit: string | null): void {
+		const fast = this.fast!;
+		if (junit === null) return;
+		const e = fastExec(junit, fast.plan.files);
+		if (!e.ok) {
+			this.f.error = `the fast check's executed counts could not be read from fast.xml: ${e.error}`;
+			return;
+		}
+		fast.exec = e.exec;
+		fast.missing = e.missing;
+		if (e.missing.length > 0) this.log(`no executed test in the fast set's ${e.missing.join(", ")}`);
 	}
 
 	/**
@@ -1892,11 +2135,13 @@ class Runner {
 		const write = (lockMine: boolean) => this.ledger.db.transaction(() => {
 			const owner = lockMine && !this.superseded && ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id);
 			const facts: RunFacts = { ...this.f, owner, sliceState: this.ledger.slice(this.request.slice)?.state ?? null };
-			const decided = decideRun(facts);
+			const decided = this.fast === null ? decideRun(facts) : fastDecision(facts, this.fast);
 			// A run displaced from the lock says so; decideRun's reason alone speaks only of the request.
 			const lost = this.superseded ?? (lockMine ? null : `the lock row holds ${lockRow(this.lockDb)?.runId ?? "no run"}`);
 			const decision = decided.verdict === "superseded" && lost ? { ...decided, reason: `${lost}; ${decided.reason}` } : decided;
-			const run = buildTestRun(this.request, facts, decision, { base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight });
+			const built = buildTestRun(this.request, facts, decision, { base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight });
+			// A fast run's row says scope fast, where it ran, and its executed counts (D4).
+			const run: TestRun = this.fast === null ? built : { ...built, scope: "fast", host: this.fast.host, exec: this.fast.exec };
 			this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, sliceId: this.request.slice, kind: "assumption", body: testRunBody(run) });
 			// decision.settle holds only for an owner whose slice this transaction read as open. The
 			// completion is a nested write (a savepoint): a refusal rolls back only itself, and the
@@ -1992,9 +2237,10 @@ class Runner {
 				// A locked/unavailable ledger cannot accept a transaction. Preserve a local
 				// error verdict instead of silently leaving no artifact; never settle here.
 				const reason = `result publication failed: ${errText(e)}${this.f.error ? `; ${this.f.error}` : ""}`;
-				const run = buildTestRun(this.request, this.f, { verdict: "error", outcome: "error", reason, settle: false }, {
+				const built = buildTestRun(this.request, this.f, { verdict: "error", outcome: "error", reason, settle: false }, {
 					base: this.f.base, mergeBase: this.f.mergeBase, runDir: this.runDir, preflight: this.f.preflight,
 				});
+				const run: TestRun = this.fast === null ? built : { ...built, scope: "fast", host: this.fast.host, exec: this.fast.exec };
 				this.log(`test-run error: ${reason}`);
 				this.writeResult(run);
 				return START_EXIT.failed;
@@ -2053,10 +2299,15 @@ async function cmdRun(runId: string): Promise<number> {
 
 const USAGE = "usage: test-runner.ts start <wl> <pr> [--slice <id>] --requested-by <laneId> | run <run id> | reap | main --repo <owner/repo> --sha <sha> | promote --sha <sha>";
 
-/** `reap` (D6, R37): settle every admitted request with no settle and no live heartbeat `runner died`; admits nothing; exit 0 either way. */
+/**
+ * `reap` (D6, R37; surface/scripts/train-tick.ts `LandDeps.runner`): settle every admitted request with no settle and no live
+ * heartbeat `runner died`; admits nothing. Exit 0 whether it settled some or none (none is a no-op); a workload it could not
+ * settle on is exit 3 (`START_EXIT.failed`) naming each, after the others were settled, and the tick requests no main run that pass.
+ */
 function cmdReap(): number {
-	const settled = reap(openLedger(), runsRoot(process.env));
+	const { settled, failed } = reap(openLedger(), runsRoot(process.env));
 	process.stdout.write(settled.length === 0 ? "reaped none\n" : `reaped ${settled.join(" ")}\n`);
+	if (failed.length > 0) throw new Fail(`reap could not settle on ${failed.join("; ")}; the next reap tries again`, START_EXIT.failed);
 	return START_EXIT.ok;
 }
 

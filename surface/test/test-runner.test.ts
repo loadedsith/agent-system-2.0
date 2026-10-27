@@ -107,7 +107,7 @@ const GATE_RED = `import { test } from "bun:test";
 test("refuses a forged approve", () => { throw new Error("the gate let it through"); });
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, parse: 11 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -121,6 +121,8 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	gate: { "gates/test/gate.test.ts": GATE_RED },
 	skipped: { "a.test.ts": SKIPPED("a skipped") },
 	loud: { "loud.test.ts": HANG_LOUD },
+	// PLAN wl-mvq4edbaf13vnk D4: a changed .ts that does not transpile beside a passing test, for the fast run's parse check.
+	parse: { "a.test.ts": PASS("a"), "lib.ts": "export const x = ;\n" },
 };
 
 interface Fixture {
@@ -166,13 +168,36 @@ beforeAll(() => {
 
 // `gh api <path>` answers `<root>/api/<path, / as _>` when a test saved one (`saveApi`: the starter's compare and commit reads);
 // any other `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
+// Land-first (PLAN wl-mvq4edbaf13vnk D4): `gh api -X POST <path>` answers `<root>/post/<key>` (or fails with `<key>.fail`'s text);
+// a status post of state S fails while `<root>/status-fails-S` exists, and each status post that succeeds is logged to status-ok.log.
+// `gh run download … -n as2-fast-<run> -D <dir>` copies `<root>/artifact/` into <dir>, `@REQ@` in fast.summary replaced by the run.
 const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ "$2" = -X ]; then
+	st=""
+	for a in "$@"; do case "$a" in state=*) st="\${a#state=}" ;; esac; done
+	if [ -n "$st" ] && [ -f "$dir/status-fails-$st" ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
+	key=$(printf '%s' "$4" | tr / _)
+	if [ -f "$dir/post/$key.fail" ]; then cat "$dir/post/$key.fail" >&2; exit 1; fi
+	if [ -f "$dir/post/$key" ]; then cat "$dir/post/$key"; exit 0; fi
+	if [ -n "$st" ] && [ ! -f "$dir/status-fails" ]; then printf '%s %s\\n' "$st" "$4" >> "$dir/status-ok.log"; fi
+fi
 if [ "$1" = api ] && [ -f "$dir/api/$(printf '%s' "$2" | tr / _)" ]; then cat "$dir/api/$(printf '%s' "$2" | tr / _)"; exit 0; fi
 if [ "$1" = api ] && [ ! -f "$dir/status-fails" ]; then echo '{}'; exit 0; fi
 if [ "$1" = api ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
+if [ "$1 $2" = "run download" ]; then
+	d=""; n=""; prev=""
+	for a in "$@"; do [ "$prev" = -D ] && d="$a"; [ "$prev" = -n ] && n="$a"; prev="$a"; done
+	if [ -d "$dir/artifact" ] && [ -n "$d" ]; then
+		mkdir -p "$d" && cp "$dir/artifact/"* "$d/" || exit 1
+		if [ -f "$dir/artifact/fast.summary" ]; then sed "s/@REQ@/\${n#as2-fast-}/" "$dir/artifact/fast.summary" > "$d/fast.summary"; fi
+		exit 0
+	fi
+	echo "no valid artifacts found to download" >&2
+	exit 1
+fi
 echo "no pull requests found" >&2
 exit 1
 `;

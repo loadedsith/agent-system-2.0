@@ -93,7 +93,7 @@ export const CONTROL_PREFIXES = [
 	"queued",
 	"lane-metrics", "daily-report",
 	"now", "ruling-conflict",
-	"land-first", "main-retry", "train-reconciled", "runner-preflight",
+	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -191,7 +191,10 @@ export const DAILY_REPORT_BY = "daily-report";
  * Land-first's rows (PLAN wl-mvq4edbaf13vnk § 2, D12) are on the standing workload: `land-first: <repo> on|off <instruction id>` and
  * `main-retry: <repo> <instruction id>` are the surface's alone, Jo's words written after his instruction in one transaction
  * (`landFirstOn` reads the first); `train-reconciled: …` is the train tick's alone (MERGE_TRAIN_BY, D6), which the merge hold reads;
- * `runner-preflight: ok|refused <reason> source <sha> root <path>` is the runner's alone (TEST_RUNNER_BY, D5).
+ * `runner-preflight: ok|refused <reason> source <sha> root <path>` is the runner's alone (TEST_RUNNER_BY, D5), and so are its D4 rows on
+ * the run's workload (surface/scripts/test-runner.ts): `fast-plan: <run id> <json>` (the admission's plan), `fast-fallback: <run id>
+ * <reason>` (the one Mac fallback of the hosted fast check) and `status-failed: <run id> <state> on <sha>: <error>` (a refused final
+ * post). `main-red:` is not one of them: a train holder writes `main-red: <url> run <id>` (surface/src/merge-train.ts D7).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -257,6 +260,9 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"main-retry": [SURFACE_BY],
 	"train-reconciled": [MERGE_TRAIN_BY],
 	"runner-preflight": [TEST_RUNNER_BY],
+	"fast-plan": [TEST_RUNNER_BY],
+	"fast-fallback": [TEST_RUNNER_BY],
+	"status-failed": [TEST_RUNNER_BY],
 };
 
 export interface ControlEntry {
