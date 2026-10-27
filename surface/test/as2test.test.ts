@@ -10,6 +10,7 @@
 // runs with fake dscl, sudo and visudo under AS2TEST_SETUP_TEST_PREFIX; real sudo is never called.
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
@@ -21,6 +22,7 @@ import {
 	bundleInputs, CAPTURE_MS, CREDENTIAL_PATHS, execArgv, execConfigOf, type InstallVerdict, installDecision, installLayout, parseSource, preflightDecision,
 	preflightProbes, probeCall, probeDecision, readInstall, renderExecWrapper, type SweepScope, UID_SWEEP, WrapperRenderError,
 } from "../src/as2test";
+import { STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
 import { tmp } from "./helpers";
 
@@ -117,8 +119,17 @@ interface Box {
 	hooks: string;
 }
 
+/** The detector's test-only knobs a box's wrapper may carry (PLAN wl-mvq8x4pkjmx69s D3). */
+interface DetectKnobs {
+	detectTickMs?: number;
+	detectPersistMs?: number;
+	signatureCaptureMs?: number;
+	stopGraceMs?: number;
+	detectTrace?: boolean;
+}
+
 /** A tmp as2test root with a groups-scope wrapper and a fake sudo on PATH (§ 6 S4b). */
-function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } = {}): Box {
+function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number; captureMs?: number; script?: string } & DetectKnobs = {}): Box {
 	const base = dir(tag);
 	const root = join(base, "root");
 	for (const d of ["stage", "runs", "locks"]) mkdirSync(join(root, d), { recursive: true });
@@ -129,7 +140,8 @@ function box(tag: string, opts: { killGraceMs?: number; sweepLockWaitMs?: number
 	mkdirSync(bin);
 	writeFileSync(join(bin, "sudo"), FAKE_SUDO, { mode: 0o755 });
 	const exec = join(base, "exec");
-	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: opts.script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: opts.killGraceMs ?? 500, sweepLockWaitMs: opts.sweepLockWaitMs, captureMs: opts.captureMs }), { mode: 0o755 });
+	const { script, killGraceMs, ...limits } = opts;
+	writeFileSync(exec, renderExecWrapper({ root, bun: BUN, script: script ?? SCRIPT, sweepScope: "groups", hooks, killGraceMs: killGraceMs ?? 500, ...limits }), { mode: 0o755 });
 	return { root, exec, bin, hooks };
 }
 
@@ -498,8 +510,9 @@ describe("prepare, full and solo", () => {
 		// The wrapper fixes PATH, LANG, TERM and SHELL, and takes USER and LOGNAME from `id -un`, never from the caller.
 		const me = userInfo().username;
 		const expected = childEnv({ PATH: SYS_PATH, LANG: "en_US.UTF-8", USER: me, LOGNAME: me, SHELL: "/bin/sh", TERM: "dumb" }, work);
-		// bun test sets NODE_ENV for its own tests; everything else is ours.
-		expect(Object.keys(env).filter((k) => !(k in expected)).sort()).toEqual(Object.keys(env).filter((k) => k === "NODE_ENV"));
+		// bun test sets NODE_ENV for its own tests; the executor adds the part's marker dir (PLAN wl-mvq8x4pkjmx69s D3); everything else is ours.
+		expect(Object.keys(env).filter((k) => !(k in expected)).sort()).toEqual(Object.keys(env).filter((k) => k === "NODE_ENV" || k === "AS2TEST_STUCK_MARKERS").sort());
+		expect(env.AS2TEST_STUCK_MARKERS).toBe(join(work, "stuck-markers-full"));
 		for (const k of ["GH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "MOONSHOT_API_KEY", "SSH_AUTH_SOCK", "OMP_TOKEN", "AGENT_SYSTEM_TEST_RUNS"]) expect(env[k]).toBeUndefined();
 		for (const k of CHILD_ENV_ALLOWLIST) expect(env[k]).toBe(expected[k]!);
 		expect(env.PATH).toBe(expected.PATH);
@@ -780,6 +793,542 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 	}, 60_000);
 });
 
+// ---- the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3) ---------------------------------------
+
+/** The test knobs the plan names for these fixtures (sl-sd-exec): 250 ms ticks, a 2 s persistence, the trace on. */
+const DETECT = { detectTickMs: 250, detectPersistMs: 2_000, detectTrace: true } as const;
+
+type TraceMarker = { pid: number; since: number; command: string };
+/** One `<part>.stuck-trace.jsonl` row: what one tick observed. */
+interface TraceRow {
+	at: number;
+	snap: string;
+	markers: TraceMarker[] | { denied: string };
+	candidates: { pid: number; cpuNs: number | null }[];
+	tree: { pid: number; ppid: number; pgid: number; comm: string }[];
+	zombies: { pid: number; ppid: number; startUs: number; comm: string }[];
+	signatures: { worker: number; zombie: number; since: number; command: string }[];
+}
+const traceOf = (work: string, stem = "full"): TraceRow[] =>
+	readFileSync(join(work, `${stem}.stuck-trace.jsonl`), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as TraceRow);
+/** The markers a tick saw active (a denied marker dir counts as none). */
+const activeAt = (row: TraceRow): TraceMarker[] => (Array.isArray(row.markers) ? row.markers : []);
+
+/** The detector's stdout lines (CONTRACT.md), each split into keyword, ISO time, part and the rest. */
+function detectorLines(stdout: string): { keyword: string; iso: string; part: string; rest: string; line: string }[] {
+	return [...stdout.matchAll(/^(stuck-[a-z-]+) (\S+) part (\S+) (.*)$/gm)].map((m) => ({ keyword: m[1]!, iso: m[2]!, part: m[3]!, rest: m[4]!, line: m[0] }));
+}
+const keywordsOf = (stdout: string): string[] => detectorLines(stdout).map((l) => l.keyword);
+type DetectorLine = ReturnType<typeof detectorLines>[number];
+/**
+ * An enforce stop's stdout: the last four lines are stuck-signature, stuck-stop, stuck-captured and stuck-killed for this worker
+ * and zombie. Before them only flaps of the same signature may come (a stuck-signature then a `stuck-cleared … matched no`, a
+ * tick on which the spinning worker fell under the hot share on a loaded machine); every line is the contract's shape.
+ */
+function enforceLines(stdout: string, worker: number, zombie: number): { first: DetectorLine; sig: DetectorLine; stop: DetectorLine; captured: DetectorLine; killed: DetectorLine } {
+	const lines = detectorLines(stdout);
+	expect(lines.length).toBeGreaterThanOrEqual(4);
+	for (const l of lines) {
+		expect(new Date(l.iso).toISOString()).toBe(l.iso);
+		expect(l.part).toBe("full");
+	}
+	const flaps = lines.slice(0, -4);
+	expect(flaps.length % 2).toBe(0);
+	for (let i = 0; i < flaps.length; i += 2) {
+		expect(flaps[i]!.keyword).toBe("stuck-signature");
+		expect(flaps[i]!.rest).toStartWith(`worker ${worker} zombie ${zombie} since `);
+		expect(flaps[i + 1]!.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} held \\d+ matched no$`));
+		expect(flaps[i + 1]!.keyword).toBe("stuck-cleared");
+	}
+	const [sig, stop, captured, killed] = lines.slice(-4) as [DetectorLine, DetectorLine, DetectorLine, DetectorLine];
+	expect([sig.keyword, stop.keyword, captured.keyword, killed.keyword]).toEqual(["stuck-signature", "stuck-stop", "stuck-captured", "stuck-killed"]);
+	expect(sig.rest).toStartWith(`worker ${worker} zombie ${zombie} since `);
+	expect(stop.rest).toBe(`worker ${worker} zombie ${zombie}`);
+	return { first: lines[0]!, sig, stop, captured, killed };
+}
+/** `<part>.signature.log` split at its `== <n>. … ==` headings, as the stuck capture's. */
+const signatureSections = stuckSections;
+
+/**
+ * When AS2TEST_STUCK_REPORT names a file, a fixture's measured figures are appended there as one JSON line (the lane's
+ * acceptance report reads them); unset, nothing is written.
+ */
+function report(row: Record<string, unknown>): void {
+	const to = process.env.AS2TEST_STUCK_REPORT;
+	if (to) writeFileSync(to, `${JSON.stringify(row)}\n`, { flag: "a" });
+}
+
+/** The lines a positive spin fixture's test file starts with: flock from libSystem, as the preload binds it. */
+const SPIN_HEAD = `import { test } from "bun:test";
+import { dlopen, FFIType } from "bun:ffi";
+import { spawn } from "node:child_process";
+import { closeSync, constants, ftruncateSync, openSync, writeFileSync, writeSync } from "node:fs";
+const flock = dlopen("/usr/lib/libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock;
+/** Hold this process's marker exactly as the preload does: O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, LOCK_EX|LOCK_NB, then the D1 content. */
+function holdMarker(command) {
+	const fd = openSync(process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | 0x1000000, 0o600);
+	if (flock(fd, 2 | 4) !== 0) throw new Error("the marker's flock was not granted");
+	ftruncateSync(fd, 0);
+	const since = Date.now();
+	writeSync(fd, since + "\\t" + command + "\\n", 0);
+	return fd;
+}
+`;
+/**
+ * A detached helper (its own process group) the spinning worker starts first: once the signature capture's file exists it
+ * starts a second detached group (`sleep 300`) and records it in ../late.pid, then stays alive as its parent.
+ */
+const LATE_HELPER = `const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+fs.writeFileSync("../helper.pid", String(process.pid));
+const t = setInterval(() => {
+	if (!fs.existsSync("../full.signature.log")) return;
+	clearInterval(t);
+	const s = spawn("/bin/sleep", ["300"], { detached: true, stdio: "ignore" });
+	fs.writeFileSync("../late.pid", String(s.pid));
+}, 25);
+`;
+/**
+ * The positive fixture (PLAN sl-sd-exec): the observable lost-reap state built by hand. The test holds its own marker for
+ * `true`, spawns /usr/bin/true asynchronously at once, then spins forever: marker active, the worker hot, the child an
+ * unreaped zombie. With `late`, a detached helper group is started first (LATE_HELPER).
+ */
+const spinTest = (late: boolean) => `${SPIN_HEAD}test("spins", () => {
+	writeFileSync("../spin.pid", String(process.pid));
+${late ? `\tspawn(process.execPath, ["-e", ${JSON.stringify(LATE_HELPER)}], { detached: true, stdio: "ignore" });\n` : ""}	holdMarker("true");
+	const z = Bun.spawn(["/usr/bin/true"]);
+	writeFileSync("../zombie.pid", String(z.pid));
+	for (;;) {}
+}, 600_000);
+`;
+
+/** The pid a fixture wrote to `<work>/<name>`, added to the pids afterAll kills. */
+function fixturePid(work: string, name: string): number {
+	const pid = Number(readFileSync(join(work, name), "utf8"));
+	pids.push(pid);
+	return pid;
+}
+
+/**
+ * Every Bun.spawnSync and node sync child_process call shape the qualification compares: run once inside the wrapped fixture
+ * and once here (no preload), the two results must be equal. Its source is copied into the fixture, so it names no import.
+ */
+function callFields(cp: typeof childProcess) {
+	const bunFields = (r: ReturnType<typeof Bun.spawnSync>) => ({
+		exitCode: r.exitCode, success: r.success, signalCode: r.signalCode ?? null, stdout: r.stdout?.toString() ?? null, stderr: r.stderr?.toString() ?? null,
+	});
+	const thrown = (f: () => unknown) => {
+		try {
+			f();
+			return { threw: false };
+		} catch (e) {
+			const x = e as NodeJS.ErrnoException & { status?: number };
+			return { threw: true, name: x?.name ?? null, code: x?.code ?? null, errno: x?.errno ?? null, syscall: x?.syscall ?? null, path: x?.path ?? null, status: x?.status ?? null, message: String(x?.message) };
+		}
+	};
+	const node = (r: ReturnType<typeof cp.spawnSync>) => ({ status: r.status, signal: r.signal, stdout: r.stdout?.toString() ?? null, stderr: r.stderr?.toString() ?? null, error: (r.error as NodeJS.ErrnoException | undefined)?.code ?? null });
+	return {
+		echo: bunFields(Bun.spawnSync(["/bin/echo", "hi"])),
+		exit3: bunFields(Bun.spawnSync(["/bin/sh", "-c", "echo out; echo err >&2; exit 3"])),
+		object: bunFields(Bun.spawnSync({ cmd: ["/bin/echo", "obj"] })),
+		nodeSpawnSync: node(cp.spawnSync("/bin/sh", ["-c", "echo a; echo b >&2; exit 2"])),
+		execSync: cp.execSync("echo x").toString(),
+		execFileSync: cp.execFileSync("/bin/echo", ["y"]).toString(),
+		execSyncFails: thrown(() => cp.execSync("exit 4", { stdio: "pipe" })),
+		missingBun: thrown(() => Bun.spawnSync(["/nonexistent/as2test-missing-binary"])),
+		missingNodeSpawnSync: node(cp.spawnSync("/nonexistent/as2test-missing-binary")),
+		missingExecFileSync: thrown(() => cp.execFileSync("/nonexistent/as2test-missing-binary")),
+	};
+}
+
+/**
+ * The real preload's qualification fixture (PLAN sl-sd-exec). Each phase logs its window to ../qual.jsonl and idles 1 s after,
+ * so the trace's 250 ms ticks see the marker during the call and its absence after.
+ */
+const QUAL_TEST = `import { test } from "bun:test";
+import * as cp from "node:child_process";
+import { appendFileSync } from "node:fs";
+const callFields = ${callFields.toString()};
+const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
+const idle = (ms = 1_000) => Bun.sleep(ms);
+async function phase(name, command, f) {
+	const start = Date.now();
+	const out = f();
+	const end = Date.now();
+	log({ name, command, start, end, out });
+	await idle();
+}
+test("qualifies", async () => {
+	const marker = process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid;
+	log({ name: "start", pid: process.pid, preloadGlobal: globalThis.__fixturePreload ?? null, wrapped: Bun.spawnSync[Symbol.for("as2test.stuck-marker")] === true });
+	await idle();
+	await phase("bun", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"]).exitCode);
+	await phase("node-spawnSync", "sleep", () => cp.spawnSync("/bin/sleep", ["2"]).status);
+	await phase("node-execSync", "sh", () => cp.execSync("/bin/sleep 2; echo slept").toString());
+	await phase("node-execFileSync", "sleep", () => cp.execFileSync("/bin/sleep", ["2"]).toString());
+	await phase("fields", null, () => callFields(cp));
+	const uchg = Bun.spawnSync(["/usr/bin/chflags", "uchg", marker]).exitCode;
+	await idle();
+	try {
+		await phase("immutable", null, () => ({ uchg, sleep: Bun.spawnSync(["/bin/sleep", "2"]).exitCode, node: cp.spawnSync("/bin/sleep", ["1"]).status, fields: callFields(cp) }));
+	} finally {
+		log({ name: "nouchg", out: Bun.spawnSync(["/usr/bin/chflags", "nouchg", marker]).exitCode });
+	}
+	await idle();
+	const start = Date.now();
+	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 4 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
+	const end = Date.now();
+	await idle(1_500);
+	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-p", String(child)]);
+	let alive = true;
+	try {
+		process.kill(child, 0);
+	} catch {
+		alive = false;
+	}
+	log({ name: "inherit", command: null, start, end, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
+}, 120_000);
+`;
+
+describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, return and throw what they would unwrapped, an immutable marker only stops publication, and the marker fd is not inherited", () => {
+		const b = box("stuck-qual", DETECT);
+		prepared(b, "tr-sq1", {
+			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
+			"setup.ts": "(globalThis as Record<string, unknown>).__fixturePreload = 1;\n",
+			"qual.test.ts": QUAL_TEST,
+			"a.test.ts": OK_TEST,
+		}, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		const r = call(b, { sub: "full", runId: "tr-sq1" });
+		const work = workOf(b, "tr-sq1");
+		expect(r.stderr).toBe("");
+		expect(r.exit).toBe(0);
+		// No signature ever forms: the worker blocks in each call (never hot) and no child is left unreaped.
+		expect(keywordsOf(r.stdout)).toEqual([]);
+		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
+		const byName = Object.fromEntries(rows.map((x) => [x.name, x]));
+		expect(byName.start).toMatchObject({ preloadGlobal: 1, wrapped: true });
+		const w = byName.start!.pid!;
+		// A worker of --parallel=2, not the leader.
+		expect(w).not.toBe(Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]));
+		const trace = traceOf(work);
+		expect(trace.every((t) => t.snap === "ok")).toBe(true);
+		const mine = (t: TraceRow) => activeAt(t).filter((m) => m.pid === w);
+		const ticks = (from: number, to: number) => trace.filter((t) => t.at > from && t.at < to);
+		const phases = rows.filter((x) => typeof x.start === "number");
+		for (const [i, p] of phases.entries()) {
+			const next = phases[i + 1]?.start ?? p.end + 1_000;
+			const during = ticks(p.start + 300, p.end - 300);
+			if (p.command !== null) {
+				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
+				expect(during.length).toBeGreaterThanOrEqual(3);
+				for (const t of during) {
+					expect({ phase: p.name, at: t.at, markers: mine(t).map((m) => m.command) }).toEqual({ phase: p.name, at: t.at, markers: [p.command] });
+					expect(mine(t)[0]!.since).toBeGreaterThanOrEqual(p.start);
+					expect(mine(t)[0]!.since).toBeLessThanOrEqual(p.end);
+				}
+			}
+			const after = ticks(p.end + 300, Math.min(p.end + 1_000, next) - 50);
+			expect(after.length).toBeGreaterThanOrEqual(1);
+			for (const t of after) expect({ phase: p.name, at: t.at, markers: mine(t) }).toEqual({ phase: p.name, at: t.at, markers: [] });
+		}
+		expect(byName.bun!.out).toBe(0);
+		expect(byName["node-spawnSync"]!.out).toBe(0);
+		expect(byName["node-execSync"]!.out).toBe("slept\n");
+		expect(byName["node-execFileSync"]!.out).toBe("");
+		// The same fields, and the same thrown errors (a missing binary included), as the unwrapped calls in this process.
+		const plain = JSON.parse(JSON.stringify(callFields(childProcess)));
+		expect(byName.fields!.out).toEqual(plain);
+		expect(plain.missingBun.threw).toBe(true);
+		expect(plain.missingExecFileSync.threw).toBe(true);
+		// Immutable marker: chflags worked, every call still returned what it would, and no marker was active in its window.
+		const imm = byName.immutable!;
+		expect(imm.out).toEqual({ uchg: 0, sleep: 0, node: 0, fields: plain });
+		const immTicks = ticks(imm.start + 100, imm.end - 100);
+		expect(immTicks.length).toBeGreaterThanOrEqual(3);
+		for (const t of immTicks) expect(mine(t)).toEqual([]);
+		expect(byName.nouchg!.out).toBe(0);
+		// Not inherited: the backgrounded sleep outlived the call, holds no marker fd, and the marker was inactive meanwhile.
+		expect(byName.inherit!.out).toMatchObject({ alive: true, lsofExit: 0, holdsMarker: false, lsofHasSleep: true });
+		// The part's marker dir and preload are gone; the trace and nothing else of the detector's is left.
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 120_000);
+
+	test("enforce: the spin fixture gets a signature line, stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125 within persist + capture + teardown + slack; capture tools, marker dir and preload are gone", async () => {
+		const b = box("stuck-enforce", DETECT);
+		prepared(b, "tr-se1", { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		const work = workOf(b, "tr-se1");
+		const hook = join(b.hooks, "tr-se1.signature-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const p = spawnCall(b, { sub: "full", runId: "tr-se1" });
+		try {
+			// Hold the capture until the helper has made its second group: that group is new during the capture.
+			expect(await until(() => existsSync(`${hook}.reached`), 30_000)).toBe(true);
+			expect(await until(() => existsSync(join(work, "late.pid")), 2_000)).toBe(true);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+		const code = await p.exited;
+		const exitedAt = Date.now();
+		const stdout = await new Response(p.stdout).text();
+		const stderr = await new Response(p.stderr).text();
+		const worker = fixturePid(work, "spin.pid");
+		const zombie = fixturePid(work, "zombie.pid");
+		const helper = fixturePid(work, "helper.pid");
+		const late = fixturePid(work, "late.pid");
+		const leader = Number(readFileSync(join(work, "groups"), "utf8").split("\n")[0]);
+		report({ fixture: "enforce", exit: code, stdout, stderr });
+		expect(worker).not.toBe(leader);
+		expect(code).toBe(WRAPPER_EXIT.stuck);
+		const { first, sig, stop, captured, killed } = enforceLines(stdout, worker, zombie);
+		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode enforce bun ${Bun.version.replaceAll(".", "\\.")} ${Bun.revision}$`));
+		expect(captured.rest).toMatch(/^file full\.signature\.log ms \d+$/);
+		const k = /^pgids ([\d,]+) ms (\d+) contained$/.exec(killed.rest);
+		expect(k).not.toBeNull();
+		const stopSet = k![1]!.split(",").map(Number);
+		// The leader's group (the worker's too), the helper's and the one made during the capture.
+		expect(stopSet).toEqual(expect.arrayContaining([leader, helper, late]));
+		expect(stderr).toMatch(new RegExp(`^stuck: worker ${worker} spun \\d+ ms in Bun\\.spawnSync with unreaped child ${zombie}; ${stopSet.length} process groups killed, containment contained\\n$`));
+		const spun = Number(/ spun (\d+) ms /.exec(stderr)![1]);
+		expect(spun).toBeGreaterThanOrEqual(DETECT.detectPersistMs);
+		expect(Date.parse(stop.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
+		// The budget runs from the matching signature's first tick (PLAN § Budget).
+		const signatureToExit = exitedAt - Date.parse(sig.iso);
+		expect(signatureToExit).toBeLessThan(DETECT.detectPersistMs + STUCK_DEFAULTS.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+		report({ fixture: "enforce", signatureToExitMs: signatureToExit, firstSignatureToExitMs: exitedAt - Date.parse(first.iso), stopToExitMs: exitedAt - Date.parse(stop.iso) });
+		// Every owned process and group is gone, with no sweep.
+		for (const pid of [leader, worker, helper, late]) expect({ pid, alive: alive(pid) }).toEqual({ pid, alive: false });
+		for (const g of stopSet) expect({ g, alive: alive(-g) }).toEqual({ g, alive: false });
+		const groups = readFileSync(join(work, "groups"), "utf8").split("\n").filter(Boolean).map(Number);
+		expect(groups).toEqual(expect.arrayContaining(stopSet));
+		// The signature capture: tree, marker, sample, lsof, log tail; its tools are gone and its cap dir cleared.
+		const text = readFileSync(join(work, "full.signature.log"), "utf8");
+		expect(text).toContain(`signature capture of full: worker ${worker} spun `);
+		const s = signatureSections(text);
+		expect(Object.keys(s)).toEqual(["1", "2", "3", "4", "5"]);
+		expect(s["1"]).toContain(`${worker} `);
+		expect(s["1"]).toContain("<- worker");
+		expect(s["1"]).toContain("<- unreaped child");
+		expect(s["2"]).toMatch(/observed: since \d+ \(.+\) command true\n/);
+		expect(s["3"]).toContain(`$ /usr/bin/sample ${worker} 1 -mayDie -file `);
+		expect(s["4"]).toContain(`$ /usr/sbin/lsof -nP -p ${worker} `);
+		expect(s["5"]).toContain("bun test v");
+		expect(text).not.toContain("capture cut");
+		const tools = capturePids(text);
+		expect(tools.length).toBeGreaterThan(0);
+		expect(tools.filter(alive)).toEqual([]);
+		expect(readdirSync(work).filter((n) => n.startsWith("full.signature-"))).toEqual([]);
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 90_000);
+
+	test("shadow (caps.json without stuckStop): the spin fixture gets stuck-would-stop and a signature capture, nothing is stopped, and the part runs on to its cap and exits 124 as before", async () => {
+		const b = box("stuck-shadow", DETECT);
+		prepared(b, "tr-ss1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 0.15, soloCapMin: 0.15, fullWorkers: 2 });
+		const t0 = Date.now();
+		const r = call(b, { sub: "full", runId: "tr-ss1" });
+		const work = workOf(b, "tr-ss1");
+		const worker = fixturePid(work, "spin.pid");
+		const zombie = fixturePid(work, "zombie.pid");
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toBe("as2test: timeout: the part passed its cap of 9000 ms; its group was killed\n");
+		expect(Date.now() - t0).toBeGreaterThanOrEqual(9_000);
+		expect(Date.now() - t0).toBeLessThan(9_000 + CAPTURE_MS + 500 + 5_000);
+		const lines = detectorLines(r.stdout);
+		// Only this signature's lines; a flap (a tick under the hot share on a loaded machine) may clear and restart it.
+		for (const l of lines) {
+			expect(["stuck-signature", "stuck-cleared", "stuck-would-stop", "stuck-captured"]).toContain(l.keyword);
+			expect(new Date(l.iso).toISOString()).toBe(l.iso);
+			if (l.keyword !== "stuck-captured") expect(l.rest).toStartWith(`worker ${worker} zombie ${zombie}`);
+		}
+		const would = lines.findIndex((l) => l.keyword === "stuck-would-stop");
+		expect(would).toBeGreaterThan(0);
+		const sig = lines[would - 1]!;
+		expect(sig.keyword).toBe("stuck-signature");
+		expect(sig.rest).toMatch(new RegExp(`^worker ${worker} zombie ${zombie} since \\d+ mode shadow bun `));
+		expect(lines[would]!.rest).toBe(`worker ${worker} zombie ${zombie}`);
+		expect(lines.filter((l) => l.keyword === "stuck-captured").map((l) => l.rest)).toEqual([expect.stringMatching(/^file full\.signature\.log ms \d+$/)]);
+		// The would-stop came at the persistence, long before the cap: the part ran on untouched.
+		expect(Date.parse(lines[would]!.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
+		expect(Date.parse(lines[would]!.iso) - t0).toBeLessThan(9_000 - 2_000);
+		report({ fixture: "shadow", stdout: r.stdout, stderr: r.stderr });
+		expect(Object.keys(signatureSections(readFileSync(join(work, "full.signature.log"), "utf8")))).toEqual(["1", "2", "3", "4", "5"]);
+		// D5's cap path is unchanged: its stuck capture, then the group's kill.
+		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
+		// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
+		// know; a spinning one never notices its leader's death, so the test ends it here.
+		process.kill(worker, "SIGKILL");
+		expect(await until(() => !alive(worker), 3_000)).toBe(true);
+		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
+		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
+	}, 90_000);
+
+	test("a signature capture whose tools are still running at its deadline is cut there: every capture group is SIGKILLed, the file says so, and the stop still exits 125 within the bound", async () => {
+		const signatureCaptureMs = 600;
+		const b = box("stuck-cut", { ...DETECT, signatureCaptureMs });
+		prepared(b, "tr-sk1", { "spin.test.ts": spinTest(false), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		const work = workOf(b, "tr-sk1");
+		// Never released: sample (1 s) cannot finish inside 600 ms either.
+		const hook = join(b.hooks, "tr-sk1.signature-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const p = spawnCall(b, { sub: "full", runId: "tr-sk1" });
+		try {
+			const code = await p.exited;
+			const exitedAt = Date.now();
+			const stdout = await new Response(p.stdout).text();
+			const worker = fixturePid(work, "spin.pid");
+			const zombie = fixturePid(work, "zombie.pid");
+			expect(code).toBe(WRAPPER_EXIT.stuck);
+			expect(existsSync(`${hook}.reached`)).toBe(true);
+			const { sig } = enforceLines(stdout, worker, zombie);
+			expect(exitedAt - Date.parse(sig.iso)).toBeLessThan(DETECT.detectPersistMs + signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+			const text = readFileSync(join(work, "full.signature.log"), "utf8");
+			const cutAt = Number(/^capture cut at (\d+) ms$/m.exec(text)?.[1]);
+			expect(cutAt).toBeGreaterThanOrEqual(signatureCaptureMs);
+			expect(cutAt).toBeLessThan(signatureCaptureMs + 1_000);
+			expect(Object.keys(signatureSections(text))).toEqual(["1", "2"]);
+			const killed = /^killed capture groups: (.*)$/m.exec(text)?.[1] ?? "";
+			expect(killed).toMatch(/^\d+( \d+)*$/);
+			const tools = capturePids(text);
+			expect(await until(() => tools.every((t) => !alive(t)), 2_000)).toBe(true);
+			expect(readdirSync(work).filter((n) => n.startsWith("full.signature-"))).toEqual([]);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+	}, 90_000);
+
+	test("a caps.json stuckStop other than shadow or enforce is refused for full and solo", () => {
+		for (const bad of ["on", true, null, 1]) {
+			const b = box("stuck-bad");
+			prepared(b, "tr-sb1", { "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, stuckStop: bad });
+			for (const c of [{ sub: "full", runId: "tr-sb1" }, { sub: "solo", runId: "tr-sb1", file: "./a.test.ts" }] as WrapperCall[]) {
+				const r = call(b, c);
+				expect(r.exit).toBe(WRAPPER_EXIT.refused);
+				expect(r.stderr).toContain("stuckStop");
+			}
+		}
+	});
+
+	describe("negative controls: each part ends normally with no signature and no decision (enforce, --parallel=2)", () => {
+		/** One test file per control; `<name>.pid` is the worker's pid. Each runs about 6 s. */
+		const LOOP = "const end = Date.now() + 6_000;\n\twhile (Date.now() < end) {}";
+		const fixtures: Record<string, Record<string, string>> = {
+			"zombie-no-marker": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+			},
+			"returned-call-then-zombie": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+			},
+			"immutable-marker": {
+				"c.test.ts": `import { test } from "bun:test";
+import { dlopen, FFIType } from "bun:ffi";
+import { writeFileSync } from "node:fs";
+const { chflags } = dlopen("/usr/lib/libSystem.B.dylib", { chflags: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.i32 } }).symbols;
+test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const marker = Buffer.from(process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid + "\\0");
+	// UF_IMMUTABLE, as chflags uchg; cleared again so the executor can remove the dir.
+	if (chflags(marker, 2) !== 0) throw new Error("chflags uchg failed");
+	try {
+		Bun.spawnSync(["/usr/bin/true"]);
+		Bun.spawn(["/usr/bin/true"]);
+		${LOOP}
+	} finally {
+		chflags(marker, 0);
+	}
+}, 60_000);
+`,
+			},
+			"long-async": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", async () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tawait Bun.sleep(6_000);\n}, 60_000);\n`,
+			},
+			"sync-sleep": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/bin/sleep", "3"]);\n}, 60_000);\n`,
+			},
+			"printer-beside-idle": {
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("prints", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tconst end = Date.now() + 6_000;\n\twhile (Date.now() < end) console.log("x".repeat(100));\n}, 60_000);\n`,
+				"d.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("idles", async () => {\n\twriteFileSync("../idle.pid", String(process.pid));\n\tawait Bun.sleep(6_000);\n}, 60_000);\n`,
+			},
+			// The positive fixture but for the zombie's parent: a sleeping process of the fixture, not the hot marked worker.
+			"zombie-of-a-sleeper": {
+				"c.test.ts": `${SPIN_HEAD}test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const fd = holdMarker("true");
+	Bun.spawn(["/bin/sh", "-c", "/usr/bin/true & exec /bin/sleep 8"]);
+	${LOOP}
+	closeSync(fd);
+}, 60_000);
+`,
+			},
+		};
+		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
+		let all: Promise<Record<string, Done>> | null = null;
+		/** Every control at once (each in its own box), started by the first test that needs them. */
+		const results = (): Promise<Record<string, Done>> =>
+			(all ??= Promise.all(Object.entries(fixtures).map(async ([name, files], i): Promise<[string, Done]> => {
+				const b = box(`stuck-neg-${name}`, DETECT);
+				const runId = `tr-sn${i}`;
+				prepared(b, runId, { "a.test.ts": OK_TEST, ...files }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+				const p = spawnCall(b, { sub: "full", runId });
+				const exit = await p.exited;
+				return [name, { b, work: workOf(b, runId), exit, stdout: await new Response(p.stdout).text(), stderr: await new Response(p.stderr).text() }];
+			})).then(Object.fromEntries));
+		/** The control ended normally, with no detector line at all; returns its trace and worker pid. */
+		async function settled(name: string): Promise<{ trace: TraceRow[]; w: number; work: string }> {
+			const d = (await results())[name]!;
+			expect({ name, exit: d.exit, stderr: d.stderr, lines: keywordsOf(d.stdout) }).toEqual({ name, exit: 0, stderr: "", lines: [] });
+			const trace = traceOf(d.work);
+			expect(trace.length).toBeGreaterThanOrEqual(10);
+			expect(trace.every((t) => t.snap === "ok" && t.signatures.length === 0)).toBe(true);
+			expect(existsSync(join(d.work, "stuck-markers-full"))).toBe(false);
+			return { trace, w: fixturePid(d.work, "w.pid"), work: d.work };
+		}
+		const zombieOf = (trace: TraceRow[], ppid: number) => trace.some((t) => t.zombies.some((z) => z.ppid === ppid && z.comm === "true"));
+
+		test("a 6 s sync loop holding a zombie child, with no marker", async () => {
+			const { trace, w } = await settled("zombie-no-marker");
+			expect(zombieOf(trace, w)).toBe(true);
+			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
+		}, 90_000);
+
+		test("a real Bun.spawnSync(['/usr/bin/true']) that returns, then an async /usr/bin/true born at once and a 6 s sync loop: the marker is inactive", async () => {
+			const { trace, w } = await settled("returned-call-then-zombie");
+			expect(zombieOf(trace, w)).toBe(true);
+			expect(trace.filter((t) => t.zombies.length > 0).every((t) => activeAt(t).length === 0)).toBe(true);
+		}, 90_000);
+
+		test("the same with the marker file made immutable before the first call: no marker ever becomes active", async () => {
+			const { trace, w } = await settled("immutable-marker");
+			expect(zombieOf(trace, w)).toBe(true);
+			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
+		}, 90_000);
+
+		test("a long async test", async () => {
+			const { trace, w } = await settled("long-async");
+			expect(trace.some((t) => t.tree.some((p) => p.pid === w))).toBe(true);
+		}, 90_000);
+
+		test("a real Bun.spawnSync(['/bin/sleep', '3']): the marker is active with a live child, and the worker is not hot", async () => {
+			const { trace, w } = await settled("sync-sleep");
+			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "sleep") && t.tree.some((p) => p.ppid === w && p.comm === "sleep"))).toBe(true);
+		}, 90_000);
+
+		test("another worker printing continuously beside an idle one", async () => {
+			const { trace, w, work } = await settled("printer-beside-idle");
+			const idle = fixturePid(work, "idle.pid");
+			expect(idle).not.toBe(w);
+			expect(trace.some((t) => t.tree.some((p) => p.pid === w) && t.tree.some((p) => p.pid === idle))).toBe(true);
+		}, 90_000);
+
+		test("a zombie whose parent is a sleeping fixture process, beside a hot worker holding a marker", async () => {
+			const { trace, w } = await settled("zombie-of-a-sleeper");
+			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "true") && t.zombies.some((z) => z.comm === "true" && z.ppid !== w))).toBe(true);
+			expect(zombieOf(trace, w)).toBe(false);
+		}, 90_000);
+	});
+});
+
 // ---- sweep --------------------------------------------------------------------------------------------------
 
 describe("sweep", () => {
@@ -870,13 +1419,22 @@ describe("sweep", () => {
 		const argvUses = text.split("\n").flatMap((l, i) => (/"\$@"/.test(l) ? [i] : []));
 		expect(argvUses).toEqual([execLine + 2]);
 		expect(text).toContain(`'/usr/local/libexec/as2test/bun' '/usr/local/libexec/as2test/test-exec.js' "$@"`);
-		for (const extra of [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }]) {
+		const knobs = [{ hooks: "/tmp/h" }, { killGraceMs: 1 }, { sweepLockWaitMs: 1 }, { captureMs: 1 }, { detectTickMs: 1 }, { detectPersistMs: 1 }, { signatureCaptureMs: 1 }, { stopGraceMs: 1 }, { detectTrace: true }, { detectTrace: false }];
+		for (const extra of knobs) {
 			expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid", ...extra })).toThrow(WrapperRenderError);
 		}
 		expect(() => renderExecWrapper({ root: "r", bun: "/b", script: "/s", sweepScope: "uid" })).toThrow(WrapperRenderError);
 		expect(() => renderExecWrapper({ root: "/r", bun: "/b", script: "/s", sweepScope: "all" as SweepScope })).toThrow(WrapperRenderError);
-		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({ killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null });
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "uid" })).toMatchObject({
+			killGraceMs: 10_000, sweepLockWaitMs: 60_000, captureMs: 20_000, hooks: null,
+			detectTickMs: STUCK_DEFAULTS.tickMs, detectPersistMs: STUCK_DEFAULTS.persistMs, signatureCaptureMs: STUCK_DEFAULTS.signatureCaptureMs, stopGraceMs: STUCK_DEFAULTS.stopGraceMs, detectTrace: false,
+		});
 		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", captureMs: 1_500 }).captureMs).toBe(1_500);
+		expect(execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true }))
+			.toMatchObject({ detectTickMs: 50, detectPersistMs: 400, signatureCaptureMs: 900, stopGraceMs: 300, detectTrace: true });
+		for (const bad of [{ detectTickMs: 0 }, { detectPersistMs: -1 }, { stopGraceMs: 1.5 }, { detectTrace: "yes" as unknown as boolean }]) {
+			expect(() => execConfigOf({ root: "/r", bun: "/b", script: "/s", sweepScope: "groups", ...bad })).toThrow(WrapperRenderError);
+		}
 	});
 });
 

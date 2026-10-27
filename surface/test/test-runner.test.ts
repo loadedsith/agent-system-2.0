@@ -25,6 +25,7 @@ import {
 import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
+import { STUCK_DEFAULTS } from "../src/stuck-detect";
 import { alive, tmp, until } from "./helpers";
 import { carry305 } from "./train-world";
 
@@ -106,8 +107,34 @@ test("hangs loudly", async () => {
 const GATE_RED = `import { test } from "bun:test";
 test("refuses a forged approve", () => { throw new Error("the gate let it through"); });
 `;
+// The positive spin fixture of surface/test/as2test.test.ts (`SPIN_HEAD` and `spinTest(false)`, PLAN wl-mvq8x4pkjmx69s sl-sd-exec),
+// its text reused: the lost-reap state built by hand. The test holds its own marker for `true` exactly as the preload does (flock
+// LOCK_EX|LOCK_NB, the D1 content `<since ms>\t<command>\n` on `$AS2TEST_STUCK_MARKERS/<pid>`), spawns /usr/bin/true asynchronously
+// at once, then spins forever: marker active, the worker hot, the child an unreaped zombie.
+const SPIN = `import { test } from "bun:test";
+import { dlopen, FFIType } from "bun:ffi";
+import { spawn } from "node:child_process";
+import { closeSync, constants, ftruncateSync, openSync, writeFileSync, writeSync } from "node:fs";
+const flock = dlopen("/usr/lib/libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock;
+/** Hold this process's marker exactly as the preload does: O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, LOCK_EX|LOCK_NB, then the D1 content. */
+function holdMarker(command) {
+	const fd = openSync(process.env.AS2TEST_STUCK_MARKERS + "/" + process.pid, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | 0x1000000, 0o600);
+	if (flock(fd, 2 | 4) !== 0) throw new Error("the marker's flock was not granted");
+	ftruncateSync(fd, 0);
+	const since = Date.now();
+	writeSync(fd, since + "\\t" + command + "\\n", 0);
+	return fd;
+}
+test("spins", () => {
+	writeFileSync("../spin.pid", String(process.pid));
+	holdMarker("true");
+	const z = Bun.spawn(["/usr/bin/true"]);
+	writeFileSync("../zombie.pid", String(z.pid));
+	for (;;) {}
+}, 600_000);
+`;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10, spin: 11 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -121,6 +148,7 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	gate: { "gates/test/gate.test.ts": GATE_RED },
 	skipped: { "a.test.ts": SKIPPED("a skipped") },
 	loud: { "loud.test.ts": HANG_LOUD },
+	spin: { "spin.test.ts": SPIN },
 };
 
 interface Fixture {
@@ -186,7 +214,9 @@ const statusPosts = (w: World): string[] => {
 		return `${m[3]} ${m[2]}`;
 	});
 };
-// Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
+// Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id. A part call (`full`,
+// `solo`, `base-solo`) goes to `<root>/part-standin` instead when a test wrote one (`standIn`): the exec stand-in of the
+// stuck-worker tests (PLAN wl-mvq8x4pkjmx69s D4), given the wrapper's argv (`<exec> <sub> <run id> [file]`).
 const SUDO = `#!/bin/sh
 log="$(dirname "$0")/../sudo.log"
 if [ "$#" = 2 ] && [ "$1" = -n ]; then
@@ -203,6 +233,8 @@ if [ "$2" = probe ]; then
 	printf '%s\\n' "$out" | sed -e 's/"read":true/"read":false/g' -e 's/"write":true/"write":false/g'
 	exit 0
 fi
+standin="$(dirname "$0")/../part-standin"
+case "$2" in full|solo|base-solo) [ -x "$standin" ] && exec "$standin" "$@" ;; esac
 exec "$@"
 `;
 /** The installed refresh helper's stand-in until a test arms one (`setRefresh`): a run that calls it fails loudly. */
@@ -246,7 +278,10 @@ interface World {
 	pin: <T>(iso: string, fn: () => T) => T;
 }
 
-function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number } = {}): World {
+/** The executor's test-only detector knobs (PLAN wl-mvq8x4pkjmx69s D3): a groups render carries them into the wrapper's config. */
+interface DetectKnobs { detectTickMs?: number; detectPersistMs?: number; signatureCaptureMs?: number; stopGraceMs?: number }
+
+function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number; stuckStop?: "shadow" | "enforce"; detect?: DetectKnobs } = {}): World {
 	const root = realpathSync(tmp("trun"));
 	roots.push(root);
 	const gid = statSync(root).gid;
@@ -295,7 +330,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	chmodSync(libexec, 0o755);
 	const exec = join(libexec, "exec");
 	writeFileSync(exec, renderExecWrapper({
-		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks, killGraceMs: o.killGraceMs ?? 300, sweepLockWaitMs: o.sweepLockWaitMs ?? 30_000,
+		root: as2, bun: process.execPath, script: TEST_EXEC, sweepScope: "groups", hooks, killGraceMs: o.killGraceMs ?? 300, sweepLockWaitMs: o.sweepLockWaitMs ?? 30_000, ...o.detect,
 	}));
 	writeFileSync(join(libexec, "bun"), "stand-in for the installed bun\n");
 	writeFileSync(join(libexec, "test-exec.js"), "stand-in for the installed bundle\n");
@@ -323,7 +358,8 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	const cap = o.capMin ?? 2;
 	const config = join(root, "config.yml");
 	const workers = o.fullWorkers === undefined ? "" : `  fullWorkers: ${o.fullWorkers}\n`;
-	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n${workers}`);
+	const stuck = o.stuckStop === undefined ? "" : `  stuckStop: ${o.stuckStop}\n`;
+	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n${workers}${stuck}`);
 
 	const env: Record<string, string> = {
 		PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "en_US.UTF-8", USER: process.env.USER ?? "jo",
@@ -1119,7 +1155,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			const run = await resultOf(w, wl, runId);
 			expect(run.verdict).toBe("green");
 			expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n });
+			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n, stuckStop: "shadow" });
 			const lines = runnerLog(w, runId).split("\n");
 			const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
 			const workersLine = at(/ full workers \d+$/);
@@ -2497,4 +2533,456 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 		go(w, runId, "result");
 		await child.exited;
 	}
+});
+
+// ---- the stuck-worker detector's runner side (PLAN wl-mvq8x4pkjmx69s D4) -----------------------------------
+
+/**
+ * The exec stand-in: the fake sudo hands a part call (`full`, `solo`, `base-solo`) to this /bin/sh script instead of the wrapper,
+ * with the wrapper's argv (`$1` exec, `$2` sub, `$3` run id, `$4` file); `exec "$@"` runs the real part. Helpers: `sig`, `clr`, `stp`
+ * print the exec's `stuck-signature`, `stuck-cleared` and `stuck-stop` lines for a worker and zombie, stamped now (whole seconds,
+ * as `date` gives); `survivor` leaves a `/bin/sleep` in its own process group listed in the run's groups file (the groups render's
+ * containment) and records its pid in `<root>/survivor.pid`; `holdSweep` pauses every later sweep of the run at `sweep-read1`.
+ */
+function standIn(w: World, body: string): void {
+	const p = join(w.root, "part-standin");
+	writeFileSync(p, `#!/bin/sh
+here="$(dirname "$0")"
+work="$AGENT_SYSTEM_TEST_RUNNER_ROOT/runs/$3"
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+sig() { echo "stuck-signature $(now) part full worker $1 zombie $2 since 5000 mode enforce bun 1.3.14 abc"; }
+clr() { echo "stuck-cleared $(now) part full worker $1 zombie $2 held 800 matched no"; }
+stp() { echo "stuck-stop $(now) part full worker $1 zombie $2"; }
+survivor() {
+	/usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV' /bin/sleep 300 </dev/null >/dev/null 2>&1 &
+	echo $! >> "$work/groups"
+	echo $! > "$here/survivor.pid"
+}
+holdSweep() { : > "$AGENT_SYSTEM_TEST_HOOKS/$3.sweep-read1.pause"; }
+echo "$$" > "$here/standin.pid"
+${body}
+`);
+	chmodSync(p, 0o755);
+}
+
+/** The stuck tests' timer knobs: a 2 s backstop read every 100 ms, a 3 s sweep deadline, containment retried every 300 ms for 20 s. */
+const STUCK_KNOBS: Record<string, string> = {
+	AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS: "2000", AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS: "100", AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: "3000",
+	AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS: "300", AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS: "20000",
+};
+const STOP_REASON = "stuck: worker 4242 spun in Bun.spawnSync with unreaped child 4243";
+const pidIn = (w: World, name: string): number => Number(readFileSync(join(w.root, name), "utf8").trim());
+/** A `/bin/sleep` in its own process group, as a survivor of an earlier run whose groups file lists it (the groups render). */
+function earlierSurvivor(w: World): number {
+	const p = Bun.spawn(["/usr/bin/perl", "-e", "setpgrp(0, 0); exec @ARGV", "/bin/sleep", "300"], { stdio: ["ignore", "ignore", "ignore"] });
+	p.unref();
+	const earlier = join(w.as2, "runs", makeRunId(Date.now() - 60_000, "surv"));
+	mkdirSync(earlier, { recursive: true });
+	writeFileSync(join(earlier, "groups"), `${p.pid}\n`);
+	return p.pid;
+}
+const kill = (pid: number): void => {
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {
+		// already gone
+	}
+};
+/** runner.log's time of the first line matching `re`. */
+const logAt = (log: string, re: RegExp): number => {
+	const line = log.split("\n").find((l) => re.test(l));
+	if (!line) throw new Error(`no runner.log line matches ${re}\n--- runner.log ---\n${log}`);
+	return Date.parse(line.slice(0, line.indexOf(" ")));
+};
+
+describe("the stuck-worker detector's runner side (PLAN wl-mvq8x4pkjmx69s D4)", () => {
+	const partsOf = (w: World, runId: string) => subsOf(w, runId).filter((s) => s !== "sweep");
+
+	test("enforce: exit 125 with its stop lines: error with the exec's stuck reason, the junit's failures (a gates/test one) kept and security-red sent, the signature log imported, no solo or base part, the lock released before the status post", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `"$@"
+sig 4242 4243
+stp 4242 4243
+printf 'the signature capture\\n' > "$work/full.signature.log"
+echo "stuck-captured $(now) part full file full.signature.log ms 120"
+echo "stuck: worker 4242 spun 5200 ms in Bun.spawnSync with unreaped child 4243; 1 process groups killed, containment contained" >&2
+exit 125`);
+		const runId = request(w, wl, slice, PR.gate, fx.head.gate);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		const reason = "full: stuck: worker 4242 spun 5200 ms in Bun.spawnSync with unreaped child 4243; 1 process groups killed, containment contained";
+		expect(run).toMatchObject({ verdict: "error", reason });
+		expect(run.full).toMatchObject({ exit: WRAPPER_EXIT.stuck, error: reason.slice("full: ".length) });
+		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", "gates/test/gate.test.ts > refuses a forged approve"]]);
+		expect(heldMessages(w, wl).filter((m) => m.body.startsWith("security-red: ")).map((m) => m.body)).toEqual([
+			`security-red: ${wl} ${slice} ${runId} ${fx.head.gate} 1 gates/test/gate.test.ts > refuses a forged approve`,
+		]);
+		expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+		expect(readFileSync(join(w.runs, runId, "full.signature.log"), "utf8")).toBe("the signature capture\n");
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full.signature.log imported");
+		expect(log).toContain("stuck detector enforce");
+		expect(log).toContain("full part stopped the run: no solo or base parts");
+		expect(log).toMatch(/ full tr-[a-z0-9]+ → exit 125\n/);
+		// the halt's one sweep, in place of the part's own, then the containment check
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
+		expect(log).toContain("contained after full: no live _as2test process");
+		// the lock goes before the status post, and the post says error
+		expect(logAt(log, / lock released$/)).toBeLessThanOrEqual(logAt(log, /status as2\/full-suite error on /));
+		expect(log.indexOf(" lock released\n")).toBeLessThan(log.indexOf("status as2/full-suite error on "));
+		expect(statusPosts(w)).toEqual([`error ${fx.head.gate}`]);
+		const db = lockDbOf(w);
+		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+		expect(w.ledger.slice(slice)!.state).toBe("open");
+	});
+
+	test("enforce: a stuck-signature then a stalled exec: the backstop abandons the call at its deadline, SIGKILLs it, one sweep, error `executor stalled during stuck detection`, never a stuck reason", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `sig 4242 4243
+exec /bin/sleep 300`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: "full: executor stalled during stuck detection; worker 4242 was a candidate, not confirmed" });
+		expect(run.reason).not.toContain("stuck:");
+		expect(run.full).toMatchObject({ exit: null, error: "executor stalled during stuck detection; worker 4242 was a candidate, not confirmed" });
+		const log = runnerLog(w, runId);
+		expect(log).toContain("executor-stalled part full worker 4242");
+		expect(log).toMatch(/ full tr-[a-z0-9]+ → exit null \(abandoned by the stuck backstop\)\n/);
+		// abandoned at the 2 s backstop after the line's (whole-second) time, never left to the 2 min cap
+		expect(run.full!.ms).toBeLessThan(6_000);
+		expect(alive(pidIn(w, "standin.pid"))).toBe(false);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
+		expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+		expect(log).toContain(" lock released\n");
+	});
+
+	for (const [what, script] of [
+		["a stuck-stop then a stalled exec", "sig 4242 4243\nstp 4242 4243\nexec /bin/sleep 300"],
+		["a stop line then stuck-cleared then a stalled exec: the deadline is terminal", "sig 4242 4243\nstp 4242 4243\nclr 4242 4243\nexec /bin/sleep 300"],
+	] as const) {
+		test(`enforce: ${what}: the backstop fires at its first deadline; stuck, the executor did not finish the stop`, async () => {
+			const w = world({ stuckStop: "enforce" });
+			const { wl, slice } = workload(w);
+			standIn(w, script);
+			const runId = request(w, wl, slice, PR.green, fx.head.green);
+			await spawnRun(w, runId, STUCK_KNOBS).exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "error", reason: `full: ${STOP_REASON}; executor did not finish the stop` });
+			const log = runnerLog(w, runId);
+			expect(log).toMatch(/ full tr-[a-z0-9]+ → exit null \(abandoned by the stuck backstop\)\n/);
+			expect(log).not.toContain("executor-stalled part");
+			expect(run.full!.ms).toBeLessThan(6_000);
+			expect(alive(pidIn(w, "standin.pid"))).toBe(false);
+			expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+		});
+	}
+
+	test("enforce: overlapping signatures A and B, A cleared, then a stalled exec: B's deadline still fires", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `sig 11 12
+sleep 1
+sig 21 22
+clr 11 12
+exec /bin/sleep 300`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: "full: executor stalled during stuck detection; worker 21 was a candidate, not confirmed" });
+		expect(runnerLog(w, runId)).toContain("executor-stalled part full worker 21");
+	});
+
+	test("enforce: a signature then stuck-cleared disarms the backstop: the part runs on past the deadline, green", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `sig 4242 4243
+clr 4242 4243
+sleep 4
+exec "$@"`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("green");
+		expect(run.full!.ms).toBeGreaterThanOrEqual(4_000);
+		const log = runnerLog(w, runId);
+		expect(log).not.toContain("abandoned by the stuck backstop");
+		expect(log).toContain(" lock released\n");
+	});
+
+	test("shadow, the default (caps.json carries it): the backstop is never armed, a signature with no clear runs on past its deadline, green", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		standIn(w, `sig 4242 4243
+sleep 4
+exec "$@"`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("green");
+		expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: 1, stuckStop: "shadow" });
+		const log = runnerLog(w, runId);
+		expect(log).toContain("stuck detector shadow");
+		expect(log).not.toContain("abandoned by the stuck backstop");
+	});
+
+	test("a stop line then a signal exit is still stuck", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `stp 4242 4243
+kill -KILL $$`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: `full: ${STOP_REASON}` });
+		expect(run.full!.exit).toBeNull();
+		expect(runnerLog(w, runId)).toMatch(/ full tr-[a-z0-9]+ → SIGKILL\n/);
+		expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+	});
+
+	test("a stuck solo part ends the run: no base part; the full part's failures stay", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `[ "$2" = solo ] || exec "$@"
+stp 7 8
+exit 125`);
+		const runId = request(w, wl, slice, PR.red, fx.head.red);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: "./red.test.ts: stuck: worker 7 spun in Bun.spawnSync with unreaped child 8" });
+		expect(run.failures.filter((f) => f.part === "full")).toHaveLength(25);
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./red.test.ts", exit: 125, error: "stuck: worker 7 spun in Bun.spawnSync with unreaped child 8" })]);
+		expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full", "solo"]);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "solo-1"]);
+	});
+
+	test("a stuck base-solo part ends the run with its stuck reason; its result is not cached", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `[ "$2" = base-solo ] || exec "$@"
+stp 7 8
+exit 125`);
+		const runId = request(w, wl, slice, PR.red, fx.head.red);
+		await spawnRun(w, runId, STUCK_KNOBS).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "error", reason: "base ./red.test.ts: stuck: worker 7 spun in Bun.spawnSync with unreaped child 8" });
+		expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full", "solo", "base-prepare", "base-solo"]);
+		expect(cached(w, fx.main, "./red.test.ts")).toBe(false);
+	});
+
+	test("a held sweep and a held head re-check stop at their shared deadlines (the stuck sweep deadline, STUCK_FINALIZE_MS); the paused sweep is abandoned and killed", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `holdSweep "$@"
+stp 4242 4243
+exit 125`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		arm(w, runId, "head-recheck");
+		await spawnRun(w, runId, { ...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: "1500", AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS: "1500" }).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toStartWith(`full: ${STOP_REASON}; `);
+		expect(run.reason).toContain("post-sweep deadline exceeded");
+		const log = runnerLog(w, runId);
+		expect(log).toContain("the sweep after full was abandoned at its deadline");
+		const paused = JSON.parse(readFileSync(`${hookBase(w, runId, "sweep-read1")}.reached`, "utf8")) as { pid: number };
+		expect(alive(paused.pid)).toBe(false);
+		const stuckAt = logAt(log, / full tr-[a-z0-9]+ → exit 125$/);
+		const started = logAt(log, /post-sweep finalization started/);
+		const deadline = Date.parse(/post-sweep finalization started; deadline (\S+)/.exec(log)![1]!);
+		expect(started - stuckAt).toBeLessThan(1500 + 1000);
+		expect(deadline - started).toBeLessThanOrEqual(1500);
+		expect(logAt(log, / lock released$/) - stuckAt).toBeLessThan(1500 + 1500 + 2000);
+	});
+
+	test("containment (groups render): a survivor left by the stand-in is found by the check, killed by the retry after the stalled sweep was abandoned, then contained", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `holdSweep "$@"
+survivor
+stp 4242 4243
+exit 125`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const child = spawnRun(w, runId, { ...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: "1500" });
+		try {
+			await until("the check finds the survivor", () => /not contained after full: live _as2test processes \d+/.test(runnerLog(w, runId)), 60_000);
+			const survivor = pidIn(w, "survivor.pid");
+			expect(runnerLog(w, runId)).toContain(`not contained after full: live _as2test processes ${survivor}`);
+			expect(alive(survivor)).toBe(true);
+			// The sweep that stalled was abandoned at its deadline; let the retries through.
+			go(w, runId, "sweep-read1");
+			await child.exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "error", reason: `full: ${STOP_REASON}` });
+			expect(alive(survivor)).toBe(false);
+			const log = runnerLog(w, runId);
+			expect(log).toContain("the sweep after full was abandoned at its deadline");
+			expect(log).toContain("contained after full: no live _as2test process");
+			expect(log).not.toContain("stuck-containment-failed");
+			expect(marks(w, runId, "sweep").filter((x) => x.after === "full").length).toBeGreaterThanOrEqual(2);
+		} finally {
+			go(w, runId, "sweep-read1");
+			if (existsSync(join(w.root, "survivor.pid"))) kill(pidIn(w, "survivor.pid"));
+			await child.exited;
+		}
+	});
+
+	test("containment: a survivor that outlives STUCK_CONTAIN_MS: `containment failed` in the reason and the status, stuck-containment-failed logged, the lock released", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `holdSweep "$@"
+survivor
+stp 4242 4243
+exit 125`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		try {
+			await spawnRun(w, runId, { ...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: "800", AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS: "2500" }).exited;
+			const survivor = pidIn(w, "survivor.pid");
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "error", reason: `full: ${STOP_REASON}; containment failed: ${survivor}` });
+			const log = runnerLog(w, runId);
+			expect(log).toContain(`stuck-containment-failed part full pids ${survivor}\n`);
+			expect(log).toContain(" lock released\n");
+			const db = lockDbOf(w);
+			try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+			expect(statusPosts(w)).toEqual([`error ${fx.head.green}`]);
+			expect(readFileSync(join(w.root, "gh.log"), "utf8")).toContain(`description=full suite error, run ${runId}, containment failed`);
+			expect(alive(survivor)).toBe(true);
+		} finally {
+			if (existsSync(join(w.root, "survivor.pid"))) kill(pidIn(w, "survivor.pid"));
+		}
+	});
+
+	test("the admission gate: a live survivor of an earlier run before the first part: retried, then `admission refused` with no part run", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const survivor = earlierSurvivor(w);
+		try {
+			const runId = request(w, wl, slice, PR.green, fx.head.green);
+			await spawnRun(w, runId, { ...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS: "1500" }).exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "error", reason: `admission refused: live _as2test processes ${survivor}`, full: null });
+			// no exec part call, nor anything after the gate: sweeps only
+			expect(new Set(subsOf(w, runId))).toEqual(new Set(["sweep"]));
+			expect(subsOf(w, runId).length).toBeGreaterThanOrEqual(2);
+			const log = runnerLog(w, runId);
+			expect(log).toContain(`admission: live _as2test processes ${survivor}; sweeping and checking again`);
+			expect(log).toContain(` admission refused: live _as2test processes ${survivor}\n`);
+			expect(log).toContain(" lock released\n");
+			expect(alive(survivor)).toBe(true);
+		} finally {
+			kill(survivor);
+		}
+	});
+
+	test("the admission gate: a survivor gone after one retry: the run is admitted and runs normally", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const survivor = earlierSurvivor(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const child = spawnRun(w, runId, STUCK_KNOBS);
+		try {
+			await until("the gate finds the survivor", () => runnerLog(w, runId).includes(`admission: live _as2test processes ${survivor}; sweeping and checking again`), 60_000);
+			kill(survivor);
+			await child.exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("green");
+			expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+			expect(runnerLog(w, runId)).not.toContain("admission refused");
+		} finally {
+			kill(survivor);
+			await child.exited;
+		}
+	});
+
+	test("the admission gate (uid render): a live process of the uid is found by the spawn-free check", async () => {
+		// The test install's _as2test account is this user, so its own processes (this test's among them) are live ones of the uid.
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, runId, { ...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_CONTAIN_SCOPE: "uid", AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS: "600" }).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toStartWith("admission refused: live _as2test processes ");
+		expect(run.reason!.slice("admission refused: live _as2test processes ".length).split(",")).toContain(String(process.pid));
+		expect(partsOf(w, runId)).toEqual([]);
+	});
+
+	test("end to end (real exec, enforce): the spin fixture's full part is stopped by the executor: error with the stuck reason, no solo or base call, the signature log imported, contained, the lock released, and the queued run takes the lock within the knobs' bound", async () => {
+		// The executor's knobs (groups render) and the runner's stuck timers, each enforcing one stage of PLAN § Budget.
+		const detect = { detectTickMs: 250, detectPersistMs: 2_000, signatureCaptureMs: 3_000, stopGraceMs: 1_000 };
+		const sweepMs = 5_000;
+		const finalizeMs = 5_000;
+		const queuePollMs = 2_000;
+		const exitSeenMs = 1_000;
+		const slackMs = 5_000;
+		const knobs: Record<string, string> = {
+			...STUCK_KNOBS,
+			// production's formula over these knobs: the backstop stays behind an executor that is alive and ticking
+			AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS: String(detect.detectPersistMs + detect.signatureCaptureMs + detect.stopGraceMs + STUCK_DEFAULTS.verifyMs + 5_000),
+			AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS: "250",
+			AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: String(sweepMs), AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS: String(finalizeMs),
+			AGENT_SYSTEM_TEST_RUNNER_POLL_MS: String(queuePollMs),
+		};
+		const boundMs = detect.detectTickMs + detect.detectPersistMs + detect.signatureCaptureMs + detect.stopGraceMs + STUCK_DEFAULTS.verifyMs + exitSeenMs
+			+ sweepMs + finalizeMs + queuePollMs + slackMs;
+		const w = world({ stuckStop: "enforce", fullWorkers: 2, capMin: 1, detect });
+		const first = workload(w);
+		const second = workload(w);
+		const runId = request(w, first.wl, first.slice, PR.spin, fx.head.spin, 1_000);
+		Bun.sleepSync(5);
+		const nextId = request(w, second.wl, second.slice, PR.green, fx.head.green);
+		const kids: Child[] = [];
+		let pgids: number[] = [];
+		try {
+			kids.push(spawnRun(w, runId, knobs));
+			await until(`${runId} took the lock`, () => / took the lock\n/.test(runnerLog(w, runId)), 60_000);
+			kids.push(spawnRun(w, nextId, knobs));
+			await until(`${nextId} queued behind ${runId}`, () => marks(w, nextId, "queued").length >= 1, 60_000);
+			await kids[0]!.exited;
+			const run = await resultOf(w, first.wl, runId);
+			const log = runnerLog(w, runId);
+			// The executor's own lines, echoed into runner.log after the call: the first signature, the stop, the capture and the kill.
+			const sig = /^stuck-signature (\S+) part full worker (\d+) zombie (\d+) /m.exec(log);
+			expect(sig).not.toBeNull();
+			const [, sigIso, worker, zombie] = sig!;
+			expect(log).toMatch(new RegExp(`^stuck-stop \\S+ part full worker ${worker} zombie ${zombie}`, "m"));
+			expect(log).toMatch(/^stuck-captured \S+ part full file full\.signature\.log ms \d+$/m);
+			const killed = /^stuck-killed \S+ part full pgids ([\d,]+) ms \d+ contained$/m.exec(log);
+			expect(killed).not.toBeNull();
+			pgids = killed![1]!.split(",").map(Number);
+			// error with the exec's stuck reason, never a timeout
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toMatch(new RegExp(`^full: stuck: worker ${worker} spun \\d+ ms in Bun\\.spawnSync with unreaped child ${zombie}; ${pgids.length} process groups killed, containment contained$`));
+			expect(run.reason).not.toContain("timeout");
+			expect(run.full).toMatchObject({ exit: WRAPPER_EXIT.stuck });
+			// no solo or base-solo call
+			expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+			expect(log).toContain("full part stopped the run: no solo or base parts");
+			// the signature log imported into the run dir
+			expect(log).toContain("full.signature.log imported");
+			expect(readFileSync(join(w.runs, runId, "full.signature.log"), "utf8")).toContain(`signature capture of full: worker ${worker} spun `);
+			// containment passed: the runner's check, and no process or group of the part is alive
+			expect(log).toContain("contained after full: no live _as2test process");
+			expect(log).not.toContain("stuck-containment-failed");
+			for (const pid of [Number(worker), Number(zombie)]) expect({ pid, alive: alive(pid) }).toEqual({ pid, alive: false });
+			for (const g of pgids) expect({ g, alive: alive(-g) }).toEqual({ g, alive: false });
+			expect(log).toContain(" lock released\n");
+			// the queued run takes the lock within the bound, measured from the first signature
+			await kids[1]!.exited;
+			const next = await resultOf(w, second.wl, nextId);
+			const tookAt = logAt(runnerLog(w, nextId), / took the lock$/);
+			const intervalMs = tookAt - Date.parse(sigIso!);
+			console.log(`e2e stuck: first stuck-signature ${sigIso} → next run took the lock ${new Date(tookAt).toISOString()}: ${intervalMs} ms (bound ${boundMs} ms)`);
+			expect(intervalMs).toBeGreaterThan(0);
+			expect(intervalMs).toBeLessThanOrEqual(boundMs);
+			expect(tookAt).toBeGreaterThanOrEqual(logAt(log, / lock released$/));
+			expect(next.verdict).toBe("green");
+		} finally {
+			await reap(kids);
+			for (const g of pgids) kill(-g);
+		}
+	}, 240_000);
 });

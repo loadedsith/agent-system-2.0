@@ -16,10 +16,18 @@
 // The wrapper fixes the root, bun, the env and the sweep's reach in AS2TEST_EXEC_CONFIG; argv picks
 // only the subcommand and its operands. Every subcommand is fenced: it refuses unless
 // <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and `base-solo`
-// otherwise pass bun's own exit through (128 + the signal number when bun died by a signal).
+// otherwise pass bun's own exit through (128 + the signal number when bun died by a signal), except 125
+// (`WRAPPER_EXIT.stuck`) after a stuck-worker stop.
 //
 // At a part's cap, before its group is killed, a bounded stuck capture (process tree, `sample` per bun process, `lsof` per
 // process, the log's last 200 lines) goes to `<part stem>.stuck.log` beside the part's log (PLAN wl-mvq4edh02r5z40 D5).
+//
+// Stuck workers (PLAN wl-mvq8x4pkjmx69s D3): caps.json `stuckStop` (`shadow` when absent, `enforce`; anything else is
+// refused). Every part gets `--preload <work>/stuck-preload-<stem>.js`, which holds an flock on
+// `$AS2TEST_STUCK_MARKERS/<pid>` for exactly each `Bun.spawnSync` call, and a detector timer (surface/src/stuck-detect.ts,
+// spawn-free) that writes `stuck-*` lines to stdout. On a match it takes one bounded signature capture to
+// `<part stem>.signature.log` (both modes); in enforce it then kills every process group holding an owned process and
+// exits 125. Shadow only logs `stuck-would-stop` and leaves the part to its cap.
 //
 // Parallel files (workload wl-mvg2kzuvwngdmo): the worker count rides in caps.json, never in argv, so `full <run id>`
 // keeps its operand count and the installed wrapper needs no change. The runner logs `full workers <n>` before the PR
@@ -34,6 +42,9 @@ import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { type ExecConfig, probeAnswerLine, REAL_GIT, UID_SWEEP } from "../src/as2test";
 import { sweepLegacyNativeTemps } from "../src/as2test-temp";
+import {
+	liveOwned, type Observation, observe, type Proc as Seen, type Signature, type Snapshot, snapshot, STUCK_DEFAULTS, StuckDetector, type TickResult,
+} from "../src/stuck-detect";
 import {
 	AS2TEST_USER, childEnv, childGitconfigText, childLayout, gitShimText, isBunTestFile, RUN_ID_RE, SHA_RE, WRAPPER_EXIT,
 } from "../src/test-run";
@@ -63,11 +74,15 @@ function config(): Config {
 	const c = v as Record<string, unknown>;
 	const abs = (x: unknown): x is string => typeof x === "string" && isAbsolute(x) && normalize(x) === x;
 	const ms = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x) && x >= 0;
-	if (!abs(c.root) || !abs(c.bun) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)) {
+	if (!abs(c.root) || !abs(c.bun) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)
+		|| !ms(c.detectTickMs) || c.detectTickMs < 1 || !ms(c.detectPersistMs) || !ms(c.signatureCaptureMs) || !ms(c.stopGraceMs) || typeof c.detectTrace !== "boolean") {
 		return refuse("wrapper config is malformed");
 	}
-	if (c.sweep !== "groups" && (c.hooks !== null)) return refuse("hooks are for a groups render only");
-	return { root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs, captureMs: c.captureMs };
+	if (c.sweep !== "groups" && (c.hooks !== null || c.detectTrace)) return refuse("hooks and detectTrace are for a groups render only");
+	return {
+		root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs, captureMs: c.captureMs,
+		detectTickMs: c.detectTickMs, detectPersistMs: c.detectPersistMs, signatureCaptureMs: c.signatureCaptureMs, stopGraceMs: c.stopGraceMs, detectTrace: c.detectTrace,
+	};
 }
 
 /** The canonical root and its three areas. */
@@ -461,18 +476,30 @@ async function processTree(c: Capture, pgid: number): Promise<{ body: string; pr
 	return { body: `${lines.join("\n")}\n`, procs: [...found].map(([pid, command]) => ({ pid, bun: runsBun(command) })) };
 }
 
-/** Section 2, one bun process: `sample` into the cap dir, then (before the deadline only) its report read the safe way. Never rejects. */
-async function sampleOne(cfg: Config, runId: string, c: Capture, pid: number): Promise<string> {
+/**
+ * One bun process: `sample <pid> <seconds>` into the cap dir, then (before the deadline only, after the `point` hook) its report
+ * read the safe way. Never rejects.
+ */
+async function sampleOne(cfg: Config, runId: string, c: Capture, pid: number, seconds: number, point: string): Promise<string> {
 	try {
 		const report = c.reportPath(pid);
-		const r = await c.tool(["/usr/bin/sample", String(pid), "3", "-mayDie", "-file", report]);
-		await hook(cfg, runId, "stuck-sample-read", { stop: c.late, info: { report } });
+		const r = await c.tool(["/usr/bin/sample", String(pid), String(seconds), "-mayDie", "-file", report]);
+		await hook(cfg, runId, point, { stop: c.late, info: { report } });
 		if (c.late()) return `${toolBlock(r)}report not read: the capture is over\n`;
 		const read = readRegular(report, CAPTURE_CAP, "head");
 		return `${toolBlock(r)}${"text" in read ? `report (first ${CAPTURE_CAP} bytes at most):\n${read.text}` : `report refused: ${read.refused}`}\n`;
 	} catch (e) {
 		return e instanceof Abandoned ? "" : `sample ${pid}: failed: ${errText(e)}\n`;
 	}
+}
+
+/** The last LOG_TAIL_LINES lines of the part's log, read the safe way (a capture's last section). */
+function logTail(logPath: string): string {
+	const tail = readRegular(logPath, CAPTURE_CAP, "tail");
+	if ("refused" in tail) return `refused: ${tail.refused}\n`;
+	const lines = tail.text.split("\n");
+	if (lines.at(-1) === "") lines.pop();
+	return lines.length === 0 ? "(empty)\n" : `${lines.slice(-LOG_TAIL_LINES).join("\n")}\n`;
 }
 
 /** Sections 1-4 in order; sample and lsof start together once the tree is known. */
@@ -483,7 +510,7 @@ async function captureSections(cfg: Config, runId: string, c: Capture, pgid: num
 	c.section(`1. process tree of group ${pgid}: ${PS.join(" ")}`, since, body);
 	since = Date.now();
 	const buns = procs.filter((p) => p.bun);
-	const samples = buns.map((p) => sampleOne(cfg, runId, c, p.pid));
+	const samples = buns.map((p) => sampleOne(cfg, runId, c, p.pid, 3, "stuck-sample-read"));
 	const lsofs = procs.map((p) => c.tool(["/usr/sbin/lsof", "-nP", "-p", String(p.pid)]));
 	await hook(cfg, runId, "stuck-capture", { stop: c.late });
 	c.alive();
@@ -495,40 +522,30 @@ async function captureSections(cfg: Config, runId: string, c: Capture, pgid: num
 	c.section(`3. lsof per process (${procs.length})`, since, procs.length === 0 ? "no process in the tree\n" : listed.map(toolBlock).join("\n"));
 	c.clearCapDir();
 	since = Date.now();
-	const tail = readRegular(logPath, CAPTURE_CAP, "tail");
-	let text = "refused" in tail ? `refused: ${tail.refused}\n` : "";
-	if ("text" in tail) {
-		const lines = tail.text.split("\n");
-		if (lines.at(-1) === "") lines.pop();
-		text = lines.length === 0 ? "(empty)\n" : `${lines.slice(-LOG_TAIL_LINES).join("\n")}\n`;
-	}
-	c.section(`4. last ${LOG_TAIL_LINES} lines of ${logPath}`, since, text);
+	c.section(`4. last ${LOG_TAIL_LINES} lines of ${logPath}`, since, logTail(logPath));
 }
 
 /**
- * D5: before the cap's kill, a bounded stuck capture into `<part stem>.stuck.log` beside the part's log, opened
- * O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one stderr line and null comes back.
- * One deadline (cfg.captureMs) owns it: at the deadline every capture group still running is SIGKILLed, its readers are
- * abandoned, the cap dir is cleared with bounded work only (`clearCapDir`) and the file says `capture cut at <ms> ms`.
- * The caller kills the part's group, then calls the returned capture's `afterKill` (a leftover cap dir goes, the file
- * closes). Never throws; nothing it does changes the part's exit.
+ * A bounded capture into `path`, opened O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one
+ * stderr line naming `what` and null comes back. One deadline (`ms`) owns it: at the deadline every capture group still running
+ * is SIGKILLed, its readers are abandoned, the cap dir is cleared with bounded work only (`clearCapDir`) and the file says
+ * `capture cut at <ms> ms`. The caller calls the returned capture's `afterKill` (a leftover cap dir goes, the file closes).
+ * Never throws.
  */
-async function stuckCapture(cfg: Config, runId: string, work: string, pgid: number, logPath: string, cap: number): Promise<Capture | null> {
-	const stem = basename(logPath, ".log");
-	const path = join(work, `${stem}.stuck.log`);
+async function boundedCapture(what: string, path: string, ms: number, header: (started: number) => string, sections: (c: Capture) => Promise<void>): Promise<Capture | null> {
 	let fd: number;
 	try {
 		fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
 	} catch (e) {
-		process.stderr.write(`as2test: stuck capture skipped: cannot create ${path}: ${errText(e)}\n`);
+		process.stderr.write(`as2test: ${what} skipped: cannot create ${path}: ${errText(e)}\n`);
 		return null;
 	}
-	const c = new Capture(fd, cfg.captureMs);
+	const c = new Capture(fd, ms);
 	try {
-		c.write(`stuck capture of ${stem} (process group ${pgid}) at its cap of ${cap} ms, ${new Date(c.started).toISOString()}, deadline ${cfg.captureMs} ms\n`);
+		c.write(header(c.started));
 		const deadline = Promise.withResolvers<"cut">();
-		const timer = setTimeout(() => deadline.resolve("cut"), cfg.captureMs);
-		const run = captureSections(cfg, runId, c, pgid, work, stem, logPath).then(
+		const timer = setTimeout(() => deadline.resolve("cut"), ms);
+		const run = sections(c).then(
 			() => "done" as const,
 			(e: unknown) => {
 				if (!(e instanceof Abandoned)) c.write(`capture failed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`);
@@ -545,6 +562,22 @@ async function stuckCapture(cfg: Config, runId: string, work: string, pgid: numb
 		c.write(`capture failed: ${errText(e)}\n`);
 	}
 	return c;
+}
+
+/**
+ * D5: before the cap's kill, a bounded stuck capture into `<part stem>.stuck.log` beside the part's log (`boundedCapture`,
+ * deadline cfg.captureMs). The caller kills the part's group, then calls the returned capture's `afterKill`. Nothing it does
+ * changes the part's exit.
+ */
+async function stuckCapture(cfg: Config, runId: string, work: string, pgid: number, logPath: string, cap: number): Promise<Capture | null> {
+	const stem = basename(logPath, ".log");
+	return boundedCapture(
+		"stuck capture",
+		join(work, `${stem}.stuck.log`),
+		cfg.captureMs,
+		(started) => `stuck capture of ${stem} (process group ${pgid}) at its cap of ${cap} ms, ${new Date(started).toISOString()}, deadline ${cfg.captureMs} ms\n`,
+		(c) => captureSections(cfg, runId, c, pgid, work, stem, logPath),
+	);
 }
 
 // ---- prepare ---------------------------------------------------------------------------------------
@@ -671,35 +704,462 @@ function unlinkIfPresent(path: string): void {
 	}
 }
 
+// ---- the stuck-worker detector (PLAN wl-mvq8x4pkjmx69s D3) ------------------------------------------------------------
+
+type StuckMode = "shadow" | "enforce";
+
+/** caps.json `stuckStop`: `shadow` when the key is absent; anything but `shadow` or `enforce` is refused, as a bad fullWorkers. */
+function stuckMode(a: Areas, runId: string): StuckMode {
+	const { path, v } = caps(a, runId);
+	const m = v.stuckStop;
+	if (m === undefined) return "shadow";
+	if (m !== "shadow" && m !== "enforce") return refuse(`${path} has a stuckStop that is not shadow or enforce`);
+	return m;
+}
+
+/**
+ * The marker preload (D1, D3), written per part to `<work>/stuck-preload-<part>.js` and passed as `bun test --preload`. bun runs
+ * a preload once per isolated test file, each in a fresh global (probe, bun 1.3.14), so each run wraps that global's
+ * `Bun.spawnSync`. The marker is opened per call and closed after it (no fd outlives a call or a discarded global); it is created
+ * at load so a test can act on it before its first call. No backtick and no dollar-brace in it: it is a String.raw constant.
+ */
+const STUCK_PRELOAD = String.raw`// agent-system 2.0 test runner: the stuck-worker marker preload (PLAN wl-mvq8x4pkjmx69s D1, D3). test-exec writes it for
+// one part and removes it when the part ends. It wraps Bun.spawnSync (node's sync child_process APIs route through it): for
+// each outermost call it writes "<since ms>\t<command>\n" to $AS2TEST_STUCK_MARKERS/<pid> and holds an flock on that file for
+// exactly the call. The call returns or throws exactly what it would have; the wrapper's own fs and ffi errors only stop
+// publication (a missed detection, never a false one).
+import fs from "node:fs";
+import { dlopen, FFIType } from "bun:ffi";
+
+const MARK = Symbol.for("as2test.stuck-marker");
+const dir = process.env.AS2TEST_STUCK_MARKERS;
+if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darwin" && typeof Bun.spawnSync === "function" && !Bun.spawnSync[MARK]) {
+	try {
+		// Bound at load: a test that later replaces any of these cannot reach the marker.
+		const openSync = fs.openSync;
+		const closeSync = fs.closeSync;
+		const ftruncateSync = fs.ftruncateSync;
+		const writeSync = fs.writeSync;
+		const nowMs = Date.now;
+		const apply = Reflect.apply;
+		const flock = dlopen("/usr/lib/libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock;
+		const original = Bun.spawnSync;
+		const path = dir + "/" + process.pid;
+		// O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC (0x1000000 on darwin; bun's fs constants lack it): a child never inherits it.
+		const FLAGS = fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW | 0x1000000;
+		const LOCK_EX = 2;
+		const LOCK_NB = 4;
+		const LOCK_UN = 8;
+		closeSync(openSync(path, FLAGS, 0o600));
+		let depth = 0;
+		let off = false;
+		// The fd holding this call's lock, or -1 when the call runs unpublished. Lock first (LOCK_EX|LOCK_NB: a held lock or the
+		// observer's momentary shared lock means this call runs unpublished), then the content; a write that fails unpublishes.
+		const publish = (a) => {
+			if (off) return -1;
+			let fd = -1;
+			let locked = false;
+			try {
+				const cmd = Array.isArray(a) ? a : a !== null && typeof a === "object" && Array.isArray(a.cmd) ? a.cmd : null;
+				const argv0 = cmd !== null && typeof cmd[0] === "string" ? cmd[0] : "";
+				const command = argv0.slice(argv0.lastIndexOf("/") + 1).slice(0, 16);
+				if (!/^[^\t\n]{1,16}$/.test(command)) return -1;
+				fd = openSync(path, FLAGS, 0o600);
+				if (flock(fd, LOCK_EX | LOCK_NB) !== 0) throw 0;
+				locked = true;
+				ftruncateSync(fd, 0);
+				writeSync(fd, nowMs() + "\t" + command + "\n", 0);
+				return fd;
+			} catch {}
+			if (locked) release(fd);
+			else if (fd >= 0) {
+				try {
+					closeSync(fd);
+				} catch {}
+			}
+			return -1;
+		};
+		const release = (fd) => {
+			let unlocked = false;
+			try {
+				unlocked = flock(fd, LOCK_UN) === 0;
+			} catch {}
+			// An unlock that failed: the close below drops the lock, and nothing is published again.
+			if (!unlocked) off = true;
+			try {
+				closeSync(fd);
+			} catch {}
+		};
+		const spawnSync = function spawnSync(...args) {
+			// A nested call is not published again.
+			if (depth > 0) return apply(original, this, args);
+			depth++;
+			let fd = -1;
+			try {
+				fd = publish(args[0]);
+				return apply(original, this, args);
+			} finally {
+				depth--;
+				if (fd >= 0) release(fd);
+			}
+		};
+		spawnSync[MARK] = true;
+		Bun.spawnSync = spawnSync;
+	} catch {
+		// No marker for this process: a missed detection, never a false one.
+	}
+}
+`;
+
+/** Remove a file or a tree (no link followed) when it is there. */
+function removeIfPresent(path: string): void {
+	try {
+		removeTree(path);
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+	}
+}
+
+/** One detector line on stdout (CONTRACT.md): `<keyword> <ISO time> part <part> <rest>`, written synchronously. */
+function stuckLine(stem: string, keyword: string, rest: string): void {
+	try {
+		writeSync(1, `${keyword} ${new Date().toISOString()} part ${stem} ${rest}\n`);
+	} catch {
+		// stdout gone: the runner reads the exit and stderr
+	}
+}
+
+/** A signature's identity: worker and zombie (pid and start) and the marker's since. */
+const sigKey = (s: Signature): string => `${s.worker.pid}:${s.worker.startUs}|${s.zombie.pid}:${s.zombie.startUs}|${s.since}`;
+
+/** An enforce match: the signature, how long it held, and the observation it matched on. */
+interface StopDecision {
+	sig: Signature;
+	spunMs: number;
+	snap: Snapshot;
+	owned: Seen[];
+}
+
+interface WatchPart {
+	cfg: Config;
+	runId: string;
+	work: string;
+	stem: string;
+	logPath: string;
+	mode: StuckMode;
+	leader: number;
+	markerDir: string;
+}
+
+/**
+ * The detector of one part (D3): one observation per tick from the spawn until the part ends, the cap fires or a stop is
+ * decided. Each signature's first tick, its clearing and its match are stdout lines. A shadow match starts the part's one
+ * signature capture and the part runs on; an enforce match writes `stuck-stop`, stops classifying and resolves `stopped`.
+ */
+class StuckWatch {
+	private readonly det: StuckDetector;
+	private readonly uid = process.getuid!();
+	private timer: ReturnType<typeof setInterval> | undefined;
+	/** Set at the part's end, the cap or a stop decision: no tick classifies after it. */
+	private ended = false;
+	/** Each holding signature's first tick. */
+	private readonly firstAt = new Map<string, number>();
+	private readonly decided = Promise.withResolvers<StopDecision>();
+	/** Resolves on an enforce match only. */
+	readonly stopped = this.decided.promise;
+	/** An enforce match was decided: the cap is ignored from here on. */
+	stopping = false;
+	/** The shadow capture (started at the first would-stop), awaited before the part's files go. */
+	private shadowCapture: Promise<void> | null = null;
+
+	constructor(private readonly p: WatchPart) {
+		this.det = new StuckDetector({ tickMs: p.cfg.detectTickMs, persistMs: p.cfg.detectPersistMs, bunPath: p.cfg.bun, leaderPid: p.leader });
+	}
+
+	start(): void {
+		this.timer = setInterval(() => this.tick(), this.p.cfg.detectTickMs);
+	}
+
+	/** No tick classifies after this (the part ended, the cap fired, or a stop was decided). */
+	end(): void {
+		this.ended = true;
+		clearInterval(this.timer);
+	}
+
+	/** The part's end: stop ticking and let a running shadow capture finish (bounded by its own deadline). */
+	async settle(): Promise<void> {
+		this.end();
+		await this.shadowCapture;
+	}
+
+	private line(keyword: string, rest: string): void {
+		stuckLine(this.p.stem, keyword, rest);
+	}
+
+	private tick(): void {
+		if (this.ended) return;
+		const { cfg, mode } = this.p;
+		try {
+			const obs = observe({ uid: this.uid, markerDir: this.p.markerDir, candidatesOf: (s) => this.det.candidatesOf(s), argvOf: (s) => this.det.argvNeeded(s) });
+			if (obs.snap.kind === "unavailable") {
+				this.line("stuck-detector-off", `reason ${obs.snap.why}`);
+				this.end();
+				return;
+			}
+			const r = this.det.tick(obs);
+			if (cfg.detectTrace) this.trace(obs, r);
+			const pair = (s: Signature) => `worker ${s.worker.pid} zombie ${s.zombie.pid}`;
+			for (const c of r.cleared) {
+				this.firstAt.delete(sigKey(c.sig));
+				this.line("stuck-cleared", `${pair(c.sig)} held ${Math.round(c.heldMs)} matched ${c.matched ? "yes" : "no"}`);
+			}
+			for (const s of r.started) {
+				this.firstAt.set(sigKey(s), obs.at);
+				this.line("stuck-signature", `${pair(s)} since ${s.since} mode ${mode} bun ${Bun.version} ${Bun.revision}`);
+			}
+			for (const m of r.matched) {
+				const spunMs = Math.round(obs.at - (this.firstAt.get(sigKey(m)) ?? obs.at));
+				if (mode === "enforce") {
+					this.line("stuck-stop", pair(m));
+					this.stopping = true;
+					this.end();
+					this.decided.resolve({ sig: m, spunMs, snap: obs.snap, owned: r.owned });
+					return;
+				}
+				this.line("stuck-would-stop", pair(m));
+				// One signature capture per part; in shadow nothing is killed, so the capture's file closes as soon as it ends.
+				this.shadowCapture ??= this.capture({ sig: m, spunMs, snap: obs.snap, owned: r.owned }).then((c) => c?.afterKill());
+			}
+		} catch (e) {
+			this.line("stuck-detector-off", `reason detector failed: ${errText(e)}`);
+			this.end();
+		}
+	}
+
+	/** `detectTrace` (tests): the tick's markers, candidates (with CPU), live part tree and its zombies, as one JSON line. */
+	private trace(obs: Observation, r: TickResult): void {
+		const tree = obs.snap.kind === "ok" ? liveOwned(obs.snap, r.owned) : [];
+		const pids = new Set(tree.map((p) => p.pid));
+		const zombies = obs.snap.kind === "ok" ? obs.snap.procs.filter((p) => p.zombie && pids.has(p.ppid)) : [];
+		const row = {
+			at: Math.round(obs.at),
+			snap: obs.snap.kind === "ok" ? "ok" : `${obs.snap.kind}: ${obs.snap.why}`,
+			markers: obs.markers.kind === "ok" ? obs.markers.active : { denied: obs.markers.why },
+			candidates: [...obs.cpu].map(([pid, cpuNs]) => ({ pid, cpuNs })),
+			tree: tree.map(({ pid, ppid, pgid, comm }) => ({ pid, ppid, pgid, comm })),
+			zombies: zombies.map(({ pid, ppid, startUs, comm }) => ({ pid, ppid, startUs, comm })),
+			signatures: r.signatures.map((s) => ({ worker: s.worker.pid, zombie: s.zombie.pid, since: s.since, command: s.command })),
+		};
+		appendFileSync(join(this.p.work, `${this.p.stem}.stuck-trace.jsonl`), `${JSON.stringify(row)}\n`);
+	}
+
+	/** The part's one signature capture (D3), bounded by signatureCaptureMs; `stuck-captured` once its file is written. */
+	async capture(d: StopDecision): Promise<Capture | null> {
+		const { cfg, runId, work, stem, logPath, markerDir } = this.p;
+		const { sig } = d;
+		const c = await boundedCapture(
+			"signature capture",
+			join(work, `${stem}.signature.log`),
+			cfg.signatureCaptureMs,
+			(started) =>
+				`signature capture of ${stem}: worker ${sig.worker.pid} spun ${d.spunMs} ms in Bun.spawnSync (marker since ${sig.since}, command ${sig.command}) with unreaped child ${sig.zombie.pid}; mode ${this.p.mode}, ${new Date(started).toISOString()}, deadline ${cfg.signatureCaptureMs} ms\n`,
+			(c) => signatureSections(cfg, runId, c, d, work, stem, logPath, markerDir),
+		);
+		if (c !== null) this.line("stuck-captured", `file ${stem}.signature.log ms ${Date.now() - c.started}`);
+		return c;
+	}
+}
+
+/**
+ * The signature capture's sections: 1 the part tree from the match's snapshot (no ps), 2 the worker's marker, 3 `sample` of the
+ * worker for 1 s and 4 `lsof` of it (both started together), 5 the log's last lines.
+ */
+async function signatureSections(cfg: Config, runId: string, c: Capture, d: StopDecision, work: string, stem: string, logPath: string, markerDir: string): Promise<void> {
+	const w = d.sig.worker.pid;
+	c.capDir = mkdtempSync(join(work, `${stem}.signature-`));
+	let since = Date.now();
+	let tree = `inspection: ${d.snap.kind}\n`;
+	if (d.snap.kind === "ok") {
+		const live = liveOwned(d.snap, d.owned);
+		const pids = new Set(live.map((p) => p.pid));
+		const rows = [...live, ...d.snap.procs.filter((p) => p.zombie && pids.has(p.ppid))].map((p) => {
+			const role = p.pid === w ? "  <- worker" : p.pid === d.sig.zombie.pid ? "  <- unreaped child" : "";
+			return `${p.pid} ${p.ppid} ${p.pgid} ${p.zombie ? "Z" : "-"} ${new Date(p.startUs / 1000).toISOString()} ${p.comm}${role}`;
+		});
+		tree = ["PID PPID PGID ZOMBIE START COMM", ...rows, ""].join("\n");
+	}
+	c.section("1. part tree from the detector's snapshot", since, tree);
+	since = Date.now();
+	const markerPath = join(markerDir, String(w));
+	const marker = readRegular(markerPath, 64, "head");
+	c.section(
+		`2. marker ${markerPath}`,
+		since,
+		`observed: since ${d.sig.since} (${new Date(d.sig.since).toISOString()}) command ${d.sig.command}\nnow: ${"text" in marker ? JSON.stringify(marker.text) : `refused: ${marker.refused}`}\n`,
+	);
+	since = Date.now();
+	const sampled = sampleOne(cfg, runId, c, w, 1, "signature-sample-read");
+	const listed = c.tool(["/usr/sbin/lsof", "-nP", "-p", String(w)]);
+	await hook(cfg, runId, "signature-capture", { stop: c.late });
+	c.alive();
+	const sample = await sampled;
+	c.alive();
+	c.section(`3. sample of worker ${w}`, since, sample);
+	const lsof = await listed;
+	c.alive();
+	c.section(`4. lsof of worker ${w}`, since, toolBlock(lsof));
+	c.clearCapDir();
+	since = Date.now();
+	c.section(`5. last ${LOG_TAIL_LINES} lines of ${logPath}`, since, logTail(logPath));
+}
+
+/** What the enforce teardown did: the groups it signalled, how long it took, and whether every owned process is gone. */
+interface Teardown {
+	pgids: number[];
+	ms: number;
+	/** null when contained; else the `stuck-killed` token (`<pid,pid>` or `inspection-denied`) and the stderr reason. */
+	unconfirmed: { token: string; why: string } | null;
+}
+
+/**
+ * The enforce teardown (D3), after the signature capture. Owned = every identity the detector saw (leader and descendants) plus
+ * every live descendant of one in a fresh snapshot (new during the capture included). The stop set is the pgids with a live
+ * owned member, matched by pid and start; it joins the groups file. SIGTERM each, wait ≤ stopGraceMs for the owned processes to
+ * go, SIGKILL each, then poll ≤ verifyMs until no owned identity is alive (a zombie is dead). A denied fresh snapshot signals
+ * nothing from stale data. Signal errors other than ESRCH go to stderr.
+ */
+async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teardown> {
+	const uid = process.getuid!();
+	const t0 = Date.now();
+	const fresh = snapshot(uid);
+	if (fresh.kind !== "ok") return { pgids: [], ms: Date.now() - t0, unconfirmed: { token: "inspection-denied", why: `inspection denied (${fresh.why})` } };
+	const live = liveOwned(fresh, owned);
+	const self = fresh.procs.find((p) => p.pid === process.pid)?.pgid;
+	const pgids = [...new Set(live.map((p) => p.pgid))].filter((g) => g > 1 && g !== self);
+	if (pgids.length > 0) appendFileSync(groupsFile(work), pgids.map((g) => `${g}\n`).join(""));
+	const tracked = [...owned, ...live];
+	/** The owned processes still alive, or null when the snapshot is denied. */
+	const left = (): Seen[] | null => {
+		const s = snapshot(uid);
+		return s.kind === "ok" ? liveOwned(s, tracked) : null;
+	};
+	const errors: string[] = [];
+	const signal = (sig: NodeJS.Signals) => {
+		for (const g of pgids) {
+			try {
+				process.kill(-g, sig);
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "ESRCH") errors.push(`kill(-${g}, ${sig}): ${errText(e)}`);
+			}
+		}
+	};
+	signal("SIGTERM");
+	let now = left();
+	for (const until = Date.now() + cfg.stopGraceMs; (now === null || now.length > 0) && Date.now() < until; now = left()) await Bun.sleep(50);
+	if (now === null || now.length > 0) {
+		signal("SIGKILL");
+		now = left();
+		for (const until = Date.now() + STUCK_DEFAULTS.verifyMs; (now === null || now.length > 0) && Date.now() < until; now = left()) await Bun.sleep(50);
+	}
+	for (const e of errors) process.stderr.write(`as2test: stuck stop: ${e}\n`);
+	const ms = Date.now() - t0;
+	if (now === null) return { pgids, ms, unconfirmed: { token: "inspection-denied", why: "inspection denied after the kill" } };
+	if (now.length > 0) {
+		const pids = now.map((p) => p.pid).join(",");
+		return { pgids, ms, unconfirmed: { token: pids, why: `${pids} still alive ${STUCK_DEFAULTS.verifyMs} ms after SIGKILL` } };
+	}
+	return { pgids, ms, unconfirmed: null };
+}
+
 /**
  * Run `bun test …` in `<dir>/repo` with `<dir>`'s child env, in its own process group under the cap; the group is recorded in the
  * run's groups file for a `groups` sweep. At the cap, the stuck capture (D5) runs, bounded by its own deadline, before the kill.
+ * The stuck-worker detector (PLAN wl-mvq8x4pkjmx69s D3) watches the part from its spawn to its end, the cap or a stop: the part
+ * runs with the marker preload and `AS2TEST_STUCK_MARKERS`, both removed when the part ends. An enforce match is stopped here
+ * (signature capture, teardown) and exits WRAPPER_EXIT.stuck; a cap that fires during a stop is ignored, and a stop never
+ * starts after the cap.
  */
-async function part(cfg: Config, runId: string, work: string, dir: string, argv: string[], logPath: string, cap: number): Promise<number> {
+async function part(cfg: Config, runId: string, work: string, dir: string, argv: string[], logPath: string, cap: number, mode: StuckMode): Promise<number> {
+	const stem = basename(logPath, ".log");
+	const markerDir = join(work, `stuck-markers-${stem}`);
+	const preload = join(work, `stuck-preload-${stem}.js`);
+	let off: string | null = process.platform === "darwin" ? null : `not darwin (${process.platform})`;
+	if (off === null) {
+		try {
+			removeIfPresent(markerDir);
+			removeIfPresent(preload);
+			mkdirSync(markerDir, { mode: 0o700 });
+			const fd = openSync(preload, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+			try {
+				writeSync(fd, STUCK_PRELOAD);
+			} finally {
+				closeSync(fd);
+			}
+		} catch (e) {
+			off = `setup failed: ${errText(e)}`;
+		}
+	}
+	const env = childEnv(process.env, dir);
+	if (off === null) env.AS2TEST_STUCK_MARKERS = markerDir;
 	const log = openSync(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-	const child = spawn(cfg.bun, argv, { cwd: join(dir, "repo"), env: childEnv(process.env, dir), stdio: ["ignore", log, log], detached: true });
+	const args = off === null ? [argv[0]!, "--preload", preload, ...argv.slice(1)] : argv;
+	const child = spawn(cfg.bun, args, { cwd: join(dir, "repo"), env, stdio: ["ignore", log, log], detached: true });
 	closeSync(log);
 	const pgid = child.pid;
 	if (pgid === undefined) return failed(`bun did not start`);
 	appendFileSync(groupsFile(work), `${pgid}\n`);
 	const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => child.on("exit", (code, signal) => r({ code, signal })));
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const capped = new Promise<"cap">((r) => {
-		timer = setTimeout(() => r("cap"), cap);
-	});
-	const first = await Promise.race([done, capped]);
-	clearTimeout(timer);
-	if (first === "cap") {
-		const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
-		await killGroup(cfg, pgid);
-		// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
-		await capture?.afterKill();
-		await done;
-		throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
+	const watch = off === null ? new StuckWatch({ cfg, runId, work, stem, logPath, mode, leader: pgid, markerDir }) : null;
+	if (off !== null) stuckLine(stem, "stuck-detector-off", `reason ${off}`);
+	watch?.start();
+	try {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const capped = new Promise<"cap">((r) => {
+			timer = setTimeout(() => {
+				if (watch?.stopping) return;
+				watch?.end();
+				r("cap");
+			}, cap);
+		});
+		const first = await Promise.race([done, capped, watch?.stopped ?? new Promise<never>(() => {})]);
+		clearTimeout(timer);
+		if (first === "cap") {
+			const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
+			await killGroup(cfg, pgid);
+			// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
+			await capture?.afterKill();
+			await done;
+			throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
+		}
+		if ("sig" in first) {
+			const capture = await watch!.capture(first);
+			const t = await teardown(cfg, work, first.owned);
+			stuckLine(stem, "stuck-killed", `pgids ${t.pgids.join(",") || "none"} ms ${t.ms} ${t.unconfirmed === null ? "contained" : `unconfirmed ${t.unconfirmed.token}`}`);
+			await capture?.afterKill();
+			// Never an unbounded wait: a leader that outlived the teardown must not hold this process open.
+			child.unref();
+			await Promise.race([done, Bun.sleep(1_000)]);
+			const { sig } = first;
+			throw new Exit(
+				WRAPPER_EXIT.stuck,
+				`stuck: worker ${sig.worker.pid} spun ${first.spunMs} ms in Bun.spawnSync with unreaped child ${sig.zombie.pid}; ${t.pgids.length} process groups killed, containment ${t.unconfirmed === null ? "contained" : `unconfirmed: ${t.unconfirmed.why}`}`,
+			);
+		}
+		// Anything the part left behind in its group is the sweep's (§ 2.3 step 4): the runner sweeps after every part.
+		if (first.code !== null) return first.code;
+		return 128 + (first.signal ? (osConstants.signals[first.signal] ?? 0) : 0);
+	} finally {
+		await watch?.settle();
+		if (off === null) {
+			for (const path of [markerDir, preload]) {
+				try {
+					removeIfPresent(path);
+				} catch (e) {
+					process.stderr.write(`as2test: stuck detector: ${path} not removed: ${errText(e)}\n`);
+				}
+			}
+		}
 	}
-	// Anything the part left behind in its group is the sweep's (§ 2.3 step 4): the runner sweeps after every part.
-	if (first.code !== null) return first.code;
-	return 128 + (first.signal ? (osConstants.signals[first.signal] ?? 0) : 0);
 }
 
 async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
@@ -707,12 +1167,11 @@ async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
 	const work = workDir(a, runId);
 	const cap = capMs(a, runId, "fullCapMin");
 	const workers = fullWorkers(a, runId);
+	const mode = stuckMode(a, runId);
 	const xml = join(work, "full.xml");
 	const log = join(work, "full.log");
-	unlinkIfPresent(xml);
-	unlinkIfPresent(log);
-	unlinkIfPresent(join(work, "full.stuck.log"));
-	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap);
+	for (const stale of ["full.xml", "full.log", "full.stuck.log", "full.signature.log", "full.stuck-trace.jsonl"]) unlinkIfPresent(join(work, stale));
+	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap, mode);
 }
 
 async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
@@ -735,6 +1194,7 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 	if (!inside(target, realRepo) || realpathSync(target) === realRepo) refuse(`${file} resolves outside the clone`);
 	if (!lstatSync(realpathSync(target)).isFile()) refuse(`${file} is not a file`);
 	const cap = capMs(a, runId, "soloCapMin");
+	const mode = stuckMode(a, runId);
 	// Claim the lowest free index: <stem>-<i>.log is created exclusively.
 	let i = 1;
 	let log = "";
@@ -748,10 +1208,9 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 		}
 	}
 	const xml = join(work, `${stem}-${i}.xml`);
-	unlinkIfPresent(xml);
-	unlinkIfPresent(join(work, `${stem}-${i}.stuck.log`));
-	process.stdout.write(`part ${stem}-${i}\n`);
-	return part(cfg, runId, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
+	for (const stale of [".xml", ".stuck.log", ".signature.log", ".stuck-trace.jsonl"]) unlinkIfPresent(join(work, `${stem}-${i}${stale}`));
+	writeSync(1, `part ${stem}-${i}\n`);
+	return part(cfg, runId, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap, mode);
 }
 
 // ---- sweep -------------------------------------------------------------------------------------------
@@ -961,7 +1420,8 @@ try {
 	process.exitCode = await main(process.argv.slice(2));
 } catch (e) {
 	if (e instanceof Exit) {
-		process.stderr.write(`as2test: ${e.message}\n`);
+		// The stuck reason is one bare `stuck: …` line: the runner takes it as the part's error (test-run.ts stuckReason).
+		process.stderr.write(e.code === WRAPPER_EXIT.stuck ? `${e.message}\n` : `as2test: ${e.message}\n`);
 		process.exitCode = e.code;
 	} else {
 		process.stderr.write(`as2test: failed: ${(e as Error).stack ?? String(e)}\n`);

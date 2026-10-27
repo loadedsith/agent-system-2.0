@@ -33,15 +33,24 @@
 //       full suite never runs on base). After a call that timed out, the wrapper's stuck capture `<part>.stuck.log` is imported
 //       into the run dir under the report checks; a missing or refused capture is one runner.log line and changes nothing. Then
 //       the head re-check, one `test-run:` entry and the settle
-//       in one ledger transaction; then, when the fetch confirmed the requested sha, the `as2/full-suite` commit status on
+//       in one ledger transaction; then the lock released (`<ts> lock released`) and, when the fetch confirmed the requested
+//       sha, the `as2/full-suite` commit status on
 //       that sha for any PR (green and red-main success, red failure, error error; stale and superseded post none; PLAN
-//       wl-mv8s8srodefytc rev 17.1 D2, D8), and the lock released. No `pending` is posted: a missing status already blocks a
+//       wl-mv8s8srodefytc rev 17.1 D2, D8). No `pending` is posted: a missing status already blocks a
 //       protected merge. A failed status post is logged and never changes the verdict.
 //
 //       Parallel files (workload wl-mvg2kzuvwngdmo): the trusted phase writes the profile's `testRunner.fullWorkers` into
 //       caps.json beside the caps, and the run logs `<ts> full workers <n>` right before the PR full part; test-exec runs that
 //       part with `bun test --parallel=<n>` when n is over 1. Solo parts, on the PR and on base, run one file each.
 //       surface/scripts/test-run-waits.ts reads the waits, the `full workers` lines and the results back per day.
+//
+//       Stuck workers (PLAN wl-mvq8x4pkjmx69s D4): caps.json carries `testRunner.stuckStop` (`shadow` by default, `enforce`) for
+//       the exec's detector. A stuck part (exit 125 or a `stuck-stop` line) or a stalled executor (enforce only: the backstop
+//       abandons a call STUCK_BACKSTOP_MS after a `stuck-signature` no stop line followed) ends the run with an error: one
+//       bounded sweep, a spawn-free containment check of `_as2test`'s processes (retried up to STUCK_CONTAIN_MS, then
+//       `stuck-containment-failed`), the shorter STUCK_FINALIZE_MS and the release. Shadow never arms the backstop. After a
+//       `stuck-captured` line the run imports `<stem>.signature.log`; each run logs `stuck detector <mode>`. Every run
+//       checks containment after its first sweep and runs no part while a survivor lives (`admission refused` after ADMIT_MS).
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -56,6 +65,15 @@
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    shared post-sweep head/result/publication deadline (default 150 s)
+//   AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS  the same after a stuck or stalled part (default 12 s, never over FINALIZE_MS)
+//   AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS  an enforce signature's backstop deadline after its line (default 16.5 s)
+//   AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS  how often the backstop reads a part's stdout (default 1 s)
+//   AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS one deadline over every attempt of a bounded sweep (default 12 s)
+//   AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS  how long containment may be retried after the stuck fact (default 60 s)
+//   AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS  between containment checks (default 5 s)
+//   AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS       how long the admission gate retries (default 30 s)
+//   AGENT_SYSTEM_TEST_RUNNER_CONTAIN_SCOPE  `uid` makes a test install's containment check read the caller's uid; by default a
+//                                           test install's check counts only live members of a `<as2test root>/runs/*/groups` pgid
 //   AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS     how long a part's wrapper may outlive its cap before the runner sweeps (default 60 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
@@ -82,12 +100,13 @@ import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, executedFiles, fullSuiteSlice, HEARTBEAT_EVERY_MS,
-	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
-	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
-	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
-	soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, executedFiles, executorStalledReason,
+	fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
+	partResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf,
+	runnerDiedRun, type RunRecord, runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, StuckWatch, stuckReason, type TestRequested, type TestRun, testRequestedBody,
+	testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict, soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
+import { liveProcs, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -107,6 +126,28 @@ const OUTLIVE_MS = 60_000;
 const REFRESH_TIMEOUT_MS = REFRESH_CAP_S * 1000 + 60_000;
 const REFRESH_KILL_GRACE_MS = 10_000;
 const REFRESH_REAP_MS = 30_000;
+
+/**
+ * The stuck-worker detector's runner side (PLAN wl-mvq8x4pkjmx69s D4). The backstop of an enforce part abandons the wrapper call
+ * this long after a `stuck-signature` line's own time: the executor's persistence, signature capture, stop grace and 2 s
+ * verification, plus STUCK_SLACK_MS; 16.5 s with the production defaults (AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS in tests).
+ */
+const STUCK_SLACK_MS = 5_000;
+const STUCK_BACKSTOP_MS = STUCK_DEFAULTS.persistMs + STUCK_DEFAULTS.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + STUCK_SLACK_MS;
+/** How often the backstop reads an enforce part's stdout (AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS). */
+const STUCK_POLL_MS = 1_000;
+/** One deadline over every attempt of the sweep after a stuck or stalled part, the only cleanup step (AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS). */
+const STUCK_SWEEP_MS = 12_000;
+/** The post-sweep deadline of a stuck or stalled run, under FINALIZE_MS (AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS). */
+const STUCK_FINALIZE_MS = 12_000;
+/** How long after the stuck fact the containment check may retry before the run names its failure (AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS). */
+const STUCK_CONTAIN_MS = 60_000;
+/** Between containment checks, a bounded sweep and this wait (AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS). */
+const CONTAIN_RETRY_MS = 5_000;
+/** How long a run retries the admission gate before it ends `admission refused` (AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS). */
+const ADMIT_MS = 30_000;
+/** The post-sweep finalization deadline of a run that was not stuck (AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS). */
+const FINALIZE_MS = 150_000;
 
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
@@ -663,11 +704,15 @@ const NETWORK = [...NO_HOOKS, "-c", "init.templateDir=", "-c", "credential.helpe
  * File-backed output cannot wait for EOF held by a grandchild. Poll the exit status with a
  * deadline as well: signalling a process does not bound an unresolved stream/exited promise.
  * Each caller owns its private output directory; no output is trimmed except stderr.
+ * `watch` (the stuck backstop, PLAN wl-mvq8x4pkjmx69s D4) reads the stdout so far every `everyMs` and answers the time to abandon
+ * the call at (Infinity for none; it may move, never past the timeout); at that time the stdout is read once more, and when the
+ * answer still holds the child gets SIGKILL and the call returns at once, `abandoned`, with no exit of its own.
  */
 export async function run(cmd: string[], o: {
 	cwd: string; env: Record<string, string | undefined>; timeoutMs: number; inheritStderr?: boolean;
 	onSpawn?: (pid: number) => void;
-}): Promise<{ code: number | null; signal: string | null; out: string; err: string }> {
+	watch?: { everyMs: number; abandonAt: (out: string, nowMs: number) => number };
+}): Promise<{ code: number | null; signal: string | null; out: string; err: string; abandoned: boolean }> {
 	const dir = mkdtempSync(join(tmpdir(), "as2-runner-command-"));
 	const outPath = join(dir, "stdout");
 	const errPath = join(dir, "stderr");
@@ -683,23 +728,38 @@ export async function run(cmd: string[], o: {
 		}
 		o.onSpawn?.(p.pid);
 		const deadline = Date.now() + o.timeoutMs;
+		let abandonAt = Infinity;
+		let nextRead = 0;
 		while (p.exitCode === null && p.signalCode === null) {
-			if (Date.now() >= deadline) {
+			const now = Date.now();
+			if (now >= deadline) {
 				// Release the wait even if signalling is refused or Bun never reports completion.
 				try { p.kill("SIGKILL"); } catch { /* the deadline still applies */ }
 				throw new Stop(`command timed out after ${o.timeoutMs} ms: ${cmd.join(" ")}`);
 			}
-			await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
+			if (o.watch && (now >= nextRead || now >= abandonAt)) {
+				abandonAt = o.watch.abandonAt(readFileSync(outPath, "utf8"), now);
+				nextRead = now + o.watch.everyMs;
+				if (now >= abandonAt) {
+					try { p.kill("SIGKILL"); } catch { /* the wait is abandoned either way */ }
+					return { code: null, signal: null, out: readFileSync(outPath, "utf8"), err: readFileSync(errPath, "utf8").trim(), abandoned: true };
+				}
+			}
+			await Bun.sleep(Math.min(25, Math.max(1, Math.min(deadline, abandonAt) - Date.now())));
 		}
-		return { code: p.exitCode, signal: p.signalCode ?? null, out: readFileSync(outPath, "utf8"), err: readFileSync(errPath, "utf8").trim() };
+		return { code: p.exitCode, signal: p.signalCode ?? null, out: readFileSync(outPath, "utf8"), err: readFileSync(errPath, "utf8").trim(), abandoned: false };
 	} finally {
 		p?.unref();
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
 
-/** One wrapper call's end: its exit, and whether the outlive sweep fired on it (PLAN wl-mvq4edh02r5z40 D0; `callTimedOut`). */
-type Wrapped = { code: number | null; signal: string | null; out: string; outlived: boolean };
+/**
+ * One wrapper call's end: its exit, and whether the outlive sweep fired on it (PLAN wl-mvq4edh02r5z40 D0; `callTimedOut`); for a part,
+ * its stderr (echoed into runner.log), and whether the stuck backstop abandoned it with the worker of the signature it fired on
+ * (PLAN wl-mvq8x4pkjmx69s D4; `callStuck`).
+ */
+type Wrapped = { code: number | null; signal: string | null; out: string; outlived: boolean; err: string; abandoned: boolean; candidate: number | null };
 
 class Runner {
 	readonly root = runsRoot(process.env);
@@ -728,6 +788,8 @@ class Runner {
 	/** The run's place in the lock queue: its `test-requested:` entry's created_at in ms, read once at start. */
 	readonly requestedAt: number;
 	private readonly f: RunFacts & { base: string | null; mergeBase: string | null; preflight: string | null };
+	/** `_as2test`'s uid as the install check read it (dscl), for the spawn-free containment check; null until then or when unknown. */
+	private as2testUid: number | null = null;
 
 	constructor(readonly ledger: Ledger, readonly wl: string, readonly request: TestRequested, readonly config: TestRunnerConfig) {
 		this.runDir = runDirOf(this.root, request.runId);
@@ -741,7 +803,7 @@ class Runner {
 		this.capBytes = reportCapBytes(config);
 		this.f = {
 			requestedSha: request.sha, fetchedSha: null, error: null, full: null, fullTimedOut: false, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null, baseRuns: null,
-			base: null, mergeBase: null, preflight: null,
+			stuck: null, executorStalled: null, base: null, mergeBase: null, preflight: null,
 		};
 	}
 
@@ -871,10 +933,13 @@ class Runner {
 	}
 
 	/**
-	 * One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stderr goes to runner.log; stdout is captured and echoed there.
-	 * It starts in the as2test root, which `_as2test` can read: the run dir is Jo's 0700 dir, and a cwd the child cannot read kills bun on getcwd.
+	 * One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stderr goes to runner.log (a part's after the
+	 * call, so its `stuck:` reason can be read); stdout is captured and echoed there. It starts in the as2test root, which `_as2test`
+	 * can read: the run dir is Jo's 0700 dir, and a cwd the child cannot read kills bun on getcwd. `timeoutMs` bounds a call that has
+	 * no cap (a stuck run's sweep, D4): past it the call is abandoned and the Stop thrown. A part under `testRunner.stuckStop:
+	 * enforce` carries the stuck backstop (`StuckWatch`, PLAN wl-mvq8x4pkjmx69s D4); shadow never arms it.
 	 */
-	async wrap(call: WrapperCall, capMs: number | null = null): Promise<Wrapped> {
+	async wrap(call: WrapperCall, capMs: number | null = null, timeoutMs?: number): Promise<Wrapped> {
 		const argv = wrapperArgv(call, this.exec);
 		const outliveMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS", OUTLIVE_MS);
 		let outlived = false;
@@ -883,18 +948,30 @@ class Runner {
 			this.log(`${call.sub} outlived its cap by ${outliveMs / 1000} s; sweeping`);
 			void this.wrap({ sub: "sweep", runId: this.id }).catch((e) => this.log(`the outlive sweep failed: ${errText(e)}`));
 		}, capMs + outliveMs);
+		const backstop = capMs !== null && this.config.stuckStop === "enforce" ? new StuckWatch(msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_BACKSTOP_MS", STUCK_BACKSTOP_MS)) : null;
 		const r = await run(argv, {
 			cwd: this.as2root, env: process.env,
-			timeoutMs: (capMs ?? 0) + outliveMs + 120_000, inheritStderr: true,
+			timeoutMs: timeoutMs ?? (capMs ?? 0) + outliveMs + 120_000, inheritStderr: capMs === null,
 			onSpawn: (pid) => {
 				hookMark(this.id, `spawn-${call.sub}`, { pid });
 				this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
 			},
+			...(backstop && {
+				watch: {
+					everyMs: msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_POLL_MS", STUCK_POLL_MS),
+					abandonAt: (out: string, now: number) => {
+						backstop.feed(out, now);
+						return backstop.first()?.deadline ?? Infinity;
+					},
+				},
+			}),
 		}).finally(() => clearTimeout(watchdog ?? undefined));
-		const { out } = r;
+		const { out, err } = r;
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
-		this.log(`${argv.slice(4).join(" ")} → ${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`);
-		return { code: r.code, signal: r.signal, out, outlived };
+		if (capMs !== null && err) process.stderr.write(`${err}\n`);
+		const ended = r.abandoned ? "exit null (abandoned by the stuck backstop)" : `${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`;
+		this.log(`${argv.slice(4).join(" ")} → ${ended}`);
+		return { code: r.code, signal: r.signal, out, outlived, err, abandoned: r.abandoned, candidate: r.abandoned ? (backstop?.first()?.worker ?? null) : null };
 	}
 
 	/** A fenced exit (77) while this run believes it holds the lock: the checkpoint decides whether it was displaced. */
@@ -922,10 +999,140 @@ class Runner {
 		}
 	}
 
+	/**
+	 * The sweep after a stuck or stalled part (PLAN wl-mvq8x4pkjmx69s D4), the only cleanup step, and the admission gate's sweep:
+	 * each attempt is its own call bounded by `deadline`, one deadline over all of them, and an attempt still running there is
+	 * abandoned (its sudo child SIGKILLed), never awaited. A signal retries as `sweep` does. Returns whether a sweep finished clean;
+	 * a failure is logged, never thrown (the containment check after it judges what is left), but a fenced exit goes through `fenced`.
+	 */
+	private async boundedSweep(after: string, deadline: number): Promise<boolean> {
+		for (let attempt = 0; attempt <= SWEEP_RETRIES; attempt++) {
+			await this.checkpoint("sweep");
+			const left = deadline - Date.now();
+			if (left <= 0) break;
+			hookMark(this.id, "sweep", { after, attempt });
+			let r: Wrapped;
+			try {
+				r = await this.wrap({ sub: "sweep", runId: this.id }, null, left);
+			} catch (e) {
+				if (!(e instanceof Stop)) throw e;
+				this.log(`the sweep after ${after} was abandoned at its deadline: ${e.message}`);
+				return false;
+			}
+			if (r.code === WRAPPER_EXIT.ok) return true;
+			if (r.code === WRAPPER_EXIT.fenced) await this.fenced("the sweep");
+			if (r.signal === null) {
+				this.log(`the sweep after ${after} failed: exit ${r.code}`);
+				return false;
+			}
+			if (attempt < SWEEP_RETRIES) this.log(`the sweep after ${after} ended by ${r.signal}; retry ${attempt + 1} of ${SWEEP_RETRIES}`);
+		}
+		this.log(`the sweep after ${after} did not finish before its deadline`);
+		return false;
+	}
+
+	/**
+	 * The spawn-free containment check (D4): `snapshot()` of `_as2test`'s uid (sysctl, stuck-detect.ts), contained when it lists no
+	 * live (non-zombie) process; the real install always checks the uid. A test install (AGENT_SYSTEM_TEST_RUNNER_INSTALL: a `groups`
+	 * render running as the caller, whose every process is the caller's) reads the caller's own uid and counts only the live processes
+	 * whose pgid is in a `<as2test root>/runs/<run>/groups` file, unless AGENT_SYSTEM_TEST_RUNNER_CONTAIN_SCOPE=uid. A snapshot that
+	 * is not `ok`, or no known uid, is `denied`.
+	 */
+	private containment(): { kind: "contained" } | { kind: "live"; pids: number[] } | { kind: "denied"; why: string } {
+		const groups = !!process.env.AGENT_SYSTEM_TEST_RUNNER_INSTALL && process.env.AGENT_SYSTEM_TEST_RUNNER_CONTAIN_SCOPE !== "uid";
+		const uid = groups ? process.getuid!() : this.as2testUid;
+		if (uid === null) return { kind: "denied", why: `the ${AS2TEST_USER} uid is unknown` };
+		const s = snapshot(uid);
+		if (s.kind !== "ok") return { kind: "denied", why: s.why };
+		let live = liveProcs(s);
+		if (groups) {
+			const runs = join(this.as2root, "runs");
+			const pgids = new Set<number>();
+			let ids: string[] = [];
+			try {
+				ids = readdirSync(runs);
+			} catch {
+				// no runs yet
+			}
+			for (const id of ids) {
+				try {
+					for (const l of readFileSync(join(runs, id, "groups"), "utf8").split("\n")) if (/^\d+$/.test(l)) pgids.add(Number(l));
+				} catch {
+					// a run with no groups file
+				}
+			}
+			live = live.filter((p) => pgids.has(p.pgid));
+		}
+		return live.length === 0 ? { kind: "contained" } : { kind: "live", pids: live.map((p) => p.pid) };
+	}
+
+	/**
+	 * After a stuck or stalled part `stem` (D4), in place of its sweep: the bounded sweep (STUCK_SWEEP_MS over every attempt), then
+	 * the containment check; not contained or denied, another bounded sweep and a check every CONTAIN_RETRY_MS until contained or
+	 * STUCK_CONTAIN_MS after `at`, the stuck fact. Never contained: runner.log's `stuck-containment-failed part <stem> pids
+	 * <a,b|denied>`, and the run's stuck (or stalled) reason gains `; containment failed: <a,b | inspection denied>`. Either way the run
+	 * then finalizes and releases its lock, to the next run's admission gate.
+	 */
+	private async halt(stem: string, at: number): Promise<void> {
+		const after = stem;
+		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
+		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
+		const deadline = at + msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS", STUCK_CONTAIN_MS);
+		await this.boundedSweep(after, Date.now() + sweepMs);
+		for (;;) {
+			const checkedAt = Date.now();
+			const c = this.containment();
+			if (c.kind === "contained") {
+				this.log(`contained after ${after}: no live ${AS2TEST_USER} process`);
+				return;
+			}
+			const pids = c.kind === "live" ? c.pids.join(",") : null;
+			this.log(`not contained after ${after}: ${pids !== null ? `live ${AS2TEST_USER} processes ${pids}` : `inspection denied: ${c.kind === "denied" ? c.why : ""}`}`);
+			if (checkedAt >= deadline) {
+				this.log(`stuck-containment-failed part ${stem} pids ${pids ?? "denied"}`);
+				const failed = `; containment failed: ${pids ?? "inspection denied"}`;
+				if (this.f.stuck !== null) this.f.stuck += failed;
+				else if (this.f.executorStalled !== null) this.f.executorStalled += failed;
+				return;
+			}
+			await this.boundedSweep(after, Math.min(deadline, Date.now() + sweepMs));
+			const wait = Math.min(checkedAt + retryMs, deadline) - Date.now();
+			if (wait > 0) await Bun.sleep(wait);
+		}
+	}
+
+	/**
+	 * The admission gate (D4), every run, after its first sweep and before its first part: no part runs while a live `_as2test`
+	 * process remains (`containment`). Not contained, a bounded sweep and the check again every CONTAIN_RETRY_MS for up to ADMIT_MS;
+	 * still not, the run's error is `admission refused: live _as2test processes <a,b>` (or `inspection denied`), logged as that line,
+	 * and it runs no part. Returns whether the run was admitted.
+	 */
+	private async admit(): Promise<boolean> {
+		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
+		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
+		const deadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_ADMIT_MS", ADMIT_MS);
+		for (;;) {
+			const checkedAt = Date.now();
+			const c = this.containment();
+			if (c.kind === "contained") return true;
+			const why = c.kind === "live" ? `live ${AS2TEST_USER} processes ${c.pids.join(",")}` : "inspection denied";
+			if (checkedAt >= deadline) {
+				this.f.error = `admission refused: ${why}`;
+				this.log(this.f.error);
+				return false;
+			}
+			this.log(`admission: ${why}${c.kind === "denied" ? ` (${c.why})` : ""}; sweeping and checking again`);
+			await this.boundedSweep("admission", Math.min(deadline, Date.now() + sweepMs));
+			const wait = Math.min(checkedAt + retryMs, deadline) - Date.now();
+			if (wait > 0) await Bun.sleep(wait);
+		}
+	}
+
 	/** The install facts of the runner's own checkout (REPO_ROOT) against the install, and their verdict. */
 	private decideInstall(): { facts: InstallFacts; v: InstallVerdict } {
 		const spec = this.install;
 		const facts = readInstall({ checkout: REPO_ROOT, libexec: spec.libexec, root: this.as2root, sudoers: spec.sudoers, dscl: spec.dscl });
+		this.as2testUid = facts.account?.uid ?? null;
 		return { facts, v: installDecision(facts, spec.ids) };
 	}
 
@@ -1125,7 +1332,7 @@ class Runner {
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
 		const caps = join(this.stage, "caps.json");
-		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers })}\n`, { mode: 0o640 });
+		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers, stuckStop: this.config.stuckStop })}\n`, { mode: 0o640 });
 		chmodSync(caps, 0o640);
 		chmodSync(this.stage, 0o750);
 		this.log(`trusted phase: ${q.sha} on base ${this.f.base}, merge-base ${this.f.mergeBase}; changed test files: ${changed.join(" ") || "none"}`);
@@ -1144,8 +1351,13 @@ class Runner {
 	 * (executedFiles reads it) and whether the call timed out (`callTimedOut`: exit 124 or the outlive sweep, PLAN wl-mvq4edh02r5z40
 	 * D0). After a timed-out call the wrapper's stuck capture `<part>.stuck.log` (D5) is imported too; a missing or refused capture
 	 * is one runner.log line and never changes the result. `base-solo` runs the file in the base clone (D8), reports `base-solo-<i>.*`.
+	 * The stuck-worker detector (PLAN wl-mvq8x4pkjmx69s D4): after a part whose stdout has `stuck-captured`, its `<part>.signature.log`
+	 * is imported the same way. A stuck call (`callStuck`, however it ended) or one the backstop abandoned with no stop line (the
+	 * executor stalled) gets its `stuck:` or `executor stalled` error over any other, never a timeout, sets the run's `stuck` or
+	 * `executorStalled` fact, and `halt` takes the place of the part's sweep: `halted` tells the caller to sweep nothing and run no
+	 * further part.
 	 */
-	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean }> {
+	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean; halted: boolean }> {
 		await this.checkpoint(call.sub);
 		const capMs = (call.sub === "full" ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
 		const started = Date.now();
@@ -1160,20 +1372,40 @@ class Runner {
 			this.baseSoloCalls++;
 			name = /^part (base-solo-\d+)$/m.exec(r.out)?.[1] ?? `base-solo-${this.baseSoloCalls}`;
 		}
-		const timedOut = callTimedOut(r);
-		if (timedOut) this.importStuck(name);
+		const stuck = callStuck(r);
+		const stalled = !stuck && r.abandoned;
+		const halt = stuck ? stuckReason(r) : stalled ? executorStalledReason(r.candidate ?? 0) : null;
+		const timedOut = halt === null && callTimedOut(r);
+		if (timedOut) this.importCapture(`${name}.stuck.log`);
+		if (/^stuck-captured /m.test(r.out)) this.importCapture(`${name}.signature.log`);
+		let out: { result: PartResult; junit: string | null };
 		if (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed) {
 			const wrapper = `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})`;
-			return { result: { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: timedOut ? `timeout; ${wrapper}` : wrapper }, junit: null, timedOut };
+			out = { result: { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: timedOut ? `timeout; ${wrapper}` : wrapper }, junit: null };
+		} else {
+			const imported = importPart(this.workDir, this.runDir, name, this.capBytes);
+			out = { result: partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, maxBytes: this.capBytes }), junit: imported.junit };
 		}
-		const imported = importPart(this.workDir, this.runDir, name, this.capBytes);
-		const result = partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, maxBytes: this.capBytes });
-		return { result, junit: imported.junit, timedOut };
+		if (halt === null) return { ...out, timedOut, halted: false };
+		const at = Date.now();
+		out.result = { ...out.result, error: halt };
+		// The verdict's part label (`full`, a solo's `./<file>`, `base ./<file>`); runner.log's lines name the stem, as the exec's do.
+		const label = call.sub === "full" ? "full" : call.sub === "solo" ? call.file : `base ${call.file}`;
+		if (stuck) this.f.stuck = `${label}: ${halt}`;
+		else {
+			this.f.executorStalled = `${label}: ${halt}`;
+			this.log(`executor-stalled part ${name} worker ${r.candidate ?? 0}`);
+		}
+		this.log(`${name}: ${halt}; no further part`);
+		await this.halt(name, at);
+		return { ...out, timedOut, halted: true };
 	}
 
-	/** The wrapper's stuck capture of a timed-out part (`<part>.stuck.log`, D5) into the run dir under importReport's checks; logged, never thrown. */
-	private importStuck(name: string): void {
-		const file = `${name}.stuck.log`;
+	/**
+	 * A capture of the wrapper's into the run dir under importReport's checks: a timed-out part's `<part>.stuck.log` (PLAN
+	 * wl-mvq4edh02r5z40 D5), a detector match's `<part>.signature.log` (PLAN wl-mvq8x4pkjmx69s D3); logged, never thrown.
+	 */
+	private importCapture(file: string): void {
 		try {
 			const r = importReport(this.workDir, this.runDir, file, this.capBytes);
 			this.log(r.error !== null ? `${file} not imported: ${r.error}` : r.text === null ? `${file} not imported: the wrapper wrote none` : `${file} imported`);
@@ -1210,10 +1442,11 @@ class Runner {
 				}
 				this.basePrepared = true;
 			}
-			const { result } = await this.part({ sub: "base-solo", file });
+			const { result, halted } = await this.part({ sub: "base-solo", file });
+			results[file] = result;
+			if (halted) break;
 			await this.sweep(`base ${file}`);
 			if (result.error === null) writeBaseCache(this.root, sha, file, result);
-			results[file] = result;
 		}
 		this.f.baseRuns = { sha, parts: results };
 	}
@@ -1232,36 +1465,45 @@ class Runner {
 	}
 
 	/**
-	 * Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare →
-	 * the full part and its sweep → the solo parts `soloPlan` names (none after a timed-out full part), a sweep after each → base runs
-	 * (none after a timeout) → post-sweep finalization deadline → head re-check.
+	 * Steps in the plan's order: lock and publish → install check (and refresh) → sweep → admission gate (PLAN wl-mvq8x4pkjmx69s
+	 * D4) → probe → retention → trusted → prepare → the full part and its sweep → the solo parts `soloPlan` names (none after a
+	 * timed-out, stuck or stalled full part), a sweep after each → base runs (none after a timeout) → post-sweep finalization
+	 * deadline → head re-check. A stuck or stalled part (`part`'s `halted`) ends the parts there, its `halt` in place of the sweep,
+	 * and its finalization deadline is the shorter STUCK_FINALIZE_MS.
 	 */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
 		await this.acquire();
 		const install = await this.installCheck();
 		await this.sweep("publish");
+		if (!(await this.admit())) return;
 		await this.preflight(install);
 		await this.retention();
 		const changed = await this.trusted();
 		if (changed === null) return;
 		await this.prepare();
 		this.log(`full workers ${this.config.fullWorkers}`);
+		this.log(`stuck detector ${this.config.stuckStop}`);
 		const full = await this.part({ sub: "full" });
 		this.f.full = full.result;
 		this.f.fullTimedOut = full.timedOut;
-		await this.sweep("full");
-		const plan = soloPlan({ full: full.result, timedOut: full.timedOut, changed, executed: full.junit === null ? [] : executedFiles(full.junit) });
-		if (plan.stop) this.log("full part timed out: no solo or base parts");
+		let halted = full.halted;
+		if (!halted) await this.sweep("full");
+		const plan = soloPlan({ full: full.result, timedOut: full.timedOut, halted, changed, executed: full.junit === null ? [] : executedFiles(full.junit) });
+		if (plan.stop) this.log(`full part ${halted ? "stopped the run" : "timed out"}: no solo or base parts`);
 		else {
 			this.log(`solo parts: ${plan.files.join(" ") || "none"}`);
 			for (const file of plan.files) {
-				this.f.solo.push({ file, ...(await this.part({ sub: "solo", file })).result });
+				const solo = await this.part({ sub: "solo", file });
+				this.f.solo.push({ file, ...solo.result });
+				if ((halted = solo.halted)) break;
 				await this.sweep(file);
 			}
-			await this.baseRuns();
+			if (!halted) await this.baseRuns();
 		}
-		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+		const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
+		const stopped = this.f.stuck !== null || this.f.executorStalled !== null;
+		this.postSweepDeadline = Date.now() + (stopped ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
 		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
 		this.f.headAtEnd = await this.headNow(Math.max(1, this.postSweepDeadline - Date.now()));
@@ -1363,7 +1605,11 @@ class Runner {
 				else this.f.error = `the runner failed: ${errText(e)}`;
 				if (!(e instanceof Superseded)) this.log(`stopped: ${this.f.error}`);
 			}
-			if (!Number.isFinite(this.postSweepDeadline)) this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
+			if (!Number.isFinite(this.postSweepDeadline)) {
+				const finalizeMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
+				const stopped = this.f.stuck !== null || this.f.executorStalled !== null;
+				this.postSweepDeadline = Date.now() + (stopped ? Math.min(finalizeMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS", STUCK_FINALIZE_MS)) : finalizeMs);
+			}
 			try {
 				await hook(this.id, "result", {}, this.postSweepDeadline);
 				if (Date.now() >= this.postSweepDeadline) throw new Stop("post-sweep deadline exceeded before publication");
@@ -1389,26 +1635,37 @@ class Runner {
 				this.writeResult(run);
 				return START_EXIT.failed;
 			}
+			// The lock goes before the status post (PLAN wl-mvq8x4pkjmx69s D4): the next run's slot does not wait on gh.
+			this.release();
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
-			// postFullSuite never throws and kills gh after 15 s.
+			// postFullSuite never throws and kills gh after 15 s. A run whose containment failed says so in the description.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
-			if (state) await postFullSuite(this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}`, (s) => this.log(s));
+			const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
+			if (state) await postFullSuite(this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}${contained}`, (s) => this.log(s));
 			return 0;
 		} finally {
 			clearInterval(this.timer);
-			// The run lock goes even when a refresh helper this run started may outlive it (installCheck's `live`):
-			// releasing it proves nothing about that helper. Refreshes are serialised by the helper's own lockf lock
-			// on refresh.d/lock, which the next run's refresh waits on (exit 69, lock, while the old helper holds it).
-			if (this.held) {
-				this.lockDb.exec("PRAGMA busy_timeout = 100");
-				try {
-					busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));
-				} catch (e) {
-					this.log(`the lock was not released: ${errText(e)}`);
-				}
-			}
+			this.release();
 			this.leaveQueue();
 			this.lockDb.close();
+		}
+	}
+
+	/**
+	 * Delete this run's lock row, once, and log `lock released` (the field report's slot end, PLAN wl-mvq8x4pkjmx69s D5). The run
+	 * lock goes even when a refresh helper this run started may outlive it (installCheck's `live`): releasing it proves nothing about
+	 * that helper. Refreshes are serialised by the helper's own lockf lock on refresh.d/lock, which the next run's refresh waits on
+	 * (exit 69, lock, while the old helper holds it).
+	 */
+	private release(): void {
+		if (!this.held) return;
+		this.held = false;
+		this.lockDb.exec("PRAGMA busy_timeout = 100");
+		try {
+			const { changes } = busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));
+			this.log(changes > 0 ? "lock released" : "lock released: the row no longer held this run");
+		} catch (e) {
+			this.log(`the lock was not released: ${errText(e)}`);
 		}
 	}
 }
