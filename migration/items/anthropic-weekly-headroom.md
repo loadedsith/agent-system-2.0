@@ -11,6 +11,8 @@ This item records the Anthropic weekly headroom policy implemented by workload `
 
 Anthropic weekly projected pace is advisory rather than a dispatch refusal. Actual weekly exhaustion remains a refusal, including before pace warm-up. Existing five-hour pace and exhaustion protections remain unchanged. Other labs retain their existing weekly pace behavior, as do non-weekly Anthropic windows and tier/model binding.
 
+The runtime warning helper and its test are registered in `install/manifest.tsv`; installation retains the manifest-or-fail coverage guard.
+
 ## Shared weekly warning
 
 At a fresh observation of at least 70% usage on the shared Anthropic weekly meter, the surface enqueues one one-line warning for Jo for that weekly window. The warning is informational, not a question or dispatch refusal. The shared meter is the tier-null Anthropic 7-day meter (including its equivalent `1w` representation); a tier-specific meter such as Fable's is not the warning source. The weekly pace exception does not waive tier-specific actual exhaustion.
