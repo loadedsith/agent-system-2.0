@@ -13,7 +13,7 @@ import { currentModel, DEFAULT_LANE_MODEL, dist, fakeRegistry, recordedJudge, re
 const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
-			fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna"],
+			fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna"],
 			standard: ["anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5"],
 			strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
 			deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"],
@@ -148,8 +148,8 @@ describe("classifier extension on a lane task call", () => {
 		const result = await h.toolCall({ agent: "standard", name: "sl-find", task: FIND_BRIEF }, "call-9");
 		expect(result.input).toEqual({ agent: "fast", name: "sl-find", task: FIND_BRIEF });
 		await h.spawn("fast", "sl-find");
-		h.settle("call-9", "sl-find", "fast", "anthropic/claude-haiku-4-5");
-		expect(h.routings()).toMatchObject([{ slice_id: "sl-find", tier: "fast", model: "anthropic/claude-haiku-4-5", outcome: "ran" }]);
+		h.settle("call-9", "sl-find", "fast", "anthropic/claude-haiku-5-5");
+		expect(h.routings()).toMatchObject([{ slice_id: "sl-find", tier: "fast", model: "anthropic/claude-haiku-5-5", outcome: "ran" }]);
 	});
 
 	test("an eval agent() spawn routes on its tier row's entries of the lane's lab and writes no routing row", async () => {
@@ -184,7 +184,7 @@ describe("fail closed", () => {
 
 	test("an invalid profile table refuses the spawn", async () => {
 		const h = host({
-			tierTable: () => tierTableFromConfig({ task: { agentModelOverrides: { fast: ["anthropic/claude-haiku-4-5"] } } }),
+			tierTable: () => tierTableFromConfig({ task: { agentModelOverrides: { fast: ["anthropic/claude-haiku-5-5"] } } }),
 		});
 		const spawn = await h.spawn("standard", undefined, "eval");
 		expect(spawn?.block).toBe(true);

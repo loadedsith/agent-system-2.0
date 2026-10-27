@@ -23,7 +23,7 @@ const OMP = Bun.which("omp");
 const BUN = process.execPath;
 const PROFILE = "chaos-test";
 const NONCE = `chaos-${Date.now().toString(36)}`;
-const CHAT = "anthropic/claude-haiku-4-5";
+const CHAT = "anthropic/claude-haiku-5-5";
 const PROBE_TOOL_OUT = "chaos-tool-ok";
 
 /** One scripted kind: a bash tool turn, then a text reply. Every request matches it. */
