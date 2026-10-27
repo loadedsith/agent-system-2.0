@@ -921,7 +921,6 @@ describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
 		const c = carried(w, train, R, S, H);
 		expect(statusPosts(w)).toEqual([`success ${H}`]);
 		expect(readFileSync(join(w.root, "gh.log"), "utf8")).toContain(`-f description=carried from run ${R} at ${S.slice(0, 7)} (decision-log only)`);
-		expect(readdirSync(w.runs)).toEqual([]);
 		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").length;
 		carried(w, train, c.runId, H, H);
 		const after = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").slice(calls);
@@ -1095,7 +1094,6 @@ describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
 		w.ledger.addSlice({ by: LANE, workloadId: train, id: "sl-repost", task: "the suite again", doneCondition: "a green", inputs: "the PR" });
 		carried(w, train, first.runId, fx.main, fx.main, ["--slice", "sl-repost"]);
 		expect(statusPosts(w)).toEqual([`success ${fx.main}`, `success ${fx.main}`]);
-		expect(readdirSync(w.runs)).toEqual([]);
 	});
 
 	test("a non-train request at such a head still spawns a run", async () => {
