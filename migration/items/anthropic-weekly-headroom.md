@@ -2,12 +2,12 @@
 title: Anthropic weekly headroom advisory and warning
 status: building
 workload: wl-mvr67h2tbqkvv3
-pr: null
+pr: 370
 ---
 
 ## Scope and delivery boundary
 
-This item records the Anthropic weekly headroom policy implemented by workload `wl-mvr67h2tbqkvv3`. The PR number is not assigned yet. Delivery is pending: this item does not claim that the PR is merged, tested, installed or live.
+This item records the Anthropic weekly headroom policy implemented by workload `wl-mvr67h2tbqkvv3`, PR #370. Delivery is pending: this item does not claim that the PR is merged, installed or live. The PR's exact-head full-suite check is the delivery verification record.
 
 Anthropic weekly projected pace is advisory rather than a dispatch refusal. Actual weekly exhaustion remains a refusal, including before pace warm-up. Existing five-hour pace and exhaustion protections remain unchanged. Other labs retain their existing weekly pace behavior, as do non-weekly Anthropic windows and tier/model binding.
 
