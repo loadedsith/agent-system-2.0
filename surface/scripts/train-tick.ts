@@ -11,7 +11,9 @@
 //     each PR with an unsettled task, the pushes to its head branch from GitHub's repository activity (`trainActivityArgs`, every
 //     page): D8's push evidence, at GitHub's time of the push.
 //  2. Settles (D8). `settleTasks` at the PRs' current heads and pushes; each `train-task-settled:` is written once, as MERGE_TRAIN_BY.
-//     A PR whose activity could not be read this pass has no push evidence, so neither push rule settles it.
+//     A PR whose activity could not be read this pass has no push evidence, so neither push rule settles it. Before that write,
+//     each (S, head) pair `carryPairs` lists, a green at S the head may keep, is compared on GitHub (`ghCompare`, PLAN
+//     wl-mvpwkpqobyp20w D2) outside the ledger's transaction; a pair it cannot compare is absent, so that green does not carry.
 //     Then the failed-twice alert question (`raiseTwiceFailed`, options retry / skip / stop) for each PR whose attempt 2 settled failed.
 //  3. Deliveries (D7, D10 step 2). A task with no open owner gets its fix workload (`openTrainFix`: at most one per (repo, PR),
 //     reused when open), except on a fork's PR (`forkOf`): no workload can push there, so the tick settles the task failed
@@ -43,7 +45,7 @@
 //     newest close first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
 //     and a ready one the live half: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` (OPEN, no draft, base
 //     main, head branch exactly wl/<W> on the same repository, `prStakes` normal) and, when the head is not the green sha G,
-//     `gh api repos/<r>/compare/<G>...<head>` and `gh api repos/<r>/commits/<sha>` per commit: each commit touches only
+//     `ghCompare(G, head)` judged by `decisionLogFault`: the head descends from G through single-parent commits each touching only
 //     .ai/decision-log/ (never the net diff). The ready PRs board (`boardLanding`) oldest close first; the board makes the train
 //     actionable, so step 4 launches it. A W that cannot board gets `train-board-skip:` once per head and reason; a PR GitHub
 //     shows MERGED or CLOSED gets an `ended:` one, and its W is never read again.
@@ -65,15 +67,15 @@ import { ceilingStopped } from "../src/ceiling";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import { attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, launchRequestedBody } from "../src/launch";
 import {
-	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, checkoutOwnerRepo, expiredHolds, forkOf, forkTaskAlert,
-	isTrainOrFix, type Landing, landingReady, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS,
+	actionable, type AlertAction, autoboardCandidates, autoboardCutover, BOARD_ENDED, boardedWorkloads, boardLanding, boardSkips, carryPairs, checkoutOwnerRepo, expiredHolds, forkOf,
+	forkTaskAlert, ghCompare, isTrainOrFix, type Landing, landingReady, mainRedNoticeBody, mainRedNotices, mainRedRows, openTrainFix, openTrains, ownerDeliveries, PROTECTION_UNKNOWN_RAISE_MS,
 	protectionEpisodes, protectionGap, protectionNoticeBody, type ProtectionNoticeState, protectionPassOvers, prStakes, raiseTwiceFailed, settleTasks, TASK_VIEW_FIELDS,
 	type TaskView, taskViewOf, TRAIN_ALERT_LABEL, TRAIN_ALERT_LADDER, TRAIN_ALERT_MENTION, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertActions, trainAlertBody,
 	trainAlertEndBody, trainAlertMarker, trainAutoboardBody, trainBoardSkipBody, trainCheckout, trainHeadWokenBody, trainPrs, trainPushesOf, trainRetries, trainSliceId,
 	type TrainPush, type TrainTask, trainWakeBody, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
-import { DECISION_LOG_DIR, SHA_RE, type TestRunnerConfig, testRuns } from "../src/test-run";
+import { type CompareResult, decisionLogFault, type TestRunnerConfig, testRuns } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 /** One gh process: its exit code and output. */
@@ -210,8 +212,18 @@ export function tick(d: TickDeps): string[] {
 				}
 			}
 			const heads = new Map([...facts.views].map(([n, v]) => [n, v.headRefOid]));
+			// D2's compares, read before the settle transaction: no gh call holds the ledger's lock.
+			const compares = new Map<string, CompareResult | null>();
+			for (const p of carryPairs(ledger, { train: wl, heads })) {
+				try {
+					const c = ghCompare(repo, p.from, p.to, ghJson);
+					if (c.ok) compares.set(`${p.from} ${p.to}`, c.compare);
+				} catch (err) {
+					errors.push(err);
+				}
+			}
 			const settled = ledger.write(() => {
-				const bodies = settleTasks(ledger, { train: wl, heads, pushes: facts.pushes }, ledger.now());
+				const bodies = settleTasks(ledger, { train: wl, heads, pushes: facts.pushes, compares }, ledger.now());
 				for (const body of bodies) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body });
 				return bodies;
 			});
@@ -437,16 +449,12 @@ function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (li
 	return ready;
 }
 
-/** GitHub's get-a-commit lists at most this many files across its pages (300 a page): a commit listing this many may have more. */
-const COMMIT_FILES_CAP = 3000;
-
 /**
  * D1's live half for ready landing `l`: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` shows it OPEN, no
  * draft, based on main, its head branch exactly `wl/<W>` with `prStakes` normal (same repository, no fork); and its head is the
- * green sha G, or ahead of G (`gh api repos/<r>/compare/<G>...<head>`) only by commits each touching only .ai/decision-log/
- * (`gh api repos/<r>/commits/<sha> --paginate --slurp`, each commit's own files over every page, never the net diff; a rename's
- * `previous_filename` too, review wl-mvbjiettjrfpxc r1 #2). A commit listing COMMIT_FILES_CAP files may have more GitHub does not
- * list, so it never boards. A failed or unreadable gh call throws.
+ * green sha G, or keeps G's green: `decisionLogFault` passes GitHub's compare of G and the head (`ghCompare`, PLAN
+ * wl-mvpwkpqobyp20w D3), the one rule, so a merge commit after G never boards and a compare GitHub cannot answer completely
+ * never boards either. A failed or unreadable gh call throws.
  */
 function liveHalf(ledger: Ledger, l: Extract<Landing, { ready: true }>, ghJson: (args: string[]) => unknown): { ok: true; head: string } | { ok: false; head: string | null; reason: string } {
 	const v = ghJson(["pr", "view", String(l.pr), "-R", l.repo, "--json", `${TASK_VIEW_FIELDS},state,baseRefName,isDraft`]);
@@ -467,29 +475,9 @@ function liveHalf(ledger: Ledger, l: Extract<Landing, { ready: true }>, ghJson: 
 	if (stakes.stakes === "hold") return no(`#${l.pr} is held: ${stakes.reason} until ${stakes.until}`);
 	if (stakes.stakes !== "normal") return no(`#${l.pr} is production: ${stakes.reason}`);
 	if (head === l.sha) return { ok: true, head };
-	const cmp = ghJson(["api", `repos/${l.repo}/compare/${l.sha}...${head}`]);
-	const [status, commits, total] = [field(cmp, "status"), field(cmp, "commits"), field(cmp, "total_commits")];
-	if (typeof status !== "string" || !Array.isArray(commits) || typeof total !== "number") throw new GhError(`gh api repos/${l.repo}/compare returned an unexpected shape`);
-	if (status !== "ahead") return no(`head ${head} is not ahead of the green sha ${l.sha} (compare: ${status})`);
-	if (commits.length !== total) return no(`head ${head} is ${total} commits ahead of ${l.sha}, more than the compare lists (${commits.length})`);
-	for (const c of commits as unknown[]) {
-		const sha = field(c, "sha");
-		if (typeof sha !== "string" || !SHA_RE.test(sha)) throw new GhError(`gh api repos/${l.repo}/compare listed a commit with no sha`);
-		// Every page of the commit's files: an array of pages, each the commit object with its share of `files`.
-		const pages = ghJson(["api", `repos/${l.repo}/commits/${sha}`, "--paginate", "--slurp"]);
-		const files = Array.isArray(pages) && pages.length > 0 ? (pages as unknown[]).map((p) => field(p, "files")) : null;
-		if (files === null || !files.every(Array.isArray)) throw new GhError(`gh api repos/${l.repo}/commits/${sha} returned an unexpected shape`);
-		const entries = (files as unknown[][]).flat();
-		if (entries.length >= COMMIT_FILES_CAP) return no(`commit ${sha} after the green sha lists ${entries.length} files, the most GitHub lists; its other files cannot be read`);
-		for (const f of entries) {
-			// A rename touches the path it left as well as the one it made; a rename that names no previous path fails closed.
-			const prev = field(f, "previous_filename");
-			const paths = [field(f, "filename"), ...(prev !== undefined || field(f, "status") === "renamed" ? [prev] : [])];
-			const i = paths.findIndex((p) => typeof p !== "string" || !p.startsWith(DECISION_LOG_DIR));
-			if (i >= 0) return no(`commit ${sha} after the green sha touches ${String(paths[i])}, not only ${DECISION_LOG_DIR}`);
-		}
-	}
-	return { ok: true, head };
+	const c = ghCompare(l.repo, l.sha, head, ghJson);
+	const fault = c.ok ? decisionLogFault(c.compare) : c.reason;
+	return fault === null ? { ok: true, head } : no(`head ${head} is not the green ${l.sha}: ${fault}`);
 }
 
 /**

@@ -3,7 +3,8 @@
 // re-sends it louder at 4 h and 8 h until acknowledged, and keeps acting while a question is open. Auto-boarding (PLAN
 // wl-mvbjiettjrfpxc D1, D3, D4, D6): the cutover, the live half of "a lane finished green", one skip row per head and reason,
 // boarding oldest close first, and a protection episode that clears and wakes the trains it held. The relaunch loop (PLAN
-// wl-mvgn310dpi5gcg D1, D3): a wake per request whichever starter serves it, and no request at the ceiling.
+// wl-mvgn310dpi5gcg D1, D3): a wake per request whichever starter serves it, and no request at the ceiling. A green carries over
+// decision-log commits in settle and boarding through GitHub's compare (PLAN wl-mvpwkpqobyp20w D2, D3).
 // Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only
 // (surface/test/train-world.ts).
 import { describe, expect, test } from "bun:test";
@@ -16,11 +17,12 @@ import {
 	actionable, fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs,
 	trainRetries, trainSliceId, type TrainTask, trainWakeBody,
 } from "../src/merge-train";
-import { makeRunId, testRequestedBody } from "../src/test-run";
+import { makeRunId, testRequestedBody, testRuns } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
-	boardWorld, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE, world,
+	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
+	world,
 } from "./train-world";
 
 describe("settles and deliveries (D8, D10)", () => {
@@ -94,6 +96,70 @@ describe("settles and deliveries (D8, D10)", () => {
 		w.g.failWhen(null);
 		w.run();
 		expect(w.settles().map((e) => e.body)).toEqual([`train-task-settled: ${t.id} failed no push for 2 h since ${pushedAt}`]);
+	});
+});
+
+describe("a green carries over decision-log commits in settle (PLAN wl-mvpwkpqobyp20w D2)", () => {
+	/** A task on #101 at H0, the owner's push of `s` green, then a commit pushed on it to `head` (GitHub records both). */
+	const greenThenCommit = (s: string, head: string) => {
+		const w = world();
+		const t = w.task(101);
+		w.c.plusHours(0.05);
+		w.push(101, s, "green");
+		w.c.plusHours(0.05);
+		const p = w.g.prs.get(101)!;
+		p.head = head;
+		w.g.pushed(p.branch, head, w.c.now());
+		// every ledger transaction of the pass, and whether a compare was read inside it
+		const write = w.ledger.write.bind(w.ledger);
+		const inside: string[][] = [];
+		w.ledger.write = <T>(fn: () => T): T => {
+			const before = w.g.calls.length;
+			const r = write(fn);
+			inside.push(...w.g.calls.slice(before));
+			return r;
+		};
+		return { w, t, inside };
+	};
+	const compares = (calls: string[][]) => calls.filter((a) => a[0] === "api" && a[1]!.includes("/compare/"));
+
+	test("R1, R7: a green at S and one decision-log-only commit to H settles fixed with no new run; the compare is read outside the settle transaction", () => {
+		const { w, t, inside } = greenThenCommit(H1, H2);
+		w.g.compares.set(`${H1}...${H2}`, { status: "ahead", commits: [H2] });
+		w.g.commitFiles.set(H2, [DECISION_LOG_FILE]);
+		w.run();
+		const run = testRuns(w.ledger.entries(w.owner));
+		expect(w.settles().map((e) => e.body)).toEqual([`train-task-settled: ${t.id} fixed run ${run[0]!.request.runId} green at ${H1}, head ${H2} decision-log only`]);
+		expect(run.map((r) => r.request.sha)).toEqual([H1]);
+		expect(compares(w.g.calls)).toEqual([["api", `repos/${REPO}/compare/${H1}...${H2}`]]);
+		expect(compares(inside)).toEqual([]);
+	});
+
+	test("R4: a commit touching another path, or a merge commit touching only .ai/decision-log/, does not settle", () => {
+		const { w: code } = greenThenCommit(H1, H2);
+		code.g.compares.set(`${H1}...${H2}`, { status: "ahead", commits: [H2] });
+		code.g.commitFiles.set(H2, [DECISION_LOG_FILE, "src/x.ts"]);
+		code.run();
+		expect(code.settles()).toEqual([]);
+		const { w: merge } = greenThenCommit(H1, H2);
+		merge.g.compares.set(`${H1}...${H2}`, { status: "ahead", commits: [{ sha: H2, parents: 2 }] });
+		merge.g.commitFiles.set(H2, [DECISION_LOG_FILE]);
+		merge.run();
+		expect(merge.settles()).toEqual([]);
+		// a merge's files are never read
+		expect(merge.g.calls.some((a) => a[1] === `repos/${REPO}/commits/${H2}`)).toBe(false);
+	});
+
+	test("R6: the #305 fixture (green aebe37a4, decision-log commit cde03460) settles fixed; a compare gh cannot read settles nothing and is logged", () => {
+		const f = carry305();
+		const { w, t } = greenThenCommit(f.green, f.head);
+		for (const [path, answer] of Object.entries(f.answers)) w.g.saved.set(path, answer);
+		w.run();
+		expect(w.settles().map((e) => e.body)).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${t.id} fixed run \\S+ green at ${f.green}, head ${f.head} decision-log only$`))]);
+		const { w: v } = greenThenCommit(f.green, f.head);
+		v.run();
+		expect(v.settles()).toEqual([]);
+		expect(v.ledger.entries(v.train).filter((e) => e.body.startsWith("train-error: tick ")).map((e) => e.body)).toEqual([expect.stringContaining("exited 1")]);
 	});
 });
 
@@ -709,8 +775,8 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		expect(w.boards()).toEqual([]);
 		expect(w.launches).toEqual([]);
 		const skipsOf = (wl: string) => w.skips().filter((s) => s.includes(`workload ${wl} `));
-		expect(skipsOf(code)).toEqual([`train-board-skip: workload ${code} pr 120 head ${H1} commit ${H1} after the green sha touches src/x.ts, not only .ai/decision-log/`]);
-		expect(skipsOf(behind)).toEqual([`train-board-skip: workload ${behind} pr 121 head ${H2} head ${H2} is not ahead of the green sha ${H0} (compare: behind)`]);
+		expect(skipsOf(code)).toEqual([`train-board-skip: workload ${code} pr 120 head ${H1} head ${H1} is not the green ${H0}: commit bbbbbbb changes src/x.ts`]);
+		expect(skipsOf(behind)).toEqual([`train-board-skip: workload ${behind} pr 121 head ${H2} head ${H2} is not the green ${H0}: it is behind the green`]);
 		expect(skipsOf(base)).toEqual([`train-board-skip: workload ${base} pr 122 head ${H0} #122's base is release, not main`]);
 		expect(skipsOf(branch)).toEqual([`train-board-skip: workload ${branch} pr 123 head ${H0} #123's head branch feature/header is not wl/${branch}`]);
 		expect(skipsOf(fork)).toEqual([expect.stringMatching(new RegExp(`^train-board-skip: workload ${fork} pr 124 head ${H0} #124 is production: `))]);
@@ -734,7 +800,7 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		w.run();
 		expect(w.boards()).toEqual([]);
 		expect(w.launches).toEqual([]);
-		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 126 head ${H1} commit ${H1} after the green sha touches src/late.ts, not only .ai/decision-log/`]);
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 126 head ${H1} head ${H1} is not the green ${H0}: commit bbbbbbb changes src/late.ts`]);
 	});
 
 	test("R2: a commit after G renaming a file from outside .ai/decision-log/ into it never boards (review wl-mvbjiettjrfpxc r1 #2)", () => {
@@ -742,7 +808,7 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		w.run();
 		expect(w.boards()).toEqual([]);
 		expect(w.launches).toEqual([]);
-		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 127 head ${H2} commit ${H2} after the green sha touches src/notes.md, not only .ai/decision-log/`]);
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 127 head ${H2} head ${H2} is not the green ${H0}: commit ccccccc changes src/notes.md`]);
 	});
 
 	test("R2: a commit after G listing as many files as GitHub lists may have more, so it never boards; a rename within .ai/decision-log/ boards", () => {
@@ -750,11 +816,35 @@ describe("auto-boarding, the live half (PLAN wl-mvbjiettjrfpxc D1, D3, D4)", () 
 		w.run();
 		expect(w.boards()).toEqual([]);
 		expect(w.skips()).toEqual([
-			`train-board-skip: workload ${wl} pr 128 head ${H1} commit ${H1} after the green sha lists ${COMMIT_FILES_CAP} files, the most GitHub lists; its other files cannot be read`,
+			`train-board-skip: workload ${wl} pr 128 head ${H1} head ${H1} is not the green ${H0}: commit ${H1} lists ${COMMIT_FILES_CAP} files, the most GitHub lists; its other files cannot be read`,
 		]);
 		const { w: v, wl: within } = aheadBy(129, H2, [...logs(COMMIT_FILES_PER_PAGE), { filename: DECISION_LOG_FILE, status: "renamed", previous_filename: ".ai/decision-log/old.md" }]);
 		v.run();
 		expect(v.boards()).toEqual([expect.objectContaining({ pr: 129, workload: within, head: H2 })]);
+	});
+
+	test("R4: a merge commit after G touching only .ai/decision-log/ never boards (PLAN wl-mvpwkpqobyp20w D3)", () => {
+		const w = boardWorld();
+		const wl = w.landing(134);
+		w.g.prs.get(134)!.head = H2;
+		w.g.compares.set(`${H0}...${H2}`, { status: "ahead", commits: [H1, { sha: H2, parents: 2 }] });
+		w.g.commitFiles.set(H1, [DECISION_LOG_FILE]);
+		w.g.commitFiles.set(H2, [DECISION_LOG_FILE]);
+		w.run();
+		expect(w.boards()).toEqual([]);
+		expect(w.launches).toEqual([]);
+		expect(w.skips()).toEqual([`train-board-skip: workload ${wl} pr 134 head ${H2} head ${H2} is not the green ${H0}: commit ccccccc is a merge`]);
+	});
+
+	test("R6: the #305 fixture (green aebe37a4, decision-log commit cde03460) boards at cde03460 (PLAN wl-mvpwkpqobyp20w D3)", () => {
+		const f = carry305();
+		const w = boardWorld();
+		const wl = w.landing(135, { sha: f.green });
+		w.g.prs.get(135)!.head = f.head;
+		for (const [path, answer] of Object.entries(f.answers)) w.g.saved.set(path, answer);
+		w.run();
+		expect(w.boards()).toEqual([expect.objectContaining({ pr: 135, workload: wl, head: f.head })]);
+		expect(w.skips()).toEqual([]);
 	});
 
 	test("R17: a draft PR never boards; once it is ready for review it boards", () => {
