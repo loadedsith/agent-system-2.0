@@ -47,9 +47,10 @@
 //
 //       Land-first (PLAN wl-mvq4edbaf13vnk D4): on a land-first repository `start` posts `pending` first (a refused post refuses
 //       the request) and records `fast-plan:` in the admission's transaction: a tree carry (no run), the fast set, or the full
-//       suite by exception, which runs as above. A fast-set run holds no Mac slot for its hosted part: its preflight (the install
-//       read, no refresh), the trusted clone, the parse check over the plan's parse targets (one that does not transpile makes
-//       the run red and nothing runs), then `as2-fast.yml` dispatched on `as2-verified` (`hostedFast`); fast.xml, fast.log and
+//       suite by exception, which runs as above. A fast-set run holds no Mac slot for its hosted part: its preflight reconciles
+//       current/tag/bundle under promotion.db (one refresh at most), then the trusted clone and the parse check over the plan's parse
+//       targets (one that does not transpile makes the run red and nothing runs), then `as2-fast.yml` dispatched on `as2-verified`
+//       (`hostedFast`); fast.xml, fast.log and
 //       fast.summary are imported into the run dir and judged (`fastExec`: a planned file with no executed test makes it red).
 //       A dispatch failure, a workflow run of other code than the tag's, or no result in fastWaitMin records `fast-fallback:
 //       <run> <reason>` and runs the same set once on the Mac (`exec fast`), under the lock with the install check, sweep and
@@ -868,17 +869,23 @@ export function gateDecision(i: GateInput): GateDecision {
 }
 
 /**
- * Post the gate's state on the head (D4, through #320's mechanism): mergeGate's success, or failure naming every reason; a gate that
- * cannot read main or the head posts failure naming that (F7). A post GitHub refuses records `status-failed: <run id> <state> on <sha>:
- * <error>` on the run's workload (F6), so the head stays `pending` and the train sees why. Returns what was decided and the post's error.
+ * Post the gate's state on the head (D4, through #320's mechanism), re-reading activation at publication: off refuses fast/tree
+ * plans and requires a full Mac green at the head; on uses mergeGate's live main policy. An unreadable gate posts failure (F7).
+ * A post GitHub refuses records `status-failed: <run id> <state> on <sha>: <error>` (F6), leaving the head pending.
  */
 export function postGate(i: GateInput & { wl: string; runId: string; log: (s: string) => void }): { state: "success" | "failure"; description: string; error: string | null } {
 	let decided: { state: "success" | "failure"; description: string };
 	try {
-		const d = gateDecision(i);
-		decided = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
+		if (!landFirstNow(i.ledger, i.repo)) {
+			if (i.need === "fast") decided = { state: "failure", description: "land-first is off: a fast/tree plan is not a full-suite result; request the full suite" };
+			else if (i.result?.sha === i.head && i.result.verdict === "green" && i.result.scope === "full" && i.result.host === "mac") decided = { state: "success", description: "full suite green" };
+			else decided = { state: "failure", description: "land-first is off: a full-suite green on the Mac at this head is required" };
+		} else {
+			const d = gateDecision(i);
+			decided = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
+		}
 	} catch (e) {
-		decided = { state: "failure", description: `the gate could not read main or the head: ${errText(e)}` };
+		decided = { state: "failure", description: `the gate could not read activation, main or the head: ${errText(e)}` };
 	}
 	i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
 	const error = postStatus(i.gh, i.repo, decided.state, i.head, decided.description, i.log);
@@ -1185,6 +1192,15 @@ export function promoteVerified(sha: string, manual = false): number {
 }
 export type Promotion = { ok: true; sha: string; schema: string | null } | { ok: false; reason: string };
 export interface PromotionOptions { directory?: string; origin?: string; gh?: Gh; manual?: boolean }
+const PROMOTION_LOCK_MS = 5_000;
+
+/** One serialization store for promotion and preflight's current/tag/bundle reconciliation. Caller closes even a failed BEGIN. */
+function openPromotionDb(directory: string): Database {
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	if (realpathSync(directory) !== directory) throw new Error(`verified directory ${directory} is a symlink; refusing reconciliation`);
+	return new Database(join(directory, "promotion.db"));
+}
+
 /**
  * D5/R14/R15: immutable main verdict -> detached release -> atomic current -> tag -> retention.
  * The SQLite write lock serializes publishers and disappears on process death. No live ledger migration is attempted.
@@ -1197,10 +1213,9 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 			throw new Error(`${sha} has no green believable main verdict; nothing promoted`);
 		}
 		const dir = resolve(o.directory ?? verifiedDirectory());
-		mkdirSync(dir, { recursive: true, mode: 0o700 });
-		if (realpathSync(dir) !== dir) throw new Error(`verified directory ${dir} is a symlink; refusing promotion`);
-		db = new Database(join(dir, "promotion.db"));
-		db.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+		db = openPromotionDb(dir);
+		hookMark(sha, "promotion-acquiring");
+		db.exec(`PRAGMA busy_timeout = ${PROMOTION_LOCK_MS}; BEGIN IMMEDIATE`);
 		const clone = join(dir, "repo");
 		const origin = o.origin ?? process.env.AGENT_SYSTEM_TEST_RUNNER_ORIGIN ?? `https://github.com/${repo}.git`;
 		if (!existsSync(clone)) verifierGit(dir, ["clone", "--no-checkout", "--no-local", "--template=", origin, clone]);
@@ -1583,6 +1598,7 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 
 	if (carried !== null) {
 		// D4d, after the commit: the status the run would post, outside any transaction; a failed post is logged and the green stands.
+		await hook(wl, "gate-publication", {}, Date.now() + FINALIZE_MS);
 		// On a land-first repository the gate decides it (D4); a refused post records `status-failed:` and leaves the head pending.
 		if (land !== null || landFirstNow(ledger, ownerRepo)) {
 			postGate({
@@ -1736,6 +1752,8 @@ class Runner {
 	private source: { ok: true; sha: string } | { ok: false; error: string } = { ok: false, error: "the install was not read" };
 	/** D5: this process wrote its one `runner-preflight:` row (or logged why it could not). */
 	private preflightRecorded = false;
+	/** The final verifier check made under promotion.db; publication of its receipt must not re-sample a later promotion. */
+	private verifiedReasons: string[] | null = null;
 	private mainExec: ExecCounts | null = null;
 	private mainTree: CommitTree | null = null;
 	private mainSuspects: string[] = [];
@@ -2190,7 +2208,7 @@ class Runner {
 		if (this.preflightRecorded) return;
 		this.preflightRecorded = true;
 		const src = this.source;
-		const reasons = [...(refusal === null ? [] : [refusal]), ...verifiedPreflight(this.ledger, this.ownerRepo, src.ok ? src.sha : null, join(this.install.libexec, "refresh"))];
+		const reasons = [...(refusal === null ? [] : [refusal]), ...(this.verifiedReasons ?? verifiedPreflight(this.ledger, this.ownerRepo, src.ok ? src.sha : null, join(this.install.libexec, "refresh")))];
 		try {
 			const body = runnerPreflightBody({ ok: reasons.length === 0, reason: reasons.length === 0 ? null : reasons.join("; "), source: src.ok ? src.sha : "0".repeat(40), root: realpathSync(controlCheckout()) });
 			this.ledger.write(() => {
@@ -2289,13 +2307,50 @@ class Runner {
 	 */
 	async installCheck(): Promise<Verdict> {
 		await this.checkpoint("install");
+		const on = landFirstNow(this.ledger, this.ownerRepo);
+		if (!on) return this.reconcileInstall(false);
+		const directory = resolve(verifiedDirectory());
+		const db = openPromotionDb(directory);
+		let failure: unknown;
+		try {
+			// Do not block the event loop/heartbeat while a released predecessor is still promoting. This is the sole retry
+			// layer: nonblocking BEGINs, bounded backoff and one deadline, followed by exactly one reconciliation.
+			db.exec("PRAGMA busy_timeout = 0");
+			const deadline = Date.now() + PROMOTION_LOCK_MS;
+			let waitMs = 25;
+			for (;;) {
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					break;
+				} catch (e) {
+					if (!isBusy(e)) throw e;
+					if (Date.now() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within ${PROMOTION_LOCK_MS} ms: ${errText(e)}; retry after the publisher finishes`);
+					if (waitMs === 25) this.log(`verified reconciliation waiting for ${join(directory, "promotion.db")}`);
+					hookMark(this.id, "promotion-busy");
+					await Bun.sleep(Math.min(waitMs, Math.max(0, deadline - Date.now())));
+					waitMs = Math.min(waitMs * 2, 250);
+				}
+			}
+			return await this.reconcileInstall(true);
+		} catch (e) {
+			failure = e;
+			throw e;
+		} finally {
+			try { db.close(); }
+			catch (e) {
+				throw new Error(`verified reconciliation could not close ${join(directory, "promotion.db")}: ${errText(e)}${failure === undefined ? "" : `; original failure: ${errText(failure)}`}; repair the verifier lock before retrying`);
+			}
+		}
+	}
+
+	/** Current/tag, input hashes, the one refresh and the final coherence check all share the publisher's transaction. */
+	private async reconcileInstall(on: boolean): Promise<Verdict> {
 		const stop: (reason: string) => never = (reason) => {
 			this.f.preflight = `preflight: ${reason}`;
 			throw new Stop(this.f.preflight);
 		};
 		let { facts, v } = this.decideInstall();
 		let refreshed: string | null = null;
-		const on = landFirstNow(this.ledger, this.ownerRepo);
 		let verifierMismatch = false;
 		if (on) {
 			const own = runnerControlRoot();
@@ -2341,8 +2396,8 @@ class Runner {
 		}
 		if (!v.ok) return stop(v.reason);
 		if (on) {
-			const reasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"));
-			if (reasons.length > 0) return stop(`verified preflight refused after one refresh: ${reasons.join("; ")}`);
+			this.verifiedReasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"));
+			if (this.verifiedReasons.length > 0) return stop(`verified preflight refused after one refresh: ${this.verifiedReasons.join("; ")}`);
 		}
 		return refreshed ? { ok: true, summary: `${v.summary}; ${refreshed}` } : v;
 	}
@@ -2656,19 +2711,16 @@ class Runner {
 	}
 
 	/**
-	 * D4's fast run, holding no Mac slot: the preflight's install read (no refresh: the hosted check runs none of the Mac install,
-	 * so a refusal is recorded and logged and the check goes on), then D5's row → trusted → the parse check over the plan's parse
+	 * D4's fast run, holding no Mac slot: on-mode preflight reconciles the verifier under promotion.db; off-mode records and logs
+	 * Mac install drift without stopping hosted work (a Mac fallback refreshes or stops on it). Then D5's row → trusted → parse
 	 * targets at the tree (one that does not transpile makes the run red and nothing runs) → the hosted check (`hosted`) → on a
 	 * dispatch failure, other workflow code or no result, the one Mac fallback (`macFast`) → the head re-check.
 	 */
 	private async fastBody(plan: FastSetPlan): Promise<void> {
 		this.fast = { plan, host: "linux", parse: [], missing: [], exec: null };
 		this.slotless = true;
-		const { v } = this.decideInstall();
-		if (landFirstNow(this.ledger, this.ownerRepo)) {
-			// Hosted work still executes control code locally. Its root/bundle guard is not optional.
-			await this.installCheck();
-		}
+		// Hosted work still executes control code locally: on-mode install facts must be read inside the reconciliation lock.
+		const v = landFirstNow(this.ledger, this.ownerRepo) ? await this.installCheck() : this.decideInstall().v;
 		this.f.preflight = v.ok ? v.summary : `preflight: ${v.reason}`;
 		if (!v.ok) this.log(`preflight: ${v.reason}; the hosted fast check runs none of the Mac install, so it goes on (a Mac fallback refreshes or stops on it)`);
 		this.recordPreflight(v.ok ? null : v.reason);
@@ -2933,6 +2985,7 @@ class Runner {
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			if (state) {
 				try {
+					await hook(this.wl, "gate-publication", {}, this.postSweepDeadline);
 					const plan = fastPlanOf(this.ledger.entries(this.wl), this.id);
 					if (plan !== null || landFirstNow(this.ledger, this.ownerRepo)) {
 						const ref = plan?.ref ?? ghPrView(this.ownerRepo, run.pr).headRefName;

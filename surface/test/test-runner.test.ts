@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "
 import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
@@ -24,7 +24,7 @@ import {
 } from "../src/test-run";
 import { landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { admitMain, citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
+import { admitMain, citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, postGate, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
 import { mainResults, mainVerdicts, parseRunnerPreflight } from "../src/main-state";
 import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { alive, tmp, until } from "./helpers";
@@ -1232,7 +1232,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./a.test.ts"]);
 	});
 
-	test("fullWorkers (wl-mvg2kzuvwngdmo) and fastCapMin (PLAN wl-mvq4edbaf13vnk D4): the trusted phase writes them into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
+	test("fullWorkers (wl-mvg2kzuvwngdmo): runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
 		for (const [workers, n] of [[3, 3], [undefined, 1]] as const) {
 			const w = world({ fullWorkers: workers });
 			const { wl, slice } = workload(w);
@@ -1241,7 +1241,6 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			const run = await resultOf(w, wl, runId);
 			expect(run.verdict).toBe("green");
 			expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n, fastCapMin: 10, stuckStop: "shadow" });
 			const lines = runnerLog(w, runId).split("\n");
 			const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
 			const workersLine = at(/ full workers \d+$/);
@@ -2765,6 +2764,70 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		});
 	}
 
+	for (const mode of ["hosted", "fallback", "tree carry", "full"] as const) {
+		test(`${mode}: admission on then publication off requires a full-suite green, not a fast/tree plan`, async () => {
+			const w = landWorld();
+			const head = mode === "tree carry"
+				? g(w.origin, "commit-tree", g(w.origin, "rev-parse", `${fx.main}^{tree}`), "-p", fx.main, "-m", "off transition tree")
+				: fx.head.green;
+			if (mode === "tree carry") g(w.origin, "update-ref", `refs/pull/${PR.green}/head`, head);
+			const { wl, slice } = bind(w, PR.green, head);
+			if (mode === "full") w.ledger.setStakes(wl, { by: SURFACE_BY, stakes: "production" });
+			if (mode === "hosted") artifact(w, head, "green");
+			if (mode === "fallback") writeFileSync(join(w.root, "post", `repos_${OWNER_REPO.replaceAll("/", "_")}_actions_workflows_as2-fast.yml_dispatches.fail`), "dispatch denied\n");
+			// This boundary is outside the carry transaction and shared by normal publication.
+			arm(w, wl, "gate-publication");
+			const starter = Bun.spawn([process.execPath, RUNNER, "start", wl, String(PR.green), "--slice", slice, "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+			let id = "";
+			try {
+				await reached(w, wl, "gate-publication");
+				id = testRuns(w.ledger.entries(wl)).at(-1)!.request.runId;
+				expect(fastPlanOf(w.ledger.entries(wl), id)?.scope).toBe(mode === "tree carry" ? "tree" : mode === "full" ? "full" : "fast");
+				expect((await resultOf(w, wl, id)).verdict).toBe("green");
+				expect(statusPosts(w)).toEqual([`pending ${head}`]);
+				landFirst(w.ledger, OWNER_REPO, false);
+			} finally { go(w, wl, "gate-publication"); }
+			expect(await starter.exited).toBe(START_EXIT.ok);
+			const result = await finalized(w, wl, id);
+			expect(result.scope).toBe(mode === "full" || mode === "tree carry" ? "full" : "fast");
+			expect(statusPosts(w)).toEqual([`pending ${head}`, `${mode === "full" ? "success" : "failure"} ${head}`]);
+			expect(calls(w).at(-1)).toContain(mode === "full" ? "description=full suite green" : "description=land-first is off: a fast/tree plan is not a full-suite result");
+			if (mode === "tree carry") {
+				expect((await new Response(starter.stdout).text())).toContain("runner none");
+				expect(dispatches(w)).toEqual([]);
+			} else {
+				expect(result.host).toBe(mode === "hosted" ? "linux" : "mac");
+			}
+		});
+	}
+
+	test("publication off keeps full-scope policy strict: only a green full Mac result at this head succeeds", () => {
+		const w = landWorld();
+		landFirst(w.ledger, OWNER_REPO, false);
+		const { wl } = bind(w, PR.green, fx.head.green);
+		for (const variant of ["green", "red-main", "red", "error", "fast", "linux", "wrong head"] as const) {
+			const posts: string[][] = [];
+			const gh: Gh = (args) => {
+				if (args[0] !== "api" || args[1] !== "-X" || !args[3]?.includes("/statuses/")) throw new Error(`off publication unexpectedly read GitHub: ${args.join(" ")}`);
+				posts.push(args);
+				return { code: 0, stdout: "{}", stderr: "" };
+			};
+			const result = postGate({
+				gh, ledger: w.ledger, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green, need: "full",
+				result: {
+					verdict: variant === "red-main" || variant === "red" || variant === "error" ? variant : "green",
+					sha: variant === "wrong head" ? fx.main : fx.head.green,
+					scope: variant === "fast" ? "fast" : "full", host: variant === "linux" ? "linux" : "mac",
+				},
+				wl, runId: "tr-offpolicy", log: () => {},
+			});
+			expect(result).toMatchObject({ state: variant === "green" ? "success" : "failure", error: null });
+			expect(posts).toHaveLength(1);
+			expect(posts[0]).toContain(`state=${variant === "green" ? "success" : "failure"}`);
+			if (variant !== "green") expect(result.description).toBe("land-first is off: a full-suite green on the Mac at this head is required");
+		}
+	});
+
 	test("pending refusal admits nothing and does not compute a plan or dispatch", () => {
 		const w = landWorld();
 		const { wl, slice } = bind(w, PR.green, fx.head.green);
@@ -3335,6 +3398,101 @@ describe("verified control promotion and bootstrap (R14/R15/R34)", () => {
 		expect(w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("runner-preflight:")).map((e) => parseRunnerPreflight(e.body)?.ok)).toEqual([false]);
 		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.main);
 	});
+	test("verified reconciliation waits for promotion, reads current fresh, and excludes promotion through refresh and final coherence", async () => {
+		const w = world();
+		const old = verifiedWorld(w);
+		landFirst(w.ledger, OWNER_REPO, true);
+		mainRun(w.ledger, "tr-racenext", fx.main, "green");
+		mainRun(w.ledger, "tr-raceafter", fx.head.green, "green");
+		const directory = w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!;
+		const next = join(directory, fx.main.slice(0, 12));
+		g(join(directory, "repo"), "worktree", "add", "-q", "--detach", next, fx.main);
+		const refreshReached = join(w.root, "refresh.reached");
+		const refreshGo = join(w.root, "refresh.go");
+		const helper = join(w.libexec, "refresh");
+		const refresh = readFileSync(helper, "utf8");
+		writeFileSync(helper, refresh.replace("set -eu", `set -eu
+touch '${refreshReached}'
+n=0
+while [ ! -f '${refreshGo}' ]; do
+	n=$((n+1))
+	[ "$n" -lt 200 ] || { echo 'race fixture refresh release timed out' >&2; exit 72; }
+	sleep 0.025
+done`));
+		// SOURCE must describe the installed barrier helper; only its commit is stale before reconciliation.
+		writeSource(w.libexec, { sha: fx.control });
+		// Stand in for a publisher holding the same transaction before its atomic current/tag move.
+		const publisher = new Database(join(directory, "promotion.db"));
+		publisher.exec("BEGIN IMMEDIATE");
+		let locked = true;
+		const owner = workload(w);
+		const id = request(w, owner.wl, owner.slice, PR.green, fx.head.green);
+		const runner = spawnRun(w, id, { AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "25" });
+		let promotion: Subprocess | null = null;
+		try {
+			await until("preflight waiting for promotion", () => marks(w, id, "promotion-busy").length > 0);
+			const firstBeat = parseHeartbeat(readFileSync(join(w.runs, id, "heartbeat"), "utf8"), id)!;
+			await until("heartbeat while promotion is contended", () => parseHeartbeat(readFileSync(join(w.runs, id, "heartbeat"), "utf8"), id)! > firstBeat);
+			expect(realpathSync(join(directory, "current"))).toBe(old);
+			expect(existsSync(join(w.root, "sudo.log"))).toBe(false);
+			symlinkSync(next, join(directory, "next"));
+			renameSync(join(directory, "next"), join(directory, "current"));
+			writeFileSync(join(w.root, "verified-tag"), fx.main);
+			publisher.exec("ROLLBACK");
+			locked = false;
+			await until("refresh holding reconciliation transaction", () => existsSync(refreshReached));
+			// A real publisher must wait while the bundle is still old, not just while tag/current move.
+			promotion = Bun.spawn([process.execPath, RUNNER, "promote", "--sha", fx.head.green], { env: w.env, stdout: "pipe", stderr: "pipe" });
+			await until("promotion acquiring reconciliation lock", () => marks(w, fx.head.green, "promotion-acquiring").length > 0);
+			expect(() => publisher.exec("BEGIN IMMEDIATE")).toThrow(/locked|busy/i);
+			expect(realpathSync(join(directory, "current"))).toBe(next);
+			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.main);
+			writeFileSync(refreshGo, "");
+			expect(await runner.exited).toBe(0);
+			expect(await promotion.exited).toBe(0);
+			expect(await resultOf(w, owner.wl, id)).toMatchObject({ verdict: "green", reason: null });
+			expect(readFileSync(join(w.libexec, "SOURCE"), "utf8")).toContain(`source-sha ${fx.main}`);
+			expect(w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("runner-preflight:")).map((e) => parseRunnerPreflight(e.body))).toEqual([
+				{ ok: true, reason: null, source: fx.main, root: old },
+			]);
+			expect(readFileSync(join(w.root, "sudo.log"), "utf8").split("\n").filter((s) => s === "refresh")).toHaveLength(1);
+			expect(realpathSync(join(directory, "current"))).toBe(join(directory, fx.head.green.slice(0, 12)));
+			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.head.green);
+		} finally {
+			if (locked) publisher.exec("ROLLBACK");
+			publisher.close();
+			writeFileSync(refreshGo, "");
+			await runner.exited;
+			if (promotion !== null) await promotion.exited;
+		}
+	});
+
+	test("verified reconciliation lock contention is bounded, keeps heartbeats alive, and never refreshes or repoints", async () => {
+		const w = world();
+		verifiedWorld(w);
+		landFirst(w.ledger, OWNER_REPO, true);
+		const publisher = new Database(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "promotion.db"));
+		publisher.exec("BEGIN IMMEDIATE");
+		const owner = workload(w);
+		const id = request(w, owner.wl, owner.slice, PR.green, fx.head.green);
+		const runner = spawnRun(w, id);
+		try {
+			expect(await runner.exited).toBe(0);
+			expect(await resultOf(w, owner.wl, id)).toMatchObject({
+				verdict: "error", reason: expect.stringContaining("verified reconciliation could not acquire"),
+			});
+			expect(runnerLog(w, id)).toContain("within 5000 ms");
+			expect(marks(w, id, "heartbeat").length).toBeGreaterThan(1);
+			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.control);
+			expect(existsSync(join(w.root, "sudo.log"))).toBe(false);
+			expect(marks(w, id, "spawn-full")).toEqual([]);
+		} finally {
+			publisher.exec("ROLLBACK");
+			publisher.close();
+			await runner.exited;
+		}
+	});
+
 	for (const mode of ["wrong", "dirty", "unverified", "bundle", "repair"] as const) {
 		test(`verified runner preflight ${mode} uses real facts and at most one bundle refresh`, async () => {
 			const w = world();
@@ -3701,7 +3859,7 @@ exec "$@"`);
 		expect(log).toContain(" lock released\n");
 	});
 
-	test("shadow, the default (caps.json carries it): the backstop is never armed, a signature with no clear runs on past its deadline, green", async () => {
+	test("shadow, the default: the backstop is never armed, a signature with no clear runs on past its deadline, green", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		standIn(w, `sig 4242 4243
@@ -3711,7 +3869,6 @@ exec "$@"`);
 		await spawnRun(w, runId, STUCK_KNOBS).exited;
 		const run = await resultOf(w, wl, runId);
 		expect(run.verdict).toBe("green");
-		expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: 1, stuckStop: "shadow" });
 		const log = runnerLog(w, runId);
 		expect(log).toContain("stuck detector shadow");
 		expect(log).not.toContain("abandoned by the stuck backstop");
