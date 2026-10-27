@@ -58,6 +58,13 @@
 //       settle-only (D6, R37): every open workload's runner request with no settle and no live heartbeat gets `runner died`;
 //       it admits nothing. Prints `reaped none` or `reaped <run id>…`, exit 0; a workload it could not settle on is exit 3,
 //       after every other workload was tried.
+//   promote --sha <sha>
+//       reconciles a green believable main verdict to a detached verified/<sha12> release and atomic current symlink,
+//       then as2-verified; keeps three releases. Idempotent after root/tag partial publication. Prints `promoted <sha>`
+//       or `schema <first crossing sha>` (exit 0; the tick files the issue/notice), or verifier-stalled (exit 3).
+//       Schema crossings require Jo's stop tick -> migrate live ledger -> promote-verified.ts <verified sha> -> restart.
+//       Shadow mode earns the first G/tag before setup and verified install; only actual root/tag/helper/SOURCE facts
+//       earn an ok runner-preflight receipt. Neither command performs a ledger migration.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -67,6 +74,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_CONFIG         a yml replacing <checkout>/profile/config.yml
 //   AGENT_SYSTEM_TEST_RUNNER_ORIGIN         the URL cloned and ls-remoted instead of the repo's origin
 //   AGENT_SYSTEM_TEST_RUNNER_ROOT           the as2test root instead of AS2TEST_ROOT
+//   AGENT_SYSTEM_TEST_RUNNER_VERIFIED       isolated verified directory instead of ~/.agent-system-2/verified
+//   AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT   isolated own-root fixture for verified self-checks
 //   AGENT_SYSTEM_TEST_RUNNER_INSTALL        json {libexec, sudoers, ids: {root, wheel, jo}, account: {uid, gid}}: a test
 //                                           install the preflight checks instead of the real one (`installSpec`)
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
@@ -85,10 +94,10 @@
 import { spawn, spawnSync, type Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import {
-	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync,
-	rmSync, type Stats, writeFileSync,
+	appendFileSync, chmodSync, closeSync, constants as FS, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync,
+	rmSync, symlinkSync, type Stats, writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, type EntryRow, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
@@ -103,7 +112,7 @@ import {
 	attemptBlock, attribute, CHAIN_MAX, type ChainCommit, type GateDecision, type GateFacts, ghMainChain, mainResults, type MainState, mainState, mainVerdicts, type MainVerdictKind, mergeGate,
 	runnerPreflightBody,
 } from "../src/main-state";
-import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, type LandFirstRow, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
+import { type ControlRoot, controlRootRefusal, FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, type LandFirstRow, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, type ExecCounts, execOf, executedFiles, fullSuiteSlice, HEARTBEAT_EVERY_MS,
@@ -1017,15 +1026,156 @@ export function mainRedFactsBody(facts: MainRedFacts): string {
 	return `main-red: ${facts.repo.toLowerCase()} ${JSON.stringify(facts)}`;
 }
 
+/** Promotion and self-check use the same root; overrides are only for isolated process fixtures. */
+export function verifiedDirectory(): string {
+	return process.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED || join(homedir(), ".agent-system-2", "verified");
+}
+function controlCheckout(): string { return process.env.AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT || REPO_ROOT; }
+
+/** Trusted git, bounded, with no caller gitconfig, hooks or templates. */
+function verifierGit(cwd: string, args: string[]): string {
+	const r = spawnSync(["git", "-C", cwd, ...NETWORK, ...args], {
+		env: trustedEnv("/dev/null"), stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 120_000,
+	});
+	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} in ${cwd}: ${r.exitedDueToTimeout ? "timed out after 120 s" : r.stderr.toString().trim() || `exit ${r.exitCode}`}`);
+	return r.stdout.toString().trim();
+}
+function resolvedCurrent(dir: string): string | null {
+	try { return realpathSync(join(dir, "current")); }
+	catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
+}
+export function runnerControlRoot(root = controlCheckout(), dir = verifiedDirectory()): ControlRoot {
+	const own = realpathSync(root);
+	const current = resolvedCurrent(dir);
+	return {
+		root: own, head: verifierGit(own, ["rev-parse", "HEAD"]),
+		modified: verifierGit(own, ["status", "--porcelain", "--untracked-files=no"]).split("\n").filter(Boolean),
+		current, currentHead: current === null ? null : verifierGit(current, ["rev-parse", "HEAD"]),
+		repo: ownerRepoOf(originOf(own) ?? "")?.toLowerCase() ?? null,
+	};
+}
+/** Publish only a lightweight commit tag, after the root. A read-after-write makes partial failures safely retryable. */
+export function pointVerifiedTag(gh: Gh, repo: string, sha: string): void {
+	const old = verifiedTagOf(gh, repo);
+	if (old === sha) return;
+	const path = `repos/${repo}/git/${old === null ? "refs" : `refs/tags/${AS2_VERIFIED_TAG}`}`;
+	const args = old === null
+		? ["api", "-X", "POST", path, "-f", `ref=refs/tags/${AS2_VERIFIED_TAG}`, "-f", `sha=${sha}`]
+		: ["api", "-X", "PATCH", path, "-f", `sha=${sha}`, "-F", "force=true"];
+	const r = gh(args);
+	if (r.code !== 0) throw new Error(`updating ${AS2_VERIFIED_TAG} on ${repo}: ${ghWhy(r)}; retry promote --sha ${sha}`);
+	if (verifiedTagOf(gh, repo) !== sha) throw new Error(`${AS2_VERIFIED_TAG} on ${repo} did not resolve to ${sha} after update; retry promotion`);
+}
+
+
+/** The activation receipt is earned from actual filesystem/tag/helper facts, even in shadow mode. */
+export function verifiedPreflight(
+	ledger: Ledger, repo: string, source: string | null, helper: string, gh: Gh = realGh,
+	root = controlCheckout(), directory = verifiedDirectory(),
+): string[] {
+	try {
+		const facts = runnerControlRoot(root, directory);
+		const refusal = controlRootRefusal(facts, ledger.entries(STANDING_WORKLOAD_ID));
+		if (refusal.length > 0) return refusal;
+		const tag = verifiedTagOf(gh, repo);
+		if (tag !== facts.currentHead) refusal.push(`${AS2_VERIFIED_TAG} ${tag ?? "missing"} does not name current ${facts.currentHead}`);
+		if (source !== facts.currentHead) refusal.push(`bundle SOURCE ${source ?? "unreadable"} does not equal current/tag commit ${facts.currentHead}`);
+		if (!readFileSync(helper, "utf8").includes(`refs/tags/${AS2_VERIFIED_TAG}:refs/tags/${AS2_VERIFIED_TAG}`)) refusal.push(`refresh helper ${helper} does not fetch refs/tags/${AS2_VERIFIED_TAG}; rerun install/as2test-setup.sh`);
+		return refusal;
+	} catch (e) { return [`verified preflight could not read root/tag/helper: ${errText(e)}`]; }
+}
+/** Both CLIs share the verdict guard; manual alone may cross schema commits after Jo's live migration. */
+export function promoteVerified(sha: string, manual = false): number {
+	if (!SHA40.test(sha)) throw new Fail(`promotion requires a full commit sha: ${sha}`, START_EXIT.usage);
+	const repo = ownerRepoOf(originOf(controlCheckout()) ?? "");
+	if (repo === null) throw new Fail(`cannot identify GitHub repository of ${controlCheckout()}; nothing promoted`, START_EXIT.failed);
+	const ledger = openLedger();
+	try {
+		const r = promoteMain(ledger, repo, sha, (s) => process.stderr.write(`${s}\n`), { manual });
+		if (!r.ok) throw new Fail(r.reason, START_EXIT.failed);
+		process.stdout.write(r.schema === null ? `promoted ${r.sha}\n` : `schema ${r.schema}\n`);
+		return START_EXIT.ok;
+	} finally { ledger.db.close(); }
+}
+export type Promotion = { ok: true; sha: string; schema: string | null } | { ok: false; reason: string };
+export interface PromotionOptions { directory?: string; origin?: string; gh?: Gh; manual?: boolean }
 /**
- * D5/D14 integration seam: a green verdict is durable, but no verified root or tag has moved here.
- * The verifier slice replaces this body with atomic root/tag promotion; until then the stall is explicit and durable.
+ * D5/R14/R15: immutable main verdict -> detached release -> atomic current -> tag -> retention.
+ * The SQLite write lock serializes publishers and disappears on process death. No live ledger migration is attempted.
+ * A stopped schema crossing is the tick's existing `schema <sha>` contract (it owns the issue and notice).
  */
-export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: string) => void): { ok: false; reason: string } {
-	const reason = "verified-root promotion is not installed; run the verifier promotion step";
-	ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `verifier-stalled: ${repo.toLowerCase()} ${sha} ${reason}` });
-	log(`verifier-stalled: ${sha}: ${reason}`);
-	return { ok: false, reason };
+export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: string) => void, o: PromotionOptions = {}): Promotion {
+	let db: Database | null = null;
+	try {
+		if (!SHA40.test(sha) || mainVerdicts(mainResults(ledger.entries(STANDING_WORKLOAD_ID))).get(sha)?.verdict !== "green") {
+			throw new Error(`${sha} has no green believable main verdict; nothing promoted`);
+		}
+		const dir = resolve(o.directory ?? verifiedDirectory());
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		if (realpathSync(dir) !== dir) throw new Error(`verified directory ${dir} is a symlink; refusing promotion`);
+		db = new Database(join(dir, "promotion.db"));
+		db.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE");
+		const clone = join(dir, "repo");
+		const origin = o.origin ?? process.env.AGENT_SYSTEM_TEST_RUNNER_ORIGIN ?? `https://github.com/${repo}.git`;
+		if (!existsSync(clone)) verifierGit(dir, ["clone", "--no-checkout", "--no-local", "--template=", origin, clone]);
+		if (realpathSync(clone) !== clone || verifierGit(clone, ["rev-parse", "--show-toplevel"]) !== clone) throw new Error(`dedicated verified clone ${clone} is not its own root`);
+		const configuredOrigin = verifierGit(clone, ["config", "--get", "remote.origin.url"]);
+		if (configuredOrigin !== origin && ownerRepoOf(configuredOrigin)?.toLowerCase() !== repo.toLowerCase()) throw new Error(`verified clone ${clone} has a different origin than ${origin}`);
+		verifierGit(clone, ["fetch", "--no-tags", origin, sha]);
+		if (verifierGit(clone, ["rev-parse", `${sha}^{commit}`]) !== sha) throw new Error(`fetched promotion target is not ${sha}`);
+		const current = resolvedCurrent(dir);
+		const before = current === null ? null : verifierGit(current, ["rev-parse", "HEAD"]);
+		if (!o.manual && before !== null && before !== sha) {
+			const chain = verifierGit(clone, ["rev-list", "--first-parent", "--reverse", sha]).split("\n");
+			const at = chain.indexOf(before);
+			if (at < 0) throw new Error(`current ${before} is not on ${sha}'s first-parent chain; manual repair required`);
+			for (const next of chain.slice(at + 1)) {
+				const diff = verifierGit(clone, ["diff", `${next}^1`, next, "--", "ledger/schema.sql"]);
+				const version = verifierGit(clone, ["diff", "--unified=0", `${next}^1`, next, "--", "ledger/src/index.ts"]);
+				if (diff || version.split("\n").some((l) => /^[+-](?![+-])/.test(l) && /\bSCHEMA_VERSION\b/.test(l))) {
+					log(`verifier-stalled: schema change at ${next}; Jo must migrate the ledger and run promote-verified.ts with a verified sha`);
+					ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `verifier-stalled: ${repo.toLowerCase()} ${sha} schema ${next}` });
+					return { ok: true, sha: before, schema: next };
+				}
+			}
+		}
+		const release = join(dir, sha.slice(0, 12));
+		if (!existsSync(release)) verifierGit(clone, ["worktree", "add", "--detach", release, sha]);
+		if (realpathSync(release) !== release || verifierGit(release, ["rev-parse", "HEAD"]) !== sha
+			|| verifierGit(release, ["rev-parse", "--git-common-dir"]) !== join(clone, ".git")
+			|| verifierGit(release, ["status", "--porcelain", "--untracked-files=no"]) !== "") throw new Error(`verified release ${release} is foreign, dirty or names another commit; repair it before retrying`);
+		const link = join(dir, `.current-${process.pid}`);
+		// A crashed publisher may leave only this symlink. Never replace a directory or an unrelated file.
+		if (existsSync(link) || (() => { try { return lstatSync(link).isSymbolicLink(); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; } })()) {
+			if (!lstatSync(link).isSymbolicLink()) throw new Error(`promotion staging path ${link} is not a symlink`);
+			rmSync(link);
+		}
+		symlinkSync(release, link);
+		renameSync(link, join(dir, "current"));
+		pointVerifiedTag(o.gh ?? realGh, repo, sha);
+		// Only registered, owned detached worktrees directly below this root may be removed.
+		const releases = verifierGit(clone, ["worktree", "list", "--porcelain"]).split("\n\n").flatMap((block) => {
+			const path = /^worktree (.+)$/m.exec(block)?.[1];
+			return path && dirname(path) === dir && /^[0-9a-f]{12}$/.test(path.slice(dir.length + 1)) && /^detached$/m.test(block) ? [path] : [];
+		}).sort((a, b) => lstatSync(b).mtimeMs - lstatSync(a).mtimeMs);
+		const keep = new Set(releases.slice(0, 3));
+		keep.add(release); // A manual rollback may make current older than the newest three; never delete it.
+		for (const path of releases) {
+			if (keep.has(path) || resolvedCurrent(dir) === path) continue;
+			if (realpathSync(path) !== path || verifierGit(path, ["rev-parse", "--git-common-dir"]) !== join(clone, ".git")) throw new Error(`refusing retention of foreign worktree ${path}`);
+			verifierGit(clone, ["worktree", "remove", path]);
+		}
+		log(`promoted ${sha}`);
+		return { ok: true, sha, schema: null };
+	} catch (e) {
+		const reason = errText(e).replace(/\s+/g, " ");
+		log(`verifier-stalled: ${sha}: ${reason}`);
+		try { ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `verifier-stalled: ${repo.toLowerCase()} ${sha} ${reason}` }); }
+		catch (recordError) { log(`verifier-stalled record failed: ${errText(recordError)}; original promotion failure: ${reason}`); }
+		return { ok: false, reason };
+	} finally {
+		db?.close();
+	}
 }
 
 /**
@@ -1683,27 +1833,28 @@ class Runner {
 		}
 	}
 
-	/** The install facts of the runner's own checkout (REPO_ROOT) against the install, and their verdict; the SOURCE commit is kept for D5's row. */
+	/** Install facts against current's bundle inputs (or the development checkout in shadow); SOURCE is retained for D5's row. */
 	private decideInstall(): { facts: InstallFacts; v: InstallVerdict } {
 		const spec = this.install;
-		const facts = readInstall({ checkout: REPO_ROOT, libexec: spec.libexec, root: this.as2root, sudoers: spec.sudoers, dscl: spec.dscl });
+		// The bundle follows current/tag even while this already-running process finishes on an older verified release.
+		const checkout = landFirstNow(this.ledger, this.ownerRepo) ? resolvedCurrent(verifiedDirectory()) ?? controlCheckout() : REPO_ROOT;
+		const facts = readInstall({ checkout, libexec: spec.libexec, root: this.as2root, sudoers: spec.sudoers, dscl: spec.dscl });
 		this.source = facts.source.ok ? { ok: true, sha: facts.source.source.sourceSha } : { ok: false, error: facts.source.error };
 		return { facts, v: installDecision(facts, spec.ids) };
 	}
 
 	/**
-	 * D5: this process's one `runner-preflight:` row on the standing workload, `ok` when `refusal` is null, else `refused <refusal>`,
-	 * naming the bundle's SOURCE commit (`decideInstall`) and the runner's own root (REPO_ROOT; the verified-root self-check is
-	 * sl-fast-verifier's). A SOURCE that did not parse is a refusal, its sha written as forty zeros, which names no commit. A row
-	 * that cannot be written is one runner.log line naming why; it never changes the run.
+	 * D5: write ok only after actual verified-root/tag/helper/SOURCE checks pass. In shadow mode a refused row
+	 * is still recorded, but does not prevent the first main run earning G. Activation consumes this same receipt.
+	 * A SOURCE that did not parse is written as forty zeros; recording failure is loud in runner.log.
 	 */
 	private recordPreflight(refusal: string | null): void {
 		if (this.preflightRecorded) return;
 		this.preflightRecorded = true;
 		const src = this.source;
-		const reasons = [...(refusal === null ? [] : [refusal]), ...(src.ok ? [] : [`the bundle SOURCE did not parse (${src.error}), so the sha written is forty zeros`])];
+		const reasons = [...(refusal === null ? [] : [refusal]), ...verifiedPreflight(this.ledger, this.ownerRepo, src.ok ? src.sha : null, join(this.install.libexec, "refresh"))];
 		try {
-			const body = runnerPreflightBody({ ok: reasons.length === 0, reason: reasons.length === 0 ? null : reasons.join("; "), source: src.ok ? src.sha : "0".repeat(40), root: REPO_ROOT });
+			const body = runnerPreflightBody({ ok: reasons.length === 0, reason: reasons.length === 0 ? null : reasons.join("; "), source: src.ok ? src.sha : "0".repeat(40), root: realpathSync(controlCheckout()) });
 			this.ledger.write(() => {
 				ensureStandingWorkload(this.ledger);
 				this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
@@ -1806,8 +1957,22 @@ class Runner {
 		};
 		let { facts, v } = this.decideInstall();
 		let refreshed: string | null = null;
-		if (!v.ok && v.kind !== "install") {
-			this.log(`preflight: ${v.reason}; running the refresh helper`);
+		const on = landFirstNow(this.ledger, this.ownerRepo);
+		let verifierMismatch = false;
+		if (on) {
+			const own = runnerControlRoot();
+			const rootRefusal = controlRootRefusal(own, this.ledger.entries(STANDING_WORKLOAD_ID));
+			if (rootRefusal.length > 0) return stop(rootRefusal.join("; "));
+			const reasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"));
+			if (reasons.length > 0) {
+				if (!readFileSync(join(this.install.libexec, "refresh"), "utf8").includes(`refs/tags/${AS2_VERIFIED_TAG}:refs/tags/${AS2_VERIFIED_TAG}`)) return stop(reasons.join("; "));
+				this.log(`verified preflight: ${reasons.join("; ")}; re-pointing the tag and refreshing once`);
+				pointVerifiedTag(realGh, this.ownerRepo, own.currentHead!);
+				verifierMismatch = true;
+			}
+		}
+		if (verifierMismatch || (!v.ok && v.kind !== "install")) {
+			this.log(`preflight: ${!v.ok ? v.reason : "bundle/tag mismatch"}; running the refresh helper`);
 			const r = await this.refresh();
 			if (r.code !== REFRESH_EXIT.ok) {
 				// The REFRESH_EXIT name of the code (`fetch` for 70); `failed` for a code the helper does not define, such as sudo's own refusal.
@@ -1837,6 +2002,10 @@ class Runner {
 			}
 		}
 		if (!v.ok) return stop(v.reason);
+		if (on) {
+			const reasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"));
+			if (reasons.length > 0) return stop(`verified preflight refused after one refresh: ${reasons.join("; ")}`);
+		}
 		return refreshed ? { ok: true, summary: `${v.summary}; ${refreshed}` } : v;
 	}
 
@@ -2120,6 +2289,10 @@ class Runner {
 		this.fast = { plan, host: "linux", parse: [], missing: [], exec: null };
 		this.slotless = true;
 		const { v } = this.decideInstall();
+		if (landFirstNow(this.ledger, this.ownerRepo)) {
+			// Hosted work still executes control code locally. Its root/bundle guard is not optional.
+			await this.installCheck();
+		}
 		this.f.preflight = v.ok ? v.summary : `preflight: ${v.reason}`;
 		if (!v.ok) this.log(`preflight: ${v.reason}; the hosted fast check runs none of the Mac install, so it goes on (a Mac fallback refreshes or stops on it)`);
 		this.recordPreflight(v.ok ? null : v.reason);
@@ -2367,8 +2540,11 @@ class Runner {
 					this.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: this.wl, kind: "assumption", body: `main-publication: ${this.id} ${s.replace(/\s+/g, " ")}` });
 				};
 				const verdict = mainVerdicts(mainResults(this.ledger.entries(this.wl))).get(run.sha);
-				if (verdict?.verdict === "green") promoteMain(this.ledger, this.ownerRepo, run.sha, log);
-				else revokeOpen(realGh, this.ownerRepo, `main ${run.sha.slice(0, 7)} ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log);
+				if (verdict?.verdict === "green") {
+					const controlRepo = ownerRepoOf(originOf(controlCheckout()) ?? "")?.toLowerCase() ?? null;
+					if (controlRepo === this.ownerRepo.toLowerCase()) promoteMain(this.ledger, this.ownerRepo, run.sha, log);
+					else log(`verified promotion skipped for served repository ${this.ownerRepo}: this runner's control repository is ${controlRepo ?? "unreadable (repair its origin before promotion)"}`);
+				} else revokeOpen(realGh, this.ownerRepo, `main ${run.sha.slice(0, 7)} ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log);
 				const state = verdict?.verdict === "green" ? "success" : verdict !== undefined ? "failure" : "error";
 				postStatus(realGh, this.ownerRepo, state, run.sha, `main full ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log, MAIN_FULL_STATUS);
 				return 0;
@@ -2507,8 +2683,7 @@ export async function main(argv: string[]): Promise<number> {
 		return cmdMain(rest[1]!, rest[3]!);
 	}
 	if (cmd === "promote" && rest.length === 2 && rest[0] === "--sha" && SHA40.test(rest[1]!)) {
-		// The seam sl-fast-verifier fills (D5, § 2 The verified root): never a fake success.
-		throw new Fail(`promote ${rest[1]}: not built yet (sl-fast-verifier builds the verified-root promotion); nothing was promoted`, START_EXIT.failed);
+		return promoteVerified(rest[1]!);
 	}
 	throw new Fail(USAGE, START_EXIT.usage);
 }

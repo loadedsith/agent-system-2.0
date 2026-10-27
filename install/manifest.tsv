@@ -1138,6 +1138,7 @@ surface/test/fast-set.test.ts	test	-
 surface/src/main-state.ts	module	-
 surface/test/main-state.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
+surface/scripts/promote-verified.ts	module	-
 surface/test/test-runner.test.ts	test	-
 surface/scripts/test-run-waits.ts	module	-
 surface/test/test-run-waits.test.ts	test	-

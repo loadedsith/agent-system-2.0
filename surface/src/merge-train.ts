@@ -20,6 +20,7 @@
 // repository's newest open train (pending when held or done, opening one only when none exists), and `trainBrief` reads its members from `merge-train.ts list`.
 // Part 4 (PLAN wl-mvbjiettjrfpxc D1, D6, D7): the train tick's boarding scan (`autoboardCandidates`, `boardedWorkloads`,
 // `boardSkips`), main's protection read live (`protectionGap`) with its episodes, and the main-red notices, on the standing workload.
+import { basename, dirname } from "node:path";
 import { parseHandSpawn } from "../../classifier/src/lab";
 import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import {
@@ -2716,14 +2717,17 @@ export interface ControlRoot {
 }
 
 /**
- * Why a control root fails § 2's self-check, every reason; empty when it passes: it must be `verified/current`, its HEAD must
- * have a green believable main verdict (`mainVerdicts` over the standing workload's runner rows, `entries`), and its tracked
- * files must be unmodified.
+ * Why a control root fails § 2's self-check, every reason. New processes load `verified/current`; a process already
+ * running may finish from an older immutable sibling `verified/<HEAD 12>` after promotion. Either root must have a
+ * green believable main verdict and unmodified tracked files. An arbitrary checkout or sibling name is never accepted.
  */
 export function controlRootRefusal(r: ControlRoot, entries: readonly EntryRow[]): string[] {
 	const out: string[] = [];
 	if (r.current === null) out.push("no verified control root: ~/.agent-system-2/verified/current does not exist");
-	else if (r.root !== r.current) out.push(`root ${r.root} is not verified/current (${r.current})`);
+	else if (r.root !== r.current && !(dirname(r.root) === dirname(r.current)
+		&& /\/\.agent-system-2\/verified\/[0-9a-f]{12}$/.test(r.root) && basename(r.root) === r.head.slice(0, 12))) {
+		out.push(`root ${r.root} is not verified/current (${r.current})`);
+	}
 	if (mainVerdicts(mainResults(entries)).get(r.head)?.verdict !== "green") out.push(`HEAD ${r.head.slice(0, 12)} has no green believable main verdict`);
 	if (r.modified.length > 0) out.push(`tracked files modified: ${r.modified.join(", ")}`);
 	return out;

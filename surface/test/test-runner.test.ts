@@ -24,7 +24,7 @@ import {
 } from "../src/test-run";
 import { landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { admitMain, citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT } from "../scripts/test-runner";
+import { admitMain, citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
 import { mainResults, mainVerdicts, parseRunnerPreflight } from "../src/main-state";
 import { alive, tmp, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
@@ -133,6 +133,7 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 interface Fixture {
 	bare: string;
 	main: string;
+	control: string;
 	head: Record<PrName, string>;
 }
 let fx: Fixture;
@@ -146,8 +147,15 @@ beforeAll(() => {
 	writeFileSync(join(work, "README.md"), "runner fixture\n");
 	// `xa.test.ts` shares a substring with `a.test.ts`: a solo run by `./a.test.ts` must not pick it up.
 	writeFileSync(join(work, "xa.test.ts"), PASS("xa"));
+	mkdirSync(join(work, "surface", "scripts"), { recursive: true });
+	writeFileSync(join(work, "surface", "scripts", "test-exec.ts"), readFileSync(TEST_EXEC));
 	// Every checkout would run the `evil` smudge filter if any config the runner reads defined it.
 	writeFileSync(join(work, ".gitattributes"), "*.ts filter=evil\n");
+	g(work, "add", "-A");
+	g(work, "commit", "-q", "-m", "main");
+	const control = g(work, "rev-parse", "HEAD");
+	g(work, "update-ref", "refs/heads/control", control);
+	writeFileSync(join(work, "README.md"), "main after verified control fixture\n");
 	g(work, "add", "-A");
 	g(work, "commit", "-q", "-m", "main");
 	const main = g(work, "rev-parse", "HEAD");
@@ -165,8 +173,8 @@ beforeAll(() => {
 	}
 	const bare = join(root, "origin.git");
 	g(root, "init", "-q", "--bare", "-b", "main", bare);
-	g(work, "push", "-q", bare, "main", "+refs/pull/*:refs/pull/*");
-	fx = { bare, main, head };
+	g(work, "push", "-q", bare, "main", "control", "+refs/pull/*:refs/pull/*");
+	fx = { bare, main, control, head };
 });
 
 // ---- a world: ledger, runs root, as2test root, install, fake gh and sudo --------------------------------
@@ -180,6 +188,20 @@ const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ "$2" = -X ]; then
+	case "$4" in
+	*/git/refs|*/git/refs/tags/as2-verified)
+		if [ -f "$dir/tag-fails" ]; then echo 'tag write failed (HTTP 502)' >&2; exit 1; fi
+		for a in "$@"; do case "$a" in sha=*) printf '%s' "\${a#sha=}" > "$dir/verified-tag" ;; esac; done
+		echo '{}'; exit 0 ;;
+	esac
+fi
+if [ "$1" = api ]; then
+	case "$2" in */git/ref/tags/as2-verified)
+		if [ -f "$dir/verified-tag" ]; then printf '{"object":{"type":"commit","sha":"%s"}}' "$(cat "$dir/verified-tag")"; exit 0; fi
+		if [ ! -f "$dir/api/$(printf '%s' "$2" | tr / _)" ]; then echo 'HTTP 404 Not Found' >&2; exit 1; fi ;;
+	esac
+fi
 if [ "$1 $2" = "pr list" ] && [ -f "$dir/open-prs.json" ]; then cat "$dir/open-prs.json"; exit 0; fi
 if [ "$1" = api ] && [ "$2" = -X ]; then
 	st=""
@@ -246,12 +268,12 @@ exit 99
  * The install's SOURCE over its four files as they are now, at `to` (the installed SOURCE by default), recording
  * `inputSha` for surface/scripts/test-exec.ts: its hash in this checkout by default, so the install matches.
  */
-function writeSource(libexec: string, o: { inputSha?: string; to?: string } = {}): void {
+function writeSource(libexec: string, o: { inputSha?: string; to?: string; sha?: string } = {}): void {
 	const uid = process.getuid!();
 	const gid = statSync(libexec).gid;
 	const to = o.to ?? join(libexec, "SOURCE");
 	const source = [
-		"version 1", "source /tmp/as2-checkout", `source-sha ${"0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
+		"version 1", "source /tmp/as2-checkout", `source-sha ${o.sha ?? "0".repeat(40)}`, `bun-version ${Bun.version}`, "user _as2test", `uid ${uid}`, `gid ${gid}`, "jo jo", `jo-uid ${uid}`,
 		...["exec", "bun", "test-exec.js", "refresh"].map((f) => `file ${f} ${sha256(join(libexec, f))}`),
 		`input surface/scripts/test-exec.ts ${o.inputSha ?? sha256(TEST_EXEC)}`,
 	];
@@ -360,6 +382,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "en_US.UTF-8", USER: process.env.USER ?? "jo",
 		AGENT_SYSTEM_LEDGER_DB: ledgerPath, AGENT_SYSTEM_TEST_RUNS: join(root, "runs"), AGENT_SYSTEM_TEST_RUNNER_CONFIG: config, AGENT_SYSTEM_TEST_RUNNER_ORIGIN: origin,
 		AGENT_SYSTEM_TEST_RUNNER_ROOT: as2,
+		AGENT_SYSTEM_TEST_RUNNER_VERIFIED: join(home, ".agent-system-2", "verified"),
 		AGENT_SYSTEM_TEST_RUNNER_INSTALL: JSON.stringify({ libexec, sudoers, ids: { root: uid, wheel: gid, jo: uid }, account: { uid, gid } }),
 		AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "500", AGENT_SYSTEM_TEST_RUNNER_POLL_MS: "200", AGENT_SYSTEM_TEST_RUNNER_BUSY_MS: "300", AGENT_SYSTEM_TEST_HOOKS: hooks,
 		// Credentials in Jo's env: none may reach the code under test (plan § 3).
@@ -367,6 +390,32 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
 	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago, pin };
+}
+
+/** Real detached control root and actual tag/helper/SOURCE facts; no fixture-only ok row. */
+function verifiedWorld(w: World, sha = fx.control): string {
+	const dir = w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!;
+	mkdirSync(dir, { recursive: true });
+	const clone = join(dir, "repo");
+	g(w.root, "clone", "-q", "--no-checkout", w.origin, clone);
+	const release = join(dir, sha.slice(0, 12));
+	g(clone, "worktree", "add", "-q", "--detach", release, sha);
+	g(clone, "remote", "set-url", "origin", `https://github.com/${OWNER_REPO}.git`);
+	symlinkSync(release, join(dir, "current"));
+	w.env.AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT = release;
+	mainRun(w.ledger, "tr-controlseed", sha, "green", { exec: { files: 1, tests: 1, treeFiles: 1 } });
+	writeFileSync(join(w.root, "verified-tag"), sha);
+	writeFileSync(join(w.libexec, "refresh"), `#!/bin/sh
+# refs/tags/as2-verified:refs/tags/as2-verified
+set -eu
+sha=$(cat '${join(w.root, "verified-tag")}')
+sed "s/^source-sha .*/source-sha $sha/" '${join(w.libexec, "SOURCE")}' > '${join(w.libexec, "SOURCE.new")}'
+chmod 755 '${join(w.libexec, "SOURCE.new")}'
+mv '${join(w.libexec, "SOURCE.new")}' '${join(w.libexec, "SOURCE")}'
+echo refreshed
+`);
+	writeSource(w.libexec, { sha });
+	return release;
 }
 
 /** An open autonomous workload on the world's checkout, with one open slice. */
@@ -1088,7 +1137,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		// The handoff: `_as2test`'s clone from the bundle is a real repository.
 		const clone = join(workDirOf(runId!, w.as2), "repo");
 		expect(g(clone, "rev-parse", "HEAD")).toBe(fx.head.green);
-		expect(g(clone, "log", "--format=%H").split("\n")).toEqual([fx.head.green, fx.main]);
+		expect(g(clone, "log", "--format=%H").split("\n")).toEqual([fx.head.green, fx.main, fx.control]);
 		expect(g(clone, "diff", "--name-only", run.mergeBase!)).toBe("a.test.ts");
 		expect(g(clone, "remote")).toBe("");
 		// The trusted base for `migration-items check`: beside the tested-commit branch, the only ref in the clone, at origin/main.
@@ -2542,6 +2591,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		const w = world();
 		landFirst(w.ledger, OWNER_REPO, true);
 		mainRun(w.ledger, "tr-mainseed", fx.main, "green");
+		verifiedWorld(w, fx.main);
 		api(w, "git/ref/heads/main", { object: { sha: fx.main } });
 		api(w, `git/commits/${fx.main}`, {
 			sha: fx.main, tree: { sha: g(w.origin, "rev-parse", `${fx.main}^{tree}`) },
@@ -2623,7 +2673,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("fast-fallback:"))).toEqual([]);
 			expect(preflights(w)).toHaveLength(1);
 			expect(preflights(w)[0]!.created_by).toBe(TEST_RUNNER_BY);
-			expect(parseRunnerPreflight(preflights(w)[0]!.body)).toEqual({ ok: true, reason: null, source: "0".repeat(40), root: resolve(import.meta.dir, "..", "..") });
+			expect(parseRunnerPreflight(preflights(w)[0]!.body)).toEqual({ ok: true, reason: null, source: fx.main, root: w.env.AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT! });
 		});
 	}
 
@@ -2740,6 +2790,7 @@ describe("land-first main D5 (R13, R14)", () => {
 	function mainWorld() {
 		const w = world();
 		landFirst(w.ledger, OWNER_REPO, true);
+		verifiedWorld(w);
 		return w;
 	}
 	function admit(w: World, sha: string) {
@@ -2775,7 +2826,8 @@ describe("land-first main D5 (R13, R14)", () => {
 			expect(result).toMatchObject({ main: true, scope: "full", host: "mac", verdict: "green", exec: { files: 2, tests: 2, treeFiles: 2 }, base: null, mergeBase: null });
 			expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(result.sha)?.verdict).toBe("green");
 			expect(w.ledger.slice(testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).find((r) => r.request.runId === id)!.request.slice)).toBeNull();
-			expect(calls(w)).toBe("");
+			expect(calls(w)).not.toContain("context=as2/main-full");
+			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.control);
 			// A later main tip and missing PR ref do not make an immutable main target stale.
 			g(w.root, "--git-dir", w.origin, "update-ref", "refs/heads/main", fx.head.red);
 		} finally {
@@ -2785,7 +2837,8 @@ describe("land-first main D5 (R13, R14)", () => {
 		expect(calls(w)).toContain("context=as2/main-full");
 		expect(calls(w)).not.toContain("context=as2/full-suite");
 		expect(calls(w)).not.toContain("pr view 0");
-		expect(w.ledger.entries(STANDING_WORKLOAD_ID).some((e) => e.body.startsWith("verifier-stalled:"))).toBe(true);
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID).some((e) => e.body.startsWith("verifier-stalled:"))).toBe(false);
+		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.head.green);
 		expect(admit(w, fx.head.green).action).toBe("verdict");
 	});
 	for (const scenario of ["red", "skipped", "exit"] as const) {
@@ -2816,7 +2869,7 @@ describe("land-first main D5 (R13, R14)", () => {
 					expect(result.solo.map((s) => s.file)).toEqual(["./red.test.ts"]);
 					expect(subsOf(w, id)).not.toContain("base-prepare");
 				}
-				expect(calls(w)).toBe("");
+				expect(calls(w)).not.toContain("state=failure");
 			} finally {
 				go(w, id, "main-published");
 			}
@@ -2891,7 +2944,7 @@ describe("land-first main D5 (R13, R14)", () => {
 		expect(await spawnRun(w, id).exited).toBe(0);
 		expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(fx.head.green)?.verdict).toBe("implausible");
 	});
-	test("main takes the Mac before waiting PRs; coalesces pending targets without cancelling active main", async () => {
+	test("main takes the Mac before waiting PRs; queued older verified workers continue after promotion and coalesce pending targets", async () => {
 		const w = mainWorld();
 		const owner = workload(w);
 		const prId = request(w, owner.wl, owner.slice, PR.green, fx.head.green, 1000);
@@ -2914,11 +2967,15 @@ describe("land-first main D5 (R13, R14)", () => {
 		go(w, id, "main-published");
 		expect(await active.exited).toBe(0);
 		const next = await until("pending main admission", () => testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).find((r) => r.request.sha === fx.head.green) ?? null);
-		expect((await resultOf(w, STANDING_WORKLOAD_ID, next.request.runId)).verdict).toBe("green");
+		const pendingResult = await resultOf(w, STANDING_WORKLOAD_ID, next.request.runId);
+		expect({ verdict: pendingResult.verdict, reason: pendingResult.reason }).toEqual({ verdict: "green", reason: null });
 		expect(testRuns(w.ledger.entries(STANDING_WORKLOAD_ID)).some((r) => r.request.sha === fx.head.red)).toBe(false);
 		expect(await pr.exited).toBe(0);
 		expect((await resultOf(w, owner.wl, prId)).verdict).toBe("green");
 		expect(w.ledger.slice(owner.slice)?.state).toBe("done");
+		expect(g(w.env.AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT!, "rev-parse", "HEAD")).toBe(fx.control);
+		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.head.green);
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("runner-preflight:")).map((e) => parseRunnerPreflight(e.body)?.ok)).toEqual([true, true, true]);
 	});
 	test("three inconclusive attempts refuse another admission", () => {
 		const w = mainWorld();
@@ -2929,4 +2986,238 @@ describe("land-first main D5 (R13, R14)", () => {
 		}
 		expect(() => admit(w, fx.head.exit)).toThrow("spent attempt block");
 	});
+});
+
+describe("verified control promotion and bootstrap (R14/R15/R34)", () => {
+	function promoter(w: World) {
+		let tag: string | null = null;
+		let fail = false;
+		let writes = 0;
+		const directory = w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!;
+		const gh: Gh = (args) => {
+			if (args[1] !== "-X") return tag === null
+				? { code: 1, stdout: "", stderr: "HTTP 404 Not Found" }
+				: { code: 0, stdout: JSON.stringify({ object: { type: "commit", sha: tag } }), stderr: "" };
+			const sha = args.find((s) => s.startsWith("sha="))!.slice(4);
+			expect(g(realpathSync(join(directory, "current")), "rev-parse", "HEAD")).toBe(sha);
+			writes++;
+			if (fail) return { code: 1, stdout: "", stderr: "injected tag failure HTTP 502" };
+			tag = sha;
+			return { code: 0, stdout: "{}", stderr: "" };
+		};
+		const logs: string[] = [];
+		return {
+			gh, logs, directory, get tag() { return tag; }, get writes() { return writes; },
+			setFail(value: boolean) { fail = value; },
+			promote(sha: string, manual = false) { return promoteMain(w.ledger, OWNER_REPO, sha, (s) => logs.push(s), { directory, origin: w.origin, gh, manual }); },
+		};
+	}
+	function next(w: World, parent: string, changes: Record<string, string>): string {
+		const work = join(w.root, "commits");
+		if (!existsSync(work)) g(w.root, "clone", "-q", w.origin, work);
+		g(work, "checkout", "-q", "--detach", parent);
+		for (const [path, text] of Object.entries(changes)) {
+			mkdirSync(dirname(join(work, path)), { recursive: true });
+			writeFileSync(join(work, path), text);
+		}
+		g(work, "add", "-A");
+		g(work, "commit", "-q", "-m", "next verified fixture");
+		const sha = g(work, "rev-parse", "HEAD");
+		g(work, "push", "-q", w.origin, `${sha}:refs/heads/verified-fixture`);
+		return sha;
+	}
+	test("verified real git promotion publishes root before tag, is idempotent, retains newest three and active current", () => {
+		const w = world();
+		const p = promoter(w);
+		let sha = fx.main;
+		const shas: string[] = [];
+		for (let i = 0; i < 5; i++) {
+			if (i > 0) sha = next(w, sha, { "README.md": `release ${i}\n` });
+			mainRun(w.ledger, `tr-release${i}`, sha, "green");
+			expect(p.promote(sha)).toEqual({ ok: true, sha, schema: null });
+			shas.push(sha);
+		}
+		expect(p.promote(sha)).toEqual({ ok: true, sha, schema: null });
+		expect(p.writes).toBe(5);
+		expect(p.tag).toBe(sha);
+		expect(readdirSync(p.directory).filter((n) => /^[0-9a-f]{12}$/.test(n)).sort()).toEqual(shas.slice(-3).map((s) => s.slice(0, 12)).sort());
+		expect(g(realpathSync(join(p.directory, "current")), "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
+		expect(g(join(p.directory, "repo"), "worktree", "list", "--porcelain")).not.toContain(`worktree ${join(p.directory, shas[0]!.slice(0, 12))}\n`);
+	});
+	test("verified retry after tag failure preserves prior release and repairs without a new verdict", () => {
+		const w = world();
+		const p = promoter(w);
+		mainRun(w.ledger, "tr-oldverified", fx.main, "green");
+		expect(p.promote(fx.main).ok).toBe(true);
+		mainRun(w.ledger, "tr-newverified", fx.head.green, "green");
+		p.setFail(true);
+		expect(p.promote(fx.head.green)).toMatchObject({ ok: false, reason: expect.stringContaining("tag failure") });
+		expect(p.tag).toBe(fx.main);
+		expect(existsSync(join(p.directory, fx.main.slice(0, 12)))).toBe(true);
+		expect(g(realpathSync(join(p.directory, "current")), "rev-parse", "HEAD")).toBe(fx.head.green);
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID).at(-1)!.body).toContain("verifier-stalled:");
+		p.setFail(false);
+		expect(p.promote(fx.head.green).ok).toBe(true);
+		expect(p.tag).toBe(fx.head.green);
+	});
+	test("verified rejects missing, red-laundered and implausible verdicts before any filesystem publish", () => {
+		const w = world();
+		const p = promoter(w);
+		mainRun(w.ledger, "tr-redfirst", fx.main, "red");
+		mainRun(w.ledger, "tr-laundered", fx.main, "green");
+		mainRun(w.ledger, "tr-implausible", fx.head.green, "green", { exec: { files: 1, treeFiles: 10, tests: 1 } });
+		for (const sha of [fx.main, fx.head.green, fx.head.red]) expect(p.promote(sha)).toMatchObject({ ok: false, reason: expect.stringContaining("no green believable") });
+		expect(existsSync(p.directory)).toBe(false);
+		expect(p.writes).toBe(0);
+	});
+	for (const change of ["schema", "version"] as const) {
+		test(`verified automatic ${change} crossing stops at first barrier; manual still requires a verdict`, () => {
+			const w = world();
+			const p = promoter(w);
+			mainRun(w.ledger, "tr-firstverified", fx.main, "green");
+			expect(p.promote(fx.main).ok).toBe(true);
+			const schema = next(w, fx.main, change === "schema" ? { "ledger/schema.sql": "CREATE TABLE example (id TEXT);\n" } : { "ledger/src/index.ts": "export const SCHEMA_VERSION = 42;\n" });
+			const tip = next(w, schema, { "README.md": "past schema\n" });
+			mainRun(w.ledger, "tr-postschema", tip, "green");
+			expect(p.promote(tip)).toEqual({ ok: true, sha: fx.main, schema });
+			expect(p.tag).toBe(fx.main);
+			expect(p.promote(schema, true).ok).toBe(false);
+			expect(p.promote(tip, true)).toEqual({ ok: true, sha: tip, schema: null });
+			expect(p.tag).toBe(tip);
+		});
+	}
+	test("verified guards wrong, dirty, unverified roots, actual helper and bundle SOURCE", () => {
+		const w = world();
+		const release = verifiedWorld(w);
+		const dir = w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!;
+		const helper = join(w.libexec, "refresh");
+		const gh: Gh = () => ({ code: 0, stdout: JSON.stringify({ object: { type: "commit", sha: fx.control } }), stderr: "" });
+		const check = (source = fx.control, root = release) => verifiedPreflight(w.ledger, OWNER_REPO, source, helper, gh, root, dir);
+		expect(check()).toEqual([]);
+		expect(check(fx.main).join(" ")).toContain("bundle SOURCE");
+		expect(check(fx.control, join(dir, "repo")).join(" ")).toContain("not verified/current");
+		writeFileSync(join(release, "README.md"), "dirty\n");
+		expect(check().join(" ")).toContain("tracked files modified");
+		g(release, "checkout", "--", "README.md");
+		g(release, "checkout", "-q", "--detach", fx.main);
+		expect(check().join(" ")).toContain("no green believable main verdict");
+		g(release, "checkout", "-q", "--detach", fx.control);
+		writeFileSync(helper, "#!/bin/sh\n# old origin/main helper\n");
+		expect(check().join(" ")).toContain("does not fetch refs/tags/as2-verified");
+	});
+	test("verified older immutable sibling continues after current advances; dirty older code still refuses", () => {
+		const w = world();
+		const old = verifiedWorld(w);
+		const p = promoter(w);
+		mainRun(w.ledger, "tr-advancedverified", fx.main, "green");
+		expect(p.promote(fx.main).ok).toBe(true);
+		expect(verifiedPreflight(w.ledger, OWNER_REPO, fx.main, join(w.libexec, "refresh"), p.gh, old, p.directory)).toEqual([]);
+		writeFileSync(join(old, "README.md"), "older but dirty\n");
+		expect(verifiedPreflight(w.ledger, OWNER_REPO, fx.main, join(w.libexec, "refresh"), p.gh, old, p.directory).join(" ")).toContain("tracked files modified");
+	});
+	test("verified runner promotion and manual CLIs smoke real filesystem with injected GitHub, never unverified manual", () => {
+		const w = world();
+		mainRun(w.ledger, "tr-cliverified", fx.main, "green");
+		const cli = (script: string, args: string[]) => Bun.spawnSync([process.execPath, script, ...args], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		const first = cli(RUNNER, ["promote", "--sha", fx.main]);
+		expect({ code: first.exitCode, err: first.stderr.toString() }).toMatchObject({ code: 0 });
+		expect(first.stdout.toString().trim()).toBe(`promoted ${fx.main}`);
+		expect(cli(RUNNER, ["promote", "--sha", fx.main]).exitCode).toBe(0);
+		const manual = join(import.meta.dir, "..", "scripts", "promote-verified.ts");
+		expect(cli(manual, [fx.head.red]).exitCode).toBe(START_EXIT.failed);
+		expect(cli(manual, [fx.main]).exitCode).toBe(0);
+		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.main);
+	});
+	test("verified shadow bootstrap earns first G with a refused, never fake ok, preflight", async () => {
+		const w = world();
+		landFirst(w.ledger, OWNER_REPO, false);
+		const db = lockDbOf(w);
+		let id: string;
+		try {
+			const a = admitMain(w.ledger, db, w.runs, OWNER_REPO, fx.main, MERGE_TRAIN_BY);
+			if (a.action !== "admitted") throw new Error(a.line);
+			id = a.runId;
+		} finally { db.close(); }
+		expect(await spawnRun(w, id!).exited).toBe(0);
+		expect(mainVerdicts(mainResults(w.ledger.entries(STANDING_WORKLOAD_ID))).get(fx.main)?.verdict).toBe("green");
+		expect(w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("runner-preflight:")).map((e) => parseRunnerPreflight(e.body)?.ok)).toEqual([false]);
+		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.main);
+	});
+	for (const mode of ["wrong", "dirty", "unverified", "bundle", "repair"] as const) {
+		test(`verified runner preflight ${mode} uses real facts and at most one bundle refresh`, async () => {
+			const w = world();
+			const release = verifiedWorld(w);
+			landFirst(w.ledger, OWNER_REPO, true);
+			if (mode === "wrong") w.env.AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT = resolve(import.meta.dir, "..", "..");
+			if (mode === "dirty") writeFileSync(join(release, "README.md"), "dirty\n");
+			if (mode === "unverified") g(release, "checkout", "-q", "--detach", fx.main);
+			if (mode === "bundle" || mode === "repair") {
+				const good = join(w.root, "good-source");
+				writeFileSync(join(w.libexec, "refresh"), `#!/bin/sh\n# refs/tags/as2-verified:refs/tags/as2-verified\n${mode === "repair" ? `cp '${good}' '${join(w.libexec, "SOURCE")}'` : ":"}\necho refreshed\n`);
+				writeSource(w.libexec, { sha: fx.control, to: good });
+				writeSource(w.libexec, { sha: fx.main });
+				writeFileSync(join(w.root, "verified-tag"), fx.main);
+			}
+			const owner = workload(w);
+			const id = request(w, owner.wl, owner.slice, PR.green, fx.head.green);
+			expect(await spawnRun(w, id).exited).toBe(0);
+			const result = await resultOf(w, owner.wl, id);
+			expect(result.verdict).toBe(mode === "repair" ? "green" : "error");
+			const pre = w.ledger.entries(STANDING_WORKLOAD_ID).find((e) => e.body.startsWith("runner-preflight:"))!;
+			expect(parseRunnerPreflight(pre.body)?.ok).toBe(mode === "repair");
+			const refreshes = existsSync(join(w.root, "sudo.log")) ? readFileSync(join(w.root, "sudo.log"), "utf8").split("\n").filter((l) => l === "refresh") : [];
+			expect(refreshes).toHaveLength(mode === "bundle" || mode === "repair" ? 1 : 0);
+			if (mode !== "repair") expect(marks(w, id, "spawn-full")).toEqual([]);
+		});
+	}
+});
+
+test("verified retention preserves an older active rollback as well as the newest three releases", () => {
+	const w = world();
+	const directory = w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!;
+	let tag: string | null = null;
+	let failTag = false;
+	const gh: Gh = (args) => {
+		if (args[1] !== "-X") return tag === null ? { code: 1, stdout: "", stderr: "HTTP 404" } : { code: 0, stdout: JSON.stringify({ object: { type: "commit", sha: tag } }), stderr: "" };
+		if (failTag) return { code: 1, stdout: "", stderr: "injected tag outage" };
+		tag = args.find((s) => s.startsWith("sha="))!.slice(4);
+		return { code: 0, stdout: "{}", stderr: "" };
+	};
+	const promote = (sha: string, manual = false) => promoteMain(w.ledger, OWNER_REPO, sha, () => {}, { directory, origin: w.origin, gh, manual });
+	mainRun(w.ledger, "tr-rollbackbase", fx.main, "green");
+	expect(promote(fx.main).ok).toBe(true);
+	const work = join(w.root, "rollback-commits");
+	g(w.root, "clone", "-q", w.origin, work);
+	failTag = true;
+	for (let i = 0; i < 3; i++) {
+		writeFileSync(join(work, "README.md"), `rollback release ${i}\n`);
+		g(work, "add", "-A");
+		g(work, "commit", "-q", "-m", `rollback ${i}`);
+		const sha = g(work, "rev-parse", "HEAD");
+		g(work, "push", "-q", w.origin, `${sha}:refs/heads/rollback-fixture`);
+		mainRun(w.ledger, `tr-rollback${i}`, sha, "green");
+		expect(promote(sha).ok).toBe(false);
+	}
+	failTag = false;
+	expect(promote(fx.main, true).ok).toBe(true);
+	expect(readdirSync(directory).filter((n) => /^[0-9a-f]{12}$/.test(n))).toHaveLength(4);
+	expect(realpathSync(join(directory, "current"))).toBe(join(directory, fx.main.slice(0, 12)));
+});
+
+test("verified promotion never publishes another served repository's shadow green as control code", async () => {
+	const w = world();
+	const product = "thewolff/product";
+	writeFileSync(w.env.AGENT_SYSTEM_TEST_RUNNER_CONFIG!, readFileSync(w.env.AGENT_SYSTEM_TEST_RUNNER_CONFIG!, "utf8").replace(OWNER_REPO, product));
+	landFirst(w.ledger, product, false);
+	const db = lockDbOf(w);
+	let id: string;
+	try {
+		const a = admitMain(w.ledger, db, w.runs, product, fx.main, MERGE_TRAIN_BY);
+		if (a.action !== "admitted") throw new Error(a.line);
+		id = a.runId;
+	} finally { db.close(); }
+	expect(await spawnRun(w, id!).exited).toBe(0);
+	expect((await resultOf(w, STANDING_WORKLOAD_ID, id!)).verdict).toBe("green");
+	expect(existsSync(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!)).toBe(false);
+	expect(runnerLog(w, id!)).toContain(`verified promotion skipped for served repository ${product}`);
 });
