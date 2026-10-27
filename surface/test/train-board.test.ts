@@ -60,6 +60,8 @@ interface LaneOpts {
 	mode?: "autonomous" | "user-driven";
 	pr?: number;
 	verdict?: TestVerdict | "none";
+	/** The run's scope: the full suite (default) or the land-first fast check (PLAN wl-mvq4edbaf13vnk D1). */
+	scope?: "full" | "fast";
 	/** The review on the lane's change slice: a round then its end, a round alone, an end then a fresh round, or none. */
 	review?: "pass" | "accept" | "stop" | "round-only" | "reopened" | "none";
 	/** A loop end written by another writer than the holder lane. */
@@ -92,6 +94,7 @@ function lane(w: World, o: LaneOpts = {}): string {
 			body: testRunBody({
 				runId, verdict, sha: G, pr, reason: verdict === "green" || verdict === "red" ? null : "why", headAtEnd: G, base: null, mergeBase: null,
 				full, solo: [], failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > a", firstError: "boom" }] : [], runDir: null, preflight: null,
+				...(o.scope === "fast" ? { scope: "fast" as const, host: "linux" as const } : {}),
 			}),
 		});
 	}
@@ -143,6 +146,12 @@ describe("landingReady, the ledger half of D1 (R1, R2)", () => {
 		// Jo's accept (the surface) is a passed review too
 		const accepted = lane(w, { review: "accept", endBy: SURFACE_BY });
 		expect(landingReady(w.ledger, accepted, CTX).ready).toBe(true);
+	});
+
+	test("R22: the fast check's green boards like a full green; a stale fast run does not", () => {
+		const w = world();
+		expect(ready(landingReady(w.ledger, lane(w, { pr: 118, scope: "fast" }), CTX)).pr).toBe(118);
+		expect(landingReady(w.ledger, lane(w, { pr: 119, verdict: "stale", scope: "fast" }), CTX)).toMatchObject({ ready: false, reason: expect.stringMatching(/ is stale$/) });
 	});
 
 	test("R2: each failing rule is not-ready with its reason", () => {

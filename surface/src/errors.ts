@@ -76,7 +76,9 @@
 // Merge trains (PLAN wl-mvbjiettjrfpxc D6, D7, D10): a train workload (`trainMembers`) shows no idle line and no § A3 held line (its
 // Jo-facing outputs are its questions and the notices; a train lane's death still shows). Train lines, on the standing workload,
 // from the train tick's `train-notice:` rows: an open protection episode (keyed by its `raised` row, so delivered once, showing
-// its newest text) and an uncleared red main (keyed by its `raised` row).
+// its newest text) and an uncleared red main (keyed by its `raised` row). Land-first (PLAN wl-mvq4edbaf13vnk D8): main red, landing
+// stopped, a stale train tick, exhausted main runs, failed revocations and the verifier lines, from the tick's and runner's rows
+// on the standing workload alone (`landFirstLines`).
 // Answerable lines (a waiting reserved request, an open question with options) carry a
 // session-stable number Jo answers with, set by surface/src/numbering.ts, never here. An idle line
 // has no one-word answer, so it is never numbered.
@@ -94,8 +96,12 @@ import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
 import { nowReserved } from "../../gates/src/rows/r06-reserved";
 import { openPairOffer } from "./input";
-import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit, queuedOf } from "./launch";
-import { mainRedNotices, protectionEpisodes, type TaskWindow, TRAIN_ALERT_LADDER, trainAlertLevel, trainMembers, trainTaskWindows } from "./merge-train";
+import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit, mainRetries, queuedOf } from "./launch";
+import {
+	landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow, TRAIN_ALERT_LADDER,
+	trainAlertLevel, trainMembers, trainTaskWindows,
+} from "./merge-train";
+import { attemptBlock, mainResults, mainVerdicts, parseRunnerPreflight } from "./main-state";
 import { questionSubject } from "./orchestrator-question";
 import { answerable } from "./numbering";
 import { pairOfferLine, pairTakenLine, pairTakenQuestion, shownOptions } from "./pair-suggest";
@@ -440,6 +446,88 @@ function testRunLine(ledger: Ledger, workload: WorkloadStatusRow, pending: reado
 }
 
 /**
+ * Land-first's render lines (PLAN wl-mvq4edbaf13vnk D8, R19), from the standing workload's rows alone (no GitHub), per repository
+ * land-first is on for (`landFirstRepos`): the open stop episode the tick recorded (`stopEpisode`), as `main red at …` for a
+ * regression with its repair state, else `landing stopped at …` with the reasons of the newest `train-reconciled:` and main's run
+ * at the tip; `train tick has not reconciled main since …` when the repository's newest `train-reconciled:` is missing or over
+ * RECONCILED_STALE_MS old; `main runs exhausted at …` while the exhausted block the tick recorded is still the commit's current
+ * one and it has no verdict; `revocation failed on #<n>` until the tick records that head is no longer the PR's open head. And,
+ * land-first on or not, the `verifier` lines: the runner's newest preflight refused, the tick's self-check refusing (until a
+ * `train-reconciled:` after it), a promotion given up or waiting on Jo for a schema change (until a later `promote-ok`).
+ */
+function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
+	const wl = STANDING_WORKLOAD_ID;
+	const entries = ledger.entries(wl);
+	const instructions = ledger.instructions(wl);
+	const rows = landFirstRows(entries);
+	const results = mainResults(entries);
+	const verdicts = mainVerdicts(results);
+	const out: ErrorLine[] = [];
+	const push = (rowId: string, line: string, state?: string) => out.push({ kind: "train", workloadId: wl, rowId, line, ...(state === undefined ? {} : { state }) });
+	const sha7 = (s: string) => s.slice(0, 7);
+	const prsOf = (suspects: readonly number[]) => (suspects.length === 0 ? "none named" : suspects.map((n) => `#${n}`).join(", "));
+	for (const repo of landFirstRepos(entries, instructions)) {
+		const mine = rows.filter((r) => r.repo === repo);
+		const reconciled = latestTrainReconciled(entries, repo);
+		const ep = stopEpisode(mine);
+		if (ep !== null) {
+			const s = ep.state;
+			if (s.kind === "regression") {
+				const repair = ep.failed !== null
+					? `failed: woken ${ep.failed.woken} and not landed in 30 minutes`
+					: reconciled?.r.repair
+						? `${sha7(reconciled.r.repair)} admitted`
+						: ep.woken !== null ? `woken ${ep.woken.createdAt} on ${ep.woken.train ?? "no open train"}` : "not woken yet";
+				push(ep.raised.entryId, `main red at ${sha7(s.tip)} since ${ep.raised.createdAt} on ${repo}: ${s.failing ?? "?"} failing; suspects ${prsOf(s.suspects)}; repair ${repair}${ep.filed ? ` — ${ep.filed}` : ""}`, `${s.entryId} ${repair}`);
+			} else {
+				const reasons = reconciled !== null && !reconciled.r.open && reconciled.r.tip === s.tip ? reconciled.r.reasons : `${s.kind} stop`;
+				const run = results.findLast((r) => r.sha === s.tip);
+				const phase = run === undefined ? "requested, no result yet" : `${run.runId} ${run.verdict}${run.reason ? ` (${run.reason})` : ""}`;
+				push(ep.raised.entryId, `landing stopped at ${sha7(s.tip)} on ${repo}: ${reasons}; suspects ${prsOf(s.suspects)}; main run ${phase}${ep.filed ? ` — ${ep.filed}` : ""}`, `${s.entryId} ${phase}`);
+			}
+		}
+		if (reconciled === null || Date.parse(now) - Date.parse(reconciled.createdAt) > RECONCILED_STALE_MS) {
+			push(reconciled?.entryId ?? `land-first ${repo}`, `train tick has not reconciled main since ${reconciled?.createdAt ?? "land-first went on"} on ${repo} — lane merges are held; check the tick's job (com.agent-system-2.train-tick) and its log`);
+		}
+		const retries = mainRetries(entries, instructions, repo);
+		const exhausted = new Map<string, Extract<LandFirstRow, { event: "exhausted" }>>();
+		for (const r of mine) if (r.event === "exhausted") exhausted.set(r.sha, r);
+		for (const r of exhausted.values()) {
+			const b = attemptBlock(r.sha, results, retries);
+			if (!verdicts.has(r.sha) && b.exhausted && b.block === r.block) push(r.entryId, `main runs exhausted at ${sha7(r.sha)}: fix the runner, then say main-retry ${repo}`);
+		}
+		const revocations = new Map<string, Extract<LandFirstRow, { event: "revoke-gave-up" }>>();
+		for (const r of mine) {
+			if (r.event === "revoke-gave-up") revocations.set(`${r.pr} ${r.head}`, r);
+			else if (r.event === "revoke-cleared") revocations.delete(`${r.pr} ${r.head}`);
+		}
+		for (const r of revocations.values()) {
+			push(r.entryId, `revocation failed on #${r.pr} (${repo}, head ${sha7(r.head)}): ${short(r.error, 120)} — that head still shows success; it can be merged by hand on GitHub until its head changes`);
+		}
+	}
+	const preflight = controlEntries(entries).findLast((c) => c.prefix === "runner-preflight");
+	const pre = preflight === undefined ? null : parseRunnerPreflight(preflight.body);
+	if (preflight !== undefined && pre !== null && !pre.ok) push(preflight.id, `verifier: the runner's preflight refused: ${short(pre.reason ?? "", 160)} (root ${pre.root})`);
+	const refused = rows.findLast((r) => r.event === "tick-refused");
+	const newestReconciled = controlEntries(entries).findLast((c) => c.prefix === "train-reconciled");
+	if (refused?.event === "tick-refused" && (newestReconciled === undefined || newestReconciled.createdAt < refused.createdAt)) {
+		push(refused.entryId, `verifier: the train tick refuses to run: ${short(refused.reason, 160)} — reinstall it from verified/current (install/install.sh --control-root=verified)`);
+	}
+	const promotions = new Map<string, LandFirstRow>();
+	for (const r of rows) {
+		if (r.event === "promote-gave-up" || r.event === "promote-schema") promotions.set(r.repo, r);
+		else if (r.event === "promote-ok") promotions.delete(r.repo);
+	}
+	for (const r of promotions.values()) {
+		if (r.event === "promote-gave-up") push(r.entryId, `verifier: promotion of ${sha7(r.g)} on ${r.repo} failed 3 times: ${short(r.error, 120)} — the control plane keeps running from the older verified root`);
+		else if (r.event === "promote-schema") {
+			push(r.entryId, `verifier: promotion waits on Jo: ${sha7(r.sha)} on ${r.repo} changes the ledger schema — stop the tick, migrate the live ledger, run bun surface/scripts/promote-verified.ts ${r.sha}, restart${r.issue ? ` (${r.issue})` : ""}`);
+		}
+	}
+	return out;
+}
+
+/**
  * The § 3.3 lines: each held `security-red:` the test runner sent, in the order written, whatever holds its workload, routes its
  * runs, or whether the workload is open or closed (fix round 1, F3). A body naming another workload than its message row is ignored.
  */
@@ -591,6 +679,7 @@ export function errorLines(ledger: Ledger, inFlight: InFlightWorkload[] = ledger
 			for (const n of mainRedNotices(ledger).values()) {
 				if (!n.cleared) train.push({ kind: "train", workloadId: wl, rowId: n.raised.id, line: `merge train: main is red: ${n.url} (run ${n.run}) — PRs that add no failure still merge; the line clears when that issue closes` });
 			}
+			train.push(...landFirstLines(ledger, now));
 		} else {
 			const entries = ledger.entries(wl, "assumption");
 			// The holders are read only when there is an over-cap line to validate.
