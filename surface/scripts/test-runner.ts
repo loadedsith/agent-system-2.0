@@ -74,21 +74,26 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertNotLiveLedgerUnderTest, defaultLedgerPath, type EntryRow, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
-	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, CHECKOUT_DRIFT, type DsclRead, type InstallFacts, installDecision, type InstallVerdict, type OwnerIds, preflightDecision,
+	AS2_VERIFIED_TAG, AS2TEST_LIBEXEC, AS2TEST_SUDOERS, CHECKOUT_DRIFT, type DsclRead, type InstallFacts, installDecision, type InstallVerdict, type OwnerIds, preflightDecision,
 	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_CAP_S, REFRESH_EXIT, REFRESH_FAILED, type Verdict,
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
-import { boundPrs, holdersOf, worktreePath } from "../src/launch";
-import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, trainHold, trainPrs } from "../src/merge-train";
+import { FastSetError, type FastRun, type FullRun, fastSet, parseCheck, type ReadFile } from "../src/fast-set";
+import { boundPrs, holdersOf, landFirstOn, mainRetries, worktreePath } from "../src/launch";
+import {
+	attemptBlock, attribute, CHAIN_MAX, type ChainCommit, type GateDecision, type GateFacts, ghMainChain, mainResults, type MainState, mainState, mainVerdicts, type MainVerdictKind, mergeGate,
+	runnerPreflightBody,
+} from "../src/main-state";
+import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, landFirstRows, stopEpisode, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, executedFiles, fullSuiteSlice, HEARTBEAT_EVERY_MS,
-	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
+	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, type ExecCounts, execOf, executedFiles, fullSuiteSlice, HEARTBEAT_EVERY_MS,
+	heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
 	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
 	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
-import { ORCHESTRATOR_RECIPIENT } from "../src/types";
+import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID } from "../src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 
@@ -270,6 +275,10 @@ export function openLockDb(root: string, busyMs: number = msEnv("AGENT_SYSTEM_TE
 		"CREATE TABLE IF NOT EXISTS lock (id INTEGER PRIMARY KEY CHECK (id = 1), runId TEXT NOT NULL, pid INTEGER NOT NULL, pgid INTEGER NOT NULL, runDir TEXT NOT NULL, heartbeatAt INTEGER NOT NULL)",
 	));
 	busyLoop(() => db.exec("CREATE TABLE IF NOT EXISTS queue (runId TEXT PRIMARY KEY, workloadId TEXT NOT NULL, requestedAt INTEGER NOT NULL)"));
+	// D5's one pending main target per repository (lowercased owner/repo): replaced by each newer landing, admitted when the active main run
+	// settles. It lives here, not in the ledger, on purpose: the tick re-requests every main tip that has no verdict on each pass, so losing
+	// runs.db loses nothing durable, and a replaced target never needs an inconclusive test-run of its own.
+	busyLoop(() => db.exec("CREATE TABLE IF NOT EXISTS main_pending (repo TEXT PRIMARY KEY, sha TEXT NOT NULL, at INTEGER NOT NULL)"));
 	return db;
 }
 
@@ -446,37 +455,544 @@ function stackRefusal(ownerRepo: string, view: PrView & { body: string }): strin
 	return null;
 }
 
+/** A main request's entries name no slice (`sl-main-<id>` is a name, not a slice row); a PR request's name its slice. */
+const sliceOf = (r: TestRequested): string | undefined => (r.main === undefined ? r.slice : undefined);
+
+/** The `error` result of a request whose run never ran or died, `runner died` unless a reason is given; a main request's stays a main run. */
+export function diedRun(request: TestRequested, runDir: string | null, reason = "runner died"): TestRun {
+	return { ...runnerDiedRun(request, runDir), reason, main: request.main !== undefined };
+}
+
 /** After a reservation, a run that cannot proceed (no runner spawned, no profile to run under) gets its `error` result, while it still owns its request. */
 function recordError(ledger: Ledger, wl: string, request: TestRequested, runDir: string, reason: string): void {
 	ledger.write(() => {
 		if (!ownsRequest(testRuns(ledger.entries(wl)), request.runId)) return;
-		const run: TestRun = { ...runnerDiedRun(request, runDir), reason };
-		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: request.slice, kind: "assumption", body: testRunBody(run) });
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sliceOf(request), kind: "assumption", body: testRunBody(diedRun(request, runDir, reason)) });
+	});
+}
+
+// ---- GitHub: the runner's one seam -------------------------------------------------------------------
+
+/** One gh process: its exit code (null when it was killed at its timeout) and output. */
+export interface GhResult {
+	code: number | null;
+	stdout: string;
+	stderr: string;
+}
+/** Every gh call of the status posts, the gate, the hosted fast check, main runs and revocation goes through this seam, so a test stubs GitHub. */
+export type Gh = (args: string[], timeoutMs?: number) => GhResult;
+/** gh found on PATH with this process's env, killed at `timeoutMs` (default 30 s). */
+export const realGh: Gh = (args, timeoutMs = 30_000) => {
+	const r = spawnSync(["gh", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: timeoutMs });
+	if (r.exitedDueToTimeout) return { code: null, stdout: r.stdout.toString(), stderr: `gh ${args.slice(0, 2).join(" ")} timed out after ${timeoutMs / 1000} s` };
+	return { code: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+};
+/** A failed gh call's last line: its stderr's, else its stdout's, else its exit. */
+export const ghWhy = (r: GhResult): string => r.stderr.trim().split("\n").at(-1) || r.stdout.trim().split("\n").at(-1) || `exit ${r.code}`;
+/** gh's JSON answer for `args`; a failed call or an answer that is no JSON throws, naming the call. */
+export function ghJsonOf(gh: Gh, args: string[]): unknown {
+	const what = `gh ${args.slice(0, 2).join(" ")}`;
+	const r = gh(args);
+	if (r.code !== 0) throw new Error(`${what} failed: ${ghWhy(r)}`);
+	try {
+		return JSON.parse(r.stdout);
+	} catch {
+		throw new Error(`${what} did not return json`);
+	}
+}
+const field = (v: unknown, k: string): unknown => (v !== null && typeof v === "object" ? (v as Record<string, unknown>)[k] : undefined);
+const SHA40 = /^[0-9a-f]{40}$/;
+/** The informational status a main run posts on its commit (D5); never required by the ruleset. */
+export const MAIN_FULL_STATUS = "as2/main-full";
+
+/**
+ * A commit status `context` (as2/full-suite by default, FULL_SUITE_STATUS) `state` on exactly `sha` in `ownerRepo`: `gh api -X POST
+ * repos/<owner/repo>/statuses/<sha>`. GitHub refuses a description over 140 characters, so a longer one is cut. Logged through `log`;
+ * returns why it was not posted, or null when it was. It never throws.
+ */
+export function postStatus(
+	gh: Gh, ownerRepo: string, state: "pending" | "success" | "failure" | "error", sha: string, description: string, log: (s: string) => void, context = FULL_SUITE_STATUS,
+): string | null {
+	const what = `status ${context} ${state} on ${sha}`;
+	if (!ownerRepo) {
+		log(`${what} not posted: the run has no served repo`);
+		return "the run has no served repo";
+	}
+	const desc = description.length > 140 ? `${description.slice(0, 139)}…` : description;
+	let why: string | null;
+	try {
+		const r = gh(["api", "-X", "POST", `repos/${ownerRepo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${context}`, "-f", `description=${desc}`], 15_000);
+		why = r.code === 0 ? null : ghWhy(r);
+	} catch (e) {
+		why = errText(e);
+	}
+	log(why === null ? `${what} posted` : `${what} not posted: ${why}`);
+	return why;
+}
+
+// ---- land-first (PLAN wl-mvq4edbaf13vnk D4, D5) -------------------------------------------------------
+
+/**
+ * What a land-first admission decided for head X (D4), recorded as `fast-plan: <run id> <json>` in the admission's transaction:
+ * the fast set (`files` on hosted Linux, `parse` targets, `macOnly` files left for main runs), the full suite with every
+ * exception that requires it, or a tree carry (X's tree is G's, so G's green main run `run` is X's result, no run). `ref` is
+ * the PR's head branch, which names a train revert (`train/revert-<T 7>`) to the gate.
+ */
+export type FastPlan = { ref: string } & (
+	| { scope: "fast"; files: string[]; parse: string[]; macOnly: string[] }
+	| { scope: "full"; reasons: string[] }
+	| { scope: "tree"; g: string; run: string }
+);
+export const FAST_PLAN_PREFIX = "fast-plan:";
+export function fastPlanBody(runId: string, plan: FastPlan): string {
+	if (!RUN_ID_RE.test(runId)) throw new Error(`fast-plan: ${runId} is not a run id`);
+	return `${FAST_PLAN_PREFIX} ${runId} ${JSON.stringify(plan)}`;
+}
+const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
+export function parseFastPlan(body: string): { runId: string; plan: FastPlan } | null {
+	const m = /^fast-plan: (tr-[a-z0-9]+) (\{.*\})$/.exec(body.trim());
+	if (!m) return null;
+	let v: unknown;
+	try {
+		v = JSON.parse(m[2]!);
+	} catch {
+		return null;
+	}
+	const p = v as Record<string, unknown>;
+	if (v === null || typeof v !== "object" || typeof p.ref !== "string") return null;
+	const ref = p.ref;
+	if (p.scope === "fast" && strings(p.files) && strings(p.parse) && strings(p.macOnly)) return { runId: m[1]!, plan: { ref, scope: "fast", files: p.files, parse: p.parse, macOnly: p.macOnly } };
+	if (p.scope === "full" && strings(p.reasons)) return { runId: m[1]!, plan: { ref, scope: "full", reasons: p.reasons } };
+	if (p.scope === "tree" && typeof p.g === "string" && SHA40.test(p.g) && typeof p.run === "string" && RUN_ID_RE.test(p.run)) return { runId: m[1]!, plan: { ref, scope: "tree", g: p.g, run: p.run } };
+	return null;
+}
+/** The runner's own `fast-plan:` for `runId` among a workload's entries (another writer's copy is ignored), or null. */
+export function fastPlanOf(entries: readonly EntryRow[], runId: string): FastPlan | null {
+	for (const e of entries) {
+		if (e.created_by !== TEST_RUNNER_BY || !e.body.startsWith(FAST_PLAN_PREFIX)) continue;
+		const p = parseFastPlan(e.body);
+		if (p !== null && p.runId === runId) return p.plan;
+	}
+	return null;
+}
+
+/** Land-first is on for `ownerRepo`, read now from the standing workload (`landFirstOn`, D12). */
+function landFirstNow(ledger: Ledger, ownerRepo: string): boolean {
+	return landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), ownerRepo);
+}
+
+/** A git command for the runner's own trusted reads (`trustedEnv`, no hooks), synchronous; a failure throws naming it. */
+function gitSync(gitDir: string, args: string[], env: Record<string, string>, opts: { stdin?: Uint8Array; timeoutMs?: number } = {}): Buffer {
+	const r = spawnSync(["git", `--git-dir=${gitDir}`, ...NO_HOOKS, ...args], { env, stdin: opts.stdin ?? "ignore", stdout: "pipe", stderr: "pipe", timeout: opts.timeoutMs ?? 120_000 });
+	if (r.exitCode !== 0) {
+		const why = r.exitedDueToTimeout ? `timed out after ${(opts.timeoutMs ?? 120_000) / 1000} s` : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`;
+		throw new Error(`git ${args.slice(0, 2).join(" ")} in ${gitDir} failed: ${why}`);
+	}
+	return r.stdout;
+}
+
+const MODULE_SOURCE = /\.(?:[cm]?[jt]sx?|sql)$/;
+/**
+ * A commit's tracked files and a reader over their contents (`ReadFile`, null for a path the tree does not hold), from the
+ * git dir `gitDir`: one `ls-tree`, then, with `prefetch`, every module source (and `.sql`) in one `cat-file --batch`, the
+ * rest read on demand. The fast set reads every module of the tree (its import graph); the base side reads one file.
+ */
+export function treeAt(gitDir: string, commit: string, env: Record<string, string>, prefetch: boolean): { files: string[]; read: ReadFile } {
+	const blobs = new Map<string, string>();
+	for (const line of gitSync(gitDir, ["ls-tree", "-r", "-z", "--full-tree", commit], env).toString("utf8").split("\0")) {
+		const m = /^\d+ blob ([0-9a-f]{40})\t(.+)$/s.exec(line);
+		if (m) blobs.set(m[2]!, m[1]!);
+	}
+	const cache = new Map<string, string>();
+	if (prefetch) {
+		const want = [...blobs].filter(([p]) => MODULE_SOURCE.test(p));
+		const out = gitSync(gitDir, ["cat-file", "--batch"], env, { stdin: Buffer.from(want.map(([, sha]) => `${sha}\n`).join("")) });
+		let at = 0;
+		for (const [path, sha] of want) {
+			const nl = out.indexOf(10, at);
+			const header = /^([0-9a-f]{40}) blob (\d+)$/.exec(out.subarray(at, nl).toString("utf8"));
+			if (!header || header[1] !== sha) throw new Error(`git cat-file --batch in ${gitDir} answered ${out.subarray(at, nl).toString("utf8")} for ${path} (${sha})`);
+			const size = Number(header[2]);
+			cache.set(path, out.subarray(nl + 1, nl + 1 + size).toString("utf8"));
+			at = nl + 1 + size + 1;
+		}
+	}
+	const read: ReadFile = (path) => {
+		const hit = cache.get(path);
+		if (hit !== undefined) return hit;
+		const sha = blobs.get(path);
+		if (sha === undefined) return null;
+		const text = gitSync(gitDir, ["cat-file", "blob", sha], env).toString("utf8");
+		cache.set(path, text);
+		return text;
+	};
+	return { files: [...blobs.keys()], read };
+}
+
+/** The runner's bare mirror of `ownerRepo` under the runs root: admissions fetch each head into `refs/as2/<run id>/…` there, so concurrent fetches never share a ref. */
+function mirrorOf(root: string, ownerRepo: string, env: Record<string, string>): string {
+	const dir = join(root, "mirror", `${ownerRepo.replace("/", "__")}.git`);
+	if (!existsSync(join(dir, "HEAD"))) {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		gitSync(dir, ["init", "-q", "--bare"], env);
+	}
+	return dir;
+}
+/** Remove a run's `refs/as2/<run id>/…` from the mirror; a failure is logged and leaves only a ref. */
+function dropRunRefs(gitDir: string, runId: string, env: Record<string, string>, log: (s: string) => void): void {
+	for (const ref of ["head", "main"]) {
+		try {
+			gitSync(gitDir, ["update-ref", "-d", `refs/as2/${runId}/${ref}`], env);
+		} catch (e) {
+			log(`the mirror ref refs/as2/${runId}/${ref} was not removed: ${errText(e)}`);
+		}
+	}
+}
+
+/** The commit the `as2-verified` tag names on `repo` (§ 2 The bundle); null when the tag does not exist (404). Throws when GitHub cannot answer. */
+export function verifiedTagOf(gh: Gh, repo: string): string | null {
+	const path = `repos/${repo}/git/ref/tags/${AS2_VERIFIED_TAG}`;
+	const r = gh(["api", path]);
+	if (r.code !== 0) {
+		if (/HTTP 404|Not Found/.test(`${r.stderr}\n${r.stdout}`)) return null;
+		throw new Error(`gh api ${path} failed: ${ghWhy(r)}`);
+	}
+	let v: unknown;
+	try {
+		v = JSON.parse(r.stdout);
+	} catch {
+		throw new Error(`gh api ${path} did not return json`);
+	}
+	const sha = field(field(v, "object"), "sha");
+	if (field(field(v, "object"), "type") !== "commit" || typeof sha !== "string" || !SHA40.test(sha)) throw new Error(`gh api ${path} does not name a commit`);
+	return sha;
+}
+
+/** A train revert's head branch (D7): `train/revert-<T 7>`. */
+const REVERT_REF = /^train\/revert-[0-9a-f]{7}$/;
+/**
+ * PR `pr` is the fix the open stop episode's issue names (§ 2 The merge gate, D7): a line of the issue's body or a comment that says
+ * `fix` and names `#<pr>` or `/pull/<pr>`. False with no open episode or no filed issue. Throws when GitHub cannot answer.
+ */
+export function namedFix(gh: Gh, ledger: Ledger, repo: string, pr: number): boolean {
+	const ep = stopEpisode(landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo));
+	if (ep?.filed == null) return false;
+	const v = ghJsonOf(gh, ["issue", "view", ep.filed, "--json", "body,comments"]);
+	const comments = field(v, "comments");
+	const texts = [field(v, "body"), ...(Array.isArray(comments) ? comments.map((c) => field(c, "body")) : [])].filter((t): t is string => typeof t === "string");
+	const names = new RegExp(`\\bfix\\b.*(?:#|/pull/)${pr}\\b`, "i");
+	return texts.some((t) => t.split("\n").some((l) => names.test(l)));
+}
+
+/** What the gate reads of a head besides its result: the repo, the head and its branch, the PR, and what it must pass. */
+export interface GateInput {
+	gh: Gh;
+	ledger: Ledger;
+	repo: string;
+	head: string;
+	ref: string;
+	pr: number;
+	need: "fast" | "full";
+	result: GateFacts["result"];
+}
+
+/** Main as the gate reads it now: GitHub's tip of `repo`, its first-parent chain back to G (`ghMainChain`) and main state (`mainState`) over the runner's main results. Throws when GitHub cannot answer. */
+export function readMain(gh: Gh, ledger: Ledger, repo: string): { tip: string; chain: ChainCommit[]; state: MainState; results: ResultRecord[] } {
+	const ghJson = (args: string[]) => ghJsonOf(gh, args);
+	const results = mainResults(ledger.entries(STANDING_WORKLOAD_ID));
+	const greens = new Set([...mainVerdicts(results).values()].filter((v) => v.verdict === "green").map((v) => v.sha));
+	const tipPath = `repos/${repo}/git/ref/heads/${DEFAULT_BRANCH}`;
+	const tip = field(field(ghJson(["api", tipPath]), "object"), "sha");
+	if (typeof tip !== "string" || !SHA40.test(tip)) throw new Error(`gh api ${tipPath} returned an unexpected shape`);
+	const chain = ghMainChain(repo, tip, ghJson, greens);
+	return { tip, chain, state: mainState(chain, results, Date.parse(ledger.now())), results };
+}
+
+/**
+ * The merge gate's decision on `head` (§ 2 The merge gate), re-read now from the ledger and GitHub: main's tip, its chain back to G
+ * and state (`readMain`), whether the head contains the tip (GitHub's compare), and whether it is the incident's repair (a
+ * `train/revert-…` head whose tree is G's, or the fix the incident's issue names). Throws when GitHub cannot answer.
+ */
+export function gateDecision(i: GateInput): GateDecision {
+	const ghJson = (args: string[]) => ghJsonOf(i.gh, args);
+	const { tip, chain, state } = readMain(i.gh, i.ledger, i.repo);
+	let containsTip = tip === i.head;
+	if (!containsTip) {
+		const status = field(ghJson(["api", `repos/${i.repo}/compare/${tip}...${i.head}`]), "status");
+		if (typeof status !== "string") throw new Error(`gh api repos/${i.repo}/compare/${tip.slice(0, 7)}...${i.head.slice(0, 7)} returned no status`);
+		containsTip = status === "ahead" || status === "identical";
+	}
+	let repair: GateFacts["repair"] = null;
+	let treeEqualsG = false;
+	if (!state.open) {
+		if (REVERT_REF.test(i.ref)) {
+			repair = "revert";
+			const gTree = chain.find((c) => c.sha === state.g)?.tree ?? null;
+			const headTree = field(field(ghJson(["api", `repos/${i.repo}/git/commits/${i.head}`]), "tree"), "sha");
+			if (typeof headTree !== "string") throw new Error(`gh api repos/${i.repo}/git/commits/${i.head} returned no tree`);
+			treeEqualsG = gTree !== null && headTree === gTree;
+		} else if (namedFix(i.gh, i.ledger, i.repo, i.pr)) repair = "fix";
+	}
+	return mergeGate({ head: i.head, containsTip, state, need: i.need, result: i.result, repair, treeEqualsG });
+}
+
+/**
+ * Post the gate's state on the head (D4, through #320's mechanism): mergeGate's success, or failure naming every reason; a gate that
+ * cannot read main or the head posts failure naming that (F7). A post GitHub refuses records `status-failed: <run id> <state> on <sha>:
+ * <error>` on the run's workload (F6), so the head stays `pending` and the train sees why. Returns what was decided and the post's error.
+ */
+export function postGate(i: GateInput & { wl: string; runId: string; log: (s: string) => void }): { state: "success" | "failure"; description: string; error: string | null } {
+	let decided: { state: "success" | "failure"; description: string };
+	try {
+		const d = gateDecision(i);
+		decided = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
+	} catch (e) {
+		decided = { state: "failure", description: `the gate could not read main or the head: ${errText(e)}` };
+	}
+	i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
+	const error = postStatus(i.gh, i.repo, decided.state, i.head, decided.description, i.log);
+	if (error !== null) {
+		try {
+			i.ledger.write(() => i.ledger.recordEntry({
+				by: TEST_RUNNER_BY, workloadId: i.wl, kind: "assumption", body: `status-failed: ${i.runId} ${decided.state} on ${i.head}: ${error.replace(/\s+/g, " ")}`,
+			}));
+		} catch (e) {
+			i.log(`status-failed: not recorded: ${errText(e)}`);
+		}
+	}
+	return { ...decided, error };
+}
+
+/**
+ * Revoke every open success (§ 2 Revocation): each open PR head of `repo` whose newest `as2/full-suite` is a success that is not the
+ * gate's repair (`repair: …`) gets failure `landing stopped: <reason>`. One attempt per head; a failure is logged, and the tick's pass
+ * revokes what is still owed (D6). Never throws: a list GitHub cannot answer is logged and revokes nothing.
+ */
+export function revokeOpen(gh: Gh, repo: string, reason: string, log: (s: string) => void): { revoked: number[]; failed: number[] } {
+	const out = { revoked: [] as number[], failed: [] as number[] };
+	let list: unknown;
+	try {
+		list = ghJsonOf(gh, ["pr", "list", "-R", repo, "--state", "open", "--json", "number,headRefOid", "--limit", "500"]);
+		if (!Array.isArray(list)) throw new Error(`gh pr list -R ${repo} returned an unexpected shape`);
+	} catch (e) {
+		log(`revocation on ${repo} not attempted: ${errText(e)}; the tick revokes what is owed on its next pass`);
+		return out;
+	}
+	for (const p of list as unknown[]) {
+		const n = field(p, "number");
+		const head = field(p, "headRefOid");
+		if (typeof n !== "number" || typeof head !== "string" || !SHA40.test(head)) {
+			log(`revocation on ${repo}: gh pr list named a PR with no number or head; skipped`);
+			continue;
+		}
+		let newest: unknown;
+		try {
+			const statuses = ghJsonOf(gh, ["api", `repos/${repo}/commits/${head}/statuses`]);
+			if (!Array.isArray(statuses)) throw new Error(`gh api repos/${repo}/commits/${head}/statuses returned an unexpected shape`);
+			newest = statuses.find((s) => field(s, "context") === FULL_SUITE_STATUS);
+		} catch (e) {
+			log(`revocation of #${n} at ${head.slice(0, 7)} not attempted: ${errText(e)}`);
+			out.failed.push(n);
+			continue;
+		}
+		const description = field(newest, "description");
+		if (field(newest, "state") !== "success" || (typeof description === "string" && description.startsWith("repair:"))) continue;
+		if (postStatus(gh, repo, "failure", head, `landing stopped: ${reason}`, log) === null) out.revoked.push(n);
+		else out.failed.push(n);
+	}
+	return out;
+}
+
+/** What the hosted fast check answered: its artifact downloaded into `dir`, or why the one Mac fallback runs instead (D4). */
+export type HostedFast = { ok: true; workflowRunId: number; dir: string } | { ok: false; reason: string };
+export interface HostedFastDeps {
+	gh: Gh;
+	now: () => number;
+	sleep: (ms: number) => Promise<void>;
+	log: (s: string) => void;
+}
+/** The fast check's workflow (D3), dispatched on the verified tag. */
+export const FAST_WORKFLOW = "as2-fast.yml";
+
+/**
+ * The hosted fast check (D4): dispatch `as2-fast.yml` on `as2-verified` with inputs `sha`, `files` (space-separated `./<path>`) and
+ * `request` (the run id), taking `workflow_run_id` from the answer; poll the run every `pollMs` until it completes or `waitMs` passes;
+ * then download its artifact `as2-fast-<request>` (fast.xml, fast.log, fast.summary) into `dir`. A dispatch GitHub refuses (the tag
+ * unreadable included), a run whose `head_sha` is not the tag's commit, or no result in time is `ok: false` with the reason, and the
+ * caller runs the set once on the Mac: the hosted run is never retried. A poll GitHub cannot answer is logged and polled again.
+ */
+export async function hostedFast(d: HostedFastDeps, o: { repo: string; runId: string; sha: string; files: readonly string[]; waitMs: number; pollMs: number; dir: string }): Promise<HostedFast> {
+	const start = d.now();
+	let tag: string | null;
+	try {
+		tag = verifiedTagOf(d.gh, o.repo);
+	} catch (e) {
+		return { ok: false, reason: `dispatch failed: the ${AS2_VERIFIED_TAG} tag could not be read: ${errText(e)}` };
+	}
+	if (tag === null) return { ok: false, reason: `dispatch failed: ${o.repo} has no ${AS2_VERIFIED_TAG} tag` };
+	const dispatch = d.gh([
+		"api", "-X", "POST", `repos/${o.repo}/actions/workflows/${FAST_WORKFLOW}/dispatches`, "-f", `ref=${AS2_VERIFIED_TAG}`, "-f", `inputs[sha]=${o.sha}`,
+		"-f", `inputs[files]=${o.files.map((f) => `./${f}`).join(" ")}`, "-f", `inputs[request]=${o.runId}`, "-F", "return_run_details=true",
+	]);
+	if (dispatch.code !== 0) return { ok: false, reason: `dispatch failed: ${ghWhy(dispatch)}` };
+	let id: unknown;
+	try {
+		id = field(JSON.parse(dispatch.stdout), "workflow_run_id");
+	} catch {
+		id = undefined;
+	}
+	if (typeof id !== "number" || !Number.isSafeInteger(id)) return { ok: false, reason: "dispatch failed: the answer names no workflow_run_id" };
+	d.log(`fast check dispatched: workflow run ${id} on ${AS2_VERIFIED_TAG} (${tag.slice(0, 12)})`);
+	let status = "unknown";
+	for (;;) {
+		const r = d.gh(["api", `repos/${o.repo}/actions/runs/${id}`]);
+		if (r.code === 0) {
+			let v: unknown = null;
+			try {
+				v = JSON.parse(r.stdout);
+			} catch {
+				d.log(`fast check poll of run ${id}: the answer is no json`);
+			}
+			const headSha = field(v, "head_sha");
+			if (typeof headSha === "string" && headSha !== tag) return { ok: false, reason: `run ${id} ran workflow code at ${headSha.slice(0, 12)}, not ${AS2_VERIFIED_TAG} ${tag.slice(0, 12)}` };
+			const s = field(v, "status");
+			if (typeof s === "string") status = s;
+			if (status === "completed" && typeof headSha === "string") break;
+		} else d.log(`fast check poll of run ${id} failed: ${ghWhy(r)}`);
+		if (d.now() - start >= o.waitMs) return { ok: false, reason: `no result in ${Math.round(o.waitMs / 60_000)} min (run ${id} ${status})` };
+		await d.sleep(Math.max(1, Math.min(o.pollMs, start + o.waitMs - d.now())));
+	}
+	const dl = d.gh(["run", "download", String(id), "-R", o.repo, "-n", `as2-fast-${o.runId}`, "-D", o.dir], 120_000);
+	if (dl.code !== 0) return { ok: false, reason: `no result: artifact as2-fast-${o.runId} of run ${id} not downloaded: ${ghWhy(dl)}` };
+	return { ok: true, workflowRunId: id, dir: o.dir };
+}
+
+/**
+ * The fast set's executed counts (R12): of the Linux `files`, how many show an executed test in the JUnit, and the ones that show
+ * none. Any such file fails the check. A report that does not parse is an error, never zero counts.
+ */
+export function fastExec(junit: string, files: readonly string[]): { ok: true; exec: ExecCounts; missing: string[] } | { ok: false; error: string } {
+	const e = execOf(junit, files);
+	if (!e.ok) return e;
+	return { ok: true, exec: e.exec, missing: files.filter((f) => !e.perFile.has(f)) };
+}
+
+/** A main run is re-requested only by the tick (D6); its queue key is moved this far ahead of every PR request, so it takes the Mac slot first (D5). */
+const MAIN_QUEUE_LEAD_MS = 1e12;
+/** Run directories a main run, a `main-red:` row or an open incident cites are kept this long, outside KEEP_RUNS (D5, R16). */
+export const CITED_KEEP_MS = 30 * 86_400_000;
+
+/**
+ * The run ids retention keeps outside KEEP_RUNS (D5, R16), from the standing workload's entries: every main run requested in the last
+ * 30 days, every run a runner `main-red:` row of the last 30 days names, and, while a stop episode (an open incident) is open on a
+ * repository, every main run and `main-red:` run since that episode was raised, however old.
+ */
+export function citedRuns(entries: readonly EntryRow[], nowMs: number): Set<string> {
+	const out = new Set<string>();
+	const opened = new Map<string, number>();
+	for (const r of landFirstRows(entries)) {
+		if (opened.has(r.repo)) continue;
+		const ep = stopEpisode(landFirstRows(entries, r.repo));
+		if (ep !== null) opened.set(r.repo, Date.parse(ep.raised.createdAt));
+	}
+	const since = Math.min(nowMs - CITED_KEEP_MS, ...opened.values());
+	for (const rec of testRuns(entries)) {
+		if (rec.request.main !== undefined && Date.parse(rec.request.createdAt) >= since) out.add(rec.request.runId);
+	}
+	for (const e of entries) {
+		if (e.created_by !== TEST_RUNNER_BY || !e.body.startsWith("main-red:") || Date.parse(e.created_at) < since) continue;
+		for (const id of e.body.match(/\btr-[a-z0-9]+\b/g) ?? []) out.add(id);
+	}
+	return out;
+}
+/** Retention's prune list (§ 2.3 step 9, R16): the runs past the newest KEEP_RUNS among those no main run, `main-red:` or open incident cites; never `self`. */
+export function retentionPrune(runs: readonly { id: string; at: number }[], cited: ReadonlySet<string>, self: string): string[] {
+	return pruneRuns(runs.filter((r) => !cited.has(r.id)), KEEP_RUNS).filter((id) => id !== self);
+}
+
+/** A main request's answer (`main --repo --sha`, D5): what it did, for the one line the tick logs. */
+export type MainAdmission =
+	| { action: "verdict" | "active" | "pending-same" | "pending"; line: string }
+	| { action: "admitted"; runId: string; line: string };
+
+/**
+ * D5's main request at `sha` of `repo`, in one ledger transaction on the standing workload: nothing when `sha` has a verdict; refused
+ * (Fail, refused) when its attempt block is exhausted (`attemptBlock`, reopened by Jo's `main-retry:`); every main request of the
+ * repo with no settle and no live heartbeat settled `runner died` first; nothing when `sha` is the active run or the pending target;
+ * with another run active, `sha` replaces the pending target (runs.db `main_pending`), and the active run is never cancelled; with
+ * none active, the `test-requested: … main=1 repo=<repo>` admitting it. The caller spawns the admitted run.
+ */
+export function admitMain(ledger: Ledger, lockDb: Database, root: string, repo: string, sha: string, by: string): MainAdmission {
+	if (ledger.workload(STANDING_WORKLOAD_ID) === null) throw new Fail(`no standing workload ${STANDING_WORKLOAD_ID}: a main run is recorded there`, START_EXIT.failed);
+	const want = repo.toLowerCase();
+	return ledger.write((): MainAdmission => {
+		const entries = ledger.entries(STANDING_WORKLOAD_ID);
+		const results = mainResults(entries);
+		const verdict = mainVerdicts(results).get(sha);
+		if (verdict !== undefined) return { action: "verdict", line: `main ${sha} has its verdict ${verdict.verdict} (run ${verdict.runId}); nothing requested` };
+		const block = attemptBlock(sha, results, mainRetries(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo));
+		if (block.exhausted) throw new Fail(`main ${sha} has spent attempt block ${block.block} (${block.attempts} inconclusive runs): fix the runner, then Jo says main-retry ${repo}`, START_EXIT.refused);
+		const now = Date.parse(ledger.now());
+		let active: RunRecord | null = null;
+		for (const rec of testRuns(entries)) {
+			if (rec.request.main?.repo.toLowerCase() !== want || rec.results.length > 0) continue;
+			if (recordLive(rec, heartbeatOf(root, rec.request.runId), now)) active = rec;
+			else ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: testRunBody(diedRun(rec.request, runDirOf(root, rec.request.runId))) });
+		}
+		if (active !== null) {
+			if (active.request.sha === sha) return { action: "active", line: `main ${sha} is the active main run ${active.request.runId}; nothing requested` };
+			const pending = busyLoop(() => lockDb.query<{ sha: string }, [string]>("SELECT sha FROM main_pending WHERE repo = ?").get(want));
+			if (pending?.sha === sha) return { action: "pending-same", line: `main ${sha} is already the pending target behind ${active.request.runId}; nothing requested` };
+			busyLoop(() => lockDb.query("INSERT OR REPLACE INTO main_pending (repo, sha, at) VALUES (?, ?, ?)").run(want, sha, now));
+			return { action: "pending", line: `main ${sha} is the pending target behind the active run ${active.request.runId}${pending ? ` (replacing ${pending.sha})` : ""}` };
+		}
+		const runId = makeRunId(Date.now(), Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => (b % 36).toString(36)).join(""));
+		const request: TestRequested = { runId, pr: 0, sha, slice: `sl-main-${runId.slice(3)}`, by, main: { repo } };
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: testRequestedBody(request) });
+		busyLoop(() => lockDb.query("DELETE FROM main_pending WHERE repo = ? AND sha = ?").run(want, sha));
+		return { action: "admitted", runId, line: `main ${sha} admitted as run ${runId}` };
 	});
 }
 
 /**
- * The `as2/full-suite` commit status (FULL_SUITE_STATUS) on exactly `sha` in the served repo `ownerRepo`, for any PR (PLAN wl-mv8s8srodefytc
- * rev 17.1 D2: branch protection on main requires it): `gh api -X POST repos/<owner/repo>/statuses/<sha>`, gh found on PATH with this
- * process's env, as the starter's `gh pr view` is; posted by a run on its verdict and by the starter on a carried green. A failed post is
- * logged through `log` and never changes the verdict; it never throws, and gh is killed after 15 s.
+ * `reap` (D6, R37): every open workload's runner request with no settle and no live heartbeat (`recordLive`) settled `runner died`,
+ * each workload in its own transaction that re-reads its rows. It admits nothing; none to settle is a no-op. Returns the settled run ids.
  */
-async function postFullSuite(ownerRepo: string, state: "success" | "failure" | "error", sha: string, description: string, log: (s: string) => void): Promise<void> {
-	const what = `status ${FULL_SUITE_STATUS} ${state} on ${sha}`;
-	if (!ownerRepo) {
-		log(`${what} not posted: the run has no served repo`);
-		return;
+export function reap(ledger: Ledger, root: string): string[] {
+	const wls = ledger.db.query<{ workload_id: string }, [string]>(
+		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = ? AND body LIKE 'test-requested: %'",
+	).all(TEST_RUNNER_BY).map((r) => r.workload_id);
+	const settled: string[] = [];
+	for (const wl of wls) {
+		if (ledger.workload(wl)?.status !== "open") continue;
+		settled.push(...ledger.write(() => {
+			const now = Date.parse(ledger.now());
+			const out: string[] = [];
+			for (const rec of testRuns(ledger.entries(wl))) {
+				if (rec.results.length > 0 || recordLive(rec, heartbeatOf(root, rec.request.runId), now)) continue;
+				ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sliceOf(rec.request), kind: "assumption", body: testRunBody(diedRun(rec.request, runDirOf(root, rec.request.runId))) });
+				out.push(rec.request.runId);
+			}
+			return out;
+		}));
 	}
-	const argv = ["gh", "api", "-X", "POST", `repos/${ownerRepo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`];
+	return settled;
+}
+
+/**
+ * The detached `run <run id>` (the starter's and a main admission's spawn): its log is `<run dir>/runner.log`, and `runner.json`
+ * names its pid. Throws when the process cannot start.
+ */
+function spawnRunner(runDir: string, runId: string): number {
+	mkdirSync(runDir, { recursive: true, mode: 0o700 });
+	const fd = openSync(join(runDir, "runner.log"), "a", 0o600);
 	try {
-		const p = spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
-		const timer = setTimeout(() => p.kill("SIGKILL"), 15_000);
-		const err = await new Response(p.stderr).text();
-		await p.exited;
-		clearTimeout(timer);
-		log(p.exitCode === 0 ? `${what} posted` : `${what} not posted: ${err.trim().split("\n").at(-1) || (p.signalCode ?? `exit ${p.exitCode}`)}`);
-	} catch (e) {
-		log(`${what} not posted: ${errText(e)}`);
+		const child = spawn([process.execPath, import.meta.path, "run", runId], { cwd: runDir, env: process.env, stdin: "ignore", stdout: fd, stderr: fd, detached: true });
+		child.unref();
+		writeFileSync(join(runDir, "runner.json"), `${JSON.stringify({ pid: child.pid, pgid: child.pid, runId })}\n`, { mode: 0o600 });
+		return child.pid;
+	} finally {
+		closeSync(fd);
 	}
 }
 
@@ -536,12 +1052,92 @@ function carryCandidate(ledger: Ledger, sources: readonly string[], pr: number, 
 	}
 }
 
+/** The mirror's git env (`trustedEnv`) over an empty gitconfig under the runs root. */
+function mirrorEnv(root: string): Record<string, string> {
+	const gitconfig = join(root, "mirror", "trusted.gitconfig");
+	if (!existsSync(gitconfig)) {
+		mkdirSync(dirname(gitconfig), { recursive: true, mode: 0o700 });
+		writeFileSync(gitconfig, "", { mode: 0o600 });
+	}
+	return trustedEnv(gitconfig);
+}
+
+/** A land-first admission's decision (D4): the plan, and for a tree carry G's green main run, which is the head's result. */
+export interface LandAdmission {
+	plan: FastPlan;
+	carryFrom: ResultRecord | null;
+}
+
+/**
+ * D4's admission reads for PR `pr` at `head` on a land-first repository, before any transaction: the PR head and main fetched into the
+ * runs root's mirror under `refs/as2/<run id>/`; a tree carry when X's tree is G's tree (`readMain`; a main GitHub cannot read carries
+ * nothing, logged); else the fast set over the tree at X against its merge-base with main (`fastSet`), or the full suite by exception.
+ * The mirror refs are dropped before it returns. A head that moved since the PR view, or a fast set the config cannot compute, refuses.
+ */
+function landAdmission(o: {
+	ledger: Ledger; root: string; ownerRepo: string; url: string; runId: string; pr: number; head: string; ref: string; production: boolean; config: TestRunnerConfig;
+	log: (s: string) => void;
+}): LandAdmission {
+	const env = mirrorEnv(o.root);
+	const mirror = mirrorOf(o.root, o.ownerRepo, env);
+	const headRef = `refs/as2/${o.runId}/head`;
+	const mainRef = `refs/as2/${o.runId}/main`;
+	try {
+		try {
+			gitSync(mirror, [...NETWORK.slice(NO_HOOKS.length), "fetch", "-q", "--no-tags", o.url, `+refs/pull/${o.pr}/head:${headRef}`, `+refs/heads/${DEFAULT_BRANCH}:${mainRef}`], env, { timeoutMs: 600_000 });
+		} catch (e) {
+			throw new Fail(`the fast plan could not fetch PR #${o.pr} and ${DEFAULT_BRANCH} from ${o.ownerRepo}: ${errText(e)}`, START_EXIT.failed);
+		}
+		const x = gitSync(mirror, ["rev-parse", "--verify", `${headRef}^{commit}`], env).toString().trim();
+		if (x !== o.head) throw new Fail(`PR #${o.pr}'s head moved to ${x} after it was read at ${o.head}; request again`, START_EXIT.refused);
+		try {
+			const { chain, state, results } = readMain(realGh, o.ledger, o.ownerRepo);
+			const gTree = state.g === null ? null : (chain.find((c) => c.sha === state.g)?.tree ?? null);
+			if (state.g !== null && gTree !== null && gTree === gitSync(mirror, ["rev-parse", "--verify", `${x}^{tree}`], env).toString().trim()) {
+				const verdict = mainVerdicts(results).get(state.g);
+				const from = verdict === undefined ? undefined : results.find((r) => r.runId === verdict.runId);
+				if (from !== undefined) return { plan: { ref: o.ref, scope: "tree", g: state.g, run: from.runId }, carryFrom: from };
+			}
+		} catch (e) {
+			o.log(`no tree carry: main could not be read: ${errText(e)}`);
+		}
+		const mergeBase = gitSync(mirror, ["merge-base", x, mainRef], env).toString().trim();
+		const changed = gitSync(mirror, ["diff", "--no-renames", "--name-only", "-z", mergeBase, x], env).toString("utf8").split("\0").filter((p) => p !== "");
+		const tree = treeAt(mirror, x, env, true);
+		const base = treeAt(mirror, mergeBase, env, false);
+		let s: FastRun | FullRun;
+		try {
+			s = fastSet(changed, tree.files, tree.read, base.read, o.config, o.production);
+		} catch (e) {
+			if (e instanceof FastSetError) throw new Fail(e.message, START_EXIT.refused);
+			throw e;
+		}
+		const plan: FastPlan = s.kind === "fast" ? { ref: o.ref, scope: "fast", files: s.files, parse: s.parse, macOnly: s.macOnly } : { ref: o.ref, scope: "full", reasons: s.reasons };
+		return { plan, carryFrom: null };
+	} finally {
+		dropRunRefs(mirror, o.runId, env, o.log);
+	}
+}
+
+/**
+ * A tree carry's green (D4, § 2 The merge gate): head X's tree is G's tree, so G's green main run `from` is X's result with no run:
+ * its counts, run dir, scope and host, reason `carried from main run <R> at <G> (tree equals G's)`.
+ */
+export function treeCarriedRun(request: TestRequested, from: TestRun): TestRun {
+	if (!from.main || from.verdict !== "green") throw new Error(`test-run ${from.runId} is no green main run to carry`);
+	return {
+		runId: request.runId, verdict: "green", sha: request.sha, pr: request.pr, reason: `carried from main run ${from.runId} at ${from.sha} (tree equals G's)`, headAtEnd: null,
+		base: null, mergeBase: null, full: from.full, solo: from.solo, failures: [], runDir: from.runDir, preflight: null,
+		scope: from.scope, main: false, host: from.host, exec: from.exec,
+	};
+}
+
 async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w || w.status !== "open") throw new Fail(`no open workload ${wl}`, START_EXIT.refused);
 	const config = loadConfig();
-	const { ownerRepo } = servedOf(ledger, wl, config);
+	const { ownerRepo, url } = servedOf(ledger, wl, config);
 	const view = ghPrView(ownerRepo, pr);
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
@@ -567,6 +1163,17 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 	mkdirSync(root, { recursive: true, mode: 0o700 });
 	const runId = makeRunId(Date.now(), Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => (b % 36).toString(36)).join(""));
 	const runDir = runDirOf(root, runId);
+	const say = (s: string) => process.stderr.write(`test-runner start: ${s}\n`);
+	// D4: on a land-first repository every request takes the gate. `pending` goes first, so no older success on this head counts while it
+	// runs, and a refused post refuses the request; then the tree carry, the fast set, or the full suite by exception.
+	let land: LandAdmission | null = null;
+	if (landFirstNow(ledger, ownerRepo)) {
+		const why = postStatus(realGh, ownerRepo, "pending", view.headRefOid, `as2 check requested, run ${runId}`, say);
+		if (why !== null) throw new Fail(`the pending status on ${view.headRefOid} was not posted (${why}); nothing was requested`, START_EXIT.refused);
+		const owner = view.headRefName.startsWith("wl/") ? ledger.workload(view.headRefName.slice(3)) : null;
+		const production = w.stakes === "production" || owner?.stakes === "production";
+		land = landAdmission({ ledger, root, ownerRepo, url, runId, pr, head: view.headRefOid, ref: view.headRefName, production, config, log: say });
+	}
 	const { slice, carried } = ledger.write(() => {
 		if (candidate !== null) hookSync(wl, "carry-open");
 		const now = Date.parse(ledger.now());
@@ -597,39 +1204,40 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 		const carry = from !== null && from.runId === candidate!.runId && from.sha === candidate!.sha ? from : null;
 		const request: TestRequested = { runId, pr, sha: view.headRefOid, slice: sl, by };
 		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody(request) });
-		if (carry === null) return { slice: sl, carried: null };
-		const run = carriedRun(request, carry);
+		// D4: the land-first plan rides in the admission's transaction with the request it decides.
+		if (land !== null) ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: fastPlanBody(runId, land.plan) });
+		// The tree carry first (D4): X's tree is G's, so G's green main run is X's result; then the decision-log carry (D4b).
+		const run = land?.carryFrom ? treeCarriedRun(request, land.carryFrom) : carry !== null ? carriedRun(request, carry) : null;
+		if (run === null) return { slice: sl, carried: null };
 		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRunBody(run) });
 		ledger.completeSlice(sl, { by: TEST_RUNNER_BY, artifact: settleArtifact(run) });
 		hookSync(wl, "carry-written");
-		return { slice: sl, carried: carry };
+		return { slice: sl, carried: { run, from: land?.carryFrom ?? carry! } };
 	});
 
 	if (carried !== null) {
 		// D4d, after the commit: the status the run would post, outside any transaction; a failed post is logged and the green stands.
-		await postFullSuite(ownerRepo, "success", view.headRefOid, `carried from run ${carried.runId} at ${carried.sha.slice(0, 7)} (decision-log only)`, (s) => process.stderr.write(`test-runner start: ${s}\n`));
-		process.stdout.write(`test-run ${runId} runner none sha ${view.headRefOid} slice ${slice} log none${boundBy ? ` bound-by ${boundBy}` : ""} carried ${carried.runId}\n`);
+		// On a land-first repository the gate decides it (D4); a refused post records `status-failed:` and leaves the head pending.
+		if (land !== null) {
+			postGate({
+				gh: realGh, ledger, repo: ownerRepo, head: view.headRefOid, ref: view.headRefName, pr, need: land.plan.scope === "full" ? "full" : "fast",
+				result: { verdict: carried.run.verdict, sha: carried.run.sha, scope: carried.run.scope, host: carried.run.host }, wl, runId, log: say,
+			});
+		} else postStatus(realGh, ownerRepo, "success", view.headRefOid, `carried from run ${carried.from.runId} at ${carried.from.sha.slice(0, 7)} (decision-log only)`, say);
+		process.stdout.write(`test-run ${runId} runner none sha ${view.headRefOid} slice ${slice} log none${boundBy ? ` bound-by ${boundBy}` : ""} carried ${carried.from.runId}\n`);
 		return START_EXIT.ok;
 	}
 
-	const log = join(runDir, "runner.log");
 	try {
-		mkdirSync(runDir, { recursive: true, mode: 0o700 });
-		const fd = openSync(log, "a", 0o600);
-		const child = spawn([process.execPath, import.meta.path, "run", runId], {
-			cwd: runDir, env: process.env, stdin: "ignore", stdout: fd, stderr: fd, detached: true,
-		});
-		child.unref();
-		closeSync(fd);
-		writeFileSync(join(runDir, "runner.json"), `${JSON.stringify({ pid: child.pid, pgid: child.pid, runId })}\n`, { mode: 0o600 });
-		process.stdout.write(`test-run ${runId} runner ${child.pid} sha ${view.headRefOid} slice ${slice} log ${log}${boundBy ? ` bound-by ${boundBy}` : ""}\n`);
+		const pid = spawnRunner(runDir, runId);
+		process.stdout.write(`test-run ${runId} runner ${pid} sha ${view.headRefOid} slice ${slice} log ${join(runDir, "runner.log")}${boundBy ? ` bound-by ${boundBy}` : ""}\n`);
 		return START_EXIT.ok;
 	} catch (e) {
 		const reason = `the runner did not start: ${errText(e)}`;
 		try {
 			recordError(ledger, wl, { runId, pr, sha: view.headRefOid, slice, by }, runDir, reason);
 		} catch (e2) {
-			process.stderr.write(`test-runner start: the failure could not be recorded: ${errText(e2)}\n`);
+			say(`the failure could not be recorded: ${errText(e2)}`);
 		}
 		throw new Fail(reason, START_EXIT.failed);
 	}
@@ -1071,7 +1679,9 @@ class Runner {
 			}
 		}
 		const at = (id: string): number => parseInt(id.slice(3, 12), 36) || 0;
-		const prune = pruneRuns([...ids].map((id) => ({ id, at: at(id) })), KEEP_RUNS).filter((id) => id !== this.id);
+		// D5, R16: a run a main run, a runner `main-red:` or an open incident cites is kept 30 days, outside KEEP_RUNS.
+		const cited = this.ledger.workload(STANDING_WORKLOAD_ID) === null ? new Set<string>() : citedRuns(this.ledger.entries(STANDING_WORKLOAD_ID), Date.now());
+		const prune = retentionPrune([...ids].map((id) => ({ id, at: at(id) })), cited, this.id);
 		for (const old of prune) {
 			rmSync(stageDirOf(old, this.as2root), { recursive: true, force: true });
 			if (existsSync(workDirOf(old, this.as2root))) {
@@ -1125,7 +1735,7 @@ class Runner {
 		await git([...NO_HOOKS, "bundle", "create", "-q", bundle, "--all"], "git bundle create");
 		chmodSync(bundle, 0o640);
 		const caps = join(this.stage, "caps.json");
-		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers })}\n`, { mode: 0o640 });
+		writeFileSync(caps, `${JSON.stringify({ fullCapMin: this.config.fullCapMin, soloCapMin: this.config.soloCapMin, fullWorkers: this.config.fullWorkers, fastCapMin: this.config.fastCapMin })}\n`, { mode: 0o640 });
 		chmodSync(caps, 0o640);
 		chmodSync(this.stage, 0o750);
 		this.log(`trusted phase: ${q.sha} on base ${this.f.base}, merge-base ${this.f.mergeBase}; changed test files: ${changed.join(" ") || "none"}`);
@@ -1389,10 +1999,16 @@ class Runner {
 				this.writeResult(run);
 				return START_EXIT.failed;
 			}
-			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
-			// postFullSuite never throws and kills gh after 15 s.
+			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check). On a land-first
+			// repository (a `fast-plan:` in the admission) the gate decides the state (D4); else today's mapping. Neither throws.
+			const plan = fastPlanOf(this.ledger.entries(this.wl), this.id);
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
-			if (state) await postFullSuite(this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}`, (s) => this.log(s));
+			if (state && plan !== null) {
+				postGate({
+					gh: realGh, ledger: this.ledger, repo: this.ownerRepo, head: run.sha, ref: plan.ref, pr: run.pr, need: plan.scope === "full" ? "full" : "fast",
+					result: { verdict: run.verdict, sha: run.sha, scope: run.scope, host: run.host }, wl: this.wl, runId: this.id, log: (s) => this.log(s),
+				});
+			} else if (state) postStatus(realGh, this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}`, (s) => this.log(s));
 			return 0;
 		} finally {
 			clearInterval(this.timer);
@@ -1435,7 +2051,38 @@ async function cmdRun(runId: string): Promise<number> {
 
 // ---- main ---------------------------------------------------------------------------------------------
 
-const USAGE = "usage: test-runner.ts start <wl> <pr> [--slice <id>] --requested-by <laneId> | run <run id>";
+const USAGE = "usage: test-runner.ts start <wl> <pr> [--slice <id>] --requested-by <laneId> | run <run id> | reap | main --repo <owner/repo> --sha <sha> | promote --sha <sha>";
+
+/** `reap` (D6, R37): settle every admitted request with no settle and no live heartbeat `runner died`; admits nothing; exit 0 either way. */
+function cmdReap(): number {
+	const settled = reap(openLedger(), runsRoot(process.env));
+	process.stdout.write(settled.length === 0 ? "reaped none\n" : `reaped ${settled.join(" ")}\n`);
+	return START_EXIT.ok;
+}
+
+/** `main --repo --sha` (D5): admit a main run (spawning it), replace the pending target, or nothing; one line on stdout. */
+function cmdMain(repo: string, sha: string): number {
+	const ledger = openLedger();
+	const root = runsRoot(process.env);
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	const db = openLockDb(root);
+	try {
+		const a = admitMain(ledger, db, root, repo, sha, MERGE_TRAIN_BY);
+		if (a.action === "admitted") {
+			try {
+				spawnRunner(runDirOf(root, a.runId), a.runId);
+			} catch (e) {
+				const reason = `the runner did not start: ${errText(e)}`;
+				recordError(ledger, STANDING_WORKLOAD_ID, findRequest(ledger, a.runId)!.request, runDirOf(root, a.runId), reason);
+				throw new Fail(reason, START_EXIT.failed);
+			}
+		}
+		process.stdout.write(`${a.line}\n`);
+		return START_EXIT.ok;
+	} finally {
+		db.close();
+	}
+}
 
 export async function main(argv: string[]): Promise<number> {
 	const [cmd, ...rest] = argv;
@@ -1454,11 +2101,19 @@ export async function main(argv: string[]): Promise<number> {
 		return cmdStart(wl, Number(prArg), slice, by);
 	}
 	if (cmd === "run" && rest.length === 1) return cmdRun(rest[0]!);
+	if (cmd === "reap" && rest.length === 0) return cmdReap();
+	if (cmd === "main" && rest.length === 4 && rest[0] === "--repo" && rest[2] === "--sha" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rest[1]!) && SHA40.test(rest[3]!)) {
+		return cmdMain(rest[1]!, rest[3]!);
+	}
+	if (cmd === "promote" && rest.length === 2 && rest[0] === "--sha" && SHA40.test(rest[1]!)) {
+		// The seam sl-fast-verifier fills (D5, § 2 The verified root): never a fake success.
+		throw new Fail(`promote ${rest[1]}: not built yet (sl-fast-verifier builds the verified-root promotion); nothing was promoted`, START_EXIT.failed);
+	}
 	throw new Fail(USAGE, START_EXIT.usage);
 }
 
 if (import.meta.main) {
-	const sub = process.argv[2] === "run" ? "run" : "start";
+	const sub = ["run", "reap", "main", "promote"].includes(process.argv[2] ?? "") ? process.argv[2]! : "start";
 	main(process.argv.slice(2)).then(
 		(code) => process.exit(code),
 		(err: unknown) => {

@@ -1110,7 +1110,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./a.test.ts"]);
 	});
 
-	test("fullWorkers (wl-mvg2kzuvwngdmo): the trusted phase writes it into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
+	test("fullWorkers (wl-mvg2kzuvwngdmo) and fastCapMin (PLAN wl-mvq4edbaf13vnk D4): the trusted phase writes them into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
 		for (const [workers, n] of [[3, 3], [undefined, 1]] as const) {
 			const w = world({ fullWorkers: workers });
 			const { wl, slice } = workload(w);
@@ -1119,7 +1119,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			const run = await resultOf(w, wl, runId);
 			expect(run.verdict).toBe("green");
 			expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n });
+			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n, fastCapMin: 10 });
 			const lines = runnerLog(w, runId).split("\n");
 			const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
 			const workersLine = at(/ full workers \d+$/);

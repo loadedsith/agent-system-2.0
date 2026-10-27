@@ -222,35 +222,49 @@ export const runsDbOf = (root: string): string => join(root, "runs.db");
 
 export interface TestRequested {
 	runId: string;
+	/** The PR; 0 for a main run, which names none. */
 	pr: number;
 	sha: string;
 	slice: string;
 	/** The lane that asked (or `plumb-bootstrap`, § 6 S8). */
 	by: string;
+	/**
+	 * A main run (PLAN wl-mvq4edbaf13vnk D5): the full suite on the Mac of main commit `sha` of the served `repo` (`owner/repo`),
+	 * requested by the tick on the standing workload; its slice is `sl-main-<run id>`, a name no slice row holds, so it settles none.
+	 */
+	main?: { repo: string };
 }
+
+const OWNER_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 function checkRequested(r: TestRequested): void {
 	need(isRunId(r.runId), `${r.runId} is not a run id`);
-	need(isPr(r.pr), `${r.pr} is not a PR number`);
+	if (r.main === undefined) need(isPr(r.pr), `${r.pr} is not a PR number`);
+	else {
+		need(r.pr === 0, `a main request names no PR (pr=0), not ${r.pr}`);
+		need(OWNER_REPO_RE.test(r.main.repo), `${r.main.repo} is not an owner/repo`);
+	}
 	need(isSha(r.sha), `${r.sha} is not a full sha`);
 	need(/^sl-\S+$/.test(r.slice), `${r.slice} is not a slice id`);
 	need(isToken(r.by), `${r.by} is not a requester id`);
 }
 
-/** `test-requested: <run id> pr=<N> sha=<sha> slice=<slice> by=<laneId>` (§ 2.2 step 3). */
+/** `test-requested: <run id> pr=<N> sha=<sha> slice=<slice> by=<laneId>` (§ 2.2 step 3); a main request is `pr=0 … main=1 repo=<owner/repo>`. */
 export function testRequestedBody(r: TestRequested): string {
 	checkRequested(r);
-	return `${TEST_REQUESTED_PREFIX} ${r.runId} pr=${r.pr} sha=${r.sha} slice=${r.slice} by=${r.by}`;
+	return `${TEST_REQUESTED_PREFIX} ${r.runId} pr=${r.pr} sha=${r.sha} slice=${r.slice} by=${r.by}${r.main === undefined ? "" : ` main=1 repo=${r.main.repo}`}`;
 }
 
-const REQUESTED_RE = /^test-requested: (tr-[a-z0-9]+) pr=([1-9]\d*) sha=([0-9a-f]{40}) slice=(sl-\S+) by=([^\s-]\S*)$/;
+const REQUESTED_RE = /^test-requested: (tr-[a-z0-9]+) pr=(0|[1-9]\d*) sha=([0-9a-f]{40}) slice=(sl-\S+) by=([^\s-]\S*?)(?: main=1 repo=(\S+))?$/;
 
 export function parseTestRequested(body: string): TestRequested | null {
 	const m = REQUESTED_RE.exec(body.trim());
 	if (!m) return null;
 	const pr = Number(m[2]);
-	if (!isPr(pr)) return null;
-	return { runId: m[1]!, pr, sha: m[3]!, slice: m[4]!, by: m[5]! };
+	const repo = m[6];
+	if (repo === undefined) return isPr(pr) ? { runId: m[1]!, pr, sha: m[3]!, slice: m[4]!, by: m[5]! } : null;
+	if (pr !== 0 || !OWNER_REPO_RE.test(repo)) return null;
+	return { runId: m[1]!, pr, sha: m[3]!, slice: m[4]!, by: m[5]!, main: { repo } };
 }
 
 // ---- bodies: test-run: ---------------------------------------------------------------------------
@@ -1862,7 +1876,9 @@ export type WrapperCall =
 	| { sub: "solo" | "base-solo"; runId: string; file: string }
 	| { sub: "sweep"; runId: string }
 	| { sub: "cleanup"; runId: string; oldRunId: string }
-	| { sub: "probe"; runId: string; paths: readonly string[] };
+	| { sub: "probe"; runId: string; paths: readonly string[] }
+	/** PLAN wl-mvq4edbaf13vnk D4: the Mac fallback of the hosted fast check, the fast set's files (`./<path>`, each once) in one `bun test` call. */
+	| { sub: "fast"; runId: string; files: readonly string[] };
 
 /** The exact argv: `sudo -n -u _as2test <exec> <subcommand> <run id> …`. A call the wrapper would refuse throws here first. */
 export function wrapperArgv(call: WrapperCall, exec: string = AS2TEST_EXEC): string[] {
@@ -1878,8 +1894,13 @@ export function wrapperArgv(call: WrapperCall, exec: string = AS2TEST_EXEC): str
 			return head;
 		case "solo":
 		case "base-solo":
-			need(call.file.startsWith("./") && !call.file.slice(2).split("/").some((s) => s === ".." || s === "") && isBunTestFile(call.file), `${call.file} is not a ./<path> test file inside the clone`);
+			need(isCloneTestFile(call.file), `${call.file} is not a ./<path> test file inside the clone`);
 			return [...head, call.file];
+		case "fast":
+			need(call.files.length > 0, "fast takes one or more ./<test file>");
+			for (const f of call.files) need(isCloneTestFile(f), `${f} is not a ./<path> test file inside the clone`);
+			need(new Set(call.files).size === call.files.length, "fast names a test file more than once");
+			return [...head, ...call.files];
 		case "cleanup":
 			need(isRunId(call.oldRunId) && call.oldRunId !== call.runId, `${call.oldRunId} is not another run's id`);
 			return [...head, call.oldRunId];
@@ -1889,4 +1910,9 @@ export function wrapperArgv(call: WrapperCall, exec: string = AS2TEST_EXEC): str
 	}
 	// A subcommand outside WrapperCall (`base-full`, gone with PLAN wl-mvq4edh02r5z40 D3, among them) is a caller bug the wrapper refuses too.
 	throw new TestRunShapeError(`${head[5]} is not a wrapper subcommand`);
+}
+
+/** A wrapper test operand: `./<path>` to a Bun test file name, no `..` or empty segment. */
+function isCloneTestFile(file: string): boolean {
+	return file.startsWith("./") && !file.slice(2).split("/").some((s) => s === ".." || s === "") && isBunTestFile(file);
 }
