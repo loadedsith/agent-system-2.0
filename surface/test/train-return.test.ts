@@ -391,8 +391,32 @@ describe("a green carries over decision-log commits (PLAN wl-mvpwkpqobyp20w D1, 
 		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101 again", doneCondition: "green", inputs: "#101" });
 		c.plusHours(0.05);
 		w.run(w.owner, sl, 101, H0, "green");
-		expect(carryPairs(w.ledger, { train: w.train, heads: new Map([[101, H2]]) })).toEqual([{ pr: 101, from: H1, to: H2 }]);
+		// the green at H0 is now the newest request, and an older green never carries past a newer request
+		expect(carryPairs(w.ledger, { train: w.train, heads: new Map([[101, H2]]) })).toEqual([]);
 		expect(unsettledTasks(w.ledger, w.train).map((u) => u.id)).toEqual([t.id]);
+	});
+
+	test("an older green at S never carries past a newer request: a red at H settles failed, a pending one settles nothing", () => {
+		const { c, w, t } = greenThenMoved(H1);
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101 at the head", doneCondition: "green", inputs: "#101" });
+		const compares = comparesOf(H1, H2, { [`repos/${REPO}/compare/${H1}...${H2}`]: aheadAnswer({ sha: H2 }), [`repos/${REPO}/commits/${H2}`]: commitAnswer(H2, [LOG]) });
+		const heads = { train: w.train, heads: new Map([[101, H2]]) };
+		// still pending at H: no settle, no pair
+		c.plusHours(0.05);
+		const pending = w.run(w.owner, sl, 101, H2, null);
+		expect(carryPairs(w.ledger, heads)).toEqual([]);
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, compares)).toEqual([]);
+		// red at H, both recorded before the first settle: failed on the red, never fixed
+		c.plusHours(0.05);
+		w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, kind: "assumption",
+			body: testRunBody({
+				runId: pending, verdict: "red", sha: H2, pr: 101, reason: null, headAtEnd: H2, base: null, mergeBase: null,
+				full: { pass: 0, fail: 1, skip: 0, exit: 1, ms: 10, error: null }, solo: [], failures: [], runDir: null, preflight: null,
+			}),
+		});
+		expect(carryPairs(w.ledger, heads)).toEqual([]);
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, compares)).toEqual([`train-task-settled: ${t.id} failed run ${pending} red at ${H2}`]);
 	});
 
 	test("ghCompare: from === to is identical with no gh call; what GitHub cannot answer completely is ok:false; a failed or misshapen answer throws", () => {

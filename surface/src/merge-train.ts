@@ -934,9 +934,11 @@ function settleEvent(
 	const events: SettleEvent[] = [];
 	// The first runner result requested after t0 that is not an error decides; stale and superseded runs settle nothing either.
 	// A green (or red-main) decides only at a head other than H0 that is the PR's current head; a green at S, not H0, also
-	// decides when the current head descends from S only by decision-log commits (`decisionLogFault` on GitHub's compare of S
-	// and the head, PLAN wl-mvpwkpqobyp20w D2). Until then the next result is read.
-	for (const r of taskRuns(ledger, t, owners)) {
+	// decides when it is the task's NEWEST request's own result and the current head descends from S only by decision-log
+	// commits (`decisionLogFault` on GitHub's compare of S and the head, PLAN wl-mvpwkpqobyp20w D2). A later request of any
+	// kind (pending, red, error) means no carry from S: that request's result is what is read next. Until then the next result is read.
+	const runs = taskRuns(ledger, t, owners);
+	for (const r of runs) {
 		const res = r.result;
 		if (!res) continue;
 		if (res.verdict === "red") {
@@ -947,7 +949,7 @@ function settleEvent(
 			events.push({ at: res.createdAt, outcome: "fixed", evidence: `run ${res.runId} ${res.verdict} at ${res.sha}` });
 			break;
 		}
-		if (carries(res.verdict, res.sha, t, head) && decisionLogFault(compares.get(`${res.sha} ${head}`) ?? null) === null) {
+		if (r === runs.at(-1) && carries(res.verdict, res.sha, t, head) && decisionLogFault(compares.get(`${res.sha} ${head}`) ?? null) === null) {
 			events.push({ at: res.createdAt, outcome: "fixed", evidence: `run ${res.runId} green at ${res.sha}, head ${head} decision-log only` });
 			break;
 		}
@@ -994,8 +996,8 @@ function settleEvent(
 /**
  * The settles the tick writes now on train `facts.train` (D8): the `train-task-settled:` bodies, one per unsettled task whose
  * first terminal event has happened. fixed: the first non-error runner result requested after t0 on the owner is green at a
- * head other than H0 that is the PR's current head, or green at S (not H0) with the current head past S only by decision-log
- * commits (`decisionLogFault` on `facts.compares`' `<S> <head>`, PLAN wl-mvpwkpqobyp20w D2). failed: that result is red; the owner's holder wrote
+ * head other than H0 that is the PR's current head, or the task's newest request is green at S (not H0) with the current head
+ * past S only by decision-log commits (`decisionLogFault` on `facts.compares`' `<S> <head>`, PLAN wl-mvpwkpqobyp20w D2). failed: that result is red; the owner's holder wrote
  * `train-task-failed: <id>`; an owner lane exited with no push before it; or some stretch of 2 h since t0 had no push. A push
  * is one GitHub records on the head branch (`facts.pushes`, at GitHub's time), never a runner request or row 8's `push-dest:`;
  * with no record this pass, or one that does not name the PR's current head, the two push rules wait. An `error` result never
@@ -1015,22 +1017,20 @@ function carries(verdict: string, sha: string, t: TrainTask, head: string | null
 }
 
 /**
- * The compares `settleTasks` on `facts.train` would read now (PLAN wl-mvpwkpqobyp20w D2): per unsettled task, each green at S whose
- * carry to the PR's current head it would try, read up to the result that decides without one (a red, or a green or red-main at
- * the head itself); one row per (pr, S, head). The tick fetches each with `ghCompare` before its settle transaction, so no gh
- * call holds the ledger's lock.
+ * The compares `settleTasks` on `facts.train` would read now (PLAN wl-mvpwkpqobyp20w D2): per unsettled task, the carry of its
+ * NEWEST runner request, when that request's own result is a green at S that carries to the PR's current head; one row per
+ * (pr, S, head). An older green never carries (a later request, pending or not, may be a red at the head), and a newest request
+ * with no result or any other result lists nothing. The tick fetches each with `ghCompare` before its settle transaction, so no
+ * gh call holds the ledger's lock.
  */
 export function carryPairs(ledger: Ledger, facts: Pick<SettleFacts, "train" | "heads">): { pr: number; from: string; to: string }[] {
 	const fixes = fixBindings(ledger);
 	const out = new Map<string, { pr: number; from: string; to: string }>();
 	for (const t of unsettledTasks(ledger, facts.train)) {
 		const head = facts.heads.get(t.pr) ?? null;
-		for (const r of taskRuns(ledger, t, taskOwners(ledger, t, fixes))) {
-			const res = r.result;
-			if (!res) continue;
-			if (res.verdict === "red" || (SETTLING_VERDICTS.includes(res.verdict) && res.sha !== t.head && res.sha === head)) break;
-			if (carries(res.verdict, res.sha, t, head)) out.set(`${t.pr} ${res.sha} ${head}`, { pr: t.pr, from: res.sha, to: head });
-		}
+		const runs = taskRuns(ledger, t, taskOwners(ledger, t, fixes));
+		const res = runs.at(-1)?.result;
+		if (res && carries(res.verdict, res.sha, t, head)) out.set(`${t.pr} ${res.sha} ${head}`, { pr: t.pr, from: res.sha, to: head });
 	}
 	return [...out.values()];
 }
