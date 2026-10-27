@@ -536,7 +536,7 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		const c = a.message.content;
 		expect(c).toStartWith(`Test run tr-0abc1234aaaa on ${l.wl}: red at ${SHA} (PR #17, slice ${l.sl}, ledger entry ${red}).`);
 		expect(c).toContain("Full suite: 40 passed, 11 failed, 2 skipped.");
-		expect(c).toContain("Changed test files alone: ./src/solo.test.ts 3 passed, 1 failed, 0 skipped.");
+		expect(c).toContain("Test files alone: ./src/solo.test.ts 3 passed, 1 failed, 0 skipped.");
 		expect(c).toContain(`Failing (10 of 12; the rest are in ${join(l.runs, "tr-0abc1234aaaa", "result.json")}):`);
 		expect(c).toContain("- [full] src/x.test.ts > header > case 1: error: expect(received).toBe(expected) #1\n");
 		expect(c).toContain("- [full] src/x.test.ts > header > case 10: error: expect(received).toBe(expected) #10");
@@ -557,7 +557,7 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		expect(l.asides()).toHaveLength(2);
 		const g = l.asides()[1]!.message.content;
 		expect(g).toStartWith(`Test run tr-0abc1234bbbb on ${l.wl}: green at ${SHA}`);
-		expect(g).toContain("Changed test files alone: none.");
+		expect(g).toContain("Test files alone: none.");
 		expect(g).not.toContain("Failing");
 		expect(g).toContain("Result: ledger entry en-");
 		// nothing completed the slice: green, but not settled, and why
