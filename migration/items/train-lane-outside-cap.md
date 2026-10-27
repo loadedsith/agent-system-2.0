@@ -1,6 +1,6 @@
 ---
 title: The merge train always has a live lane, outside the lane cap
-status: in-progress
+status: building
 workload: wl-mvpsrr4tr0p1xc
 pr: none
 ---
