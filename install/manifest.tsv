@@ -1132,6 +1132,10 @@ surface/test/turn-idle.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
 surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
+surface/src/fast-set.ts	module	-
+surface/test/fast-set.test.ts	test	-
+surface/src/main-state.ts	module	-
+surface/test/main-state.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
 surface/test/test-runner.test.ts	test	-
 surface/scripts/test-run-waits.ts	module	-

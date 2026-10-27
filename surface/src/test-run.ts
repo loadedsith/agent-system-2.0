@@ -88,9 +88,31 @@ export interface TestRunnerConfig {
 	queueMaxMin: number;
 	/** Workers for the PR's full part (`bun test --parallel=<n>` when over 1, written into caps.json); base runs are single files. */
 	fullWorkers: number;
+	/**
+	 * The fast check's smoke files (PLAN wl-mvq4edbaf13vnk § 2 "The fast check"): repo-relative Bun test files every fast set
+	 * holds, whatever changed (surface/src/fast-set.ts).
+	 */
+	fastSmoke: string[];
+	/** Test files that run only in main runs on the Mac, never in the hosted Linux fast check: repo-relative path → why (§ 2, Jo's in-mvqqucfcxuevb4). */
+	macOnly: Record<string, string>;
+	/** Basenames whose change takes the full suite before merge (§ 2 Exceptions: dependencies and toolchain). */
+	fullBeforeMerge: string[];
+	/** Wall minutes the hosted fast run's one `bun test` call may take (D3). */
+	fastCapMin: number;
+	/** Minutes the runner waits on the hosted fast run before its one Mac fallback (D4). */
+	fastWaitMin: number;
 }
-/** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1 };
+/** `fullBeforeMerge`'s default (§ 2 Exceptions): the dependency manifests, lockfiles and build files the repository tracks today. */
+export const FULL_BEFORE_MERGE_DEFAULT: readonly string[] = Object.freeze(["package.json", "bun.lock", "bunfig.toml", "tsconfig.json", "Cargo.toml", "Cargo.lock", "build.sh"]);
+/** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3; PLAN wl-mvq4edbaf13vnk D1), used for a key the block leaves out. */
+export const TEST_RUNNER_DEFAULTS: Readonly<Omit<TestRunnerConfig, "repos">> = Object.freeze({
+	fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1,
+	fastSmoke: Object.freeze([]) as unknown as string[], macOnly: Object.freeze({}) as Record<string, string>, fullBeforeMerge: FULL_BEFORE_MERGE_DEFAULT as string[],
+	fastCapMin: 10, fastWaitMin: 15,
+});
+
+/** A repo-relative path a config may name: no leading `/` or `./`, no empty, `.` or `..` segment, no whitespace. */
+const isRepoRelPath = (s: unknown): s is string => typeof s === "string" && s !== "" && !/\s/.test(s) && s.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -98,8 +120,11 @@ export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMi
  * caller refuses rather than run under caps nobody wrote.
  */
 export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerConfig } | { ok: false; error: string } {
+	const fresh = (repos: TestRunnerRepo[]): TestRunnerConfig => ({
+		repos, ...TEST_RUNNER_DEFAULTS, fastSmoke: [...TEST_RUNNER_DEFAULTS.fastSmoke], macOnly: { ...TEST_RUNNER_DEFAULTS.macOnly }, fullBeforeMerge: [...TEST_RUNNER_DEFAULTS.fullBeforeMerge],
+	});
 	const block = doc !== null && typeof doc === "object" && "testRunner" in doc ? doc.testRunner : undefined;
-	if (block === undefined || block === null) return { ok: true, config: { repos: [], ...TEST_RUNNER_DEFAULTS } };
+	if (block === undefined || block === null) return { ok: true, config: fresh([]) };
 	if (typeof block !== "object" || Array.isArray(block)) return { ok: false, error: "testRunner is not a mapping" };
 	const b = block as Record<string, unknown>;
 	const repos: TestRunnerRepo[] = [];
@@ -113,8 +138,8 @@ export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerCo
 			repos.push({ origin, command: row.command.trim() });
 		}
 	}
-	const out: TestRunnerConfig = { repos, ...TEST_RUNNER_DEFAULTS };
-	for (const key of ["fullCapMin", "soloCapMin", "reportCapMb", "queueMaxMin"] as const) {
+	const out = fresh(repos);
+	for (const key of ["fullCapMin", "soloCapMin", "reportCapMb", "queueMaxMin", "fastCapMin", "fastWaitMin"] as const) {
 		const v = b[key];
 		if (v === undefined) continue;
 		if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return { ok: false, error: `testRunner.${key} is not a positive number` };
@@ -124,6 +149,29 @@ export function testRunnerConfig(doc: unknown): { ok: true; config: TestRunnerCo
 		const v = b.fullWorkers;
 		if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 1) return { ok: false, error: "testRunner.fullWorkers is not an integer of 1 or more" };
 		out.fullWorkers = v;
+	}
+	if (b.fastSmoke !== undefined) {
+		const v = b.fastSmoke;
+		if (!Array.isArray(v)) return { ok: false, error: "testRunner.fastSmoke is not a list" };
+		const bad = v.find((p) => !isRepoRelPath(p) || !isBunTestFile(p));
+		if (bad !== undefined) return { ok: false, error: `testRunner.fastSmoke names ${JSON.stringify(bad)}, which is not a repo-relative Bun test file path` };
+		out.fastSmoke = [...new Set(v as string[])];
+	}
+	if (b.macOnly !== undefined) {
+		const v = b.macOnly;
+		if (v === null || typeof v !== "object" || Array.isArray(v)) return { ok: false, error: "testRunner.macOnly is not a mapping of path to reason" };
+		for (const [path, why] of Object.entries(v)) {
+			if (!isRepoRelPath(path)) return { ok: false, error: `testRunner.macOnly key ${JSON.stringify(path)} is not a repo-relative path` };
+			if (typeof why !== "string" || why.trim() === "") return { ok: false, error: `testRunner.macOnly.${path} has no reason` };
+			out.macOnly[path] = why.trim();
+		}
+	}
+	if (b.fullBeforeMerge !== undefined) {
+		const v = b.fullBeforeMerge;
+		if (!Array.isArray(v)) return { ok: false, error: "testRunner.fullBeforeMerge is not a list" };
+		const bad = v.find((n) => typeof n !== "string" || n.trim() === "" || n.includes("/") || /\s/.test(n));
+		if (bad !== undefined) return { ok: false, error: `testRunner.fullBeforeMerge names ${JSON.stringify(bad)}, which is not a file basename` };
+		out.fullBeforeMerge = [...new Set(v as string[])];
 	}
 	return { ok: true, config: out };
 }
@@ -265,6 +313,40 @@ export interface TestRun {
 	preflight: string | null;
 	/** The base comparison (D8), present only on a run whose failing parts were rerun on base. */
 	baseCompare?: BaseCompare;
+	/**
+	 * PLAN wl-mvq4edbaf13vnk D1: what ran. `full` is the whole suite; `fast` the fast set before merge (surface/src/fast-set.ts),
+	 * which never counts as a full-suite result (`isFullSuiteGreen`). A row written before the field reads as `full`.
+	 */
+	scope: TestScope;
+	/** A main run: the full suite on the Mac of one main commit (§ 2 Main state). A row written before the field reads as false. */
+	main: boolean;
+	/** Where the tests ran: the Mac runner, or the hosted Linux fast check (D3). A row written before the field reads as `mac`. */
+	host: TestHost;
+	/** The run's executed counts from its JUnit (`execOf`), or null when it has none; a row written before the field reads as null. */
+	exec: ExecCounts | null;
+}
+export type TestScope = "full" | "fast";
+export type TestHost = "mac" | "linux";
+/**
+ * From a run's JUnit (PLAN wl-mvq4edbaf13vnk D1): `files`, the tree's Bun test files with an executed (not skipped) test;
+ * `tests`, the executed tests; `treeFiles`, the Bun test files in the tested commit's tree. Believability reads them
+ * (surface/src/main-state.ts `believable`).
+ */
+export interface ExecCounts {
+	files: number;
+	tests: number;
+	treeFiles: number;
+}
+/** The fields a run written before PLAN wl-mvq4edbaf13vnk D1 lacks; a body built without them carries their old-row values. */
+type LandFirstFields = "scope" | "main" | "host" | "exec";
+/** A run as a caller may hand it to `testRunBody`: the D1 fields optional, read as a full, non-main Mac run with no exec counts. */
+export type TestRunInput = Omit<TestRun, LandFirstFields> & Partial<Pick<TestRun, LandFirstFields>>;
+/** How a row written before PLAN wl-mvq4edbaf13vnk D1 reads, and what a full PR run on the Mac carries until its runner sets exec. */
+export const OLD_ROW_FIELDS: Readonly<Pick<TestRun, LandFirstFields>> = Object.freeze({ scope: "full", main: false, host: "mac", exec: null });
+
+/** A green that counts as a full-suite result: a fast green never does (PLAN wl-mvq4edbaf13vnk D1). */
+export function isFullSuiteGreen(run: Pick<TestRun, "verdict" | "scope">): boolean {
+	return run.verdict === "green" && run.scope === "full";
 }
 
 const nat = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
@@ -305,10 +387,26 @@ function baseCompareOf(v: unknown): BaseCompare | null {
 	}
 	return { sha: b.sha, parts };
 }
+function execCountsOf(v: unknown): ExecCounts | null {
+	if (v === null || typeof v !== "object") return null;
+	const e = v as Record<string, unknown>;
+	if (!nat(e.files) || !nat(e.tests) || !nat(e.treeFiles) || e.files > e.treeFiles) return null;
+	return { files: e.files, tests: e.tests, treeFiles: e.treeFiles };
+}
 
 /** The canonical TestRun built from untrusted fields, or null: the one shape both the formatter and the parser accept. */
 function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr: unknown }, v: Record<string, unknown>): TestRun | null {
-	if (!isRunId(head.runId) || !TEST_VERDICTS.includes(head.verdict as TestVerdict) || !isSha(head.sha) || !isPr(head.pr)) return null;
+	if (!isRunId(head.runId) || !TEST_VERDICTS.includes(head.verdict as TestVerdict) || !isSha(head.sha)) return null;
+	// D1's fields, each absent on a row written before them: full scope, not main, the Mac, no exec counts.
+	const scope = v.scope === undefined ? "full" : v.scope;
+	const main = v.main === undefined ? false : v.main;
+	const host = v.host === undefined ? "mac" : v.host;
+	const exec = v.exec === undefined || v.exec === null ? null : execCountsOf(v.exec);
+	if ((scope !== "full" && scope !== "fast") || typeof main !== "boolean" || (host !== "mac" && host !== "linux")) return null;
+	if (v.exec !== undefined && v.exec !== null && exec === null) return null;
+	// A main run is the full suite on the Mac of one main commit (§ 2 Main state); it names no PR, so it alone carries pr 0.
+	if (main && (scope !== "full" || host !== "mac")) return null;
+	if (!(isPr(head.pr) || (main && head.pr === 0))) return null;
 	if (v.sha !== head.sha || v.pr !== head.pr) return null;
 	if (!strOrNull(v.reason) || !shaOrNull(v.headAtEnd) || !shaOrNull(v.base) || !shaOrNull(v.mergeBase)) return null;
 	if (!strOrNull(v.runDir) || !strOrNull(v.preflight)) return null;
@@ -323,9 +421,9 @@ function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr
 	if (v.baseCompare !== undefined && v.baseCompare !== null && baseCompare === null) return null;
 	if (head.verdict === "red-main" && baseCompare === null) return null;
 	return {
-		runId: head.runId, verdict: head.verdict as TestVerdict, sha: head.sha, pr: head.pr, reason: v.reason, headAtEnd: v.headAtEnd,
+		runId: head.runId, verdict: head.verdict as TestVerdict, sha: head.sha, pr: head.pr as number, reason: v.reason, headAtEnd: v.headAtEnd,
 		base: v.base, mergeBase: v.mergeBase, full, solo: solo as SoloCounts[], failures: failures as Failure[], runDir: v.runDir, preflight: v.preflight,
-		...(baseCompare === null ? {} : { baseCompare }),
+		...(baseCompare === null ? {} : { baseCompare }), scope, main, host, exec,
 	};
 }
 
@@ -333,18 +431,22 @@ function canonicalRun(head: { runId: unknown; verdict: unknown; sha: unknown; pr
  * `test-run: <run id> <verdict> sha=<sha> pr=<N> {json}` (§ 2.3 step 6). The json repeats sha and pr
  * and carries reason, headAtEnd, base, mergeBase, full, solo, failures (every one), runDir and
  * preflight, plus baseCompare when the run has one (D8), on one line. The same object goes to `result.json`.
+ * D1's fields ride only when they differ from an old row's reading (scope fast, main, host linux, exec counts),
+ * so a full Mac PR run's body is the one it was before them. A main run carries pr=0.
  */
-export function testRunBody(run: TestRun): string {
+export function testRunBody(run: TestRunInput): string {
 	const c = canonicalRun(run, run as unknown as Record<string, unknown>);
 	need(c !== null, `test-run ${run.runId} does not have the shape its body carries`);
 	const json = JSON.stringify({
 		sha: c!.sha, pr: c!.pr, reason: c!.reason, headAtEnd: c!.headAtEnd, base: c!.base, mergeBase: c!.mergeBase, full: c!.full, solo: c!.solo,
 		failures: c!.failures, runDir: c!.runDir, preflight: c!.preflight, ...(c!.baseCompare ? { baseCompare: c!.baseCompare } : {}),
+		...(c!.scope === "full" ? {} : { scope: c!.scope }), ...(c!.main ? { main: true } : {}), ...(c!.host === "mac" ? {} : { host: c!.host }),
+		...(c!.exec === null ? {} : { exec: c!.exec }),
 	});
 	return `${TEST_RUN_PREFIX} ${c!.runId} ${c!.verdict} sha=${c!.sha} pr=${c!.pr} ${json}`;
 }
 
-const RUN_RE = /^test-run: (tr-[a-z0-9]+) (green|red-main|red|stale|error|superseded) sha=([0-9a-f]{40}) pr=([1-9]\d*) (\{.*\})$/;
+const RUN_RE = /^test-run: (tr-[a-z0-9]+) (green|red-main|red|stale|error|superseded) sha=([0-9a-f]{40}) pr=(0|[1-9]\d*) (\{.*\})$/;
 
 export function parseTestRun(body: string): TestRun | null {
 	const m = RUN_RE.exec(body.trim());
@@ -369,7 +471,7 @@ export function resultJson(run: TestRun): string {
 export function runnerDiedRun(request: TestRequested, runDir: string | null = null): TestRun {
 	return {
 		runId: request.runId, verdict: "error", sha: request.sha, pr: request.pr, reason: "runner died", headAtEnd: null, base: null, mergeBase: null,
-		full: null, solo: [], failures: [], runDir, preflight: null,
+		full: null, solo: [], failures: [], runDir, preflight: null, ...OLD_ROW_FIELDS,
 	};
 }
 
@@ -1008,6 +1110,32 @@ export function executedFiles(xml: string): string[] {
 	return [...out];
 }
 
+/**
+ * A run's executed counts (PLAN wl-mvq4edbaf13vnk D1) from its junit report and the Bun test files of the tested commit's tree:
+ * `perFile`, each tree test file's executed (not skipped) tests, files with none left out; `exec.files`, how many tree test
+ * files are in `perFile`; `exec.tests`, every executed test of the report; `exec.treeFiles`, the tree's test files. A report
+ * that does not parse is an error, never zero counts.
+ */
+export function execOf(xml: string, treeTestFiles: readonly string[]): { ok: true; exec: ExecCounts; perFile: Map<string, number> } | { ok: false; error: string } {
+	let root: XmlNode;
+	try {
+		root = parseXml(xml);
+	} catch (e) {
+		return { ok: false, error: `junit report does not parse: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	if (root.name !== "testsuites") return { ok: false, error: `junit root is <${root.name}>, not <testsuites>` };
+	const tree = new Set(treeTestFiles.map(repoRel));
+	const perFile = new Map<string, number>();
+	let tests = 0;
+	eachCase(root, (c, file) => {
+		if (c.children.some((x) => x.name === "skipped")) return;
+		tests++;
+		const rel = repoRel(file);
+		if (tree.has(rel)) perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
+	});
+	return { ok: true, exec: { files: perFile.size, tests, treeFiles: tree.size }, perFile };
+}
+
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 
 /**
@@ -1308,7 +1436,7 @@ export function buildTestRun(
 		full: facts.full ? { pass: facts.full.pass, fail: facts.full.fail, skip: facts.full.skip, exit: facts.full.exit, ms: facts.full.ms, error: facts.full.error } : null,
 		solo: facts.solo.map((s) => ({ file: s.file, pass: s.pass, fail: s.fail, skip: s.skip, exit: s.exit, ms: s.ms, error: s.error })),
 		failures: failuresOf(facts.full, facts.solo), runDir: extra.runDir, preflight: extra.preflight,
-		...(baseCompare === null ? {} : { baseCompare }),
+		...(baseCompare === null ? {} : { baseCompare }), ...OLD_ROW_FIELDS,
 	};
 }
 
@@ -1341,6 +1469,8 @@ export function carriedRun(request: TestRequested, from: TestRun): TestRun {
 	return {
 		runId: request.runId, verdict: "green", sha: request.sha, pr: request.pr, reason: `carried from ${from.runId} at ${from.sha} (decision-log only)`, headAtEnd: null,
 		base: from.base, mergeBase: from.mergeBase, full: from.full, solo: from.solo, failures: [], runDir: from.runDir, preflight: null,
+		// What was carried is what ran: a carried fast green stays fast, never a full-suite result.
+		scope: from.scope, main: false, host: from.host, exec: null,
 	};
 }
 

@@ -93,6 +93,7 @@ export const CONTROL_PREFIXES = [
 	"queued",
 	"lane-metrics", "daily-report",
 	"now", "ruling-conflict",
+	"land-first", "main-retry", "train-reconciled", "runner-preflight",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -187,6 +188,10 @@ export const DAILY_REPORT_BY = "daily-report";
  * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
  * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
  * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
+ * Land-first's rows (PLAN wl-mvq4edbaf13vnk § 2, D12) are on the standing workload: `land-first: <repo> on|off <instruction id>` and
+ * `main-retry: <repo> <instruction id>` are the surface's alone, Jo's words written after his instruction in one transaction
+ * (`landFirstOn` reads the first); `train-reconciled: …` is the train tick's alone (MERGE_TRAIN_BY, D6), which the merge hold reads;
+ * `runner-preflight: ok|refused <reason> source <sha> root <path>` is the runner's alone (TEST_RUNNER_BY, D5).
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -248,6 +253,10 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"daily-report": [DAILY_REPORT_BY],
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
+	"land-first": [SURFACE_BY],
+	"main-retry": [SURFACE_BY],
+	"train-reconciled": [MERGE_TRAIN_BY],
+	"runner-preflight": [TEST_RUNNER_BY],
 };
 
 export interface ControlEntry {
@@ -1303,6 +1312,79 @@ export function prBindings(entries: readonly EntryRow[], instructions: readonly 
 		out.push({ word, prs, instructionId, entryId: c.id, createdAt: c.createdAt });
 	}
 	return out;
+}
+
+// ---- land-first activation and main retries (PLAN wl-mvq4edbaf13vnk § 2 Activation, Attempts; D12) ----------------
+
+/** Jo's word that turns land-first on or off for a repository: `land-first <repo> on|off`. */
+export const LAND_FIRST_WORD = "land-first";
+/** Jo's word that opens a main commit's next attempt block once the runner is repaired: `main-retry <repo>`. */
+export const MAIN_RETRY_WORD = "main-retry";
+/** A repository as Jo names it: `<name>` or `<owner>/<name>`, GitHub's characters. */
+export const REPO_WORD_RE = /^[A-Za-z0-9][\w.-]*(?:\/[A-Za-z0-9][\w.-]*)?$/;
+
+/**
+ * Two repository words name one repository: equal without case, or one is `<owner>/<name>` and the other its `<name>`
+ * (Jo says `agent-system-2.0`; the runner's config names `thewolff/agent-system-2.0`).
+ */
+export function sameRepo(a: string, b: string): boolean {
+	const x = a.toLowerCase();
+	const y = b.toLowerCase();
+	return x === y || x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
+}
+
+/** Jo's instruction body for `land-first <repo> on|off`, which `land-first:` names. */
+export function landFirstInstructionBody(repo: string, on: boolean): string {
+	return `${LAND_FIRST_WORD} ${repo} ${on ? "on" : "off"}`;
+}
+/** `land-first: <repo> on|off <instruction id>`: the surface's record on the standing workload, after Jo's instruction in one transaction. */
+export function landFirstBody(repo: string, on: boolean, instructionId: string): string {
+	return `${LAND_FIRST_WORD}: ${repo} ${on ? "on" : "off"} ${instructionId}`;
+}
+/** Jo's instruction body for `main-retry <repo>`, which `main-retry:` names. */
+export function mainRetryInstructionBody(repo: string): string {
+	return `${MAIN_RETRY_WORD} ${repo}`;
+}
+/** `main-retry: <repo> <instruction id>`: the surface's record on the standing workload, after Jo's instruction in one transaction. */
+export function mainRetryBody(repo: string, instructionId: string): string {
+	return `${MAIN_RETRY_WORD}: ${repo} ${instructionId}`;
+}
+
+/**
+ * The valid `land-first:` or `main-retry:` entries on the standing workload, oldest first: written by the surface
+ * (`controlEntries` drops any other writer's copy) and naming Jo's instruction on the standing workload, written by
+ * the surface, whose body is exactly the word's (`landFirstInstructionBody`, `mainRetryInstructionBody`).
+ */
+function joRepoEntries(
+	entries: readonly EntryRow[], instructions: readonly InstructionRow[], prefix: "land-first" | "main-retry",
+): { repo: string; on: boolean; createdAt: string }[] {
+	const out: { repo: string; on: boolean; createdAt: string }[] = [];
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== prefix) continue;
+		const on = entries.find((e) => e.id === c.id)?.workload_id;
+		const m = prefix === "land-first" ? /^(\S+) (on|off) (\S+)$/.exec(c.rest) : /^(\S+)() (\S+)$/.exec(c.rest);
+		if (!m || on !== STANDING_WORKLOAD_ID || !REPO_WORD_RE.test(m[1]!)) continue;
+		const state = m[2] === "on";
+		const body = prefix === "land-first" ? landFirstInstructionBody(m[1]!, state) : mainRetryInstructionBody(m[1]!);
+		const ins = instructions.find((x) => x.id === m[3]);
+		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== body) continue;
+		out.push({ repo: m[1]!, on: state, createdAt: c.createdAt });
+	}
+	return out;
+}
+
+/**
+ * Land-first is on for `repo` when the newest valid `land-first:` entry for it (`sameRepo`) on the standing workload says
+ * `on` (§ 2 Activation). No entry is off. Pass the standing workload's entries and instructions; the runner, the tick, the
+ * merge hold and the lane extension all read it here.
+ */
+export function landFirstOn(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): boolean {
+	return joRepoEntries(entries, instructions, "land-first").filter((e) => sameRepo(e.repo, repo)).at(-1)?.on ?? false;
+}
+
+/** The ledger times of Jo's valid `main-retry:` entries for `repo`, oldest first: what opens a main commit's next attempt block (§ 2 Attempts). */
+export function mainRetries(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): string[] {
+	return joRepoEntries(entries, instructions, "main-retry").filter((e) => sameRepo(e.repo, repo)).map((e) => e.createdAt);
 }
 
 /**

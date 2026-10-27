@@ -17,6 +17,7 @@ import {
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
 	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, soloPlan, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
+	execOf, FULL_BEFORE_MERGE_DEFAULT, isFullSuiteGreen, OLD_ROW_FIELDS,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf, failuresOf, parseSecurityRed, securityFailuresOf, securityRedBody, securityRedOf,
 } from "../src/test-run";
 import { tmp } from "./helpers";
@@ -37,7 +38,7 @@ const request = (runId: string, pr: number, sha: string, slice = "sl-full-t-1", 
 const run = (r: TestRequested, verdict: TestRun["verdict"], over: Partial<TestRun> = {}): TestRun => ({
 	runId: r.runId, verdict, sha: r.sha, pr: r.pr, reason: null, headAtEnd: r.sha, base: D, mergeBase: D,
 	full: { pass: 3, fail: verdict === "red" ? 1 : 0, skip: 0, exit: verdict === "red" ? 1 : 0, ms: 1200, error: null }, solo: [],
-	failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${r.runId}`, preflight: "ok", ...over,
+	failures: verdict === "red" ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${r.runId}`, preflight: "ok", ...OLD_ROW_FIELDS, ...over,
 });
 const reqEntry = (r: TestRequested, by = TEST_RUNNER_BY) => entry(by, testRequestedBody(r), ++seq, r.slice);
 const runEntry = (t: TestRun, by = TEST_RUNNER_BY) => entry(by, testRunBody(t), ++seq);
@@ -616,7 +617,7 @@ describe("verdict and settle", () => {
 		const c = carriedRun(request("tr-0carry", 17, B), g);
 		expect(c).toEqual({
 			runId: "tr-0carry", verdict: "green", sha: B, pr: 17, reason: `carried from tr-0abc12 at ${A} (decision-log only)`, headAtEnd: null, base: B, mergeBase: C,
-			full: g.full, solo: g.solo, failures: [], runDir: "/runs/tr-0abc12", preflight: null,
+			full: g.full, solo: g.solo, failures: [], runDir: "/runs/tr-0abc12", preflight: null, scope: "full", main: false, host: "mac", exec: null,
 		});
 		expect(parseTestRun(testRunBody(c))).toEqual(c);
 		expect(settleArtifact(c)).toBe(`test-run tr-0carry: green at ${B} on PR #17; full 10/0/0; alone: ./x.test.ts 10/0; /runs/tr-0abc12; carried from tr-0abc12 at ${A} (decision-log only)`);
@@ -1229,5 +1230,102 @@ describe("the _as2test wrapper's argv contract", () => {
 			{ sub: "base-full", runId: "tr-1" },
 		] as Parameters<typeof wrapperArgv>[0][]) expect(() => wrapperArgv(bad)).toThrow(TestRunShapeError);
 		expect(WRAPPER_EXIT).toEqual({ ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124 });
+	});
+});
+
+describe("land-first records and config (PLAN wl-mvq4edbaf13vnk D1, R7)", () => {
+	test("a body written before D1 parses as a full, non-main Mac run with no exec counts, and a PR run's body is unchanged by the fields", () => {
+		// The exact shape the runner wrote before D1 (no scope, main, host or exec in the json).
+		const old = `test-run: tr-0old1 green sha=${A} pr=17 {"sha":"${A}","pr":17,"reason":null,"headAtEnd":"${A}","base":null,"mergeBase":null,"full":{"pass":3,"fail":0,"skip":0,"exit":0,"ms":5,"error":null},"solo":[],"failures":[],"runDir":null,"preflight":"ok"}`;
+		const parsed = parseTestRun(old)!;
+		expect(parsed).toMatchObject({ scope: "full", main: false, host: "mac", exec: null });
+		expect(isFullSuiteGreen(parsed)).toBe(true);
+		expect(testRunBody(parsed)).toBe(old);
+		// a caller that predates the fields still writes the old body
+		const { scope: _s, main: _m, host: _h, exec: _e, ...bare } = parsed;
+		expect(testRunBody(bare)).toBe(old);
+	});
+
+	test("the new fields survive the body round trip and result.json; a main run alone carries pr 0", () => {
+		const fast = run(request("tr-0fast1", 17, A), "green", { scope: "fast", host: "linux", exec: { files: 12, tests: 340, treeFiles: 12 } });
+		const body = testRunBody(fast);
+		expect(body).toContain('"scope":"fast"');
+		expect(body).toContain('"host":"linux"');
+		expect(parseTestRun(body)).toEqual(fast);
+		expect(JSON.parse(resultJson(fast))).toMatchObject({ scope: "fast", host: "linux", exec: { files: 12, tests: 340, treeFiles: 12 } });
+		const main = run(request("tr-0main1", 17, B), "red", { pr: 0, main: true, exec: { files: 95, tests: 6000, treeFiles: 100 } });
+		expect(testRunBody(main)).toStartWith(`test-run: tr-0main1 red sha=${B} pr=0 {`);
+		expect(parseTestRun(testRunBody(main))).toEqual(main);
+		// a PR run never has pr 0
+		expect(() => testRunBody(run(request("tr-0pr0", 17, A), "green", { pr: 0 }))).toThrow(TestRunShapeError);
+		expect(parseTestRun(body.replace("pr=17 ", "pr=0 ").replace('"pr":17', '"pr":0'))).toBeNull();
+	});
+
+	test("a fast green is never a full-suite result; a carried fast green stays fast", () => {
+		const fast = run(request("tr-0fast1", 17, A), "green", { scope: "fast", host: "linux" });
+		expect(isFullSuiteGreen(fast)).toBe(false);
+		expect(isFullSuiteGreen(run(request("tr-0full1", 17, A), "green"))).toBe(true);
+		expect(isFullSuiteGreen(run(request("tr-0full2", 17, A), "red-main"))).toBe(false);
+		const carried = carriedRun(request("tr-0carry", 17, B), fast);
+		expect(carried).toMatchObject({ scope: "fast", host: "linux", main: false, exec: null });
+		expect(isFullSuiteGreen(carried)).toBe(false);
+		expect(isFullSuiteGreen(parseTestRun(testRunBody(carried))!)).toBe(false);
+	});
+
+	test("malformed new fields are refused: unknown scope or host, a main run that is fast or on Linux, bad exec counts", () => {
+		const good = testRunBody(run(request("tr-0x1", 17, A), "green"));
+		const withJson = (extra: string) => good.replace(/\}$/, `,${extra}}`);
+		for (const extra of [
+			'"scope":"smoke"', '"scope":null', '"host":"windows"', '"main":"yes"', '"main":true,"scope":"fast"', '"main":true,"host":"linux"',
+			'"exec":{"files":3,"tests":1}', '"exec":{"files":-1,"tests":1,"treeFiles":3}', '"exec":{"files":4,"tests":1,"treeFiles":3}', '"exec":7',
+		]) {
+			expect(parseTestRun(withJson(extra))).toBeNull();
+		}
+		expect(parseTestRun(withJson('"main":true'))).toMatchObject({ main: true, pr: 17 });
+		expect(() => testRunBody(run(request("tr-0x2", 17, A), "green", { main: true, scope: "fast" }))).toThrow(TestRunShapeError);
+	});
+
+	test("execOf: executed (not skipped) tests per tree test file, files outside the tree uncounted; an unreadable report is an error", () => {
+		const e = execOf(JUNIT_A, ["b.test.ts", "./sub/a.test.ts", "c.test.ts"]);
+		expect(e).toEqual({ ok: true, exec: { files: 2, tests: 4, treeFiles: 3 }, perFile: new Map([["b.test.ts", 1], ["sub/a.test.ts", 3]]) });
+		// a file the tree does not hold counts its tests, never a file
+		expect(execOf(JUNIT_A, ["c.test.ts"])).toEqual({ ok: true, exec: { files: 0, tests: 4, treeFiles: 1 }, perFile: new Map() });
+		expect(execOf("<testsuites", ["b.test.ts"]).ok).toBe(false);
+		expect(execOf("<testsuite/>", ["b.test.ts"])).toEqual({ ok: false, error: "junit root is <testsuite>, not <testsuites>" });
+	});
+
+	test("the config's new keys: defaults, values as written, and a malformed key is an error, never a default", () => {
+		const repos = [{ origin: "o/r", command: "bun test" }];
+		const c = testRunnerConfig({ testRunner: { repos } });
+		if (!c.ok) throw new Error(c.error);
+		expect(c.config).toMatchObject({ fastSmoke: [], macOnly: {}, fastCapMin: 10, fastWaitMin: 15 });
+		expect(c.config.fullBeforeMerge).toEqual(["package.json", "bun.lock", "bunfig.toml", "tsconfig.json", "Cargo.toml", "Cargo.lock", "build.sh"]);
+		// the parsed config is the caller's: changing it never changes the defaults
+		c.config.fullBeforeMerge.push("x.lock");
+		c.config.macOnly["a.test.ts"] = "why";
+		expect(FULL_BEFORE_MERGE_DEFAULT).not.toContain("x.lock");
+		expect(TEST_RUNNER_DEFAULTS.macOnly).toEqual({});
+		const set = testRunnerConfig(Bun.YAML.parse([
+			"testRunner:",
+			"  fastSmoke: [surface/test/smoke.test.ts, surface/test/smoke.test.ts]",
+			"  macOnly:",
+			"    gates/test/fence.test.ts: sandbox-exec is macOS only",
+			"  fullBeforeMerge: [package.json, go.mod]",
+			"  fastCapMin: 8",
+			"  fastWaitMin: 20",
+		].join("\n")));
+		expect(set.ok && set.config).toMatchObject({
+			fastSmoke: ["surface/test/smoke.test.ts"], macOnly: { "gates/test/fence.test.ts": "sandbox-exec is macOS only" }, fullBeforeMerge: ["package.json", "go.mod"],
+			fastCapMin: 8, fastWaitMin: 20,
+		});
+		for (const bad of [
+			{ fastSmoke: "surface/test/smoke.test.ts" }, { fastSmoke: ["./surface/test/smoke.test.ts"] }, { fastSmoke: ["surface/src/x.ts"] }, { fastSmoke: ["../x.test.ts"] },
+			{ macOnly: ["gates/test/fence.test.ts"] }, { macOnly: { "gates/test/fence.test.ts": "" } }, { macOnly: { "/abs/x.test.ts": "why" } },
+			{ fullBeforeMerge: "package.json" }, { fullBeforeMerge: ["sub/package.json"] }, { fullBeforeMerge: [""] },
+			{ fastCapMin: 0 }, { fastWaitMin: "15" },
+		]) {
+			const r = testRunnerConfig({ testRunner: { repos, ...bad } });
+			expect(r.ok).toBe(false);
+		}
 	});
 });
