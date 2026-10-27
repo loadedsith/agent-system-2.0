@@ -185,6 +185,10 @@ skills:
 
 modelRoles:
   judge: typesafe/jev-1.13.0
+  # Jo 2026-10-26 (in-mvplvhx6h1c35s): an unnamed lane and Ilex start on Opus by setting, not by OMP's
+  # provider-default order; a lane Jo pinned with `lane-model:` passes --model and is unaffected
+  # (surface/src/launch.ts laneArgv).
+  default: anthropic/claude-opus-5-5
 retry:
   fallbackChains:
     judge: []
@@ -209,6 +213,10 @@ retry:
 # (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
 # 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
 # kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
+# The moonshot row-3 entries are removed until Kimi is paid again (Jo, 2026-10-26,
+# in-mvplvhx6h1c35s; the Moonshot account is suspended for insufficient balance). While
+# classifier/src/lab.ts KIMI_OUT_RULE is active (ends 2026-11-01T00:00-07:00), its rowOmission treats
+# a row with no kimi entry as Kimi out. migration/items/kimi-off-tier-rows-until-paid.md restores them.
 # Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a build is
 # restricted to its lane's lab by that map, and a review is routed to labs other than the
 # builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab review"); a review whose row names a
@@ -218,15 +226,12 @@ task:
     fast:
       - anthropic/claude-haiku-4-5
       - openai-codex/gpt-5.6-luna
-      - moonshot/kimi-k2.7-code-highspeed
     standard:
       - anthropic/claude-sonnet-5-5
       - openai-codex/gpt-6-luna
-      - moonshot/kimi-k2.5
     strong:
       - anthropic/claude-opus-5-5
       - openai-codex/gpt-6.1-sol
-      - moonshot/kimi-k2.7-code
     # deep's OpenAI entry is not used for reviews: classifier/src/lab.ts REVIEW_ROW_FROM sends a
     # deep review's OpenAI reviewer to the strong row via reviewRow (Jo, 2026-10-12,
     # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise. The
@@ -238,7 +243,6 @@ task:
     deep:
       - anthropic/claude-fable-5-1
       - openai-codex/gpt-6-astra
-      - moonshot/kimi-k3
   # M4: any task.* keys for the tool policy go inside this `task:` mapping (YAML allows one
   # `task:` key per file).
 

@@ -245,6 +245,7 @@ describe("mature week-only runner admission against configured budget alternativ
 
 		test(`${named ? "named" : "unnamed"} source 5h hard ceiling cannot be waived by a faster budget alternative`, async () => {
 			const r = makeRoot({});
+			installTierTable(r, [A, SOL, K]);
 			writeComparisonPolls(r, 0.34, { sourceHard: true });
 			const wl = openWorkload(r, named ? SOL : null);
 			launch(r, wl, { steps: DONE, stateModel: { provider: "openai-codex", id: "gpt-6.1-sol" } });
