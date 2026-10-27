@@ -1383,3 +1383,7 @@ plugins/test/paired-coding.test.ts	test	-
 # 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
 gates/src/pair-call.ts	module	-
 gates/test/paired-coding.test.ts	test	-
+# GitHub's saved compare and commit answers for PR #305 (aebe37a4...cde03460), the decision-log carry fixture
+# (wl-mvpwkpqobyp20w PLAN D5, 2026-10-26).
+surface/test/fixtures/train-carry-305/compare.json	test	-
+surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
