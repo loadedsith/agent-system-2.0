@@ -2,9 +2,9 @@
 title: A decision-log-only commit never costs a full test rerun on the merge train
 status: building
 workload: wl-mvpwkpqobyp20w
-pr: none
+pr: 320
 ---
-Workload `wl-mvpwkpqobyp20w` (normal stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mvpwkpqobyp20w/PLAN.md`). Built on branch `wl/wl-mvpwkpqobyp20w`; no PR yet.
+Workload `wl-mvpwkpqobyp20w` (normal stakes, plan revision 4 at `~/agent-scratch/agent-system-2.0/wl-mvpwkpqobyp20w/PLAN.md`). Built on branch `wl/wl-mvpwkpqobyp20w`, PR #320.
 
 **Evidence.** PR #305 was green at `aebe37a4`. Then `close-entry.ts` committed one decision-log entry, `cde03460`, on the PR branch. That commit has one parent and touches one file under `.ai/decision-log/`. The train did not accept the green at the new head. It needed a fresh full run, and the runner made it wait 49 minutes, from 3:50 PM to 4:39 PM PDT on 2026-10-26. PR #309 had the same shape: green at `3edec08a`, decision-log commit `c6e3430f`. The saved GitHub answers for #305 are the fixture `surface/test/fixtures/train-carry-305/`.
 
