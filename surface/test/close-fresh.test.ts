@@ -7,7 +7,7 @@
 // fetch and push stays local), a fake `gh` first on PATH that records its argv and answers
 // `pr list --state all` per head branch from `prs/<branch>.json`, and a testRunner config through
 // `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`.
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
@@ -19,6 +19,10 @@ import { branchName, worktreePath } from "../src/launch";
 import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
+
+// Every test spawns real git and the fake gh many times (3-4 s idle); on a loaded runner the 5 s
+// bun default killed them mid-check (tr-0mvqeuifhqv87ca: 4 timeouts, the close check reading -1).
+setDefaultTimeout(30_000);
 
 const roots: string[] = [];
 afterAll(() => {
