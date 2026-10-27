@@ -52,6 +52,8 @@ const sha256 = (p: string): string => createHash("sha256").update(readFileSync(p
 // ---- the fixture repository: main plus one PR per scenario -------------------------------------------
 
 const PASS = (name: string) => `import { expect, test } from "bun:test";\ntest(${JSON.stringify(name)}, () => { expect(1 + 1).toBe(2); });\n`;
+/** A file whose only case is skipped: the full part runs no test of it, so it runs alone (PLAN wl-mvq4edh02r5z40 D1). */
+const SKIPPED = (name: string) => `import { test } from "bun:test";\ntest.skip(${JSON.stringify(name)}, () => {});\n`;
 const RED = `import { test } from "bun:test";
 for (let i = 1; i <= 25; i++) {
 	const n = String(i).padStart(2, "0");
@@ -90,12 +92,20 @@ test("hangs", async () => {
 const EXITS = `import { test } from "bun:test";
 test("exits before the report", () => { process.exit(0); });
 `;
+// HANG after 6 MiB of output: the part's log passes the world's 5 MB report cap, so its import is refused. The sleep is the
+// hang the part's cap must end; it runs in the code under test, not in this file's own tests.
+const HANG_LOUD = `import { test } from "bun:test";
+test("hangs loudly", async () => {
+	for (let i = 0; i < 6; i++) process.stdout.write(\`\${"x".repeat(1 << 20)}\\n\`);
+	await Bun.sleep(10_000_000);
+}, 100_000_000);
+`;
 // A failing security test (surface/src/test-run.ts SECURITY_TEST_PATHS): a gate test the PR breaks (fix round 1, F4).
 const GATE_RED = `import { test } from "bun:test";
 test("refuses a forged approve", () => { throw new Error("the gate let it through"); });
 `;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -104,9 +114,11 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	env: { "env.test.ts": ENV_DUMP },
 	hang: { "hang.test.ts": HANG },
 	exit: { "exits.test.ts": EXITS },
-	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling.
-	space: { " a.test.ts": PASS("space a"), "a.test.ts": PASS("a") },
+	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling. Only the skipped one runs alone.
+	space: { " a.test.ts": SKIPPED("space a"), "a.test.ts": PASS("a") },
 	gate: { "gates/test/gate.test.ts": GATE_RED },
+	skipped: { "a.test.ts": SKIPPED("a skipped") },
+	loud: { "loud.test.ts": HANG_LOUD },
 };
 
 interface Fixture {
@@ -722,7 +734,7 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 // ---- whole runs ------------------------------------------------------------------------------------------
 
 describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
-	test("green: start prints its line, the run settles the slice it added; ./ exact path; the bundle clone has history and the trusted-main tag; no smudge filter ran; a sweep after each part; no message", async () => {
+	test("green: start prints its line, the run settles the slice it added; the changed file the full part ran gets no solo part; the bundle clone has history and the trusted-main tag; no smudge filter ran; a sweep after each part; no message", async () => {
 		const w = world();
 		const { wl } = workload(w);
 		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
@@ -741,19 +753,21 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const run = await resultOf(w, wl, runId!);
 		expect(run).toMatchObject({ verdict: "green", sha: fx.head.green, headAtEnd: fx.head.green, base: fx.main, mergeBase: fx.main, runDir: join(w.runs, runId!) });
 		expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-		// `./a.test.ts` alone runs a.test.ts only: xa.test.ts, which `a.test.ts` as a substring would also match, is not in it.
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./a.test.ts", pass: 1, fail: 0, exit: 0, error: null })]);
+		// PLAN wl-mvq4edh02r5z40 D1: the full part ran a test of the changed a.test.ts, so it does not run alone.
+		expect(run.solo).toEqual([]);
+		expect(subsOf(w, runId!)).not.toContain("solo");
+		expect(runnerLog(w, runId!)).toContain("solo parts: none");
 		expect(run.preflight).toContain("probe:");
 		await until("the settle", () => w.ledger.slice(slice!)?.state === "done");
-		expect(w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: ./a.test.ts 1/0; ${join(w.runs, runId!)}`);
+		expect(w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: none; ${join(w.runs, runId!)}`);
 		// The ledger settles before result.json is published and the run lock is released.
 		await until(`runner ${pid} gone`, () => !alive(Number(pid)));
 		expect(JSON.parse(readFileSync(join(w.runs, runId!, "result.json"), "utf8"))).toMatchObject({ runId, verdict: "green", sha: fx.head.green });
-		for (const f of ["full.xml", "full.log", "solo-1.xml", "solo-1.log"]) expect(existsSync(join(w.runs, runId!, f))).toBe(true);
+		for (const f of ["full.xml", "full.log"]) expect(existsSync(join(w.runs, runId!, f))).toBe(true);
 		expect(heldMessages(w, wl)).toEqual([]);
 
 		expect(existsSync(join(w.root, "SMUDGED"))).toBe(false);
-		expect(marks(w, runId!, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./a.test.ts"]);
+		expect(marks(w, runId!, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
 
 		// The handoff: `_as2test`'s clone from the bundle is a real repository.
 		const clone = join(workDirOf(runId!, w.as2), "repo");
@@ -777,11 +791,12 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 	test("every wrapper call starts in the as2test root, never the 0700 run dir _as2test cannot read (item 24, Jo's diagnosis)", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
-		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		// A red PR, so a solo part and base's parts run too.
+		const runId = request(w, wl, slice, PR.red, fx.head.red);
 		await spawnRun(w, runId).exited;
-		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
+		expect((await resultOf(w, wl, runId)).verdict).toBe("red");
 		const calls = readFileSync(join(w.root, "sudo-cwd.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId);
-		expect(calls.map(([sub]) => sub).filter((s, i, all) => all.indexOf(s) === i).sort()).toEqual(["full", "prepare", "probe", "solo", "sweep"]);
+		expect(calls.map(([sub]) => sub).filter((s, i, all) => all.indexOf(s) === i).sort()).toEqual(["base-prepare", "base-solo", "full", "prepare", "probe", "solo", "sweep"]);
 		for (const [sub, , cwd] of calls) expect({ sub, cwd }).toEqual({ sub, cwd: w.as2 });
 	});
 
@@ -791,11 +806,23 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const runId = request(w, wl, slice, PR.space, fx.head.space);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
-		expect(run.solo).toEqual([
-			expect.objectContaining({ file: "./ a.test.ts", pass: 1, fail: 0, error: null }),
-			expect.objectContaining({ file: "./a.test.ts", pass: 1, fail: 0, error: null }),
-		]);
+		// ` a.test.ts` only skips, so it alone runs alone: its one skipped case, never its passing sibling's case.
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./ a.test.ts", pass: 0, fail: 0, skip: 1, error: null })]);
 		expect(run.verdict).toBe("green");
+	});
+
+	test("PLAN wl-mvq4edh02r5z40 D1: all-pass with a changed file whose cases all skip runs that file alone, by its exact ./ path", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.skipped, fx.head.skipped);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.full).toMatchObject({ pass: 1, fail: 0, skip: 1, exit: 0, error: null });
+		// `./a.test.ts` alone runs a.test.ts only: xa.test.ts, which `a.test.ts` as a substring would also match, is not in it.
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./a.test.ts", pass: 0, fail: 0, skip: 1, exit: 0, error: null })]);
+		expect(subsOf(w, runId).filter((s) => s === "solo")).toHaveLength(1);
+		expect(run.verdict).toBe("green");
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./a.test.ts"]);
 	});
 
 	test("fullWorkers (wl-mvg2kzuvwngdmo): the trusted phase writes it into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
@@ -854,7 +881,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(heldMessages(w, wl)).toEqual([]);
 	});
 
-	test("fix round 1 (F4): a run failing a gates/test/ test while a lane holds the workload under a live lease sends exactly one security-red: and no test-run-failed:", async () => {
+	test("fix round 1 (F4), PLAN wl-mvq4edh02r5z40 D1: a run failing a gates/test/ test is red with no rerun of it, and while a lane holds the workload under a live lease sends exactly one security-red: and no test-run-failed:", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
@@ -863,9 +890,12 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
 		expect(run.verdict).toBe("red");
-		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", "gates/test/gate.test.ts > refuses a forged approve"], ["./gates/test/gate.test.ts", "gates/test/gate.test.ts > refuses a forged approve"]]);
+		// a security failure is never rerun, on the PR or on base
+		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", "gates/test/gate.test.ts > refuses a forged approve"]]);
+		expect(run.solo).toEqual([]);
+		expect(subsOf(w, runId).filter((s) => s === "solo" || s.startsWith("base-"))).toEqual([]);
 		expect(heldMessages(w, wl)).toEqual([{
-			body: `security-red: ${wl} ${slice} ${runId} ${fx.head.gate} 2 gates/test/gate.test.ts > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
+			body: `security-red: ${wl} ${slice} ${runId} ${fx.head.gate} 1 gates/test/gate.test.ts > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
 		}]);
 	});
 
@@ -902,17 +932,18 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(statusPosts(w)).toHaveLength(3);
 	});
 
-	test("a changed _spec.ts file failing alone with the suite green is red", async () => {
+	// PLAN wl-mvq4edh02r5z40 tradeoff 1 (Jo's (2)): coverage only guarantees the file ran, so a failure only alone goes unseen.
+	test("PLAN wl-mvq4edh02r5z40 D1: an all-pass full part that ran the changed _spec.ts file runs no solo part, so a failure only alone is not run", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.solo, fx.head.solo);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
 		expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./order_spec.ts", pass: 0, fail: 1 })]);
-		expect(run.verdict).toBe("red");
-		expect(run.failures).toEqual([{ part: "./order_spec.ts", name: "order_spec.ts > needs a clean clone", firstError: "error: state leaked by an earlier run is still here" }]);
-		expect(w.ledger.slice(slice)!.state).toBe("open");
+		expect(run.solo).toEqual([]);
+		expect(subsOf(w, runId)).not.toContain("solo");
+		expect(run.verdict).toBe("green");
+		expect(run.failures).toEqual([]);
 	});
 
 	test("the head moved mid-run: stale, nothing settled", async () => {
@@ -1038,21 +1069,62 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(dump.descendantGit).toBe(join(childLayout(workDir).shimDir, "git"));
 		const leftover = Number(readFileSync(join(workDir, "repo", "leftover.pid"), "utf8"));
 		expect(alive(leftover)).toBe(false);
-		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./env.test.ts"]);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
 	});
 
-	test("a part past its cap: the wrapper kills its group and the part is error timeout", async () => {
+	/** The wrapper calls of a run that are a solo part or anything on base. */
+	const soloOrBase = (w: World, runId: string) => subsOf(w, runId).filter((s) => s === "solo" || s.startsWith("base-"));
+
+	test("PLAN wl-mvq4edh02r5z40 D0/D1: a full part past its cap ends the run: no solo or base part, its sweep and the head re-check still run, error naming the timeout, the stuck capture imported", async () => {
 		const w = world({ capMin: 0.05 });
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.hang, fx.head.hang);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
-		expect(run.verdict).toBe("error");
+		expect(run).toMatchObject({ verdict: "error", reason: "full: timeout", headAtEnd: fx.head.hang });
 		expect(run.full).toMatchObject({ exit: WRAPPER_EXIT.timeout, error: "timeout" });
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./hang.test.ts", error: "timeout" })]);
+		expect(run.solo).toEqual([]);
+		expect(soloOrBase(w, runId)).toEqual([]);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full part timed out: no solo or base parts");
+		expect(log).toContain("full.stuck.log imported");
+		expect(readFileSync(join(w.runs, runId, "full.stuck.log"), "utf8").length).toBeGreaterThan(0);
 		const pid = Number(readFileSync(join(workDirOf(runId, w.as2), "repo", "hang.pid"), "utf8"));
 		expect(alive(pid)).toBe(false);
-	});
+		expect(w.ledger.slice(slice)!.state).toBe("open");
+	}, 120_000);
+
+	test("PLAN wl-mvq4edh02r5z40 D0: a full part past its cap whose log import is refused (over the report cap) is still a timeout: no solo or base part", async () => {
+		const w = world({ capMin: 0.05 });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.loud, fx.head.loud);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toStartWith("full: timeout; report import refused: full.log is over the");
+		expect(run.full!.error).toStartWith("timeout; report import refused: full.log is over the");
+		expect(run.solo).toEqual([]);
+		expect(soloOrBase(w, runId)).toEqual([]);
+		expect(runnerLog(w, runId)).toContain("full part timed out: no solo or base parts");
+	}, 120_000);
+
+	test("PLAN wl-mvq4edh02r5z40 D0: the outlive sweep firing on the full part's call is a timeout whatever the wrapper's later exit: no solo or base part, error naming the timeout", async () => {
+		const w = world({ capMin: 0.05 });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.hang, fx.head.hang);
+		// The test knob: the runner sweeps 1 ms past the cap, before the wrapper's own cap path has ended the part.
+		await spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS: "1" }).exited;
+		const run = await resultOf(w, wl, runId);
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full outlived its cap by 0.001 s; sweeping");
+		expect(log).toMatch(/ full tr-[a-z0-9]+ → (exit \d+|SIG[A-Z]+) \(after the outlive sweep\)/);
+		expect(log).toContain("full part timed out: no solo or base parts");
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toStartWith("full: timeout");
+		expect(run.solo).toEqual([]);
+		expect(soloOrBase(w, runId)).toEqual([]);
+	}, 120_000);
 
 	test("retention: past the newest 10, a run loses its stage dir, its work dir (through the fenced cleanup) and its run dir's scratch files; logs, reports and result.json stay", async () => {
 		const w = world();
@@ -1085,7 +1157,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 	});
 });
 
-// ---- red main: failing parts rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8) ---------------------------------
+// ---- red main: failing files rerun alone on base (PLAN wl-mv8s8srodefytc rev 17.1 D8, PLAN wl-mvq4edh02r5z40 D3) ---------
 
 const BROKEN = `import { test } from "bun:test";
 test("main is red", () => { throw new Error("broken on main"); });
@@ -1101,14 +1173,13 @@ test("passes alone", () => { if (me > 1) throw new Error("the other file of the 
 const TOUCHED = "// touched by the PR\n";
 
 /**
- * The world's GitHub with a red main: main gains broken.test.ts (one failing test), the ALONE pair and `mainFiles`, then each PR
- * is one commit on that main at refs/pull/<N>/head, its files written over main's.
+ * The world's GitHub with a red main: main gains `mainFiles` (broken.test.ts, one failing test, by default), then each PR is one
+ * commit on that main at refs/pull/<N>/head, its files written over main's.
  */
-function redMain(w: World, prs: Record<number, Record<string, string>>, mainFiles: Record<string, string> = {}): { main: string; head: Record<number, string> } {
+function redMain(w: World, prs: Record<number, Record<string, string>>, mainFiles: Record<string, string> = { "broken.test.ts": BROKEN }): { main: string; head: Record<number, string> } {
 	const work = join(w.root, "red-main");
 	g(w.root, "clone", "-q", w.origin, work);
-	const files: Record<string, string> = { "broken.test.ts": BROKEN, "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE, ...mainFiles };
-	for (const [f, text] of Object.entries(files)) {
+	for (const [f, text] of Object.entries(mainFiles)) {
 		mkdirSync(dirname(join(work, f)), { recursive: true });
 		writeFileSync(join(work, f), text);
 	}
@@ -1130,100 +1201,126 @@ function redMain(w: World, prs: Record<number, Record<string, string>>, mainFile
 /** The wrapper subcommands one run made, in order (the fake sudo's log). */
 const subsOf = (w: World, runId: string): string[] =>
 	readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId).map(([sub]) => sub!);
-const cached = (w: World, sha: string, part: string): boolean => existsSync(join(w.runs, "base-cache", sha, `${encodeURIComponent(part)}.json`));
+const cachePath = (w: World, sha: string, part: string): string => join(w.runs, "base-cache", sha, `${encodeURIComponent(part)}.json`);
+const cached = (w: World, sha: string, part: string): boolean => existsSync(cachePath(w, sha, part));
 
-describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8)", () => {
-	test("a full-only failure that passes alone and fails on base's full run is red-main: settled, status success, no message; a second PR on that base reuses base's full result", async () => {
+describe("red main: each failing file rerun alone on base (PLAN wl-mv8s8srodefytc rev 17.1 D8, PLAN wl-mvq4edh02r5z40 D3)", () => {
+	test("red: only the failing file runs alone; base runs that file alone (never the full suite) and fails the same: red-main, settled, status success, no message; base's result is cached and a second PR reuses it; a `full` cache entry is never read", async () => {
 		const w = world();
-		const r = redMain(w, { 21: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED }, 22: { "broken.test.ts": BROKEN + TOUCHED } });
+		const r = redMain(w, { 22: { "broken.test.ts": BROKEN + TOUCHED, "ok.test.ts": PASS("ok") }, 23: { "broken.test.ts": `${BROKEN}// again\n` } });
+		// What an older runner cached for base's full suite: never read again.
+		const seeded = JSON.stringify({ pass: 0, fail: 0, skip: 0, exit: 0, ms: 1, error: null, failures: [] });
+		mkdirSync(dirname(cachePath(w, r.main, "full")), { recursive: true });
+		writeFileSync(cachePath(w, r.main, "full"), seeded);
 
 		const one = workload(w);
-		const first = request(w, one.wl, one.slice, 21, r.head[21]!);
+		const first = request(w, one.wl, one.slice, 22, r.head[22]!);
 		await spawnRun(w, first).exited;
 		const run = await resultOf(w, one.wl, first);
 		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
-		expect(run.full).toMatchObject({ fail: 2, error: null });
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./alone_a.test.ts", fail: 0 }), expect.objectContaining({ file: "./alone_b.test.ts", fail: 0 })]);
-		// only the full part failed, so only the full argv ran on base, and base failed every one of its failures
-		expect(run.baseCompare!.sha).toBe(r.main);
-		expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["full"]);
-		const full = run.baseCompare!.parts[0]!;
-		expect(full.failing).toContain("broken.test.ts > main is red");
-		expect(full.baseFailing).toEqual(expect.arrayContaining(full.failing));
-		expect(subsOf(w, first)).toEqual(expect.arrayContaining(["base-prepare", "base-full"]));
-		expect(subsOf(w, first)).not.toContain("base-solo");
-		expect(cached(w, r.main, "full")).toBe(true);
+		expect(run.full).toMatchObject({ fail: 1, error: null });
+		// the changed ok.test.ts passed in the full part: it does not run alone
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./broken.test.ts", fail: 1, error: null })]);
+		expect(subsOf(w, first).filter((s) => s === "solo")).toHaveLength(1);
+		expect(subsOf(w, first)).toEqual(expect.arrayContaining(["base-prepare", "base-solo"]));
+		expect(subsOf(w, first)).not.toContain("base-full");
+		expect(run.baseCompare).toEqual({ sha: r.main, parts: [{ part: "./broken.test.ts", failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"], baseError: null }] });
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
+		expect(readFileSync(cachePath(w, r.main, "full"), "utf8")).toBe(seeded);
+		expect(runnerLog(w, first)).not.toContain("base full");
 		await until("the settle", () => w.ledger.slice(one.slice)?.state === "done");
-		expect(w.ledger.slice(one.slice)!.artifact).toStartWith(`test-run ${first}: red-main at ${r.head[21]} on PR #21;`);
+		expect(w.ledger.slice(one.slice)!.artifact).toStartWith(`test-run ${first}: red-main at ${r.head[22]} on PR #22;`);
 		expect(w.ledger.slice(one.slice)!.artifact).toContain(r.main);
-		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`]);
+		expect(statusPosts(w)).toEqual([`success ${r.head[22]}`]);
 		expect(heldMessages(w, one.wl)).toEqual([]);
 
-		// PR #22 fails the same test in the suite and alone: each part is compared with base's run of that part; full comes from the cache
+		// PR #23 fails the same test: base's solo result of that file comes from the cache, so nothing runs on base
 		const two = workload(w);
-		const second = request(w, two.wl, two.slice, 22, r.head[22]!);
+		const second = request(w, two.wl, two.slice, 23, r.head[23]!);
 		await spawnRun(w, second).exited;
 		const run2 = await resultOf(w, two.wl, second);
 		expect(run2.verdict).toBe("red-main");
-		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError])).toEqual([["full", null], ["./broken.test.ts", null]]);
-		expect(run2.baseCompare!.parts[1]).toMatchObject({ failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"] });
-		expect(runnerLog(w, second)).toContain(`base full at ${r.main}: cached`);
-		expect(subsOf(w, second)).toEqual(expect.arrayContaining(["base-prepare", "base-solo"]));
-		expect(subsOf(w, second)).not.toContain("base-full");
-		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
-		expect(statusPosts(w)).toEqual([`success ${r.head[21]}`, `success ${r.head[22]}`]);
+		expect(run2.baseCompare!.parts).toEqual([{ part: "./broken.test.ts", failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"], baseError: null }]);
+		expect(runnerLog(w, second)).toContain(`base ./broken.test.ts at ${r.main}: cached`);
+		expect(subsOf(w, second).filter((s) => s.startsWith("base-"))).toEqual([]);
+		expect(statusPosts(w)).toEqual([`success ${r.head[22]}`, `success ${r.head[23]}`]);
 	});
 
-	test("fix round 1 (F4): a gates/test/ test that fails on base too is red-main, and still sends exactly one security-red: (no test-run-failed:)", async () => {
+	test("red when the failing file passes alone: the full failure stays in the entry, the reason names the file, and nothing runs on base", async () => {
+		const w = world();
+		const r = redMain(w, { 25: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED } }, { "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, 25, r.head[25]!);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("red");
+		expect(run.full).toMatchObject({ fail: 1, error: null });
+		const failing = run.failures.filter((f) => f.part === "full");
+		expect(failing).toHaveLength(1);
+		const file = failing[0]!.name.split(" > ")[0]!;
+		expect(failing[0]!.name).toBe(`${file} > passes alone`);
+		// only the failing file of the pair runs alone, and passes
+		expect(run.solo).toEqual([expect.objectContaining({ file: `./${file}`, pass: 1, fail: 0, error: null })]);
+		expect(run.failures).toEqual(failing);
+		expect(run.reason).toBe(`failing in the full part; passed alone: ./${file}`);
+		expect(subsOf(w, runId).filter((s) => s === "solo")).toHaveLength(1);
+		expect(subsOf(w, runId).filter((s) => s.startsWith("base-"))).toEqual([]);
+		expect(run.baseCompare ?? null).toBeNull();
+		expect(w.ledger.slice(slice)!.state).toBe("open");
+		expect(statusPosts(w)).toEqual([`failure ${r.head[25]}`]);
+	});
+
+	test("fix round 1 (F4), PLAN wl-mvq4edh02r5z40 D3: a gates/test/ test that fails on base too is red, never red-main: not rerun on the PR or on base, and exactly one security-red: (no test-run-failed:)", async () => {
 		const w = world();
 		const gate = "gates/test/gate.test.ts";
 		const r = redMain(w, { 23: { [gate]: GATE_RED + TOUCHED } }, { [gate]: GATE_RED });
 		const { wl, slice } = workload(w);
+		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
 		const runId = request(w, wl, slice, 23, r.head[23]!);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
-		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
-		const security = run.failures.filter((f) => f.name.startsWith(`${gate} > `));
-		expect(security.map((f) => f.part)).toEqual(["full", `./${gate}`]);
+		expect(run).toMatchObject({ verdict: "red", base: r.main });
+		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", `${gate} > refuses a forged approve`]]);
+		expect(subsOf(w, runId).filter((s) => s === "solo" || s.startsWith("base-"))).toEqual([]);
 		expect(heldMessages(w, wl)).toEqual([{
-			body: `security-red: ${wl} ${slice} ${runId} ${r.head[23]} 2 ${gate} > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
+			body: `security-red: ${wl} ${slice} ${runId} ${r.head[23]} 1 ${gate} > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
 		}]);
 	});
 
-	test("one failure base does not have gives red; a base part that errored gives red and is not cached; neither posts success", async () => {
+	test("a base-prepare that fails gives red and caches nothing; a failure base's solo run lacks gives red; neither posts success", async () => {
 		const w = world();
-		const NEW_RED = `import { test } from "bun:test";\ntest("new failure", () => { throw new Error("the PR broke it"); });\n`;
 		// The PR's own test plants runs/<id>/base, so base cannot be prepared beside its clone.
 		const PLANT = `import { test } from "bun:test";\nimport { mkdirSync } from "node:fs";\ntest("main is red", () => { throw new Error("broken on main"); });\ntest("passes", () => { mkdirSync("../base", { recursive: true }); });\n`;
-		const r = redMain(w, { 23: { "new_red.test.ts": NEW_RED }, 24: { "broken.test.ts": PLANT } });
+		const NEW_RED = `${BROKEN}test("new failure", () => { throw new Error("the PR broke it"); });\n`;
+		const r = redMain(w, { 23: { "broken.test.ts": NEW_RED }, 24: { "broken.test.ts": PLANT } });
 
 		const one = workload(w);
-		const first = request(w, one.wl, one.slice, 23, r.head[23]!);
+		const first = request(w, one.wl, one.slice, 24, r.head[24]!);
 		await spawnRun(w, first).exited;
 		const run = await resultOf(w, one.wl, first);
 		expect(run.verdict).toBe("red");
-		const full = run.baseCompare!.parts.find((p) => p.part === "full")!;
-		expect(full.failing).toContain("new_red.test.ts > new failure");
-		expect(full.baseFailing).not.toContain("new_red.test.ts > new failure");
-		expect(full.baseFailing).toContain("broken.test.ts > main is red");
+		expect(runnerLog(w, first)).toContain("base-prepare failed");
+		expect(run.baseCompare!.parts).toEqual([{ part: "./broken.test.ts", failing: ["broken.test.ts > main is red"], baseFailing: null, baseError: "not run on base" }]);
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(false);
 		expect(w.ledger.slice(one.slice)!.state).toBe("open");
 
 		const two = workload(w);
-		const second = request(w, two.wl, two.slice, 24, r.head[24]!);
+		const second = request(w, two.wl, two.slice, 23, r.head[23]!);
 		await spawnRun(w, second).exited;
 		const run2 = await resultOf(w, two.wl, second);
 		expect(run2.verdict).toBe("red");
-		// the full part matches base's (cached) full run; the solo part never ran on base
-		expect(run2.baseCompare!.parts.map((p) => [p.part, p.baseError === null])).toEqual([["full", true], ["./broken.test.ts", false]]);
-		expect(runnerLog(w, second)).toContain("base-prepare failed");
-		expect(cached(w, r.main, "./broken.test.ts")).toBe(false);
+		const part = run2.baseCompare!.parts[0]!;
+		expect(part).toMatchObject({ part: "./broken.test.ts", baseError: null });
+		expect(part.failing).toEqual(["broken.test.ts > main is red", "broken.test.ts > new failure"]);
+		expect(part.baseFailing).toEqual(["broken.test.ts > main is red"]);
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
 		expect(w.ledger.slice(two.slice)!.state).toBe("open");
-		expect(statusPosts(w)).toEqual([`failure ${r.head[23]}`, `failure ${r.head[24]}`]);
+		expect(statusPosts(w)).toEqual([`failure ${r.head[24]}`, `failure ${r.head[23]}`]);
 	});
 
 	test("base reruns longer than the finalize deadline still settle red-main: the post-sweep deadline starts after base runs", async () => {
 		const w = world();
-		const r = redMain(w, { 25: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED } });
+		const r = redMain(w, { 25: { "broken.test.ts": BROKEN + TOUCHED } });
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, 25, r.head[25]!);
 		arm(w, runId, "phase-base-prepare");
@@ -1238,7 +1335,7 @@ describe("red main: each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 
 			await child.exited;
 			const run = await resultOf(w, wl, runId);
 			expect(run).toMatchObject({ verdict: "red-main", base: r.main });
-			expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["full"]);
+			expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["./broken.test.ts"]);
 			await until("the settle", () => w.ledger.slice(slice)?.state === "done");
 			expect(statusPosts(w)).toEqual([`success ${r.head[25]}`]);
 		} finally {
@@ -1930,8 +2027,9 @@ describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 		const rb = await resultOf(w, b.wl, B);
 		expect(ra.verdict).toBe("superseded");
 		expect(w.ledger.slice(a.slice)!.state).toBe("open");
-		// B retried its sweep once, got the lock only after A's sweep ended, and its preflight and parts ran unharmed after that.
-		expect(marks(w, B, "sweep").map((m) => [m.after, m.attempt])).toEqual([["publish", 0], ["publish", 1], ["full", 0], ["./a.test.ts", 0]]);
+		// B retried its sweep once, got the lock only after A's sweep ended, and its preflight and full part ran unharmed after that
+		// (green, so no solo part: PLAN wl-mvq4edh02r5z40 D1).
+		expect(marks(w, B, "sweep").map((m) => [m.after, m.attempt])).toEqual([["publish", 0], ["publish", 1], ["full", 0]]);
 		expect(runnerLog(w, B)).toContain(`ended by ${signal}; retry 1 of 3`);
 		expect(marks(w, B, "spawn-probe")[0]!.at as number).toBeGreaterThan(resumedAt);
 		expect(rb).toMatchObject({ verdict: "green" });

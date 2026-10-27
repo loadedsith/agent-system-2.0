@@ -17,9 +17,17 @@
 //       request first, by their `test-requested:` entry's time in runs.db's `queue` table, skipping dead waiters), `current` published
 //       in the acquiring transaction, the install check (a drifted bundle is refreshed once through `sudo -n
 //       <libexec>/refresh`), sweep, probe, retention, the trusted clone and bundle, then every untrusted step through
-//       `sudo -n -u _as2test <exec> …`, a sweep after each part, then each failing part rerun on base when every part reported
-//       (`baseParts`, PLAN wl-mv8s8srodefytc rev 17.1 D8: the full argv or the file alone in a clone at base's sha, cached per base sha
-//       and part under <runs root>/base-cache), the head re-check, one `test-run:` entry and the settle
+//       `sudo -n -u _as2test <exec> …`, a sweep after each part. After the full part the solo policy (`soloPlan`, PLAN
+//       wl-mvq4edh02r5z40 D1) decides what runs alone: a full part that timed out (exit 124, or the outlive sweep fired on it)
+//       ends the run there (runner.log `full part timed out: no solo or base parts`; its sweep and the head re-check still run,
+//       and the verdict is error naming the timeout); an all-pass full part runs alone only the changed test files its junit ran
+//       no test of; a full part with failing tests runs alone only its failing files, never a security test; any other full
+//       error runs every changed test file alone but a failing security test. A rerun is diagnostic: it never turns a failure
+//       green nor drops it. Then, when every part reported cleanly (`baseParts`, D3), each failing file rerun alone is run alone
+//       on base too (`base-solo` in a clone at base's sha, cached per base sha and `./<file>` under <runs root>/base-cache; the
+//       full suite never runs on base). After a call that timed out, the wrapper's stuck capture `<part>.stuck.log` is imported
+//       into the run dir under the report checks; a missing or refused capture is one runner.log line and changes nothing. Then
+//       the head re-check, one `test-run:` entry and the settle
 //       in one ledger transaction; then, when the fetch confirmed the requested sha, the `as2/full-suite` commit status on
 //       that sha for any PR (green and red-main success, red failure, error error; stale and superseded post none; PLAN
 //       wl-mv8s8srodefytc rev 17.1 D2, D8), and the lock released. No `pending` is posted: a missing status already blocks a
@@ -27,7 +35,7 @@
 //
 //       Parallel files (workload wl-mvg2kzuvwngdmo): the trusted phase writes the profile's `testRunner.fullWorkers` into
 //       caps.json beside the caps, and the run logs `<ts> full workers <n>` right before the PR full part; test-exec runs that
-//       part with `bun test --parallel=<n>` when n is over 1. Base reruns (`base-full`) stay serial whatever n is.
+//       part with `bun test --parallel=<n>` when n is over 1. Solo parts, on the PR and on base, run one file each.
 //       surface/scripts/test-run-waits.ts reads the waits, the `full workers` lines and the results back per day.
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
@@ -43,6 +51,7 @@
 //   AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS   the heartbeat period (default 15 s)
 //   AGENT_SYSTEM_TEST_RUNNER_POLL_MS        the lock wait's poll (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS    shared post-sweep head/result/publication deadline (default 150 s)
+//   AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS     how long a part's wrapper may outlive its cap before the runner sweeps (default 60 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
@@ -68,11 +77,11 @@ import { boundPrs, holdersOf, worktreePath } from "../src/launch";
 import { FULL_SUITE_STATUS, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
+	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, callTimedOut, changedTestFiles, decideRun, executedFiles, fullSuiteSlice, HEARTBEAT_EVERY_MS,
 	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
 	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
 	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
-	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { ORCHESTRATOR_RECIPIENT } from "../src/types";
 
@@ -82,7 +91,7 @@ const REPO_ROOT = resolve(import.meta.dir, "..", "..");
 export const START_EXIT = { ok: 0, usage: 1, refused: 2, failed: 3 } as const;
 /** A sweep that ends by a signal is retried this many times while the lock row and `current` still name the run (§ 2.3 step 1). */
 export const SWEEP_RETRIES = 3;
-/** The wrapper outliving its own cap by this much makes the runner sweep (§ 2.3 step 3). */
+/** The wrapper outliving its own cap by this much makes the runner sweep (§ 2.3 step 3); AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS in tests. */
 const OUTLIVE_MS = 60_000;
 /**
  * The runner's cap on the refresh helper (PLAN wl-mv718fxhwwcn40 § 1.3), a minute above the helper's own REFRESH_CAP_S;
@@ -575,7 +584,8 @@ export async function run(cmd: string[], o: {
 	}
 }
 
-type Wrapped = { code: number | null; signal: string | null; out: string };
+/** One wrapper call's end: its exit, and whether the outlive sweep fired on it (PLAN wl-mvq4edh02r5z40 D0; `callTimedOut`). */
+type Wrapped = { code: number | null; signal: string | null; out: string; outlived: boolean };
 
 class Runner {
 	readonly root = runsRoot(process.env);
@@ -616,7 +626,7 @@ class Runner {
 		this.lockDb = openLockDb(this.root);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
-			requestedSha: request.sha, fetchedSha: null, error: null, full: null, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null, baseRuns: null,
+			requestedSha: request.sha, fetchedSha: null, error: null, full: null, fullTimedOut: false, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null, baseRuns: null,
 			base: null, mergeBase: null, preflight: null,
 		};
 	}
@@ -750,29 +760,25 @@ class Runner {
 	 */
 	async wrap(call: WrapperCall, capMs: number | null = null): Promise<Wrapped> {
 		const argv = wrapperArgv(call, this.exec);
+		const outliveMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS", OUTLIVE_MS);
 		let outlived = false;
 		const watchdog = capMs === null ? null : setTimeout(() => {
 			outlived = true;
-			this.log(`${call.sub} outlived its cap by ${OUTLIVE_MS / 1000} s; sweeping`);
+			this.log(`${call.sub} outlived its cap by ${outliveMs / 1000} s; sweeping`);
 			void this.wrap({ sub: "sweep", runId: this.id }).catch((e) => this.log(`the outlive sweep failed: ${errText(e)}`));
-		}, capMs + OUTLIVE_MS);
-		let r: Wrapped;
-		try {
-			r = await run(argv, {
-				cwd: this.as2root, env: process.env,
-				timeoutMs: (capMs ?? 0) + OUTLIVE_MS + 120_000, inheritStderr: true,
-				onSpawn: (pid) => {
-					hookMark(this.id, `spawn-${call.sub}`, { pid });
-					this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
-				},
-			});
-		} finally {
-			clearTimeout(watchdog ?? undefined);
-		}
+		}, capMs + outliveMs);
+		const r = await run(argv, {
+			cwd: this.as2root, env: process.env,
+			timeoutMs: (capMs ?? 0) + outliveMs + 120_000, inheritStderr: true,
+			onSpawn: (pid) => {
+				hookMark(this.id, `spawn-${call.sub}`, { pid });
+				this.log(`${argv.slice(4).join(" ")}: started pid ${pid}`);
+			},
+		}).finally(() => clearTimeout(watchdog ?? undefined));
 		const { out } = r;
 		if (out.trim()) process.stdout.write(out.endsWith("\n") ? out : `${out}\n`);
 		this.log(`${argv.slice(4).join(" ")} → ${r.signal ?? `exit ${r.code}`}${outlived ? " (after the outlive sweep)" : ""}`);
-		return r;
+		return { code: r.code, signal: r.signal, out, outlived };
 	}
 
 	/** A fenced exit (77) while this run believes it holds the lock: the checkpoint decides whether it was displaced. */
@@ -1018,15 +1024,16 @@ class Runner {
 	}
 
 	/**
-	 * One part through the wrapper, then its junit and log imported into the run dir and read into a result. `base` runs it in the
-	 * base clone (D8): `base-full`, `base-solo`, reports `base-full.*` and `base-solo-<i>.*`.
+	 * One part through the wrapper, then its junit and log imported into the run dir and read into a result, with the junit's text
+	 * (executedFiles reads it) and whether the call timed out (`callTimedOut`: exit 124 or the outlive sweep, PLAN wl-mvq4edh02r5z40
+	 * D0). After a timed-out call the wrapper's stuck capture `<part>.stuck.log` (D5) is imported too; a missing or refused capture
+	 * is one runner.log line and never changes the result. `base-solo` runs the file in the base clone (D8), reports `base-solo-<i>.*`.
 	 */
-	async part(call: { sub: "full" | "base-full" } | { sub: "solo" | "base-solo"; file: string }): Promise<PartResult> {
-		const isFull = call.sub === "full" || call.sub === "base-full";
-		await this.checkpoint(call.sub === "solo" ? "solo" : call.sub);
-		const capMs = (isFull ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
+	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean }> {
+		await this.checkpoint(call.sub);
+		const capMs = (call.sub === "full" ? this.config.fullCapMin : this.config.soloCapMin) * 60_000;
 		const started = Date.now();
-		const r = await this.wrap(call.sub === "solo" || call.sub === "base-solo" ? { sub: call.sub, runId: this.id, file: call.file } : { sub: call.sub, runId: this.id }, capMs);
+		const r = await this.wrap(call.sub === "full" ? { sub: call.sub, runId: this.id } : { sub: call.sub, runId: this.id, file: call.file }, capMs);
 		const ms = Date.now() - started;
 		if (r.code === WRAPPER_EXIT.fenced) await this.fenced(call.sub);
 		let name: string = call.sub;
@@ -1037,28 +1044,44 @@ class Runner {
 			this.baseSoloCalls++;
 			name = /^part (base-solo-\d+)$/m.exec(r.out)?.[1] ?? `base-solo-${this.baseSoloCalls}`;
 		}
+		const timedOut = callTimedOut(r);
+		if (timedOut) this.importStuck(name);
 		if (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed) {
-			return { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})` };
+			const wrapper = `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})`;
+			return { result: { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: timedOut ? `timeout; ${wrapper}` : wrapper }, junit: null, timedOut };
 		}
 		const imported = importPart(this.workDir, this.runDir, name, this.capBytes);
-		return partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut: r.code === WRAPPER_EXIT.timeout, maxBytes: this.capBytes });
+		const result = partResult({ ...imported, exit: r.signal !== null ? null : r.code, ms, timedOut, maxBytes: this.capBytes });
+		return { result, junit: imported.junit, timedOut };
+	}
+
+	/** The wrapper's stuck capture of a timed-out part (`<part>.stuck.log`, D5) into the run dir under importReport's checks; logged, never thrown. */
+	private importStuck(name: string): void {
+		const file = `${name}.stuck.log`;
+		try {
+			const r = importReport(this.workDir, this.runDir, file, this.capBytes);
+			this.log(r.error !== null ? `${file} not imported: ${r.error}` : r.text === null ? `${file} not imported: the wrapper wrote none` : `${file} imported`);
+		} catch (e) {
+			this.log(`${file} not imported: ${errText(e)}`);
+		}
 	}
 
 	/**
-	 * Each failing part rerun on base (PLAN wl-mv8s8srodefytc rev 17.1 D8; `baseParts`): the full argv for `full`, the file alone for
-	 * a solo part, in a clone of the same bundle at base's sha (origin/main as the trusted phase fetched it). A base result without an
-	 * error is cached per base sha and part (`baseCache`), so a second PR on the same red main reruns nothing; an error is not cached.
+	 * Each failing solo file rerun alone on base (PLAN wl-mv8s8srodefytc rev 17.1 D8, PLAN wl-mvq4edh02r5z40 D3; `baseParts`): the
+	 * same file alone (`base-solo`) in a clone of the same bundle at base's sha (origin/main as the trusted phase fetched it); the
+	 * full suite never runs on base. A base result without an error is cached per base sha and `./<file>` label (`baseCache`), so a
+	 * second PR on the same red main reruns nothing; an error is not cached. A `full` entry an older runner cached is never read.
 	 */
 	async baseRuns(): Promise<void> {
 		const parts = baseParts(this.f);
 		const sha = this.f.base;
 		if (parts.length === 0 || sha === null) return;
 		const results: Record<string, PartResult> = {};
-		for (const label of parts) {
-			const cached = readBaseCache(this.root, sha, label);
+		for (const file of parts) {
+			const cached = readBaseCache(this.root, sha, file);
 			if (cached !== null) {
-				this.log(`base ${label} at ${sha}: cached`);
-				results[label] = cached;
+				this.log(`base ${file} at ${sha}: cached`);
+				results[file] = cached;
 				continue;
 			}
 			if (!this.basePrepared) {
@@ -1071,10 +1094,10 @@ class Runner {
 				}
 				this.basePrepared = true;
 			}
-			const p = await this.part(label === "full" ? { sub: "base-full" } : { sub: "base-solo", file: label });
-			await this.sweep(`base ${label}`);
-			if (p.error === null) writeBaseCache(this.root, sha, label, p);
-			results[label] = p;
+			const { result } = await this.part({ sub: "base-solo", file });
+			await this.sweep(`base ${file}`);
+			if (result.error === null) writeBaseCache(this.root, sha, file, result);
+			results[file] = result;
 		}
 		this.f.baseRuns = { sha, parts: results };
 	}
@@ -1116,7 +1139,11 @@ class Runner {
 		}
 	}
 
-	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → base runs → post-sweep finalization deadline → head re-check. */
+	/**
+	 * Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare →
+	 * the full part and its sweep → the solo parts `soloPlan` names (none after a timed-out full part), a sweep after each → base runs
+	 * (none after a timeout) → post-sweep finalization deadline → head re-check.
+	 */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
 		await this.acquire();
@@ -1128,13 +1155,20 @@ class Runner {
 		if (changed === null) return;
 		await this.prepare();
 		this.log(`full workers ${this.config.fullWorkers}`);
-		this.f.full = await this.part({ sub: "full" });
+		const full = await this.part({ sub: "full" });
+		this.f.full = full.result;
+		this.f.fullTimedOut = full.timedOut;
 		await this.sweep("full");
-		for (const file of changed) {
-			this.f.solo.push({ file, ...(await this.part({ sub: "solo", file })) });
-			await this.sweep(file);
+		const plan = soloPlan({ full: full.result, timedOut: full.timedOut, changed, executed: full.junit === null ? [] : executedFiles(full.junit) });
+		if (plan.stop) this.log("full part timed out: no solo or base parts");
+		else {
+			this.log(`solo parts: ${plan.files.join(" ") || "none"}`);
+			for (const file of plan.files) {
+				this.f.solo.push({ file, ...(await this.part({ sub: "solo", file })).result });
+				await this.sweep(file);
+			}
+			await this.baseRuns();
 		}
-		await this.baseRuns();
 		this.postSweepDeadline = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", 150_000);
 		this.log(`post-sweep finalization started; deadline ${new Date(this.postSweepDeadline).toISOString()}`);
 		await hook(this.id, "head-recheck", {}, this.postSweepDeadline);
