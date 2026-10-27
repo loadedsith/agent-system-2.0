@@ -2,7 +2,7 @@
 title: The test runner stops wasting its one slot on solo reruns after a timeout or a green
 status: open
 workload: wl-mvq4edh02r5z40
-pr:
+pr: 324
 ---
 Workload `wl-mvq4edh02r5z40` (normal stakes, flow repair, plan revision 3 at `~/agent-scratch/agent-system-2.0/wl-mvq4edh02r5z40/PLAN.md`). Jo's instructions in-mvq5b1c565wbnk and in-mvq5hvhq6jd728 govern it.
 
