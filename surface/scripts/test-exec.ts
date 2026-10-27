@@ -978,6 +978,8 @@ class StuckWatch {
 	stopping = false;
 	/** The shadow capture (started at the first would-stop), awaited before the part's files go. */
 	private shadowCapture: Promise<void> | null = null;
+	/** The pgids of owned processes this part already added to the groups file (groups sweep only). */
+	private readonly recordedGroups = new Set<number>();
 
 	constructor(private readonly p: WatchPart) {
 		this.det = new StuckDetector({ tickMs: p.cfg.detectTickMs, persistMs: p.cfg.detectPersistMs, bunPath: p.cfg.bun, leaderPid: p.leader });
@@ -1014,6 +1016,7 @@ class StuckWatch {
 				return;
 			}
 			const r = this.det.tick(obs);
+			if (cfg.sweep === "groups") this.recordGroups(r.owned);
 			if (cfg.detectTrace) this.trace(obs, r);
 			const pair = (s: Signature) => `worker ${s.worker.pid} zombie ${s.zombie.pid}`;
 			for (const c of r.cleared) {
@@ -1041,6 +1044,18 @@ class StuckWatch {
 			this.line("stuck-detector-off", `reason detector failed: ${errText(e)}`);
 			this.end();
 		}
+	}
+
+	/**
+	 * A groups sweep signals only the groups in the run's groups file, and `--parallel` workers lead their own groups: killing
+	 * the leader's group at the cap leaves them, and their children, alive under launchd, so they would escape the sweep. Each tick
+	 * adds the pgid of every owned process it has not added yet. A uid sweep needs none of this and the file is left as it was.
+	 */
+	private recordGroups(owned: readonly Seen[]): void {
+		const fresh = [...new Set(owned.map((p) => p.pgid))].filter((g) => g > 1 && g !== this.p.leader && !this.recordedGroups.has(g));
+		if (fresh.length === 0) return;
+		for (const g of fresh) this.recordedGroups.add(g);
+		appendFileSync(groupsFile(this.p.work), fresh.map((g) => `${g}\n`).join(""));
 	}
 
 	/** `detectTrace` (tests): the tick's markers, candidates (with CPU), live part tree and its zombies, as one JSON line. */

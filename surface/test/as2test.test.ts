@@ -1467,6 +1467,11 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 	describe("negative controls: each part ends normally with no signature and no decision (enforce, --parallel=2)", () => {
 		/** One test file per control; `<name>.pid` is the worker's pid. Each runs about 6 s. */
 		const LOOP = "const end = Date.now() + 6_000;\n\twhile (Date.now() < end) {}";
+		/**
+		 * The getter controls' hot computation: as long as LOOP, well past the persistence, so a loaded machine whose late
+		 * executor ticks miss part of it still sees the unmarked zombie over MEANINGFUL_SPAN_MS.
+		 */
+		const GETTER_HOT_MS = 6_000;
 		const fixtures: Record<string, Record<string, string>> = {
 			"zombie-no-marker": {
 				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
@@ -1525,7 +1530,7 @@ test("c", () => {
 	const argv = ["/usr/bin/true"];
 	Object.defineProperty(argv, 1, { enumerable: true, get() {
 		Bun.spawn(["/usr/bin/true"]);
-		const end = Date.now() + ${DETECT.detectPersistMs + 3 * DETECT.detectTickMs};
+		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 		return "x";
 	} });
@@ -1545,7 +1550,7 @@ test("c", async () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const out = r3GetterCall("${shape}", ["/usr/bin/true"], () => {
 		Bun.spawn(["/usr/bin/true"]);
-		const end = Date.now() + ${DETECT.detectPersistMs + 3 * DETECT.detectTickMs};
+		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 	});
 	writeFileSync("../out.json", JSON.stringify(out));
@@ -1565,7 +1570,7 @@ test("c", async () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const out = byteGetterCall(cp, "own", ["/usr/bin/true"], () => {
 		Bun.spawn(["/usr/bin/true"]);
-		const end = Date.now() + ${DETECT.detectPersistMs + 3 * DETECT.detectTickMs};
+		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 	});
 	writeFileSync("../out.json", JSON.stringify(out));
@@ -1597,6 +1602,16 @@ test("c", async () => {
 			return { trace, w: fixturePid(d.work, "w.pid"), work: d.work };
 		}
 		const zombieOf = (trace: TraceRow[], ppid: number) => trace.some((t) => t.zombies.some((z) => z.ppid === ppid && z.comm === "true"));
+		/**
+		 * Whether the control meant something: ticks saw the worker's `true` zombie over at least a second (four ticks' worth)
+		 * without the worker's marker. A span, not a tick count: under a loaded machine the executor's ticks come late and few,
+		 * while the zombie still stands through the getter's whole hot computation.
+		 */
+		const unmarkedZombieSpanMs = (trace: TraceRow[], w: number): number => {
+			const at = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true") && !activeAt(t).some((m) => m.pid === w)).map((t) => t.at);
+			return at.length < 2 ? 0 : at[at.length - 1]! - at[0]!;
+		};
+		const MEANINGFUL_SPAN_MS = 4 * DETECT.detectTickMs;
 
 		test("a 6 s sync loop holding a zombie child, with no marker", async () => {
 			const { trace, w } = await settled("zombie-no-marker");
@@ -1618,8 +1633,7 @@ test("c", async () => {
 
 		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
 			const { trace, w } = await settled("argv-getter");
-			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
-			expect(zombieTicks.filter((t) => !activeAt(t).some((m) => m.pid === w)).length).toBeGreaterThanOrEqual(5);
+			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
 		}, 90_000);
 
 		for (const shape of ["proto-cwd", "env-array"] as const) {
@@ -1632,7 +1646,7 @@ test("c", async () => {
 				expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
 				// bun 1.3.14 runs the env array's getter; it stops its option lookups before Object.prototype, so the inherited
 				// getter runs only if a later bun reads it, and then it must meet no marker either.
-				expect(zombieTicks.length).toBeGreaterThanOrEqual(out.hits > 0 ? 5 : 0);
+				expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(out.hits > 0 ? MEANINGFUL_SPAN_MS : 0);
 			}, 90_000);
 		}
 
@@ -1644,7 +1658,7 @@ test("c", async () => {
 			expect(out).toEqual(native);
 			// bun runs the getter before it takes the bytes, so the zombie is there throughout the hot computation, unmarked.
 			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
-			expect(zombieTicks.length).toBeGreaterThanOrEqual(5);
+			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
 			expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
 		}, 90_000);
 
