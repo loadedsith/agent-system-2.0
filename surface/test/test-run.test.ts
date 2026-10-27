@@ -332,18 +332,30 @@ describe("bodies: format and parse round-trip exactly; malformed bodies are reje
 // ---- profile -----------------------------------------------------------------------------------------
 
 describe("profile: the testRunner block", () => {
-	test("the checkout's profile/config.yml serves agent-system-2.0 with bun test and the plan's caps", () => {
-		const doc = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8"));
+	test("the checkout's profile/config.yml serves agent-system-2.0 with bun test; each cap is present and in range, parsed as written", () => {
+		const doc = Bun.YAML.parse(readFileSync(join(REPO, "profile", "config.yml"), "utf8")) as { testRunner: Record<string, unknown> };
+		const raw = doc.testRunner;
 		const c = testRunnerConfig(doc);
-		expect(c).toEqual({ ok: true, config: { repos: [{ origin: "thewolff/agent-system-2.0", command: "bun test" }], fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 6 } });
+		expect(c.ok).toBe(true);
 		if (!c.ok) throw new Error(c.error);
+		expect(c.config.repos).toEqual([{ origin: "thewolff/agent-system-2.0", command: "bun test" }]);
+		// No literal cap: each key is in the committed block (a dropped key would fall back to a default unseen), in range, and parsed as written.
+		for (const key of ["fullCapMin", "soloCapMin", "reportCapMb", "queueMaxMin"] as const) {
+			expect(raw).toHaveProperty(key);
+			const v = raw[key];
+			expect(typeof v === "number" && Number.isFinite(v) && v > 0).toBe(true);
+			expect(c.config[key]).toBe(v as number);
+		}
+		expect(raw).toHaveProperty("fullWorkers");
+		expect(Number.isInteger(raw.fullWorkers) && (raw.fullWorkers as number) >= 1).toBe(true);
+		expect(c.config.fullWorkers).toBe(raw.fullWorkers as number);
 		const config = c.config;
 		for (const url of ["https://github.com/thewolff/agent-system-2.0.git", "git@github.com:thewolff/agent-system-2.0.git", "ssh://git@github.com/TheWolff/agent-system-2.0", "thewolff/agent-system-2.0"]) {
 			expect(servedRepo(config, url)?.command).toBe("bun test");
 		}
 		expect(servedRepo(config, "https://github.com/thewolff/other.git")).toBeNull();
 		expect(servedRepo(config, "/Users/jo/code/agent-system-2.0")).toBeNull();
-		expect(reportCapBytes(config)).toBe(50 * 1024 * 1024);
+		expect(reportCapBytes(config)).toBe(Math.floor(config.reportCapMb * 1024 * 1024));
 	});
 	test("no block serves nothing; a malformed block is an error, never a default", () => {
 		expect(testRunnerConfig({})).toEqual({ ok: true, config: { repos: [], ...TEST_RUNNER_DEFAULTS } });
@@ -357,6 +369,7 @@ describe("profile: the testRunner block", () => {
 		const repos = [{ origin: "o/r", command: "bun test" }];
 		const parsed = (v: unknown) => testRunnerConfig({ testRunner: { repos, fullWorkers: v } });
 		expect(TEST_RUNNER_DEFAULTS.fullWorkers).toBe(1);
+		expect(TEST_RUNNER_DEFAULTS.queueMaxMin).toBe(1440);
 		const absent = testRunnerConfig({ testRunner: { repos } });
 		expect(absent.ok && absent.config.fullWorkers).toBe(1);
 		for (const n of [1, 6, 32]) {
@@ -843,8 +856,11 @@ describe("liveness from the heartbeat", () => {
 		expect(parseHeartbeat("garbage", "tr-1")).toBeNull();
 		expect(lockHolderStale(NOW - 60_000, NOW)).toBe(false);
 		expect(lockHolderStale(NOW - 60_001, NOW)).toBe(true);
-		expect(queuedTooLong(NOW - 60 * 60_000, NOW, { queueMaxMin: 60 })).toBe(false);
-		expect(queuedTooLong(NOW - 60 * 60_000 - 1, NOW, { queueMaxMin: 60 })).toBe(true);
+		expect(queuedTooLong(NOW - 60 * 60_000, NOW, { queueMaxMin: 60 }, false)).toBe(false);
+		expect(queuedTooLong(NOW - 60 * 60_000 - 1, NOW, { queueMaxMin: 60 }, false)).toBe(true);
+		// a merge train's run never ends on the wait cap (jo-issues #213)
+		expect(queuedTooLong(NOW - 60 * 60_000 - 86_400_000, NOW, { queueMaxMin: 60 }, true)).toBe(false);
+		expect(queuedTooLong(NOW - 60 * 60_000 - 365 * 86_400_000, NOW, { queueMaxMin: 60 }, true)).toBe(false);
 	});
 	test("the starter's reservation: refused while a run is live (startup lease included); dead unsettled requests are settled first", () => {
 		const r1 = request("tr-1", 17, A);

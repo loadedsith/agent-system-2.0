@@ -88,7 +88,7 @@ export interface TestRunnerConfig {
 	fullWorkers: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 1 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -603,8 +603,14 @@ export function reservation(
 	return { ok: true, settleDead };
 }
 
-/** A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1). */
-export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">): boolean {
+/**
+ * A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1); a merge train's run
+ * (`train`: its workload has train membership, `trainPrs` non-empty) never does (jo-issues #213). The cap is not what keeps
+ * the queue moving past dead runs: a dead lock holder is replaced through `lockHolderStale` and a dead waiter ahead is pruned
+ * through `queueWaiterLive`, so a train's run only ever waits behind live work, and expiring it would send it to the back.
+ */
+export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">, train: boolean): boolean {
+	if (train) return false;
 	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
 }
 
