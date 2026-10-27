@@ -2580,7 +2580,9 @@ test("runs.db held for 4 s from the first lock-row delete (past the old 2 s dead
 		expect(failedInHold).toBeGreaterThan(40);
 		const releasedAt = logAt(log, / lock released$/);
 		console.info(`release after a 4 s hold: the row went ${releasedAt - heldEnd} ms after the hold ended`);
-		expect(releasedAt - heldEnd).toBeLessThan(200);
+		// The 50 ms retry frees the row soon after the hold; the bound only has to tell that apart from the 60 s stale horizon,
+		// with room for a loaded machine (a review run beside the full suite saw 600 ms).
+		expect(releasedAt - heldEnd).toBeLessThan(2_000);
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 		await kids[1]!.exited;
 		// displaced null: the row was gone when it took the lock, never waited out as a stale holder's

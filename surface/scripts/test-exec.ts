@@ -729,14 +729,16 @@ const STUCK_PRELOAD = String.raw`// agent-system 2.0 test runner: the stuck-work
 // exactly the call. The call returns or throws exactly what it would have; the wrapper's own fs and ffi errors only stop
 // publication (a missed detection, never a false one). It publishes only a call whose every input is plain data, so a held
 // marker means the native call itself is running, never test code the call runs while it reads its arguments (review r2
-// finding 1, r3): argv (or cmd) a dense, non-proxy array of own data strings; options, when given, a non-proxy, non-array object
-// with prototype Object.prototype or null whose own properties are all data properties holding, per key: for env a primitive or
-// such an object whose own properties are all data primitives (bun gets each own value); for stdio a primitive or a dense
-// array of primitives and bytes (an ArrayBuffer or a view; node puts its input Buffer there); for stdin, stdout and stderr a
-// primitive or bytes; for any other key a primitive. An object with prototype Object.prototype also needs Object.prototype
-// clean at the call: no accessor on it but the __proto__ it had at load. A function, a getter, a hole, a proxy or any other
-// object runs the call unpublished. It reads only descriptors, through functions bound at load, so no getter, proxy trap or
-// replaced builtin runs here.
+// finding 1, r3, r4): argv (or cmd) a dense, non-proxy array of own data strings; options, when given, a non-proxy, non-array
+// object with prototype Object.prototype or null whose own properties are all data properties holding, per key: for env a
+// primitive or such an object whose own properties are all data primitives (bun gets each own value); for stdio a primitive
+// or a dense array of primitives; for any other key (stdin, stdout and stderr included) a primitive. An object with prototype
+// Object.prototype also needs Object.prototype clean at the call: no accessor on it but the __proto__ it had at load. A
+// function, a getter, a hole, a proxy, bytes (an ArrayBuffer or a view, a Buffer included) or any other object runs the call
+// unpublished: bun looks up a byte container's Symbol.asyncIterator, own or inherited, before it takes the bytes, and that
+// lookup runs a getter (review r4). So a call carrying bytes, as node's spawnSync, execSync and execFileSync with input,
+// runs unpublished: a missed detection, never a false one. It reads only descriptors, through functions bound at load, so
+// no getter, proxy trap or replaced builtin runs here.
 import fs from "node:fs";
 import { types } from "node:util";
 import { dlopen, FFIType } from "bun:ffi";
@@ -758,8 +760,6 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 		const protoOf = Object.getPrototypeOf;
 		const OBJECT_PROTO = Object.prototype;
 		const isArray = Array.isArray;
-		const isView = ArrayBuffer.isView;
-		const isAnyArrayBuffer = types.isAnyArrayBuffer;
 		const isProxy = types.isProxy;
 		const strSlice = String.prototype.slice;
 		const strIndexOf = String.prototype.indexOf;
@@ -794,10 +794,6 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 		};
 		const primitive = (v) => v === null || (typeof v !== "object" && typeof v !== "function");
 		const isString = (v) => typeof v === "string";
-		// Bytes the native call reads from internal slots, never through a getter (probe, bun 1.3.14: a Uint8Array subclass's
-		// length, byteLength and buffer getters do not run).
-		const bytes = (v) => v !== null && typeof v === "object" && !isProxy(v) && (isView(v) || isAnyArrayBuffer(v));
-		const element = (v) => primitive(v) || bytes(v);
 		// A non-proxy real array with an own data property passing ok at every index (a hole is read through Array.prototype).
 		const denseArray = (a, ok) => {
 			if (a === null || typeof a !== "object" || isProxy(a) || !isArray(a)) return false;
@@ -834,13 +830,14 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 		};
 		// An option's value, per key, by what bun 1.3.14 does with it (js_bun_spawn_bindings.zig): cmd is the argv; env's own
 		// keys are enumerated and each value got (JSPropertyIterator), so it must hold data primitives only; stdio is iterated by
-		// index; stdin, stdout and stderr take bytes from internal slots; every other option is read as a primitive. A primitive
-		// env or stdio is read or refused by bun without running anything (node passes env: undefined).
+		// index; every other option, stdin, stdout and stderr included, must be a primitive. A primitive is read or refused by
+		// bun without running anything (node passes env: undefined; a probe saw no getter on String, Number, Boolean, Object or
+		// Symbol.prototype run). Bytes are refused: bun's stdio extract hands a byte container to ReadableStream.fromJS first
+		// (stdio.zig), whose Symbol.asyncIterator lookup runs an own or inherited getter (ReadableStream.cpp; review r4).
 		const optionValue = (v, key) => {
 			if (key === "cmd") return denseArray(v, isString);
 			if (key === "env") return primitive(v) || (plainObject(v) && allOwnData(v, primitive));
-			if (key === "stdio") return primitive(v) || denseArray(v, element);
-			if (key === "stdin" || key === "stdout" || key === "stderr") return element(v);
+			if (key === "stdio") return primitive(v) || denseArray(v, primitive);
 			return primitive(v);
 		};
 		// The marker command of a call (argv[, options] or { cmd, ... }), or "" when any input the original reads is not plain

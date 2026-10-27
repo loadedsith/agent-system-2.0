@@ -1062,6 +1062,34 @@ function r3GetterCall(shape: "proto-cwd" | "env-array", argv: string[], onGet: (
 }
 
 /**
+ * Review r4's byte containers: a Buffer whose Symbol.asyncIterator getter runs onGet and returns undefined, which bun 1.3.14's
+ * stdio extract looks up (ReadableStream.fromJS) before it takes the bytes. "own" defines the getter on the Buffer itself and
+ * passes it as Bun.spawnSync's stdin; "inherited" defines it on a Buffer subclass's prototype and passes an instance as stdin;
+ * "node-input" passes an "own" Buffer as cp.execFileSync's input (node puts it in the stdio array). Returns the call's exit and
+ * how often the getter ran. Its source is copied into fixtures, so it names no import.
+ */
+function byteGetterCall(cp: typeof childProcess, shape: "own" | "inherited" | "node-input", argv: string[], onGet: () => void) {
+	let hits = 0;
+	const hook = { configurable: true, get: () => {
+		hits++;
+		onGet();
+		return undefined;
+	} };
+	let bytes: Uint8Array = Buffer.from("x");
+	if (shape === "inherited") {
+		class SubBuffer extends Uint8Array {}
+		Object.setPrototypeOf(SubBuffer.prototype, Buffer.prototype);
+		Object.defineProperty(SubBuffer.prototype, Symbol.asyncIterator, hook);
+		bytes = new SubBuffer([120]);
+	} else Object.defineProperty(bytes, Symbol.asyncIterator, hook);
+	if (shape === "node-input") {
+		cp.execFileSync(argv[0]!, argv.slice(1), { input: bytes });
+		return { exitCode: 0, hits };
+	}
+	return { exitCode: Bun.spawnSync(argv, { stdin: bytes }).exitCode, hits };
+}
+
+/**
  * The real preload's qualification fixture (PLAN sl-sd-exec). Each phase logs its window to ../qual.jsonl and idles 1 s after,
  * so the trace's 250 ms ticks see the marker during the call and its absence after. A phase whose command is "" must run with
  * no marker of this worker active at all: the call's arguments ran test code, so it is unpublished.
@@ -1071,6 +1099,7 @@ import * as cp from "node:child_process";
 import { appendFileSync } from "node:fs";
 const callFields = ${callFields.toString()};
 const r3GetterCall = ${r3GetterCall.toString()};
+const byteGetterCall = ${byteGetterCall.toString()};
 const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
 const idle = (ms = 1_000) => Bun.sleep(ms);
 // A real hot computation on the real clock: the detector samples this process's CPU over real 250 ms ticks, so no fake time.
@@ -1090,14 +1119,24 @@ test("qualifies", async () => {
 	log({ name: "start", pid: process.pid, preloadGlobal: globalThis.__fixturePreload ?? null, wrapped: Bun.spawnSync[Symbol.for("as2test.stuck-marker")] === true });
 	await idle();
 	await phase("bun", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"]).exitCode);
-	// Plain data in every option (helpers.ts's sh shape, a spread of process.env, a Buffer stdin): published. process.env itself
-	// is not plain data in bun (TZ and the proxy variables are accessors), so a call given it runs unpublished.
-	await phase("bun-options", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: Buffer.from("x"), stdout: "pipe", stderr: "pipe" }).exitCode);
+	// Plain data in every option (helpers.ts's sh shape, a spread of process.env): published. process.env itself is not plain
+	// data in bun (TZ and the proxy variables are accessors), so a call given it runs unpublished.
+	await phase("bun-options-no-bytes", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe" }).exitCode);
+	// Review r4: bytes in any option (here a Buffer stdin) run unpublished, since bun looks up a byte container's
+	// Symbol.asyncIterator, own or inherited, before it takes the bytes.
+	await phase("bun-options", "", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: Buffer.from("x"), stdout: "pipe", stderr: "pipe" }).exitCode);
 	await phase("node-spawnSync", "sleep", () => cp.spawnSync("/bin/sleep", ["2"]).status);
 	await phase("node-execSync", "sh", () => cp.execSync("/bin/sleep 2; echo slept").toString());
 	await phase("node-execFileSync", "sleep", () => cp.execFileSync("/bin/sleep", ["2"]).toString());
-	// node's own options object with input (a Buffer in its stdio array), cwd, env, timeout: published.
-	await phase("node-options", "sleep", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, input: "x", timeout: 30_000, encoding: "utf8" }).status);
+	// node's own options object with cwd, env, timeout and no input: published.
+	await phase("node-options-no-input", "sleep", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, timeout: 30_000, encoding: "utf8" }).status);
+	// The same with input (node puts a Buffer in its stdio array): unpublished (review r4).
+	await phase("node-options", "", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, input: "x", timeout: 30_000, encoding: "utf8" }).status);
+	// Review r4: a hot 1.2 s Symbol.asyncIterator getter on a Buffer stdin (own, then inherited from a subclass prototype) and on
+	// node's execFileSync input, which bun runs before it takes the bytes, then the 1 s sleep itself: all unpublished.
+	await phase("byte-own-getter", "", () => byteGetterCall(cp, "own", ["/bin/sleep", "1"], () => spin(1_200)));
+	await phase("byte-inherited-getter", "", () => byteGetterCall(cp, "inherited", ["/bin/sleep", "1"], () => spin(1_200)));
+	await phase("byte-node-input-getter", "", () => byteGetterCall(cp, "node-input", ["/bin/sleep", "1"], () => spin(1_200)));
 	// Test code the original runs while it reads its arguments: a hot 1.2 s getter, then the 1 s sleep itself, all unpublished.
 	await phase("argv-getter", "", () => {
 		const argv = ["/bin/sleep"];
@@ -1167,7 +1206,7 @@ test("qualifies", async () => {
 `;
 
 describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
-	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter (an env array's included) or that meets an Object.prototype accessor unpublished (during the getter and the call), publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter (an env array's included) or that meets an Object.prototype accessor unpublished (during the getter and the call), run a call carrying bytes (a Buffer stdin, node's input) unpublished, an own or inherited Symbol.asyncIterator getter on them included, publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
 		const b = box("stuck-qual", DETECT);
 		prepared(b, "tr-sq1", {
 			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
@@ -1210,8 +1249,13 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			for (const t of after) expect({ phase: p.name, at: t.at, markers: mine(t) }).toEqual({ phase: p.name, at: t.at, markers: [] });
 		}
 		expect(byName.bun!.out).toBe(0);
-		expect(byName["bun-options"]!.out).toBe(0);
-		expect(byName["node-options"]!.out).toBe(0);
+		expect([byName["bun-options-no-bytes"]!.out, byName["bun-options"]!.out]).toEqual([0, 0]);
+		expect([byName["node-options-no-input"]!.out, byName["node-options"]!.out]).toEqual([0, 0]);
+		// Review r4: each byte getter ran once, as unwrapped, and the call did what it does unwrapped.
+		const byteShapes = ["own", "inherited", "node-input"] as const;
+		const nativeBytes = byteShapes.map((s) => byteGetterCall(childProcess, s, ["/usr/bin/true"], () => {}));
+		expect(nativeBytes.map((n) => n.hits)).toEqual([1, 1, 1]);
+		expect(byteShapes.map((s) => byName[`byte-${s}-getter`]!.out)).toEqual(nativeBytes);
 		expect([byName["argv-getter"]!.out, byName["cwd-getter"]!.out, byName["env-getter"]!.out]).toEqual([0, 0, 0]);
 		// The same exit and getter count as the unwrapped shapes here (bun runs the env array's getter once, never the inherited one).
 		expect([byName["proto-cwd-getter"]!.out, byName["env-array-getter"]!.out]).toEqual([r3GetterCall("proto-cwd", ["/usr/bin/true"], () => {}), r3GetterCall("env-array", ["/usr/bin/true"], () => {})]);
@@ -1509,6 +1553,26 @@ test("c", async () => {
 }, 60_000);
 `,
 			}])),
+			// Review r4: the same healthy getter as a Symbol.asyncIterator getter on a Buffer stdin, which bun looks up before it
+			// takes the bytes, run through byteGetterCall("own") with argv ["/usr/bin/true"]; the same real 3 s idle after (the
+			// detector samples the real process over real 250 ms ticks, so fake timers cannot stand in).
+			"byte-stdin-getter": {
+				"c.test.ts": `import { test } from "bun:test";
+import * as cp from "node:child_process";
+import { writeFileSync } from "node:fs";
+const byteGetterCall = ${byteGetterCall.toString()};
+test("c", async () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const out = byteGetterCall(cp, "own", ["/usr/bin/true"], () => {
+		Bun.spawn(["/usr/bin/true"]);
+		const end = Date.now() + ${DETECT.detectPersistMs + 3 * DETECT.detectTickMs};
+		while (Date.now() < end) {}
+	});
+	writeFileSync("../out.json", JSON.stringify(out));
+	await Bun.sleep(3_000);
+}, 60_000);
+`,
+			},
 		};
 		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
 		let all: Promise<Record<string, Done>> | null = null;
@@ -1571,6 +1635,18 @@ test("c", async () => {
 				expect(zombieTicks.length).toBeGreaterThanOrEqual(out.hits > 0 ? 5 : 0);
 			}, 90_000);
 		}
+
+		test("Bun.spawnSync(['/usr/bin/true'], { stdin: <Buffer with an own Symbol.asyncIterator getter> }) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker", async () => {
+			const { trace, w, work } = await settled("byte-stdin-getter");
+			const native = byteGetterCall(childProcess, "own", ["/usr/bin/true"], () => {});
+			expect(native).toEqual({ exitCode: 0, hits: 1 });
+			const out: unknown = JSON.parse(readFileSync(join(work, "out.json"), "utf8"));
+			expect(out).toEqual(native);
+			// bun runs the getter before it takes the bytes, so the zombie is there throughout the hot computation, unmarked.
+			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
+			expect(zombieTicks.length).toBeGreaterThanOrEqual(5);
+			expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
+		}, 90_000);
 
 		test("a long async test", async () => {
 			const { trace, w } = await settled("long-async");
