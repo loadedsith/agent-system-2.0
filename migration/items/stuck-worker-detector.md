@@ -2,7 +2,7 @@
 title: The test runner stops a positively stuck test worker within about 45 seconds
 status: open
 workload: wl-mvq8x4pkjmx69s
-pr: pending
+pr: 338
 ---
 Workload `wl-mvq8x4pkjmx69s` (normal stakes, plan revision 5 at `~/agent-scratch/agent-system-2.0/wl-mvq8x4pkjmx69s/PLAN.md`; flow repair, jo-issues #213). It depends on the runner-waste PR (#324): the wall-cap timeout fact, the solo plan and the cap capture stay as they are, and this adds a second, separate stop reason beside them.
 
