@@ -31,7 +31,7 @@ import { askJo, raisedId, type TrainSignoffFact } from "../../gates/src/rulings"
 import { canonicalPath } from "../../ledger/src/locality";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
 import { NOTICE_PREFIX } from "./notice";
-import { ownerRepoOf, pushDestBody, type RunRecord, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns } from "./test-run";
+import { type CompareResult, decisionLogFault, ownerRepoOf, pushDestBody, type RangeCommit, type RunRecord, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns } from "./test-run";
 import {
 	ESCALATION_BY, HOLD_HOURS, LANE_FULL_TEST_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -436,7 +436,11 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			"Run every resolver command below with that PR worktree as cwd (the script works on the repo of its cwd) and always your " +
 			"lane worktree's copy of the script, never the PR branch's: an older PR branch may not have it. Run " +
 			`\`${RESOLVE_COMMAND} check --base origin/main\`: exit 0 = no PR-added numbered MIGRATION.md item is left. If the head ` +
-			"contains origin/main, `check` exits 0, and its last full suite at that head is green → step 7.",
+			"contains origin/main, `check` exits 0, and its last full suite at that head is green → step 7. If the head contains origin/main and " +
+			"`check` exits 0 but the head is ahead of its last green only by decision-log commits (each touching only `.ai/decision-log/`, a " +
+			`close's entry, say), it is tested by calling \`lane_full_test { pr: <n>, slice: ${full} }\` (the PR's open \`${full}\`, or the next r) with no push: ` +
+			"a starter line ending ` carried <R>` means the slice is already green at that head (run R's green carried, no new run) → step 7; " +
+			"any other answer spawned a run, and step 6's result handling applies as for any run.",
 		"3. `git merge --no-ff origin/main` (a merge commit). Never rebase, never force-push.",
 		`4. On conflict: \`${RESOLVE_COMMAND} resolve --pr <n> --workload <head workload>\`, where <head workload> is the head branch's ` +
 			"workload id when the branch is `wl/<wl-…>`, else `none`. Exit 0: it wrote and staged MIGRATION.md / migration/items / " +
@@ -463,8 +467,9 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 		"7. Land the green PR, both stakes through a. and b. in order; only b.'s answer picks the merge or Jo's question:",
 		"   a. Ready: `git fetch origin`, then `gh pr view <n> -R <owner/repo> --json headRefOid,mergeable,mergeStateStatus`. The head must " +
 			"equal the sha the green run tested, `mergeable` must be `MERGEABLE` (an `UNKNOWN` is re-queried once and never read as " +
-			"mergeable), and `git merge-base --is-ancestor origin/main <head>` must exit 0. A moved head (not the tested sha) → back to " +
-			"step 2 (a new PR worktree at the new head, and on from there); never merge main into the older local tree. The tested " +
+			"mergeable), and `git merge-base --is-ancestor origin/main <head>` must exit 0. A moved head (not the tested sha, a head " +
+			"ahead of it only by decision-log commits included) → back to step 2 (a new PR worktree at the new head, and on from there, " +
+			"where such a head is tested by lane_full_test, which may carry); never merge main into the older local tree. The tested " +
 			"head not containing origin/main, or not `MERGEABLE` → back to step 3 (merge main in, push, a new suite run).",
 		`   b. Stakes, again: run step 1's \`${RESOLVE_COMMAND} stakes --hold-ok\` command now, just before the merge; its answer decides, not step ` +
 			"1's (the workload's stakes, its plan's hold or main's protection may have changed while the suite ran). `normal` → c. " +
@@ -475,8 +480,12 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 		"   c. Merge: `gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`, a merge commit, never `--admin`, `--squash`, " +
 			"`--rebase` or `--auto`. Main's protection, which b. verified (a strict rule requiring `as2/full-suite`, which the test runner " +
 			"posts, in a ruleset the merging account can never bypass), makes GitHub refuse a merge whose head lacks the current main or a green status, so a race ends in a refused merge.",
-		"   d. Verify: `gh pr view <n> -R <owner/repo> --json state,mergeCommit` shows `MERGED`. A refused merge (gh exits non-zero, or the " +
-			"state is not MERGED) → back to a. once; a second refusal on the same head: lane_record_entry `train-error: pr <n> merge-refused " +
+		"   d. Verify: `gh pr view <n> -R <owner/repo> --json state,mergeCommit` shows `MERGED`. The FIRST refused merge (gh exits non-zero, " +
+			"or the state is not MERGED) → back to a. Only when a. then passes again on the same head, which has a green (head unchanged, " +
+			`\`MERGEABLE\`, main contained), the head may lack its status (a carried green whose \`as2/full-suite\` post failed): add the next \`${sl}-full-<r+1>\` ` +
+			"slice and call `lane_full_test` on it once. An answer ending ` carried <R>` (the starter posted the status again from the identical " +
+			"green) → c. again; any other answer is a spawned run → step 6's result handling, never an assumed green. A moved head or main in a. " +
+			"routes to step 2 or 3 as a. says, with no repair request. A second refusal on the same head: lane_record_entry `train-error: pr <n> merge-refused " +
 			"<gh's messages>` and pass the PR over (the tick retries it).",
 		`   e. Record: complete \`${sl}\` with artifact \`merged by train <merge commit sha> (run <id>)\`, then the next PR.`,
 		`   Production stakes, reached only from b. after a. passed: raise the question on \`${sl}\`: PR green and mergeable at <the ` +
@@ -606,13 +615,13 @@ function controlOf(ledger: Ledger, wl: string): ControlEntry[] {
 	return controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
 }
 
-/** The open workloads carrying an entry by `by` whose body starts with `prefix`, oldest first. */
-function openWithEntry(ledger: Ledger, by: string, prefix: string): string[] {
-	return ledger.db.query<{ id: string }, [string, string]>(
-		`SELECT w.id AS id FROM workloads w WHERE w.status = 'open' AND EXISTS (
+/** The workloads carrying an entry by `by` whose body starts with `prefix`, open ones only unless `closed`, oldest first. */
+function withEntry(ledger: Ledger, by: string, prefix: string, closed = false): string[] {
+	return ledger.db.query<{ id: string }, [string, string, number]>(
+		`SELECT w.id AS id FROM workloads w WHERE (?3 OR w.status = 'open') AND EXISTS (
 		   SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption' AND e.created_by = ?1 AND substr(e.body, 1, length(?2)) = ?2)
 		 ORDER BY w.created_at, w.id`,
-	).all(by, prefix).map((r: { id: string }) => r.id);
+	).all(by, prefix, closed ? 1 : 0).map((r: { id: string }) => r.id);
 }
 
 /** Every open merge train: an open workload with a surface `train:` or a merge-train `train-board:` that is a valid member (`trainMembers`). */
@@ -671,31 +680,33 @@ export function onOtherTrain(ledger: Ledger, repo: string, prs: readonly number[
 	return null;
 }
 
-/** One `train-fix:` on an open fix workload. */
+/** One `train-fix:` on a fix workload. */
 export interface FixBinding extends TrainFix {
 	workloadId: string;
 	entryId: string;
 }
 
-/** Every `train-fix:` on an open workload (the tick's, MERGE_TRAIN_BY), oldest workload first. */
-export function fixBindings(ledger: Ledger): FixBinding[] {
-	return openWithEntry(ledger, MERGE_TRAIN_BY, "train-fix:").flatMap((wl) =>
+/** Every `train-fix:` on an open workload (the tick's, MERGE_TRAIN_BY), oldest workload first; on closed ones too with `closed`. */
+export function fixBindings(ledger: Ledger, opts: { closed?: boolean } = {}): FixBinding[] {
+	return withEntry(ledger, MERGE_TRAIN_BY, "train-fix:", opts.closed).flatMap((wl) =>
 		controlEntries(ledger.entries(wl)).flatMap((c) => {
 			const f = c.prefix === "train-fix" ? parseTrainFix(c.rest) : null;
 			return f ? [{ ...f, workloadId: wl, entryId: c.id }] : [];
 		}));
 }
 
+/** Fix binding `f` binds PR `pr` on `train`: it names both, and its `train-entry` is a membership entry on that train listing the PR (`trainBindings`), as `boundPrs` rules. */
+export function fixBinds(ledger: Pick<Ledger, "entries" | "instructions">, f: FixBinding, train: string, pr: number): boolean {
+	return f.train === train && f.pr === pr && trainBindings(ledger.entries(train), ledger.instructions(train)).some((b) => b.entryId === f.trainEntry && b.prs.includes(pr));
+}
+
 /**
  * The workloads that own task `t`: its D1 owner, and every fix workload bound to its train and PR (owner none, or an owner closed
- * since). A fix binding counts only when its `train-entry` is a membership entry on that train listing the PR (`trainBindings`), as `boundPrs` rules.
+ * since; `fixBinds`).
  */
 function taskOwners(ledger: Ledger, t: TrainTask, fixes: readonly FixBinding[]): string[] {
 	const out = t.owner === null ? [] : [t.owner];
-	for (const f of fixes) {
-		if (f.train !== t.train || f.pr !== t.pr || out.includes(f.workloadId)) continue;
-		if (trainBindings(ledger.entries(f.train), ledger.instructions(f.train)).some((b) => b.entryId === f.trainEntry && b.prs.includes(f.pr))) out.push(f.workloadId);
-	}
+	for (const f of fixes) if (!out.includes(f.workloadId) && fixBinds(ledger, f, t.train, t.pr)) out.push(f.workloadId);
 	return out;
 }
 
@@ -834,15 +845,76 @@ export function trainPushesOf(json: unknown, branch: string): TrainPush[] | null
 	return out.sort((a, b) => a.at.localeCompare(b.at));
 }
 
+/** GitHub's get-a-commit lists at most this many files across its pages (300 a page): a commit listing this many may have more. */
+export const COMMIT_FILES_CAP = 3000;
+
+/** The statuses GitHub's compare answers; any other is a misshapen answer. */
+const COMPARE_STATUSES: Record<CompareResult["status"], true> = { identical: true, ahead: true, behind: true, diverged: true };
+
+/** `json[key]` when `json` is an object, else undefined. */
+const jsonField = (json: unknown, key: string): unknown => (typeof json === "object" && json !== null ? Reflect.get(json, key) : undefined);
+
+/**
+ * The `CompareResult` of `from`..`to` on `repo` as GitHub answers it (PLAN wl-mvpwkpqobyp20w D1), for `decisionLogFault` to judge:
+ * it decides nothing. `gh api repos/<r>/compare/<from>...<to>` gives the status, `total_commits` and each commit's sha and parent
+ * count; each single-parent commit's own files come from every page of `gh api repos/<r>/commits/<sha> --paginate --slurp` (never
+ * the net diff), a rename contributing the path it left as well as the one it made; a merge's files are not read. `from === to`
+ * is `identical` with no gh call. What GitHub cannot answer completely is `ok: false` with its reason: a compare listing fewer
+ * commits than `total_commits`, a commit listing COMMIT_FILES_CAP files (it may have more GitHub does not list), a rename that
+ * names no previous path. `ghJson` is gh's JSON for `args` and throws on a failed call; a misshapen answer throws too.
+ */
+export function ghCompare(
+	repo: string, from: string, to: string, ghJson: (args: string[]) => unknown,
+): { ok: true; compare: CompareResult } | { ok: false; reason: string } {
+	if (from === to) return { ok: true, compare: { status: "identical", commits: [] } };
+	const cmp = ghJson(["api", `repos/${repo}/compare/${from}...${to}`]);
+	const [status, listed, total] = [jsonField(cmp, "status"), jsonField(cmp, "commits"), jsonField(cmp, "total_commits")];
+	if (typeof status !== "string" || !Object.hasOwn(COMPARE_STATUSES, status) || !Array.isArray(listed) || typeof total !== "number") {
+		throw new Error(`gh api repos/${repo}/compare/${from}...${to} returned an unexpected shape`);
+	}
+	if (status !== "ahead") return { ok: true, compare: { status: status as CompareResult["status"], commits: [] } };
+	if (listed.length !== total) return { ok: false, reason: `${to} is ${total} commits ahead of ${from}, more than the compare lists (${listed.length})` };
+	const commits: RangeCommit[] = [];
+	for (const c of listed as unknown[]) {
+		const [sha, parents] = [jsonField(c, "sha"), jsonField(c, "parents")];
+		if (typeof sha !== "string" || !SHA_RE.test(sha) || !Array.isArray(parents)) throw new Error(`gh api repos/${repo}/compare listed a commit with no sha or parents`);
+		if (parents.length !== 1) {
+			commits.push({ sha, parents: parents.length, files: [] });
+			continue;
+		}
+		// Every page of the commit's files: an array of pages, each the commit object with its share of `files`.
+		const pages = ghJson(["api", `repos/${repo}/commits/${sha}`, "--paginate", "--slurp"]);
+		const lists = Array.isArray(pages) && pages.length > 0 ? (pages as unknown[]).map((p) => jsonField(p, "files")) : null;
+		if (lists === null || !lists.every(Array.isArray)) throw new Error(`gh api repos/${repo}/commits/${sha} returned an unexpected shape`);
+		const entries = (lists as unknown[][]).flat();
+		if (entries.length >= COMMIT_FILES_CAP) return { ok: false, reason: `commit ${sha} lists ${entries.length} files, the most GitHub lists; its other files cannot be read` };
+		const files: string[] = [];
+		for (const f of entries) {
+			const [name, prev] = [jsonField(f, "filename"), jsonField(f, "previous_filename")];
+			if (typeof name !== "string") throw new Error(`gh api repos/${repo}/commits/${sha} listed a file with no filename`);
+			files.push(name);
+			// A rename touches the path it left as well as the one it made; a rename that names no previous path fails closed.
+			if (prev === undefined && jsonField(f, "status") !== "renamed") continue;
+			if (typeof prev !== "string") return { ok: false, reason: `commit ${sha} renames ${name} from no listed path` };
+			files.push(prev);
+		}
+		commits.push({ sha, parents: 1, files });
+	}
+	return { ok: true, compare: { status: "ahead", commits } };
+}
+
 /**
  * What the tick knows from GitHub when it settles: each PR's current head (`gh pr view <n> --json headRefOid`), and the pushes
  * to its head branch (`trainActivityArgs`). A PR missing from `heads` cannot settle fixed this pass; one missing from `pushes`
- * (the listing failed or was unreadable) has no push evidence this pass, so no push-based rule settles it.
+ * (the listing failed or was unreadable) has no push evidence this pass, so no push-based rule settles it. `compares` holds
+ * `ghCompare`'s result for each pair `carryPairs` lists, keyed `<S> <head>`: a pair missing from it (the fetch failed or GitHub
+ * could not answer completely) is no compare, so no green carries over it (PLAN wl-mvpwkpqobyp20w D2).
  */
 export interface SettleFacts {
 	train: string;
 	heads: ReadonlyMap<number, string>;
 	pushes: ReadonlyMap<number, readonly TrainPush[]>;
+	compares: ReadonlyMap<string, CompareResult | null>;
 }
 
 interface SettleEvent {
@@ -851,17 +923,28 @@ interface SettleEvent {
 	evidence: string;
 }
 
+/** The runner results on task `t`'s owners for its PR requested after t0, oldest request first, each with its result when it has one. */
+function taskRuns(ledger: Ledger, t: TrainTask, owners: readonly string[]) {
+	return owners.flatMap((o) => testRuns(ledger.entries(o)).filter((r) => r.request.pr === t.pr && r.request.createdAt > t.createdAt))
+		.sort((a, b) => a.request.createdAt.localeCompare(b.request.createdAt));
+}
+
 /**
  * Task `t`'s first terminal event among its owners' rows, or null while none has happened (D8). `pushes` is GitHub's record of
- * pushes to the PR's head branch (`SettleFacts.pushes`), undefined when this pass could not read it.
+ * pushes to the PR's head branch (`SettleFacts.pushes`), undefined when this pass could not read it; `compares` is
+ * `SettleFacts.compares`.
  */
-function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], head: string | null, pushes: readonly TrainPush[] | undefined, now: string): SettleEvent | null {
+function settleEvent(
+	ledger: Ledger, t: TrainTask, owners: readonly string[], head: string | null, pushes: readonly TrainPush[] | undefined, compares: SettleFacts["compares"], now: string,
+): SettleEvent | null {
 	const t0 = t.createdAt;
 	const events: SettleEvent[] = [];
 	// The first runner result requested after t0 that is not an error decides; stale and superseded runs settle nothing either.
-	// A green (or red-main) decides only at a head other than H0 that is the PR's current head; until then the next result is read.
-	const runs = owners.flatMap((o) => testRuns(ledger.entries(o)).filter((r) => r.request.pr === t.pr && r.request.createdAt > t0))
-		.sort((a, b) => a.request.createdAt.localeCompare(b.request.createdAt));
+	// A green (or red-main) decides only at a head other than H0 that is the PR's current head; a green at S, not H0, also
+	// decides when it is the task's NEWEST request's own result and the current head descends from S only by decision-log
+	// commits (`decisionLogFault` on GitHub's compare of S and the head, PLAN wl-mvpwkpqobyp20w D2). A later request of any
+	// kind (pending, red, error) means no carry from S: that request's result is what is read next. Until then the next result is read.
+	const runs = taskRuns(ledger, t, owners);
 	for (const r of runs) {
 		const res = r.result;
 		if (!res) continue;
@@ -871,6 +954,10 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 		}
 		if (SETTLING_VERDICTS.includes(res.verdict) && res.sha !== t.head && res.sha === head) {
 			events.push({ at: res.createdAt, outcome: "fixed", evidence: `run ${res.runId} ${res.verdict} at ${res.sha}` });
+			break;
+		}
+		if (r === runs.at(-1) && carries(res.verdict, res.sha, t, head) && decisionLogFault(compares.get(`${res.sha} ${head}`) ?? null) === null) {
+			events.push({ at: res.createdAt, outcome: "fixed", evidence: `run ${res.runId} green at ${res.sha}, head ${head} decision-log only` });
 			break;
 		}
 	}
@@ -916,7 +1003,8 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 /**
  * The settles the tick writes now on train `facts.train` (D8): the `train-task-settled:` bodies, one per unsettled task whose
  * first terminal event has happened. fixed: the first non-error runner result requested after t0 on the owner is green at a
- * head other than H0 that is the PR's current head. failed: that result is red; the owner's holder wrote
+ * head other than H0 that is the PR's current head, or the task's newest request is green at S (not H0) with the current head
+ * past S only by decision-log commits (`decisionLogFault` on `facts.compares`' `<S> <head>`, PLAN wl-mvpwkpqobyp20w D2). failed: that result is red; the owner's holder wrote
  * `train-task-failed: <id>`; an owner lane exited with no push before it; or some stretch of 2 h since t0 had no push. A push
  * is one GitHub records on the head branch (`facts.pushes`, at GitHub's time), never a runner request or row 8's `push-dest:`;
  * with no record this pass, or one that does not name the PR's current head, the two push rules wait. An `error` result never
@@ -925,9 +1013,33 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): string[] {
 	const fixes = fixBindings(ledger);
 	return unsettledTasks(ledger, facts.train).flatMap((t) => {
-		const e = settleEvent(ledger, t, taskOwners(ledger, t, fixes), facts.heads.get(t.pr) ?? null, facts.pushes.get(t.pr), now);
+		const e = settleEvent(ledger, t, taskOwners(ledger, t, fixes), facts.heads.get(t.pr) ?? null, facts.pushes.get(t.pr), facts.compares, now);
 		return e ? [trainTaskSettledBody(t.id, e.outcome, e.evidence)] : [];
 	});
+}
+
+/** A result of `verdict` at `sha` may carry to the PR's `head` for task `t`: a green at S, neither H0 nor the head, while the head is not H0. */
+function carries(verdict: string, sha: string, t: TrainTask, head: string | null): head is string {
+	return verdict === "green" && head !== null && head !== t.head && sha !== t.head && sha !== head;
+}
+
+/**
+ * The compares `settleTasks` on `facts.train` would read now (PLAN wl-mvpwkpqobyp20w D2): per unsettled task, the carry of its
+ * NEWEST runner request, when that request's own result is a green at S that carries to the PR's current head; one row per
+ * (pr, S, head). An older green never carries (a later request, pending or not, may be a red at the head), and a newest request
+ * with no result or any other result lists nothing. The tick fetches each with `ghCompare` before its settle transaction, so no
+ * gh call holds the ledger's lock.
+ */
+export function carryPairs(ledger: Ledger, facts: Pick<SettleFacts, "train" | "heads">): { pr: number; from: string; to: string }[] {
+	const fixes = fixBindings(ledger);
+	const out = new Map<string, { pr: number; from: string; to: string }>();
+	for (const t of unsettledTasks(ledger, facts.train)) {
+		const head = facts.heads.get(t.pr) ?? null;
+		const runs = taskRuns(ledger, t, taskOwners(ledger, t, fixes));
+		const res = runs.at(-1)?.result;
+		if (res && carries(res.verdict, res.sha, t, head)) out.set(`${t.pr} ${res.sha} ${head}`, { pr: t.pr, from: res.sha, to: head });
+	}
+	return [...out.values()];
 }
 
 /**

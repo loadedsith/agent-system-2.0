@@ -3,6 +3,8 @@
 // workload with the test runner serving REPO (`boardWorld`, PLAN wl-mvbjiettjrfpxc D1-D7). Temp ledgers and temp git checkouts
 // with a fake GitHub origin only.
 import { expect } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
@@ -69,16 +71,19 @@ export const COMMIT_FILES_CAP = 3000;
  * first page of `per_page`, or every page with `--paginate` (an array of pages with `--slurp`). `fail` makes a matching call exit 1.
  * For boarding and main's protection (PLAN wl-mvbjiettjrfpxc D1, D6): a PR's state, base, draft flag and fork flag; main's rules
  * (`rules`, protected unless set; null answers 404) and ruleset 1's bypass; `compares`
- * by `<base>...<head>` and each commit's files (a path, or a diff entry with `status` and `previous_filename`), listed as GitHub
- * lists them: COMMIT_FILES_PER_PAGE per page, each page the commit object again, at most COMMIT_FILES_CAP in all.
+ * by `<base>...<head>`, each commit a sha (one parent) or `{ sha, parents }` (a merge has two), and each commit's files (a path,
+ * or a diff entry with `status` and `previous_filename`), listed as GitHub
+ * lists them: COMMIT_FILES_PER_PAGE per page, each page the commit object again, at most COMMIT_FILES_CAP in all. `saved` answers a
+ * `gh api <path>` with a saved GitHub answer as given (surface/test/fixtures/train-carry-305/), before any of the above.
  */
 export function fakeGh() {
 	const prs = new Map<number, { head: string; branch: string; state?: string; base?: string; draft?: boolean; fork?: boolean }>();
 	const activity: FakeActivity[] = [];
 	const issues: FakeIssue[] = [];
 	const calls: string[][] = [];
-	const compares = new Map<string, { status: string; commits: string[] }>();
+	const compares = new Map<string, { status: string; commits: (string | { sha: string; parents: number })[] }>();
 	const commitFiles = new Map<string, (string | FakeDiffEntry)[]>();
+	const saved = new Map<string, unknown>();
 	/** Issues on REPO itself (a holder's main-red issue), by number. */
 	const repoIssues = new Map<number, "OPEN" | "CLOSED">();
 	const main: { rules: unknown; bypass: string } = { rules: protectedRules(), bypass: "never" };
@@ -102,6 +107,7 @@ export function fakeGh() {
 		calls.push(args);
 		if (fail?.(args)) return { code: 1, stdout: "", stderr: "HTTP 502" };
 		const [noun, verb] = args;
+		if (noun === "api" && saved.has(verb!)) return ok(saved.get(verb!));
 		if (noun === "pr" && verb === "view") {
 			const n = Number(args[2]);
 			const p = prs.get(n);
@@ -117,7 +123,9 @@ export function fakeGh() {
 		if (noun === "api" && verb === `repos/${REPO}/rulesets/1`) return ok({ id: 1, current_user_can_bypass: main.bypass });
 		if (noun === "api" && verb?.startsWith(`repos/${REPO}/compare/`)) {
 			const c = compares.get(verb.slice(`repos/${REPO}/compare/`.length));
-			return c ? ok({ status: c.status, total_commits: c.commits.length, commits: c.commits.map((sha) => ({ sha })) }) : { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+			if (!c) return { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+			const commits = c.commits.map((k) => (typeof k === "string" ? { sha: k, parents: 1 } : k));
+			return ok({ status: c.status, total_commits: commits.length, commits: commits.map((k) => ({ sha: k.sha, parents: Array.from({ length: k.parents }, (_, i) => ({ sha: String(i).repeat(40) })) })) });
 		}
 		if (noun === "api" && verb?.startsWith(`repos/${REPO}/commits/`)) {
 			const sha = verb.slice(`repos/${REPO}/commits/`.length);
@@ -177,7 +185,7 @@ export function fakeGh() {
 		const before = activity.filter((a) => a.ref === `refs/heads/${branch}`).at(-1)?.after ?? "0".repeat(40);
 		activity.push({ before, after: sha, ref: `refs/heads/${branch}`, timestamp: at, activity_type: "push" });
 	};
-	return { gh, prs, activity, pushed, issues, repoIssues, calls, compares, commitFiles, main, failWhen: (f: ((args: string[]) => boolean) | null) => { fail = f; } };
+	return { gh, prs, activity, pushed, issues, repoIssues, calls, compares, commitFiles, saved, main, failWhen: (f: ((args: string[]) => boolean) | null) => { fail = f; } };
 }
 
 /** Main's rules as `gh api repos/<repo>/rules/branches/main` answers for a protected main: a strict as2/full-suite check in ruleset 1. */
@@ -272,9 +280,26 @@ export const SERVED = { repos: [{ origin: REPO, command: "bun test" }] };
 export const DECISION_LOG_FILE = ".ai/decision-log/2026-10-01--1000--jev--fix-the-header.md";
 
 /**
+ * The #305 shape (PLAN wl-mvpwkpqobyp20w § 1): the green at `green` (aebe37a4), one decision-log commit `head` (cde03460) on it,
+ * and GitHub's compare and get-a-commit answers for the two as saved, trimmed to the fields read
+ * (surface/test/fixtures/train-carry-305/), by `gh api` path on `repo`.
+ */
+export function carry305(repo = REPO) {
+	const dir = join(import.meta.dir, "fixtures", "train-carry-305");
+	const green = "aebe37a45247466e96a200974cecfc6662efa84d";
+	const head = "cde03460fd84af134cf591abf7c6dcb0d27f86b6";
+	const answers: Record<string, unknown> = {
+		[`repos/${repo}/compare/${green}...${head}`]: JSON.parse(readFileSync(join(dir, "compare.json"), "utf8")),
+		[`repos/${repo}/commits/${head}`]: JSON.parse(readFileSync(join(dir, "commit-cde03460.json"), "utf8")),
+	};
+	return { green, head, answers };
+}
+
+/**
  * The boarding world (PLAN wl-mvbjiettjrfpxc D1-D7): the standing workload, a served checkout of REPO, a fake gh and launcher,
  * and a first tick already run (the cutover). `landing(pr)` leaves a lane workload W as an autonomous normal lane finishes:
- * a green full suite at H0 on PR `pr`, a passed review, done-because, released and closed; its PR is OPEN at H0 on `wl/<W>`.
+ * a green full suite at `o.sha` (H0 by default) on PR `pr`, a passed review, done-because, released and closed; its PR is OPEN
+ * at that sha on `wl/<W>`.
  */
 export function boardWorld() {
 	const c = clock();
@@ -294,7 +319,8 @@ export function boardWorld() {
 	c.plusHours(0.01);
 	let seq = 0;
 	/** `o.entries`: assumption entries written on W right after its `repo:`, while it is open (a `plan:` row, say). */
-	const landing = (pr: number, o: { stakes?: "normal" | "production"; entries?: { by: string; body: string }[] } = {}): string => {
+	const landing = (pr: number, o: { stakes?: "normal" | "production"; entries?: { by: string; body: string }[]; sha?: string } = {}): string => {
+		const sha = o.sha ?? H0;
 		const holder = `lane-l-${++seq}`;
 		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: `Fix the header (#${pr})`, stakes: o.stakes ?? "normal", mode: "autonomous" });
 		recordRepo(ledger, wl, repo);
@@ -302,11 +328,11 @@ export function boardWorld() {
 		expect(ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
 		const sl = ledger.addSlice({ by: holder, workloadId: wl, task: "change", doneCondition: "tests pass", inputs: "src" });
 		const runId = makeRunId(Date.parse(c.now()) + seq, "abcd");
-		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr, sha: H0, slice: sl, by: holder }) });
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice: sl, by: holder }) });
 		ledger.recordEntry({
 			by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption",
 			body: testRunBody({
-				runId, verdict: "green", sha: H0, pr, reason: null, headAtEnd: H0, base: null, mergeBase: null,
+				runId, verdict: "green", sha, pr, reason: null, headAtEnd: sha, base: null, mergeBase: null,
 				full: { pass: 1, fail: 0, skip: 0, exit: 0, ms: 10, error: null }, solo: [], failures: [], runDir: null, preflight: null,
 			}),
 		});
@@ -317,7 +343,7 @@ export function boardWorld() {
 		ledger.recordEntry({ by: holder, workloadId: wl, kind: "assumption", body: "done-because: the header is fixed" });
 		ledger.releaseWorkload(wl, { by: holder, holder });
 		ledger.closeWorkload(wl, { by: SURFACE_BY });
-		g.prs.set(pr, { head: H0, branch: `wl/${wl}` });
+		g.prs.set(pr, { head: sha, branch: `wl/${wl}` });
 		c.plusHours(0.01);
 		return wl;
 	};
