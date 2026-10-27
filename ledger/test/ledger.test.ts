@@ -839,7 +839,7 @@ describe("a killed writer's temporary snapshot is reclaimed; a live writer's is 
 			import * as fs from "node:fs";
 			import { mock } from "bun:test";
 			const realLink = fs.linkSync;
-			mock.module("node:fs", () => ({ ...fs, linkSync: (src: string, dst: string) => { realLink(src, dst); process.kill(process.pid, "SIGKILL"); } }));
+			mock.module("node:fs", () => ({ ...fs, linkSync: (src: string, dst: string) => { realLink(src, dst); if (dst.endsWith(".db")) process.kill(process.pid, "SIGKILL"); } }));
 			// Dynamic on purpose: the module must load after the mock is installed.
 			const { Ledger } = await import(${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))});
 			Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false, clock: () => "2026-09-28T00:00:00.000Z" }).backupIfDue();
@@ -860,6 +860,82 @@ describe("a killed writer's temporary snapshot is reclaimed; a live writer's is 
 			expect(taken).toBe(join(copyDir, "ledger-2026-09-30T00-00-00.000Z.db"));
 			expect(temps()).toEqual([inProgress]);
 			expect(readdirSync(copyDir).sort()).toEqual(["SOURCE", inProgress, basename(taken!)].sort());
+		} finally {
+			live.kill();
+			l.close();
+		}
+	});
+});
+
+describe("SOURCE is published whole, so a concurrent opener never reads it empty (parallel full run, lane-run-guard)", () => {
+	test("review probe: a second opener reading at every step of the first copy never sees an empty owner, and SOURCE is only a link destination", () => {
+		const dir = scratch("source-atomic");
+		const path = join(dir, "ledger.db");
+		Ledger.open(path, { create: true, backupOnOpen: false }).close();
+		// The race: a write to SOURCE creates the file before its content lands. The worker splits any
+		// such write at that point and runs the second opener's backups() in between, and after every
+		// other call that can publish a file.
+		const worker = join(dir, "source-worker.ts");
+		writeFileSync(worker, `
+			import * as fs from "node:fs";
+			import { basename, join } from "node:path";
+			import { mock } from "bun:test";
+			const real = { ...fs };
+			const targets = [];
+			const seen = [];
+			let reader = null;
+			const probe = (at) => {
+				if (!reader) return;
+				try { reader.backups(); } catch (e) { seen.push(at + ": " + e.message); }
+			};
+			const publish = (name, dst) => (...args) => {
+				if (basename(String(args[dst])) === "SOURCE") targets.push(name);
+				const r = real[name](...args);
+				probe(name);
+				return r;
+			};
+			mock.module("node:fs", () => ({
+				...fs,
+				writeFileSync: (p, data, opts) => {
+					if (basename(String(p)) !== "SOURCE") return real.writeFileSync(p, data, opts);
+					targets.push("writeFileSync");
+					real.closeSync(real.openSync(p, "w"));
+					probe("SOURCE created, content not yet written");
+					real.writeFileSync(p, data, opts);
+					probe("writeFileSync");
+				},
+				appendFileSync: publish("appendFileSync", 0),
+				copyFileSync: publish("copyFileSync", 1),
+				renameSync: publish("renameSync", 1),
+				linkSync: publish("linkSync", 1),
+			}));
+			// Dynamic on purpose: the module must load after the mock is installed.
+			const { Ledger } = await import(${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))});
+			const writer = Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false, clock: () => "2026-09-28T00:00:00.000Z" });
+			reader = Ledger.open(${JSON.stringify(path)}, { backupOnOpen: false });
+			const taken = writer.backupIfDue();
+			probe("after backupIfDue");
+			const source = real.readFileSync(join(writer.backupDir, "SOURCE"), "utf8");
+			console.log(JSON.stringify({ taken: taken !== null, targets, seen, owner: source === writer.path + "\\n" }));
+		`);
+		const r = Bun.spawnSync(["bun", "run", worker], { stdout: "pipe", stderr: "pipe" });
+		expect({ exitCode: r.exitCode, err: r.stderr.toString() }).toEqual({ exitCode: 0, err: "" });
+		expect(JSON.parse(r.stdout.toString())).toEqual({ taken: true, targets: ["linkSync"], seen: [], owner: true });
+	});
+
+	test("a killed writer's temporary SOURCE is reclaimed by the next due copy; a live writer's is not", () => {
+		const l = fresh("source-temp", { backupOnOpen: false });
+		l.backupIfDue(true);
+		const copyDir = l.backupDir!;
+		const gone = Bun.spawnSync(["true"]).pid;
+		const live = Bun.spawn(["sleep", "30"]);
+		const orphan = `.SOURCE.${gone}-orphan.tmp`;
+		const inProgress = `.SOURCE.${live.pid}-inprogress.tmp`;
+		for (const name of [orphan, inProgress]) writeFileSync(join(copyDir, name), l.path);
+		try {
+			l.backupIfDue(true);
+			expect(readdirSync(copyDir).filter((n) => n.endsWith(".tmp"))).toEqual([inProgress]);
+			expect(readFileSync(join(copyDir, "SOURCE"), "utf8")).toBe(`${l.path}\n`);
 		} finally {
 			live.kill();
 			l.close();
