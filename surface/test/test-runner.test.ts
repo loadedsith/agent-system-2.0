@@ -22,11 +22,12 @@ import {
 	childLayout, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
-import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
-import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
-import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
+import { landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
+import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT } from "../scripts/test-runner";
+import { parseRunnerPreflight } from "../src/main-state";
 import { alive, tmp, until } from "./helpers";
-import { carry305 } from "./train-world";
+import { carry305, landFirst, mainRun } from "./train-world";
 
 setDefaultTimeout(180_000);
 
@@ -205,7 +206,7 @@ exit 1
 const statusPosts = (w: World): string[] => {
 	const log = join(w.root, "gh.log");
 	if (!existsSync(log)) return [];
-	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api -X ")).map((c) => {
+	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api -X ") && c.includes("/statuses/")).map((c) => {
 		const m = /^api -X POST repos\/(\S+)\/statuses\/([0-9a-f]{40}) -f state=(\S+) -f context=as2\/full-suite -f description=/.exec(c);
 		if (!m || m[1] !== OWNER_REPO) throw new Error(`unexpected gh api call: ${c}`);
 		return `${m[3]} ${m[2]}`;
@@ -2522,4 +2523,210 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 		go(w, runId, "result");
 		await child.exited;
 	}
+});
+
+// D4 coverage: admission and actual hosted/Mac transitions use the existing process world;
+// retention and reaping exercise exported state policies without launching another runner.
+describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
+	const api = (w: World, path: string, value: unknown, post = false) => {
+		const dir = join(w.root, post ? "post" : "api");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, `repos_${OWNER_REPO.replaceAll("/", "_")}_${path.replaceAll("/", "_")}`), JSON.stringify(value));
+	};
+	function landWorld(): World {
+		const w = world();
+		landFirst(w.ledger, OWNER_REPO, true);
+		mainRun(w.ledger, "tr-mainseed", fx.main, "green");
+		api(w, "git/ref/heads/main", { object: { sha: fx.main } });
+		api(w, `git/commits/${fx.main}`, {
+			sha: fx.main, tree: { sha: g(w.origin, "rev-parse", `${fx.main}^{tree}`) },
+			committer: { date: new Date().toISOString() }, parents: [],
+		});
+		api(w, `commits/${fx.main}/pulls`, []);
+		api(w, "git/ref/tags/as2-verified", { object: { type: "commit", sha: fx.main } });
+		api(w, "actions/workflows/as2-fast.yml/dispatches", { workflow_run_id: 71 }, true);
+		api(w, "actions/runs/71", { head_sha: fx.main, status: "completed" });
+		w.env.AGENT_SYSTEM_TEST_RUNNER_FAST_WAIT_MS = "50";
+		w.env.AGENT_SYSTEM_TEST_RUNNER_FAST_POLL_MS = "10";
+		return w;
+	}
+	function bind(w: World, pr: number, sha: string) {
+		const owner = workload(w);
+		setPr(w, pr, { sha, headRefName: `wl/${owner.wl}` });
+		api(w, `compare/${fx.main}...${sha}`, { status: "ahead" });
+		return owner;
+	}
+	function artifact(w: World, sha: string, mode: "green" | "red" | "missing"): void {
+		const dir = join(w.root, "artifact");
+		mkdirSync(dir);
+		const child = mode === "red" ? '<failure message="hosted failure">hosted failure</failure>' : mode === "missing" ? "<skipped/>" : "";
+		writeFileSync(join(dir, "fast.xml"), `<testsuites tests="1" failures="${mode === "red" ? 1 : 0}" skipped="${mode === "missing" ? 1 : 0}"><testsuite name="a.test.ts"><testcase classname="a.test.ts" name="hosted" time="0.01">${child}</testcase></testsuite></testsuites>`);
+		writeFileSync(join(dir, "fast.log"), "hosted fixture output\n");
+		writeFileSync(join(dir, "fast.summary"), `request @REQ@ sha ${sha} files 1 exit ${mode === "red" ? 1 : 0} wall 1 s\n`);
+	}
+	const calls = (w: World) => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+	const dispatches = (w: World) => calls(w).filter((s) => s.includes("/dispatches"));
+	const preflights = (w: World) => w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("runner-preflight:"));
+	const runIdOf = (s: { code: number; out: string; err: string }) => {
+		expect(s).toMatchObject({ code: START_EXIT.ok });
+		const id = /^test-run (tr-[a-z0-9]+) /.exec(s.out)?.[1];
+		if (!id) throw new Error(`start did not return a run id: ${JSON.stringify(s)}`);
+		return id;
+	};
+	async function finalized(w: World, wl: string, id: string): Promise<TestRun> {
+		const r = await resultOf(w, wl, id);
+		await until("the final gate post", () => calls(w).some((s) => s.includes(`/statuses/${r.sha}`) && /state=(success|failure)/.test(s)));
+		return r;
+	}
+
+	test("pending refusal admits nothing and does not compute a plan or dispatch", () => {
+		const w = landWorld();
+		const { wl, slice } = bind(w, PR.green, fx.head.green);
+		writeFileSync(join(w.root, "status-fails-pending"), "");
+		const before = w.ledger.entries(wl);
+		const s = start(w, wl, PR.green, ["--slice", slice]);
+		expect(s.code).toBe(START_EXIT.refused);
+		expect(s.err).toContain("nothing was requested");
+		expect(w.ledger.entries(wl)).toEqual(before);
+		expect(dispatches(w)).toEqual([]);
+		expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`]);
+		expect(existsSync(join(w.root, "status-ok.log"))).toBe(false);
+		expect(existsSync(join(w.runs, "mirrors"))).toBe(false);
+	});
+
+	for (const mode of ["green", "red", "missing"] as const) {
+		test(`hosted ${mode}: pending first, recorded plan, tagged dispatch, executed counts and gate verdict without a Mac slot`, async () => {
+			const w = landWorld();
+			const { wl, slice } = bind(w, PR.green, fx.head.green);
+			artifact(w, fx.head.green, mode);
+			const id = runIdOf(start(w, wl, PR.green, ["--slice", slice]));
+			const result = await finalized(w, wl, id);
+			expect(fastPlanOf(w.ledger.entries(wl), id)).toEqual({ ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [] });
+			expect(result).toMatchObject({
+				verdict: mode === "green" ? "green" : "red", scope: "fast", host: "linux",
+				exec: { files: mode === "missing" ? 0 : 1, tests: mode === "missing" ? 0 : 1, treeFiles: 1 },
+			});
+			if (mode === "red") expect(result.full).toMatchObject({ fail: 1 });
+			if (mode === "missing") expect(result.reason).toContain("no executed test in the fast set's a.test.ts");
+			expect(w.ledger.slice(slice)!.state).toBe(mode === "green" ? "done" : "open");
+			expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `${mode === "green" ? "success" : "failure"} ${fx.head.green}`]);
+			expect(dispatches(w)).toHaveLength(1);
+			expect(dispatches(w)[0]).toContain(`ref=as2-verified -f inputs[sha]=${fx.head.green} -f inputs[files]=./a.test.ts -f inputs[request]=${id}`);
+			expect(calls(w).findIndex((s) => s.includes("state=pending"))).toBeLessThan(calls(w).findIndex((s) => s.includes("git/ref/heads/main")));
+			expect(marks(w, id, "acquired")).toEqual([]);
+			expect(existsSync(join(w.root, "sudo.log"))).toBe(false);
+			expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("fast-fallback:"))).toEqual([]);
+			expect(preflights(w)).toHaveLength(1);
+			expect(preflights(w)[0]!.created_by).toBe(TEST_RUNNER_BY);
+			expect(parseRunnerPreflight(preflights(w)[0]!.body)).toEqual({ ok: true, reason: null, source: "0".repeat(40), root: resolve(import.meta.dir, "..", "..") });
+		});
+	}
+
+	for (const reason of ["dispatch", "wrong head", "timeout"] as const) {
+		test(`${reason} falls back once: same planned set executes on the Mac, no hosted retry`, async () => {
+			const w = landWorld();
+			const { wl, slice } = bind(w, PR.green, fx.head.green);
+			if (reason === "dispatch") writeFileSync(join(w.root, "post", `repos_${OWNER_REPO.replaceAll("/", "_")}_actions_workflows_as2-fast.yml_dispatches.fail`), "dispatch denied\n");
+			if (reason === "wrong head") api(w, "actions/runs/71", { head_sha: fx.head.red, status: "completed" });
+			if (reason === "timeout") api(w, "actions/runs/71", { head_sha: fx.main, status: "in_progress" });
+			const id = runIdOf(start(w, wl, PR.green, ["--slice", slice]));
+			const result = await finalized(w, wl, id);
+			expect(result).toMatchObject({ verdict: "green", scope: "fast", host: "mac", full: { pass: 1, fail: 0 }, exec: { files: 1, tests: 1, treeFiles: 1 } });
+			expect(dispatches(w)).toHaveLength(1);
+			const rows = w.ledger.entries(wl).filter((e) => e.body.startsWith("fast-fallback:"));
+			expect(rows).toHaveLength(1);
+			expect(rows[0]!.body).toContain(reason === "dispatch" ? "dispatch failed: dispatch denied" : reason === "wrong head" ? "not as2-verified" : "no result in");
+			expect(subsOf(w, id).filter((s) => s === "fast")).toEqual(["fast"]);
+			expect(subsOf(w, id)).not.toContain("full");
+			expect(readFileSync(join(w.as2, "stage", id, "caps.json"), "utf8")).toBeTruthy();
+			expect(marks(w, id, "acquired")).toHaveLength(1);
+			expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
+			expect(preflights(w)).toHaveLength(1);
+		});
+	}
+
+	test("tree carry settles from G without a runner and a refused final gate post leaves pending with a durable failure row", async () => {
+		const w = landWorld();
+		// A distinct commit with exactly G's tree, not an identical-S carry.
+		const head = g(w.origin, "commit-tree", g(w.origin, "rev-parse", `${fx.main}^{tree}`), "-p", fx.main, "-m", "same tree");
+		g(w.origin, "update-ref", "refs/pull/12/head", head);
+		const { wl, slice } = bind(w, 12, head);
+		writeFileSync(join(w.root, "status-fails-success"), "");
+		const s = start(w, wl, 12, ["--slice", slice]);
+		const id = runIdOf(s);
+		expect(s.out).toContain("runner none");
+		expect(s.out).toEndWith("carried tr-mainseed");
+		expect(fastPlanOf(w.ledger.entries(wl), id)).toEqual({ ref: `wl/${wl}`, scope: "tree", g: fx.main, run: "tr-mainseed" });
+		expect(await resultOf(w, wl, id)).toMatchObject({ verdict: "green", sha: head, full: { pass: 400 }, runDir: "/runs/tr-mainseed", scope: "full", host: "mac" });
+		expect(w.ledger.slice(slice)!.state).toBe("done");
+		expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("status-failed:")).map((e) => e.body)).toEqual([`status-failed: ${id} success on ${head}: gh: Validation Failed (HTTP 422)`]);
+		expect(readFileSync(join(w.root, "status-ok.log"), "utf8").trim()).toBe(`pending repos/${OWNER_REPO}/statuses/${head}`);
+		expect(dispatches(w)).toEqual([]);
+		expect(existsSync(join(w.runs, id))).toBe(false);
+	});
+
+	test("refused install preflight records the outcome once and never executes a test", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		chmodSync(join(w.libexec, "bun"), 0o700);
+		const id = request(w, wl, slice, PR.green, fx.head.green);
+		expect(await spawnRun(w, id).exited).toBe(0);
+		expect(await resultOf(w, wl, id)).toMatchObject({ verdict: "error" });
+		expect(preflights(w)).toHaveLength(1);
+		expect(parseRunnerPreflight(preflights(w)[0]!.body)).toMatchObject({ ok: false, reason: expect.stringContaining("mode 700"), source: "0".repeat(40), root: resolve(import.meta.dir, "..", "..") });
+		expect(preflights(w)[0]!.created_by).toBe(TEST_RUNNER_BY);
+		expect(marks(w, id, "spawn-full")).toEqual([]);
+	});
+
+	test("reap settles dead PR and main requests, keeps live requests, admits nothing, and repeats as a no-op", () => {
+		const w = landWorld();
+		const a = workload(w);
+		const b = workload(w);
+		const dead = request(w, a.wl, a.slice, PR.green, fx.head.green, 600_000);
+		const stale = request(w, b.wl, b.slice, PR.green, fx.head.green, 600_000);
+		writeHeartbeat(w, stale, Date.now() - 120_000);
+		const liveOwner = workload(w);
+		const live = request(w, liveOwner.wl, liveOwner.slice, PR.green, fx.head.green, 600_000);
+		writeHeartbeat(w, live, Date.now());
+		const startup = workload(w);
+		request(w, startup.wl, startup.slice, PR.green, fx.head.green);
+		const main = "tr-deadmain";
+		w.ago(600_000, () => w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: testRequestedBody({ runId: main, pr: 0, sha: fx.main, slice: "sl-main-dead", by: MERGE_TRAIN_BY, main: { repo: OWNER_REPO } }) }));
+		const before = w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM entries WHERE body LIKE 'test-requested: %'").get()!.n;
+		const reaped = reapRequests(w.ledger, w.runs);
+		expect(reaped.failed).toEqual([]);
+		expect(reaped.settled.sort()).toEqual([main, dead, stale].sort());
+		for (const [wl, id] of [[a.wl, dead], [b.wl, stale], [STANDING_WORKLOAD_ID, main]]) {
+			expect(testRuns(w.ledger.entries(wl!)).find((r) => r.request.runId === id)!.results).toEqual([expect.objectContaining({ verdict: "error", reason: "runner died", main: id === main })]);
+		}
+		expect(testRuns(w.ledger.entries(liveOwner.wl))[0]!.results).toEqual([]);
+		expect(testRuns(w.ledger.entries(startup.wl))[0]!.results).toEqual([]);
+		expect(w.ledger.slice(a.slice)!.state).toBe("open");
+		const entries = w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM entries").get()!.n;
+		expect(reapRequests(w.ledger, w.runs)).toEqual({ settled: [], failed: [] });
+		expect(w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM entries").get()!.n).toBe(entries);
+		expect(w.ledger.db.query<{ n: number }, []>("SELECT count(*) AS n FROM entries WHERE body LIKE 'test-requested: %'").get()!.n).toBe(before);
+		expect(existsSync(join(w.root, "gh.log"))).toBe(false);
+	});
+
+	test("retention keeps main and main-red citations for 30 days beyond KEEP_RUNS, and an open incident keeps older evidence until cleared", () => {
+		const w = landWorld();
+		const now = Date.now();
+		const day = 86_400_000;
+		const entry = (body: string, age: number, by = TEST_RUNNER_BY) => w.pin(new Date(now - age).toISOString(), () => w.ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body }));
+		const main = (id: string, age: number) => entry(testRequestedBody({ runId: id, pr: 0, sha: fx.main, slice: `sl-${id}`, by: MERGE_TRAIN_BY, main: { repo: OWNER_REPO } }), age);
+		main("tr-boundary", 30 * day);
+		main("tr-expired", 30 * day + 1);
+		entry("main-red: run tr-recentred", 29 * day);
+		entry("main-red: run tr-oldred", 31 * day);
+		entry("main-red: run tr-forged", day, LANE);
+		const cited = citedRuns(w.ledger.entries(STANDING_WORKLOAD_ID), now);
+		expect([...cited].sort()).toEqual(["tr-boundary", "tr-recentred"]);
+		const runs = ["tr-boundary", "tr-recentred", "tr-expired", ...Array.from({ length: 10 }, (_, i) => `tr-new${i}`)].map((id, i) => ({ id, at: i }));
+		expect(retentionPrune(runs, cited, "tr-new9")).toEqual(["tr-expired"]);
+		entry(landFirstNoticeBody(OWNER_REPO, { event: "stop-raised", kind: "regression", tip: fx.main, g: fx.main, suspects: [], failing: 1 }), 40 * day, MERGE_TRAIN_BY);
+		expect([...citedRuns(w.ledger.entries(STANDING_WORKLOAD_ID), now)].sort()).toEqual(["tr-boundary", "tr-expired", "tr-oldred", "tr-recentred"]);
+		entry(landFirstNoticeBody(OWNER_REPO, { event: "stop-cleared", why: "fixed" }), 0, MERGE_TRAIN_BY);
+		expect([...citedRuns(w.ledger.entries(STANDING_WORKLOAD_ID), now)].sort()).toEqual(["tr-boundary", "tr-recentred"]);
+	});
 });
