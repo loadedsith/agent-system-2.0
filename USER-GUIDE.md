@@ -126,6 +126,15 @@ With one open workload the word applies to it. With several, add the id: `produc
 The merge train's lane does not count against the lane cap. It launches whenever the train has work: a PR on it, a settled task, or an answer to a question the train lane asked. It does so even when the cap is full of other lanes, and it never takes a slot from them. There is never more than one train lane at a time. A train with nothing to do gets no lane. A fix workload that a train opens is an ordinary workload and counts against the cap.
 
 If three launches of the train lane in a row fail before the lane is ready (it never got ready, or it crashed before readiness), nothing launches it again. A lane that got ready and then crashed is not one of those, and a session you run by hand (`as2 lane <wl>`) never counts. The surface asks you a `now` question with the options `relaunch` / `stop`, once per run of failures. `relaunch` starts the train again and resets the count. `stop` leaves it stopped until you send `launch-requested` for it or a `train` word.
+### Fast checks before merge; full suite on main after (`migration/items/train-land-first.md`)
+
+Land-first separates the fast hosted PR check from the full Mac suite on main. The runner keeps `as2/full-suite` as the strict, required, up-to-date ruleset status: a fast green alone is not a full-suite result. Before merge, changed-code tests plus the configured smoke tests run on GitHub-hosted Linux; after landing, the full suite runs on main and coalesces to the newest main commit. Main red or unknown stops further landings and raises one loud incident naming the suspects since the last believable green. A red verdict is not retried; exhausted inconclusive infrastructure attempts resume only after Jo says `main-retry <repo>`.
+
+Schema migrations, dependency or lockfile changes, and production-stakes PRs retain a full Mac suite before merge. The 13 Mac-only and four Linux-portability test files are excluded from hosted Linux and run in the post-merge Mac suite; zsh and bubblewrap tests stay in the fast set, with the hosted job installing both. A PR's fast green is covered at close only after a green believable main run on its merge commit or later. `lane_full_test` keeps its name and runs the gate; it does not change the strict ruleset. With land-first off, PRs retain the existing full-suite-before-merge behavior.
+
+Activation requires shadow mode to establish green verified commit G and its tag, then Jo reruns `install/as2test-setup.sh`, then runs `install/install.sh --control-root=verified`, and only then says `land-first agent-system-2.0 on`. Rerunning setup before the tag breaks refresh. Activation is a ledger word, not a profile flag. See the migration item for loud failure and restart recovery details.
+
+Land-first details, including the shadow-mode activation order and restart recovery, are in `migration/items/train-land-first.md`.
 
 ### Steer a workload yourself (user-driven)
 
