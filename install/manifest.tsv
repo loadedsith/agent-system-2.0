@@ -1149,6 +1149,7 @@ surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
 surface/test/train-world.ts	test	-
 surface/test/train-escalation.test.ts	test	-
+surface/test/train-live.test.ts	test	-
 surface/test/train-signoff.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-

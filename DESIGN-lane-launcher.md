@@ -136,7 +136,7 @@ Deployment boundary (*same amendment, PLAN-2 R15*): every session loads its exte
 Predicate pseudocode (≤ 30 lines; the real function takes plain rows and returns a reason, never touching the ledger):
 
 ```
-launchable(w, control, receipt, resolutions, now, liveLanes, cap):
+launchable(w, control, receipt, resolutions, now, liveLanes, cap, capExempt = false):
   if w.status != "open"                      → "closed"
   if w.id == STANDING_WORKLOAD_ID             → "standing"
   if w.brief startsWith "due:"                → "due"
@@ -149,15 +149,20 @@ launchable(w, control, receipt, resolutions, now, liveLanes, cap):
   req = oldest control "launch-requested:" whose entry id is not in consumed
   -- receipt: the newest holder/surface assumption is a holder's done-because: (doneBecause)
   if receipt and not req                      → "awaiting-close" (the tick closes it)
-  if liveLanes >= cap                         → "cap"
+  if liveLanes >= cap and not capExempt       → "cap"
   if attempts is empty                        → LAUNCH cause "first"
   if req                                      → LAUNCH cause "request <req.id>" (Jo's word)
   res = resolutions not in consumed           (answer or replan withdrawal; question raised by a lane
                                                an attempt names; its slice now open)
+    capExempt: res = resolutions not consumed by readiness instead: one is consumed only when some attempt's
+               lane wrote a lane-ready: whose time (its row cut) is later than the resolution's instruction;
+               named resume ids are not consumed at reservation, so a never-ready resume leaves the answer
   if res                                      → LAUNCH cause "resume <res ids>"
                                                 with --resume <session from the raising lane's lane-started:>
   → "died-not-relaunched"
 ```
+
+`capExempt` is true when the workload is an open merge train (it has a valid `train:` or `train-board:` member): the `cap` refusal is skipped for it, its resolutions are consumed by a ready lane's `lane-ready:` rather than at reservation (above), every other rule still applies, and its lane never counts in `liveLanes` for other workloads.
 
 Session selection and startup pseudocode (the runner recomputes the resume choice for each spawn):
 

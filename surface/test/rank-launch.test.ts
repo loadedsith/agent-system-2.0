@@ -16,8 +16,9 @@ import { recordRepo } from "../src/decision-log";
 import { ensureStandingWorkload } from "../src/identity";
 import {
 	controlEntries, doneBody, LANE_CAP_ENV, laneExitBody, laneReadyBody, laneStopAcceptedBody, laneStopRequestBody, launchRequestedBody, PRIORITY_REASON_PREFIX, priorityPausedOf,
-	STARTER_EXIT, verdictOf,
+	launchRowsFor, STARTER_EXIT, verdictOf,
 } from "../src/launch";
+import { applyTrain, interpret } from "../src/input";
 import { briefHash, formatOverride, formatSignal, goalsHash, parseShown, rankDay, rankOpen, type SignalAnswers } from "../src/rank";
 import { parallelRead, parallelVerdict, parseRankConfig, preemptFor, type RankConfig, readRankConfig } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
@@ -926,5 +927,98 @@ describe("T20 Jo's picks write their snapshot in the pick's transaction", () => 
 		await expect(call({ workloadId: hi })).rejects.toThrow("injected");
 		expect(snapshots(l)).toHaveLength(1);
 		l.close();
+	});
+});
+
+// ---- PLAN wl-mvpsrr4tr0p1xc D1: the open merge train is outside the cap and the rank gate ------------------------------
+
+describe("D1 the open train under the rank gate and the cap", () => {
+	/** A merge train on `l` as Jo's `train <pr>` word opens it, scored when `unblocks` is given. */
+	function trainOn(l: Ledger, pr: number, unblocks?: number): string {
+		const cmd = interpret(l, `train ${pr}`);
+		if (cmd?.kind !== "train") throw new Error(`not a train: ${JSON.stringify(cmd)}`);
+		const wl = applyTrain(l, cmd, tmp("train-repo")).workloadId;
+		if (unblocks !== undefined) signal(l, wl, unblocks);
+		return wl;
+	}
+
+	test("order and parallel: a train Jev ranks below a launchable workload is admitted on launchable's verdict alone, by the reservation and the surface's check", () => {
+		const { l, open } = world();
+		open("hi: Jev ranks it above the train", { unblocks: 0.9 });
+		const train = trainOn(l, 101, 0.1);
+		expect(launchVerdict(l, homeWith(ORDER_YAML), train)).toEqual({ launch: true, cause: { kind: "first" } });
+		// a parallel budget of 0 holds every ordinary workload (`parallel: budget unknown`); the train takes no slot and is not held
+		expect(launchVerdict(l, homeWith("jevRank:\n  mode: parallel\n  parallelBudgetUsd: 0\n"), train)).toEqual({ launch: true, cause: { kind: "first" } });
+		expect(reserve(l, train, ORDER)).toMatchObject({ ok: true, laneId: laneIdOf(train, 1), cause: "first" });
+	});
+
+	test("order: a launchable train ranked above never queues the workload below it", () => {
+		const { l, open } = world();
+		const lo = open("lo", { unblocks: 0.1 });
+		const train = trainOn(l, 101, 0.9);
+		pin(l, train);
+		expect(verdictOf(l.launchRows(train, 3)!)).toEqual({ launch: true, cause: { kind: "first" } });
+		// the same pin on an ordinary workload queues the one below it
+		const pinned = open("pinned ordinary", { unblocks: 0.5 });
+		pin(l, pinned);
+		expect(reserve(l, lo, ORDER)).toEqual({ ok: false, reason: `ranked: below ${pinned}` });
+		running(l, pinned);
+		expect(reserve(l, lo, ORDER)).toMatchObject({ ok: true, laneId: laneIdOf(lo, 1), cause: "first" });
+	});
+
+	test("cap 1 full of an ordinary lane: the train is admitted, and the cap line names only the cap-counted lane while the train's lane runs", async () => {
+		const { l, open } = world();
+		const busy = open("busy", { unblocks: 0.5 });
+		const next = open("next", { unblocks: 0.4 });
+		const train = trainOn(l, 101, 0.1);
+		running(l, busy);
+		const env = { ...homeWith(ORDER_YAML), AGENT_SYSTEM_MAX_LANES: "1" };
+		expect(launchVerdict(l, env, next)).toEqual({ launch: false, reason: "cap" });
+		expect(launchVerdict(l, env, train)).toEqual({ launch: true, cause: { kind: "first" } });
+		running(l, train);
+		const f = fakePi(undefined, { exec: true });
+		expect(await triggerLaunch(f.pi, l, env, next, "open")).toEqual({
+			attempted: false, code: null, line: `${next} queued behind ${laneIdOf(busy, 1)} on ${busy} (cap 1); the tick launches it when a slot frees`,
+		});
+		expect(f.execs.calls).toEqual([]);
+	});
+
+	test("show, order and parallel: a never-launched train's pending request is its launch cause, so the reservation consumes it", () => {
+		for (const config of [SHOW, ORDER, parallel(0)]) {
+			const { l, open } = world();
+			open("hi: Jev ranks it above the train", { unblocks: 0.9 });
+			const train = trainOn(l, 101, 0.1);
+			const req = request(l, train);
+			// launchable alone reads `first`; the gate promotes Jo's request for the cap-exempt train in every mode
+			expect(verdictOf(l.launchRows(train, 3, { capExempt: new Set([train]) })!)).toEqual({ launch: true, cause: { kind: "first" } });
+			expect(reserve(l, train, config)).toMatchObject({ ok: true, laneId: laneIdOf(train, 1), cause: `request ${req}` });
+			expect(launches(l, train)).toEqual([expect.stringContaining(`cause request ${req}`)]);
+		}
+	});
+
+	test("show: an ordinary workload's pending request on its first launch still launches `first`", () => {
+		const { l, open } = world();
+		const wl = open("ordinary", { unblocks: 0.5 });
+		request(l, wl);
+		expect(reserve(l, wl, SHOW)).toMatchObject({ ok: true, laneId: laneIdOf(wl, 1), cause: "first" });
+	});
+
+	test("order, cap 1: the priority pause neither counts nor stops the train's lane, and never makes room for the train", () => {
+		const { l, open } = world();
+		const train = trainOn(l, 101, 0.1);
+		pin(l, train);
+		const busy = open("busy", { unblocks: 0.5 });
+		const laneBusy = live(l, busy);
+		// the pinned train waits on no slot: nothing is paused to make room for it
+		expect(preempt(l, 1)).toEqual({ paused: null, reason: "no ruled workload waiting" });
+		l.releaseWorkload(busy, { by: LANE_STARTER_BY, holder: laneBusy });
+		const laneTrain = live(l, train);
+		const x = open("X, ruled by Jo", { unblocks: 0.9 });
+		pin(l, x);
+		// the train's live lane takes no slot, so the cap is not full and the train's lane is not stopped for X
+		expect(preempt(l, 1)).toEqual({ paused: null, reason: "below cap (0 of 1 lanes)" });
+		expect(stops(l, train)).toEqual([]);
+		expect(laneTrain).toBe(laneIdOf(train, 1));
+		expect(verdictOf(launchRowsFor(l, x, 1)!)).toEqual({ launch: true, cause: { kind: "first" } });
 	});
 });
