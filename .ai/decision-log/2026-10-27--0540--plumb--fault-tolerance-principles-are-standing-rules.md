@@ -18,7 +18,7 @@ durable: true
 6. **Recovery never destroys the evidence.** Cleanup never deletes what a receipt, log or open incident cites, and evidence is kept for a stated retention window.
 7. **One failure never hides another.** Errors chain or join, so a cleanup error never replaces the original. A run reports every failed check, not only the first.
 
-Alarms follow the same rules: loud once, repeated only when the state changes or on a slow cadence. A loud alarm that repeats every cycle trains people to ignore it.
+Alarms follow the same rules. An alarm fires only on a state that needs action; a normal exit is not a death. It is loud once, repeated only when the state changes or on a slow cadence. An alarm that repeats every cycle, or fires when nothing is wrong, trains people to ignore it.
 
 ## Why
 
@@ -47,3 +47,5 @@ Jo added the smallest-piece clause to principle 3 ("Restart the smallest piece t
 Source: Candea et al., "Microreboot: A Technique for Cheap Recovery", OSDI 2004, https://static.usenix.org/event/osdi04/tech/candea.html. From the abstract: "Microreboots recover most of the same failures as full reboots, but do so an order of magnitude faster and result in an order of magnitude savings in lost work."
 
 Second amendment, about 9:05 AM PDT the same day: Jo added the progress-only clause to principle 4 ("An attempt counts against the limit only if it made progress; an attempt that made no progress still counts against the cost budget"). The evidence, from 2026-10-27: a Kimi lane ran 123 minutes at 0 tokens without touching the conflict and used up both of PR #151's conflict-fix attempts. Meanwhile the merge train woke five lanes (79 to 83), and each found nothing to do and released, at about $3 apiece. The `tiers/` "Bound every retry" lines carry the same clause.
+
+Third amendment, about 9:10 AM PDT the same day: Jo added to the alarm rule that an alarm fires only on a state that needs action, and a normal exit is not a death. The evidence, from 2026-10-27: Ilex had to call four "lane died" alarms noise (lanes 80 to 83 of the merge train). Each was a normal exit, for example `lane-exit: lane-mvfye8lm1uwao0-80 code 0`.
