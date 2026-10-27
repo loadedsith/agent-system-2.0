@@ -23,7 +23,9 @@
 //     a passed-over PR whose retry wait has passed, a returned PR's head the train has not worked, from step 1's views, or a
 //     held PR whose hold has ended, `hold-expired`, PLAN wl-mvfkv7llkp7nk0 § 3) and not held live gets the launcher: on its own
 //     cause when it has one (`first`, a pending request, an unconsumed resolution, PLAN wl-mvpsrr4tr0p1xc D2), so the attempt
-//     names and consumes it, else after `launch-requested: by merge-train`. A head's wake is recorded (`train-head-woken:`) when
+//     names and consumes it, else, only when its verdict reads `died-not-relaunched`, after `launch-requested: by merge-train`;
+//     any other refusal read at request time (`held` by a lane another path started since the wake read, `awaiting-close`, …)
+//     gets no request and no launcher, one log line (review r1 F2). A head's wake is recorded (`train-head-woken:`) when
 //     the tick requested a lane for it (wrote the request, or its launcher served a pending one or the train's own cause), once
 //     per request, whichever starter serves it; the head stays due under the pass-over backoff until the train works it
 //     (`trainRetries`). An ended hold's wake is recorded at the same request boundary (`train-wake: pr <n> hold <entry id>`),
@@ -155,12 +157,15 @@ export function tick(d: TickDeps): string[] {
 		say(`${wl}: ${body}`);
 	};
 	/**
-	 * Run the launcher for `wl`, after writing `launch-requested: by merge-train` unless one is unconsumed already or, on an open
-	 * train (cap-exempt, PLAN wl-mvpsrr4tr0p1xc D2), the train's own cause already admits it (`launchRowsFor` + `verdictOf`:
-	 * `first`, an unconsumed resolution), so the attempt names and consumes that cause. Returns the launcher's exit code, whether
-	 * this call wrote the request, the id of the request now pending (null when the train's own cause was launched) and the
-	 * workload's entry count before the launch. Null, with nothing written and no launcher, when the workload is stopped at its
-	 * ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3).
+	 * Run the launcher for `wl`, after writing `launch-requested: by merge-train` unless one is unconsumed already. On an open
+	 * train (cap-exempt, PLAN wl-mvpsrr4tr0p1xc D2) the verdict (`launchRowsFor` + `verdictOf`) is read first: when the train's
+	 * own cause admits it (`first`, an unconsumed resolution) the launcher runs with no request, so the attempt names and
+	 * consumes that cause; only `died-not-relaunched` gets the request; any other refusal (`held` by a lane another path
+	 * launched since step 4 read the train, `awaiting-close`, `user-driven`, …) writes nothing and runs no launcher, so no
+	 * request outlives that lane to wake an idle train (review r1 F2). Returns the launcher's exit code, whether this call wrote
+	 * the request, the id of the request now pending (null when the train's own cause was launched) and the workload's entry
+	 * count before the launch. Null, with nothing written and no launcher, when the workload is stopped at its ceiling
+	 * (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3) or the train's verdict refuses with another reason; one line says which.
 	 */
 	const request = (wl: string, reason: string): { code: number; wrote: boolean; requestId: string | null; before: number } | null => {
 		const entries = ledger.entries(wl);
@@ -174,7 +179,12 @@ export function tick(d: TickDeps): string[] {
 		const consumed = consumedIds(attempts(control));
 		const pending = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
 		const rows = pending === undefined ? launchRowsFor(ledger, wl, laneCap(process.env)) : null;
-		const own = rows !== null && rows.capExempt && verdictOf(rows).launch;
+		const verdict = rows !== null && rows.capExempt ? verdictOf(rows) : null;
+		if (verdict !== null && !verdict.launch && verdict.reason !== "died-not-relaunched") {
+			say(`${wl}: launch (${reason}) not requested: ${verdict.reason}`);
+			return null;
+		}
+		const own = verdict !== null && verdict.launch;
 		const requestId = pending?.id ?? (own ? null : ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) }));
 		const before = ledger.entries(wl).length;
 		const r = d.launch(wl);
@@ -353,8 +363,9 @@ export function tick(d: TickDeps): string[] {
 		// request refused here and served by another starter still counts. A request still pending when the head is due again is
 		// the same wake, not a second (PLAN wl-mvgn310dpi5gcg D1); the head stays retried under the backoff (`trainRetries`).
 		// An expired hold is consumed by a new or pending request, even if the capped launcher leaves it for the drain to serve.
-		// A launch on the train's own cause (no request) counts only when the launcher started it. A ceiling refusal writes no
-		// request and consumes neither a head wake nor a hold's expiry.
+		// A launch on the train's own cause (no request) counts only when the launcher started it. A ceiling refusal, and a
+		// verdict refusal other than `died-not-relaunched` read in `request()`, write no request and consume neither a head wake
+		// nor a hold's expiry.
 		const r = why.length > 0 ? request(wl, why.join("; ")) : null;
 		if (r && (r.wrote || r.code === 0)) {
 			const after = ledger.entries(wl);

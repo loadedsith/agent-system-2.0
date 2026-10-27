@@ -2032,10 +2032,12 @@ export interface TrainLaunchFailures {
  * D4: the train's `launch:` attempts after the newest reset, walked newest first, counting each that has no `lane-ready:` and
  * has ended: it has a `launch-failed:` or a `lane-exit: … outcome never-ready`, or a later attempt exists, or it is the newest
  * attempt and the workload is no longer held by it under a live lease (a starter or runner that died before readiness without
- * finalizing). The walk stops at an attempt whose lane wrote `lane-ready:`; the newest attempt still held under a live lease
- * and not ready is in flight and not counted. A reset is Jo's `launch-requested: by jo`, Jo's `relaunch` answer to the D4
- * question (the tick's, options `TRAIN_LAUNCH_OPTIONS`) or a `train:` binding; an attempt counts only when written after it
- * (entry order on a tie with an entry, the attempt on a tie with an answer). Pure: pass the rows one read took.
+ * finalizing). The walk stops at an attempt whose lane wrote `lane-ready:` and at a by-hand attempt (`cause interactive`: Jo's
+ * session gets its first prompt from a file and has no runner readiness step, so it is never a failed launch, as
+ * `neverReadyLanes` reads it); the newest attempt still held under a live lease and not ready is in flight and not counted. A
+ * reset is Jo's `launch-requested: by jo`, Jo's `relaunch` answer to the D4 question (the tick's, options
+ * `TRAIN_LAUNCH_OPTIONS`) or a `train:` binding; an attempt counts only when written after it (entry order on a tie with an
+ * entry, the attempt on a tie with an answer). Pure: pass the rows one read took.
  */
 export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures {
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.holder));
@@ -2059,7 +2061,7 @@ export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures 
 	const live = heldLive({ holder: rows.holder, holder_lease_until: rows.holderLeaseUntil }, rows.now);
 	for (let i = list.length - 1; i >= 0; i--) {
 		const a = list[i]!;
-		if (control.some((c) => c.prefix === "lane-ready" && c.laneId === a.laneId)) break;
+		if (a.cause?.kind === "interactive" || control.some((c) => c.prefix === "lane-ready" && c.laneId === a.laneId)) break;
 		const failed = control.find((c) => c.prefix === "launch-failed" && c.laneId === a.laneId);
 		const exit = laneExit(control, a.laneId);
 		const next = list[i + 1];

@@ -115,7 +115,8 @@ describe("reserveLane (decision 8)", () => {
 		expect(l.launchRows(d, 3, { capExempt: exempt })).toMatchObject({ liveLanes: 1, capExempt: false });
 		expect(l.launchRows(train, 3, { capExempt: exempt })).toMatchObject({ liveLanes: 1, capExempt: true });
 		expect(l.liveLaneHolders(l.now(), exempt)).toEqual([{ workloadId: a, holder: "lane-a-1" }]);
-		expect(l.liveLaneHolders(l.now()).map((h) => h.workloadId)).toEqual([a, train]);
+		// order-free: liveLaneHolders sorts by created_at, id, and ids end in a random suffix, so a millisecond tie may put train first
+		expect(l.liveLaneHolders(l.now()).map((h) => h.workloadId).sort()).toEqual([a, train].sort());
 		const seen: { liveLanes: number; capExempt: boolean }[] = [];
 		let calls = 0;
 		const r = l.reserveLane(d, {

@@ -878,6 +878,17 @@ describe("trainLaunchFailures: consecutive train launches that never got ready (
 		expect(trainLaunchFailures(rows([]))).toEqual({ count: 0, lanes: [], failures: [], first: null, last: null });
 	});
 
+	test("a by-hand attempt (`cause interactive`, no runner lane-ready:) never counts and ends the walk as a ready one does (lane decision en-mvpx8gfkld6ku8)", () => {
+		const byHand = (lane: string, at: string, exitAt: string) => [
+			attempt(lane, at, "interactive"), row(LANE_STARTER_BY, laneExitBody(lane, { code: 0, signal: null, outcome: "interactive" }), exitAt),
+		];
+		const three = [...byHand("lane-m-1", T(1), T(2)), ...byHand("lane-m-2", T(3), T(4)), ...byHand("lane-m-3", T(5), T(6))];
+		expect(trainLaunchFailures(rows(three))).toEqual({ count: 0, lanes: [], failures: [], first: null, last: null });
+		// failures before a by-hand session are behind it; a failure after it counts from one
+		expect(trainLaunchFailures(rows([...threeFailed(), ...byHand("lane-m-4", T(7), T(8))])).count).toBe(0);
+		expect(trainLaunchFailures(rows([...byHand("lane-m-1", T(1), T(2)), attempt("lane-m-2", T(3)), failed("lane-m-2", T(4))])).lanes).toEqual(["lane-m-2"]);
+	});
+
 	test("Jo's launch word resets the count; the tick's request does not, and a backlog of Jo requests before the failures resets nothing", () => {
 		const jo = (at: string) => row(SURFACE_BY, launchRequestedBody("jo", at), at);
 		const tick = (at: string) => row(MERGE_TRAIN_BY, launchRequestedBody("merge-train", at), at);

@@ -124,7 +124,7 @@ With one open workload the word applies to it. With several, add the id: `produc
 
 The merge train's lane does not count against the lane cap. It launches whenever the train has work: a PR on it, a settled task, or an answer to a question the train lane asked. It does so even when the cap is full of other lanes, and it never takes a slot from them. There is never more than one train lane at a time. A train with nothing to do gets no lane. A fix workload that a train opens is an ordinary workload and counts against the cap.
 
-If three launches of the train lane in a row fail, nothing launches it again. The surface asks you a `now` question with the options `relaunch` / `stop`, once per run of failures. `relaunch` starts the train again and resets the count. `stop` leaves it stopped until you send `launch-requested` for it or a `train` word.
+If three launches of the train lane in a row fail before the lane is ready (it never got ready, or it crashed before readiness), nothing launches it again. A lane that got ready and then crashed is not one of those, and a session you run by hand (`as2 lane <wl>`) never counts. The surface asks you a `now` question with the options `relaunch` / `stop`, once per run of failures. `relaunch` starts the train again and resets the count. `stop` leaves it stopped until you send `launch-requested` for it or a `train` word.
 
 ### Steer a workload yourself (user-driven)
 

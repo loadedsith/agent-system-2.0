@@ -19,7 +19,7 @@ import {
 	controlEntries, LANE_CAP_ENV, laneCap, laneExitBody, laneReadyBody, laneStartedBody, launchFailedBody, launchRequestedBody, launchRowsFor, type LaneOutcome,
 	STARTER_EXIT, trainBoardBody, verdictOf,
 } from "../src/launch";
-import { actionable, fixBindings, recordTrainTask, TRAIN_ALERT_REPO, TRAIN_LAUNCH_OPTIONS, TRAIN_RETRY_OPTIONS, trainSliceId } from "../src/merge-train";
+import { actionable, fixBindings, recordTrainTask, TRAIN_ALERT_REPO, TRAIN_LAUNCH_OPTIONS, TRAIN_RETRY_OPTIONS, trainLaunchFailures, trainSliceId } from "../src/merge-train";
 import type { PidState } from "../src/omp-probe";
 import { briefHash, formatOverride, formatSignal, goalsHash, rankDay, type SignalAnswers } from "../src/rank";
 import type { RankConfig } from "../src/rank-launch";
@@ -127,10 +127,10 @@ function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 		return r;
 	};
 	const logs: string[] = [];
-	/** One tick pass, one interval after the last. */
-	const pass = () => {
+	/** One tick pass, one interval after the last; `on` is the ledger the tick reads (a test's interposing view of `ledger`). */
+	const pass = (on: Ledger = ledger) => {
 		c.plusHours(STEP_H);
-		return tick({ ledger, gh, launch, notify: () => true, log: (l) => logs.push(l) });
+		return tick({ ledger: on, gh, launch, notify: () => true, log: (l) => logs.push(l) });
 	};
 	/** The exit drain, in-process: `cmdDrain`'s walk in `show` (oldest first, `launchRowsFor` + `verdictOf`), each launch through the starter. */
 	const drain = () => {
@@ -532,6 +532,40 @@ describe("T4 (acceptance 5): no work, no lane", () => {
 		w.pass();
 		expect(w.trainLaunches()).toHaveLength(2);
 	});
+
+	test("another launch path reserves the actionable train after step 4 read it unheld, before request() reads its rows: the pass writes no request and starts nothing; after that lane readies and exits with nothing new, nothing launches (review r1 F2)", () => {
+		const w = live();
+		w.pass();
+		const q = w.park(101);
+		const ans = w.answer(q, "merge");
+		// Jo's launch path serves the answer in the gap: the tick's view of the ledger runs it just before request() reads the
+		// train's launch rows, so those rows read `held`
+		let raced: { code: number; line: string } | null = null;
+		const racing = new Proxy(w.ledger, {
+			get(target, key) {
+				const v = Reflect.get(target, key, target);
+				if (typeof v !== "function") return v;
+				if (key !== "launchRows") return v.bind(target);
+				return (wl: string, ...rest: unknown[]) => {
+					if (wl === w.train && raced === null) raced = w.starter(w.train, SURFACE_BY);
+					return v.apply(target, [wl, ...rest]);
+				};
+			},
+		});
+		const lines = w.pass(racing);
+		expect(raced).toMatchObject({ code: 0 });
+		expect(w.trainLaunches()).toEqual([expect.any(String), `${w.lane()} cause resume ${ans} requested-by ${SURFACE_BY}`]);
+		expect(w.tickRequests()).toEqual([]);
+		expect(w.launched.filter((l) => l.wl === w.train)).toHaveLength(1);
+		expect(lines).toContainEqual(expect.stringMatching(/ not requested: held$/));
+		// that lane got ready with the answer in its prompt and exits with nothing new: no pass and no drain launches the train
+		w.exit("released");
+		w.pass();
+		w.pass();
+		expect(w.drain().filter((d) => d.wl === w.train)).toEqual([]);
+		expect(w.trainLaunches()).toHaveLength(2);
+		expect(w.tickRequests()).toEqual([]);
+	});
 });
 
 describe("T5 (acceptance 6): three consecutive failed train launches stop every path, and Jo hears it NOW", () => {
@@ -696,6 +730,29 @@ describe("T6 (acceptance 6): episodes, resets, and the PR the train never worked
 		expect(w.drain().filter((d) => d.wl === w.train)).toEqual([{ wl: w.train, code: STARTER_EXIT["not-launchable"]!, line: expect.stringContaining("not-launchable: train launch limit") }]);
 		expect(w.trainLaunches()).toHaveLength(3);
 		expect(w.trainLaunches().some((l) => l.includes(requests[3]!))).toBe(false);
+	});
+
+	test("three by-hand sessions on a train Jo flipped to user-driven count no failed launch: the fourth by-hand reservation is admitted (lane decision en-mvpx8gfkld6ku8)", () => {
+		const w = live();
+		ensureStandingWorkload(w.ledger);
+		w.ledger.flipMode(w.train, { by: SURFACE_BY, mode: "user-driven", author: "jo", channel: "surface" });
+		for (let i = 0; i < 3; i++) {
+			const r = laneScript.reserve(w.ledger, w.train, "jo", true, SHOW, w.probeFor);
+			if (!r.ok) throw new Error(r.reason);
+			expect(r.cause).toBe("interactive");
+			// the by-hand starter (`cmdInteractive`): its lane-started:, no lane-ready:, then its release and a clean interactive exit
+			w.started(w.train, r.laneId);
+			w.c.plusHours(STEP_H);
+			w.ledger.releaseWorkload(w.train, { by: LANE_STARTER_BY, holder: r.laneId });
+			w.ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: w.train, kind: "assumption", body: laneExitBody(r.laneId, { code: 0, signal: null, outcome: "interactive" }) });
+			w.alive.delete(r.laneId);
+			w.c.plusHours(STEP_H);
+		}
+		const now = w.ledger.workload(w.train)!;
+		expect(trainLaunchFailures({
+			entries: w.ledger.entries(w.train), instructions: w.ledger.instructions(w.train), questions: w.ledger.questions(w.train), holder: now.holder, holderLeaseUntil: now.holder_lease_until, now: w.ledger.now(),
+		}).count).toBe(0);
+		expect(laneScript.reserve(w.ledger, w.train, "jo", true, SHOW, w.probeFor)).toMatchObject({ ok: true, cause: "interactive" });
 	});
 });
 

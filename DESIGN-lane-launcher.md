@@ -154,12 +154,15 @@ launchable(w, control, receipt, resolutions, now, liveLanes, cap, capExempt = fa
   if req                                      → LAUNCH cause "request <req.id>" (Jo's word)
   res = resolutions not in consumed           (answer or replan withdrawal; question raised by a lane
                                                an attempt names; its slice now open)
+    capExempt: res = resolutions not consumed by readiness instead: one is consumed only when some attempt's
+               lane wrote a lane-ready: whose time (its row cut) is later than the resolution's instruction;
+               named resume ids are not consumed at reservation, so a never-ready resume leaves the answer
   if res                                      → LAUNCH cause "resume <res ids>"
                                                 with --resume <session from the raising lane's lane-started:>
   → "died-not-relaunched"
 ```
 
-`capExempt` is true when the workload is an open merge train (it has a valid `train:` or `train-board:` member): the `cap` refusal is skipped for it, every other rule still applies, and its lane never counts in `liveLanes` for other workloads.
+`capExempt` is true when the workload is an open merge train (it has a valid `train:` or `train-board:` member): the `cap` refusal is skipped for it, its resolutions are consumed by a ready lane's `lane-ready:` rather than at reservation (above), every other rule still applies, and its lane never counts in `liveLanes` for other workloads.
 
 Runner signal handling pseudocode (≤ 30 lines in the original; *amended 2026-10-08, MIGRATION.md item 40, workload `wl-muq1v31q5ly7ls`*: the turn end waits for a settled omp, may send up to two continue prompts on the same omp, holds for the lane's own unsettled hands, and writes every death it decides before EOF; the decision is `turnEnd` in `surface/src/turn-end.ts`):
 
