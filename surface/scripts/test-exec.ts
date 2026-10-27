@@ -162,12 +162,72 @@ function signalGroup(pgid: number, sig: NodeJS.Signals): void {
 	}
 }
 
-/** SIGTERM the group, wait up to the grace for it to empty, then SIGKILL it (the cap, § 2.3 step 3). */
-async function killGroup(cfg: Config, pgid: number): Promise<void> {
-	signalGroup(pgid, "SIGTERM");
+/** Append once through a validated descriptor: a child may have replaced this pathname while it ran. */
+function persistGroups(work: string, groups: number[]): void {
+	const path = groupsFile(work);
+	const text = groups.map((g) => `${g}\n`).join("");
+	const errors: string[] = [];
+	let fd: number | undefined;
+	let operation = "open";
+	try {
+		fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		operation = "validate";
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error("not a regular file");
+		operation = "append";
+		const n = writeSync(fd, text);
+		if (n !== text.length) throw new Error(`short write: ${n} of ${text.length} bytes`);
+	} catch (e) {
+		errors.push(`${operation} failed: ${errText(e)}`);
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch (e) {
+				errors.push(`close failed: ${errText(e)}`);
+			}
+		}
+	}
+	if (errors.length > 0) failed(`timeout cleanup: cannot persist descendant groups to ${path}: ${errors.join("; ")}`);
+}
+
+/**
+ * Snapshot descendant group leaders before TERM can orphan them. Bun's parallel workers lead their own groups, so
+ * killing only `pgid` relies on bun forwarding the signal. Persist those groups for a later sweep as well.
+ * Discovery has one 2 s deadline; even a failed discovery must not prevent killing the groups already known.
+ */
+async function killGroup(cfg: Config, pgid: number, work: string): Promise<void> {
+	const groups = new Set([pgid]);
+	let cleanupError: unknown;
+	try {
+		const deadline = Date.now() + 2_000;
+		const query = (flag: "-g" | "-P", ids: number[]): number[] => {
+			const left = deadline - Date.now();
+			if (left <= 0) failed(`timeout cleanup: discovering descendants of group ${pgid} exceeded 2000 ms`);
+			const r = spawnSync("/usr/bin/pgrep", [flag, ids.join(",")], { encoding: "utf8", timeout: left, maxBuffer: PS_CAP });
+			if (r.error || (r.status !== 0 && r.status !== 1)) {
+				failed(`timeout cleanup: pgrep ${flag} ${ids.join(",")}: ${r.error?.message ?? (r.stderr.trim() || `exit ${r.status}, signal ${r.signal}`)}`);
+			}
+			return r.stdout.split("\n").filter((s) => /^[1-9]\d*$/.test(s)).map(Number);
+		};
+		const seen = new Set([pgid]);
+		let frontier = [...new Set([pgid, ...query("-g", [pgid])])];
+		for (let depth = 0; frontier.length > 0; depth++) {
+			if (depth >= 32) failed(`timeout cleanup: descendants of group ${pgid} exceeded 32 levels`);
+			for (const pid of frontier) if (groupAlive(pid)) groups.add(pid);
+			frontier = query("-P", frontier).filter((pid) => !seen.has(pid));
+			for (const pid of frontier) seen.add(pid);
+		}
+		persistGroups(work, [...groups].filter((g) => g !== pgid));
+	} catch (e) {
+		cleanupError = e;
+	}
+	const targets = [...groups];
+	for (const g of targets) signalGroup(g, "SIGTERM");
 	const until = Date.now() + cfg.killGraceMs;
-	while (groupAlive(pgid) && Date.now() < until) await Bun.sleep(50);
-	signalGroup(pgid, "SIGKILL");
+	while (targets.some(groupAlive) && Date.now() < until) await Bun.sleep(50);
+	for (const g of targets) signalGroup(g, "SIGKILL");
+	if (cleanupError !== undefined) throw cleanupError;
 }
 
 // ---- the stuck capture (PLAN wl-mvq4edh02r5z40 revision 3, D5) -------------------------------------------
@@ -337,7 +397,7 @@ class Capture {
 	}
 
 	/**
-	 * After killGroup has killed the part's group: remove a cap dir `clearCapDir` left, without following a link in it
+	 * After killGroup has killed the part's groups: remove a cap dir `clearCapDir` left, without following a link in it
 	 * (removeTree; a just-killed sample may still be closing, so a few tries), then close the stuck log. Never throws.
 	 */
 	async afterKill(): Promise<void> {
@@ -691,11 +751,24 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 	clearTimeout(timer);
 	if (first === "cap") {
 		const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
-		await killGroup(cfg, pgid);
-		// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
-		await capture?.afterKill();
-		await done;
-		throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
+		const errors: string[] = [];
+		try {
+			await killGroup(cfg, pgid, work);
+		} catch (e) {
+			errors.push(e instanceof Error ? e.message : String(e));
+		} finally {
+			// Off the kill path: a cap dir the capture could not clear goes after the groups are killed.
+			try {
+				await capture?.afterKill();
+			} catch (e) {
+				errors.push(`stuck capture finalization failed: ${e instanceof Error ? e.message : String(e)}`);
+			} finally {
+				await done;
+			}
+		}
+		const timeout = `timeout: the part passed its cap of ${cap} ms; its group was killed`;
+		if (errors.length > 0) throw new Exit(WRAPPER_EXIT.failed, `${timeout}\n${errors.join("\n")}`);
+		throw new Exit(WRAPPER_EXIT.timeout, timeout);
 	}
 	// Anything the part left behind in its group is the sweep's (§ 2.3 step 4): the runner sweeps after every part.
 	if (first.code !== null) return first.code;
