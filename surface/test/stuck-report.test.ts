@@ -6,7 +6,7 @@
 // with its denominator; one incident per (run, part, worker, zombie) when the shadow capture clears and re-signs the same
 // pair; an interval with no decision; the --since/--until interval; the CLI run for real.
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fieldReport, NO_DECISION, nearestRank, parseArgs, parseRun, parseRunnerLine, parseStuckLine, readRuns, renderReport, summarize } from "../scripts/stuck-report";
 import { makeRunId } from "../src/test-run";
@@ -329,6 +329,77 @@ describe("intervals", () => {
 		expect(text).toContain("  - decisions: 0 of 1 signatures (would-stop 0, stop 0)");
 		expect(text).toContain("- false positives: 0 of 0 decisions (recovered 0, part-ended 0)");
 		expect(text).toContain("- wall-cap timeouts with no decision (unmatched): 0 of 0 capped parts");
+	});
+
+	describe("unreadable evidence is reported, never read as no hang", () => {
+		const INCOMPLETE = "evidence incomplete: 1 of 2 runs unreadable; no hang observed in the readable runs";
+		/** A readable quiet run plus one run the caller damages. */
+		function twoRuns(name: string): { root: string; good: string; bad: string } {
+			const root = tmp(name);
+			const good = newId(T0);
+			const bad = newId(T0 + 5 * MIN);
+			write(root, good, [`${iso(T0 + S)} took the lock`, `${iso(T0 + 40 * S)} lock released`]);
+			write(root, bad, [`${iso(T0 + 5 * MIN + S)} took the lock`, `${iso(T0 + 5 * MIN + 40 * S)} lock released`]);
+			return { root, good, bad };
+		}
+
+		test("every run readable: no section, a zero totals line, the plain wording", () => {
+			const { root } = twoRuns("stuck-report-readable");
+			const text = fieldReport({ root, since: null, until: null });
+			expect(text).toContain("- runs with unreadable evidence: 0 of 2 runs");
+			expect(text).not.toContain("## Input problems");
+			expect(text).toContain(`## Post-signature slot time\n\n${NO_DECISION}\n`);
+		});
+
+		test("a missing runner.log", () => {
+			const { root, bad } = twoRuns("stuck-report-no-log");
+			rmSync(join(root, bad, "runner.log"));
+			const text = fieldReport({ root, since: null, until: null });
+			expect(text).toContain(`## Input problems\n\n- ${bad} runner.log: missing\n`);
+			expect(text).toContain("- runs with unreadable evidence: 1 of 2 runs");
+			expect(text).toContain(`## Post-signature slot time\n\n${INCOMPLETE}\n`);
+			expect(text).not.toContain(NO_DECISION);
+		});
+
+		test.skipIf(process.getuid?.() === 0)("an unreadable runner.log names the error", () => {
+			const { root, bad } = twoRuns("stuck-report-chmod-log");
+			const path = join(root, bad, "runner.log");
+			chmodSync(path, 0o000);
+			try {
+				const text = fieldReport({ root, since: null, until: null });
+				expect(text).toMatch(new RegExp(`- ${bad} runner\\.log: unreadable \\(.*EACCES.*\\)`));
+				expect(text).toContain("- runs with unreadable evidence: 1 of 2 runs");
+				expect(text).toContain(`## Post-signature slot time\n\n${INCOMPLETE}\n`);
+			} finally {
+				chmodSync(path, 0o644);
+			}
+		});
+
+		test("a malformed result.json", () => {
+			const { root, bad } = twoRuns("stuck-report-bad-result");
+			writeFileSync(join(root, bad, "result.json"), "{not json");
+			const text = fieldReport({ root, since: null, until: null });
+			expect(text).toMatch(new RegExp(`## Input problems\\n\\n- ${bad} result\\.json: result\\.json unreadable \\(`));
+			expect(text).toContain("- runs with unreadable evidence: 1 of 2 runs");
+			expect(text).toContain(`## Post-signature slot time\n\n${INCOMPLETE}\n`);
+		});
+
+		test("a missing result.json", () => {
+			const { root, bad } = twoRuns("stuck-report-no-result");
+			rmSync(join(root, bad, "result.json"));
+			const text = fieldReport({ root, since: null, until: null });
+			expect(text).toContain(`- ${bad} result.json: no result.json\n`);
+			expect(text).toContain(`## Post-signature slot time\n\n${INCOMPLETE}\n`);
+		});
+
+		test("the CLI still exits 0 and warns on stderr", () => {
+			const { root, bad } = twoRuns("stuck-report-cli-warn");
+			rmSync(join(root, bad, "runner.log"));
+			const r = Bun.spawnSync([process.execPath, SCRIPT, "--root", root], { stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(0);
+			expect(r.stdout.toString()).toContain("## Input problems");
+			expect(r.stderr.toString()).toContain("warning: 1 of 2 runs have unreadable evidence");
+		});
 	});
 
 	test("--since and --until keep runs requested on those PT days; the waiting run may fall outside", () => {

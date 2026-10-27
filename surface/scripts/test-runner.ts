@@ -46,11 +46,12 @@
 //
 //       Stuck workers (PLAN wl-mvq8x4pkjmx69s D4): caps.json carries `testRunner.stuckStop` (`shadow` by default, `enforce`) for
 //       the exec's detector. A stuck part (exit 125 or a `stuck-stop` line) or a stalled executor (enforce only: the backstop
-//       abandons a call STUCK_BACKSTOP_MS after a `stuck-signature` no stop line followed) ends the run with an error: one
-//       bounded sweep, a spawn-free containment check of `_as2test`'s processes (retried up to STUCK_CONTAIN_MS, then
-//       `stuck-containment-failed`), the shorter STUCK_FINALIZE_MS and the release. Shadow never arms the backstop. After a
-//       `stuck-captured` line the run imports `<stem>.signature.log`; each run logs `stuck detector <mode>`. Every run
-//       checks containment after its first sweep and runs no part while a survivor lives (`admission refused` after ADMIT_MS).
+//       abandons a call STUCK_BACKSTOP_MS after a `stuck-signature` no stop line followed) ends the run with an error, its junit and
+//       log imported whatever the wrapper's ending: one bounded sweep (its runs.db ownership checkpoint under the same deadline,
+//       nonblocking), a spawn-free containment check of `_as2test`'s processes (retried up to STUCK_CONTAIN_MS, then
+//       `stuck-containment-failed`), the shorter STUCK_FINALIZE_MS and the release (retried until RELEASE_MS). Shadow never arms the
+//       backstop. After a `stuck-captured` line the run imports `<stem>.signature.log`; each run logs `stuck detector <mode>`. Every
+//       run checks containment after its first sweep and runs no part while a survivor lives (`admission refused` after ADMIT_MS).
 //
 // Stamps: everything is written as `test-runner` (TEST_RUNNER_BY).
 //
@@ -75,7 +76,8 @@
 //   AGENT_SYSTEM_TEST_RUNNER_CONTAIN_SCOPE  `uid` makes a test install's containment check read the caller's uid; by default a
 //                                           test install's check counts only live members of a `<as2test root>/runs/*/groups` pgid
 //   AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS     how long a part's wrapper may outlive its cap before the runner sweeps (default 60 s)
-//   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s)
+//   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s); a stuck run's halt, its publication and its release use 0
+//   AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS     one deadline over the lock row's delete attempts (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
@@ -148,6 +150,8 @@ const CONTAIN_RETRY_MS = 5_000;
 const ADMIT_MS = 30_000;
 /** The post-sweep finalization deadline of a run that was not stuck (AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS). */
 const FINALIZE_MS = 150_000;
+/** One deadline over every attempt to delete the run's lock row, the finally's last attempt past it included (AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS). */
+const RELEASE_MS = 2_000;
 
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
@@ -342,11 +346,17 @@ function writeCurrent(stageRoot: string, runId: string): void {
  * and SQLite orders this after any takeover's own publication. Returns whether it published.
  */
 export function publishIfOwner(db: Database, stageRoot: string, runId: string): boolean {
-	return busyLoop(() => db.transaction(() => {
-		if (lockRow(db)?.runId !== runId) return false;
+	return busyLoop(() => publishTx(db, stageRoot, runId).published);
+}
+
+/** One attempt of publishIfOwner's transaction, under the connection's busy_timeout: whether it published, and the run the row holds. */
+function publishTx(db: Database, stageRoot: string, runId: string): { published: boolean; holder: string | null } {
+	return db.transaction(() => {
+		const holder = lockRow(db)?.runId ?? null;
+		if (holder !== runId) return { published: false, holder };
 		writeCurrent(stageRoot, runId);
-		return true;
-	}).immediate());
+		return { published: true, holder };
+	}).immediate();
 }
 
 // ---- the report import (§ 2.2 step 4) -------------------------------------------------------------
@@ -774,8 +784,12 @@ class Runner {
 	readonly lockDb: Database;
 	readonly capBytes: number;
 	private timer: Timer | undefined;
-	/** The run took the lock row at some point. */
+	/** The run holds the lock row as far as it knows: set when it takes the row, cleared only once `release` deleted it or found it held by another run. */
 	private held = false;
+	/** One deadline over every attempt of `release`, set at its first attempt (RELEASE_MS); from then on the heartbeat leaves the row alone. */
+	private releaseBy: number | null = null;
+	/** runs.db's busy_timeout on `lockDb` now (`lockBusy`): AGENT_SYSTEM_TEST_RUNNER_BUSY_MS until a deadline-bound step sets 0. */
+	private lockBusyMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_BUSY_MS", 5_000);
 	/** The run learnt it no longer holds the row (heartbeat or checkpoint) or its request. */
 	private superseded: string | null = null;
 	private soloCalls = 0;
@@ -799,7 +813,7 @@ class Runner {
 		const rec = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId);
 		if (!rec) throw new Fail(`no test-requested: record for ${request.runId} on ${wl}`, START_EXIT.failed);
 		this.requestedAt = Date.parse(rec.request.createdAt);
-		this.lockDb = openLockDb(this.root);
+		this.lockDb = openLockDb(this.root, this.lockBusyMs);
 		this.capBytes = reportCapBytes(config);
 		this.f = {
 			requestedSha: request.sha, fetchedSha: null, error: null, full: null, fullTimedOut: false, solo: [], headAtStart: request.sha, headAtEnd: null, owner: true, sliceState: null, baseRuns: null,
@@ -825,7 +839,7 @@ class Runner {
 		} catch (e) {
 			this.log(`heartbeat file not written: ${errText(e)}`);
 		}
-		if (!this.held || this.superseded) return;
+		if (!this.held || this.superseded || this.releaseBy !== null) return;
 		hookSync(this.id, "heartbeat-update");
 		try {
 			const changes = this.lockDb.query("UPDATE lock SET heartbeatAt = ? WHERE runId = ?").run(Date.now(), this.id).changes;
@@ -841,6 +855,12 @@ class Runner {
 			this.superseded = why;
 			this.log(`superseded: ${why}`);
 		}
+	}
+
+	/** `lockDb`'s busy_timeout := `ms`, remembered so a step that needs nonblocking attempts can put the one before it back. */
+	private lockBusy(ms: number): void {
+		this.lockBusyMs = ms;
+		this.lockDb.exec(`PRAGMA busy_timeout = ${Math.trunc(ms)}`);
 	}
 
 	/**
@@ -933,6 +953,53 @@ class Runner {
 	}
 
 	/**
+	 * `checkpoint` bounded by `deadline` (a bounded sweep's, D4): `publishTx` with busy_timeout 0, retried every 50 ms until the
+	 * deadline (one attempt even past it), since a synchronous SQLite busy wait cannot be cut short by a JS timer; the busy_timeout
+	 * before it is put back. A displaced run throws Superseded, as `checkpoint` does. Returns false, with one runner.log line naming
+	 * `what`, when runs.db stayed busy (or the test hook stayed paused) to the deadline: the caller goes on without the step.
+	 */
+	private async checkpointBy(phase: string, what: string, deadline: number): Promise<boolean> {
+		try {
+			await hook(this.id, `phase-${phase}`, {}, deadline);
+		} catch (e) {
+			if (!(e instanceof Stop)) throw e;
+			this.log(`${what}: the ownership checkpoint was paused at its test hook past its deadline; going on without it`);
+			return false;
+		}
+		if (this.superseded) throw new Superseded(this.superseded);
+		const before = this.lockBusyMs;
+		this.lockBusy(0);
+		let attempts = 0;
+		let tx: { published: boolean; holder: string | null } | null = null;
+		try {
+			for (;;) {
+				attempts++;
+				try {
+					tx = publishTx(this.lockDb, this.stageRoot, this.id);
+					break;
+				} catch (e) {
+					if (!isBusy(e)) throw e;
+					hookMark(this.id, "checkpoint-busy", { phase, attempts });
+				}
+				const left = deadline - Date.now();
+				if (left <= 0) break;
+				await Bun.sleep(Math.min(50, left));
+			}
+		} finally {
+			this.lockBusy(before);
+		}
+		if (tx === null) {
+			this.log(`${what}: runs.db stayed busy through ${attempts} ownership checkpoint attempts until the deadline ${new Date(deadline).toISOString()}; going on without it`);
+			return false;
+		}
+		if (!tx.published) {
+			this.lose(`the lock row holds ${tx.holder ?? "no run"}`);
+			throw new Superseded(this.superseded!);
+		}
+		return true;
+	}
+
+	/**
 	 * One wrapper call: `sudo -n -u _as2test <exec> <sub> <run id> …` (wrapperArgv). Its stderr goes to runner.log (a part's after the
 	 * call, so its `stuck:` reason can be read); stdout is captured and echoed there. It starts in the as2test root, which `_as2test`
 	 * can read: the run dir is Jo's 0700 dir, and a cwd the child cannot read kills bun on getcwd. `timeoutMs` bounds a call that has
@@ -980,6 +1047,12 @@ class Runner {
 		throw new Stop(`${what} was fenced although the lock row holds this run`);
 	}
 
+	/** `fenced` with its checkpoint bounded by `deadline` (`checkpointBy`); a checkpoint runs.db could not answer in time stops the run too. */
+	private async fencedBy(what: string, deadline: number): Promise<never> {
+		if (await this.checkpointBy("fenced", what, deadline)) throw new Stop(`${what} was fenced although the lock row holds this run`);
+		throw new Stop(`${what} was fenced, and runs.db did not answer the ownership checkpoint before its deadline`);
+	}
+
 	/** `sweep`, retried after a signal at most SWEEP_RETRIES times while the row and `current` still name this run (§ 2.3 step 1). */
 	async sweep(after: string): Promise<void> {
 		for (let attempt = 0; ; attempt++) {
@@ -1001,13 +1074,16 @@ class Runner {
 
 	/**
 	 * The sweep after a stuck or stalled part (PLAN wl-mvq8x4pkjmx69s D4), the only cleanup step, and the admission gate's sweep:
-	 * each attempt is its own call bounded by `deadline`, one deadline over all of them, and an attempt still running there is
-	 * abandoned (its sudo child SIGKILLed), never awaited. A signal retries as `sweep` does. Returns whether a sweep finished clean;
-	 * a failure is logged, never thrown (the containment check after it judges what is left), but a fenced exit goes through `fenced`.
+	 * each attempt is its own call bounded by `deadline`, one deadline over all of them and over each attempt's ownership checkpoint
+	 * (`checkpointBy`: runs.db busy to the deadline is logged and ends the sweep, never waited out), and an attempt still running
+	 * there is abandoned (its sudo child SIGKILLed), never awaited. A signal retries as `sweep` does. Returns whether a sweep finished
+	 * clean; a failure is logged, never thrown (the containment check after it judges what is left), but a fenced exit goes through
+	 * `fencedBy`.
 	 */
 	private async boundedSweep(after: string, deadline: number): Promise<boolean> {
 		for (let attempt = 0; attempt <= SWEEP_RETRIES; attempt++) {
-			await this.checkpoint("sweep");
+			if (Date.now() >= deadline) break;
+			if (!(await this.checkpointBy("sweep", `the sweep after ${after}`, deadline))) return false;
 			const left = deadline - Date.now();
 			if (left <= 0) break;
 			hookMark(this.id, "sweep", { after, attempt });
@@ -1020,7 +1096,7 @@ class Runner {
 				return false;
 			}
 			if (r.code === WRAPPER_EXIT.ok) return true;
-			if (r.code === WRAPPER_EXIT.fenced) await this.fenced("the sweep");
+			if (r.code === WRAPPER_EXIT.fenced) await this.fencedBy("the sweep", deadline);
 			if (r.signal === null) {
 				this.log(`the sweep after ${after} failed: exit ${r.code}`);
 				return false;
@@ -1067,18 +1143,21 @@ class Runner {
 	}
 
 	/**
-	 * After a stuck or stalled part `stem` (D4), in place of its sweep: the bounded sweep (STUCK_SWEEP_MS over every attempt), then
-	 * the containment check; not contained or denied, another bounded sweep and a check every CONTAIN_RETRY_MS until contained or
-	 * STUCK_CONTAIN_MS after `at`, the stuck fact. Never contained: runner.log's `stuck-containment-failed part <stem> pids
-	 * <a,b|denied>`, and the run's stuck (or stalled) reason gains `; containment failed: <a,b | inspection denied>`. Either way the run
-	 * then finalizes and releases its lock, to the next run's admission gate.
+	 * After a stuck or stalled part `stem` (D4), in place of its sweep: the bounded sweep (STUCK_SWEEP_MS over every attempt and its
+	 * ownership checkpoint, the deadline taken first), then the containment check; not contained or denied, another bounded sweep
+	 * and a check every CONTAIN_RETRY_MS until contained or STUCK_CONTAIN_MS after `at`, the stuck fact. Never contained: runner.log's
+	 * `stuck-containment-failed part <stem> pids <a,b|denied>`, and the run's stuck (or stalled) reason gains `; containment failed:
+	 * <a,b | inspection denied>`. Either way the run then finalizes and releases its lock, to the next run's admission gate. From here
+	 * runs.db's busy_timeout is 0 for the rest of the run: no synchronous busy wait (a heartbeat's included) outlasts a deadline.
 	 */
 	private async halt(stem: string, at: number): Promise<void> {
-		const after = stem;
 		const sweepMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS", STUCK_SWEEP_MS);
+		const sweepBy = Date.now() + sweepMs;
+		this.lockBusy(0);
+		const after = stem;
 		const retryMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_CONTAIN_RETRY_MS", CONTAIN_RETRY_MS);
 		const deadline = at + msEnv("AGENT_SYSTEM_TEST_RUNNER_STUCK_CONTAIN_MS", STUCK_CONTAIN_MS);
-		await this.boundedSweep(after, Date.now() + sweepMs);
+		await this.boundedSweep(after, sweepBy);
 		for (;;) {
 			const checkedAt = Date.now();
 			const c = this.containment();
@@ -1355,7 +1434,8 @@ class Runner {
 	 * is imported the same way. A stuck call (`callStuck`, however it ended) or one the backstop abandoned with no stop line (the
 	 * executor stalled) gets its `stuck:` or `executor stalled` error over any other, never a timeout, sets the run's `stuck` or
 	 * `executorStalled` fact, and `halt` takes the place of the part's sweep: `halted` tells the caller to sweep nothing and run no
-	 * further part.
+	 * further part. Such a call's junit and log are imported whatever its ending, a wrapper refusal or failure (64, 70) included, so
+	 * its partial failures and security evidence stay in the verdict (PLAN wl-mvq8x4pkjmx69s R5).
 	 */
 	async part(call: { sub: "full" } | { sub: "solo" | "base-solo"; file: string }): Promise<{ result: PartResult; junit: string | null; timedOut: boolean; halted: boolean }> {
 		await this.checkpoint(call.sub);
@@ -1379,7 +1459,7 @@ class Runner {
 		if (timedOut) this.importCapture(`${name}.stuck.log`);
 		if (/^stuck-captured /m.test(r.out)) this.importCapture(`${name}.signature.log`);
 		let out: { result: PartResult; junit: string | null };
-		if (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed) {
+		if (halt === null && (r.code === WRAPPER_EXIT.refused || r.code === WRAPPER_EXIT.failed)) {
 			const wrapper = `the wrapper ${r.code === WRAPPER_EXIT.refused ? "refused" : "failed"} ${call.sub} (exit ${r.code})`;
 			out = { result: { ...partResult({ junit: null, log: null, exit: r.code, ms }), error: timedOut ? `timeout; ${wrapper}` : wrapper }, junit: null };
 		} else {
@@ -1619,7 +1699,7 @@ class Runner {
 			}
 			// Synchronous SQLite waits cannot be interrupted by JS timers. Publication retries
 			// nonblocking BEGINs against the shared deadline, not nested fixed retry budgets.
-			this.lockDb.exec("PRAGMA busy_timeout = 0");
+			this.lockBusy(0);
 			this.ledger.db.exec("PRAGMA busy_timeout = 0");
 			let run: TestRun;
 			try {
@@ -1636,7 +1716,7 @@ class Runner {
 				return START_EXIT.failed;
 			}
 			// The lock goes before the status post (PLAN wl-mvq8x4pkjmx69s D4): the next run's slot does not wait on gh.
-			this.release();
+			await this.release();
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
 			// postFullSuite never throws and kills gh after 15 s. A run whose containment failed says so in the description.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
@@ -1645,27 +1725,45 @@ class Runner {
 			return 0;
 		} finally {
 			clearInterval(this.timer);
-			this.release();
+			await this.release();
 			this.leaveQueue();
 			this.lockDb.close();
 		}
 	}
 
 	/**
-	 * Delete this run's lock row, once, and log `lock released` (the field report's slot end, PLAN wl-mvq8x4pkjmx69s D5). The run
+	 * Delete this run's lock row and log `lock released` (the field report's slot end, PLAN wl-mvq8x4pkjmx69s D5). The run
 	 * lock goes even when a refresh helper this run started may outlive it (installCheck's `live`): releasing it proves nothing about
 	 * that helper. Refreshes are serialised by the helper's own lockf lock on refresh.d/lock, which the next run's refresh waits on
-	 * (exit 69, lock, while the old helper holds it).
+	 * (exit 69, lock, while the old helper holds it). Each attempt is nonblocking (busy_timeout 0), retried every 50 ms until one
+	 * deadline (RELEASE_MS from the first attempt). The run stays `held` until a delete succeeds (or finds the row held by another
+	 * run), so main's finally calls this again for one attempt more past that deadline; each call that ends without the delete logs
+	 * `the lock was not released`, and the row then holds until a waiter finds its heartbeat stale (the heartbeat stops touching it).
 	 */
-	private release(): void {
+	private async release(): Promise<void> {
 		if (!this.held) return;
-		this.held = false;
-		this.lockDb.exec("PRAGMA busy_timeout = 100");
-		try {
-			const { changes } = busyLoop(() => this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id));
-			this.log(changes > 0 ? "lock released" : "lock released: the row no longer held this run");
-		} catch (e) {
-			this.log(`the lock was not released: ${errText(e)}`);
+		if (this.releaseBy === null) {
+			await hook(this.id, "release");
+			this.releaseBy = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS", RELEASE_MS);
+		}
+		const by = this.releaseBy;
+		for (let attempt = 1; ; attempt++) {
+			try {
+				this.lockBusy(0);
+				const { changes } = this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id);
+				this.held = false;
+				this.log(changes > 0 ? "lock released" : "lock released: the row no longer held this run");
+				return;
+			} catch (e) {
+				hookMark(this.id, "release-failed", { attempt, error: errText(e) });
+				const left = by - Date.now();
+				if (left <= 0) {
+					this.log(`the lock was not released: ${errText(e)} (${attempt} attempts; the release deadline ${new Date(by).toISOString()} has passed); the row holds this run until a waiter finds its heartbeat stale`);
+					return;
+				}
+				if (attempt === 1) this.log(`the lock release failed: ${errText(e)}; retrying until ${new Date(by).toISOString()}`);
+				await Bun.sleep(Math.min(50, left));
+			}
 		}
 	}
 }

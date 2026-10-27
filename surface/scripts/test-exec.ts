@@ -727,8 +727,10 @@ const STUCK_PRELOAD = String.raw`// agent-system 2.0 test runner: the stuck-work
 // one part and removes it when the part ends. It wraps Bun.spawnSync (node's sync child_process APIs route through it): for
 // each outermost call it writes "<since ms>\t<command>\n" to $AS2TEST_STUCK_MARKERS/<pid> and holds an flock on that file for
 // exactly the call. The call returns or throws exactly what it would have; the wrapper's own fs and ffi errors only stop
-// publication (a missed detection, never a false one).
+// publication (a missed detection, never a false one). The command is read without running test code: only own data
+// properties of non-proxy objects, through functions bound at load, so no getter, proxy trap or replaced builtin runs here.
 import fs from "node:fs";
+import { types } from "node:util";
 import { dlopen, FFIType } from "bun:ffi";
 
 const MARK = Symbol.for("as2test.stuck-marker");
@@ -742,6 +744,13 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 		const writeSync = fs.writeSync;
 		const nowMs = Date.now;
 		const apply = Reflect.apply;
+		const ownDescriptor = Object.getOwnPropertyDescriptor;
+		const hasOwn = Object.hasOwn;
+		const isArray = Array.isArray;
+		const isProxy = types.isProxy;
+		const strSlice = String.prototype.slice;
+		const strIndexOf = String.prototype.indexOf;
+		const strLastIndexOf = String.prototype.lastIndexOf;
 		const flock = dlopen("/usr/lib/libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }).symbols.flock;
 		const original = Bun.spawnSync;
 		const path = dir + "/" + process.pid;
@@ -753,6 +762,25 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 		closeSync(openSync(path, FLAGS, 0o600));
 		let depth = 0;
 		let off = false;
+		// An own data property's value (a fresh descriptor's own "value", read without a getter), else undefined.
+		const own = (o, key) => {
+			const d = ownDescriptor(o, key);
+			return d !== undefined && hasOwn(d, "value") ? d.value : undefined;
+		};
+		// The marker command of a call's first argument (argv or { cmd }), or "" when it cannot be read without test code:
+		// a proxy, an accessor, an inherited or missing property, or an argv0 that is not a primitive string.
+		const commandOf = (a) => {
+			if (a === null || typeof a !== "object" || isProxy(a)) return "";
+			let cmd = a;
+			if (!isArray(a)) {
+				cmd = own(a, "cmd");
+				if (cmd === null || typeof cmd !== "object" || isProxy(cmd) || !isArray(cmd)) return "";
+			}
+			const argv0 = own(cmd, "0");
+			if (typeof argv0 !== "string") return "";
+			const command = apply(strSlice, apply(strSlice, argv0, [apply(strLastIndexOf, argv0, ["/"]) + 1]), [0, 16]);
+			return command.length > 0 && apply(strIndexOf, command, ["\t"]) === -1 && apply(strIndexOf, command, ["\n"]) === -1 ? command : "";
+		};
 		// The fd holding this call's lock, or -1 when the call runs unpublished. Lock first (LOCK_EX|LOCK_NB: a held lock or the
 		// observer's momentary shared lock means this call runs unpublished), then the content; a write that fails unpublishes.
 		const publish = (a) => {
@@ -760,10 +788,8 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 			let fd = -1;
 			let locked = false;
 			try {
-				const cmd = Array.isArray(a) ? a : a !== null && typeof a === "object" && Array.isArray(a.cmd) ? a.cmd : null;
-				const argv0 = cmd !== null && typeof cmd[0] === "string" ? cmd[0] : "";
-				const command = argv0.slice(argv0.lastIndexOf("/") + 1).slice(0, 16);
-				if (!/^[^\t\n]{1,16}$/.test(command)) return -1;
+				const command = commandOf(a);
+				if (command === "") return -1;
 				fd = openSync(path, FLAGS, 0o600);
 				if (flock(fd, LOCK_EX | LOCK_NB) !== 0) throw 0;
 				locked = true;

@@ -912,21 +912,62 @@ function fixturePid(work: string, name: string): number {
 /**
  * Every Bun.spawnSync and node sync child_process call shape the qualification compares: run once inside the wrapped fixture
  * and once here (no preload), the two results must be equal. Its source is copied into the fixture, so it names no import.
+ * The accessor, proxy and nested shapes count how often test-owned code runs: the wrapper must run none of it itself.
  */
 function callFields(cp: typeof childProcess) {
 	const bunFields = (r: ReturnType<typeof Bun.spawnSync>) => ({
 		exitCode: r.exitCode, success: r.success, signalCode: r.signalCode ?? null, stdout: r.stdout?.toString() ?? null, stderr: r.stderr?.toString() ?? null,
 	});
+	const errorFields = (e: unknown) => {
+		const x = e as NodeJS.ErrnoException & { status?: number };
+		return { threw: true, name: x?.name ?? null, code: x?.code ?? null, errno: x?.errno ?? null, syscall: x?.syscall ?? null, path: x?.path ?? null, status: x?.status ?? null, message: String(x?.message) };
+	};
 	const thrown = (f: () => unknown) => {
 		try {
 			f();
 			return { threw: false };
 		} catch (e) {
-			const x = e as NodeJS.ErrnoException & { status?: number };
-			return { threw: true, name: x?.name ?? null, code: x?.code ?? null, errno: x?.errno ?? null, syscall: x?.syscall ?? null, path: x?.path ?? null, status: x?.status ?? null, message: String(x?.message) };
+			return errorFields(e);
 		}
 	};
 	const node = (r: ReturnType<typeof cp.spawnSync>) => ({ status: r.status, signal: r.signal, stdout: r.stdout?.toString() ?? null, stderr: r.stderr?.toString() ?? null, error: (r.error as NodeJS.ErrnoException | undefined)?.code ?? null });
+	// f's result or error, and how many times test-owned code (each hit()) ran during it.
+	const counted = (f: (hit: () => void) => unknown) => {
+		let hits = 0;
+		const hit = () => {
+			hits++;
+		};
+		try {
+			return { out: f(hit), hits };
+		} catch (e) {
+			return { out: errorFields(e), hits };
+		}
+	};
+	const withGetter = (base: string[], i: number, get: () => unknown) => {
+		const a = [...base];
+		Object.defineProperty(a, i, { get, enumerable: true, configurable: true });
+		return a;
+	};
+	// A getter that throws on its first read only: a wrapper that read and swallowed it would change what the call does.
+	const once = (hit: () => void, value: unknown) => {
+		let first = true;
+		return () => {
+			hit();
+			if (first) {
+				first = false;
+				throw new Error("as2test one-shot getter");
+			}
+			return value;
+		};
+	};
+	const counting = <T extends object>(target: T, hit: () => void) =>
+		new Proxy(target, {
+			get: (t, k, r) => (hit(), Reflect.get(t, k, r)),
+			has: (t, k) => (hit(), Reflect.has(t, k)),
+			ownKeys: (t) => (hit(), Reflect.ownKeys(t)),
+			getOwnPropertyDescriptor: (t, k) => (hit(), Reflect.getOwnPropertyDescriptor(t, k)),
+			getPrototypeOf: (t) => (hit(), Reflect.getPrototypeOf(t)),
+		});
 	return {
 		echo: bunFields(Bun.spawnSync(["/bin/echo", "hi"])),
 		exit3: bunFields(Bun.spawnSync(["/bin/sh", "-c", "echo out; echo err >&2; exit 3"])),
@@ -938,6 +979,24 @@ function callFields(cp: typeof childProcess) {
 		missingBun: thrown(() => Bun.spawnSync(["/nonexistent/as2test-missing-binary"])),
 		missingNodeSpawnSync: node(cp.spawnSync("/nonexistent/as2test-missing-binary")),
 		missingExecFileSync: thrown(() => cp.execFileSync("/nonexistent/as2test-missing-binary")),
+		argv0Getter: counted((hit) => bunFields(Bun.spawnSync(withGetter(["/bin/echo", "a0"], 0, () => (hit(), "/bin/echo"))))),
+		cmdGetter: counted((hit) => bunFields(Bun.spawnSync({ get cmd() {
+			hit();
+			return ["/bin/echo", "cmd"];
+		} }))),
+		argv0Throws: counted((hit) => bunFields(Bun.spawnSync(withGetter(["/bin/echo", "t0"], 0, once(hit, "/bin/echo"))))),
+		cmdThrows: counted((hit) => {
+			const o = {};
+			Object.defineProperty(o, "cmd", { get: once(hit, ["/bin/echo", "tc"]), enumerable: true });
+			return bunFields(Bun.spawnSync(o as { cmd: string[] }));
+		}),
+		argv0NotString: counted((hit) => bunFields(Bun.spawnSync([{ toString: () => (hit(), "/bin/echo") } as unknown as string, "ns"]))),
+		proxyArgv: counted((hit) => bunFields(Bun.spawnSync(counting(["/bin/echo", "pa"], hit)))),
+		proxyOptions: counted((hit) => bunFields(Bun.spawnSync(counting({ cmd: ["/bin/echo", "po"] }, hit)))),
+		nestedBun: counted((hit) =>
+			bunFields(Bun.spawnSync(withGetter(["/bin/echo", "outer"], 0, () => (hit(), Bun.spawnSync(["/bin/echo", "/bin/echo"]).stdout.toString().trim())))),
+		),
+		nestedNode: counted((hit) => cp.execFileSync("/bin/echo", withGetter(["n0", "n1"], 1, () => (hit(), Bun.spawnSync(["/bin/echo", "deep"]).stdout.toString().trim()))).toString()),
 	};
 }
 
@@ -967,6 +1026,28 @@ test("qualifies", async () => {
 	await phase("node-execSync", "sh", () => cp.execSync("/bin/sleep 2; echo slept").toString());
 	await phase("node-execFileSync", "sleep", () => cp.execFileSync("/bin/sleep", ["2"]).toString());
 	await phase("fields", null, () => callFields(cp));
+	// A nested call from inside the call's own argv accessor (read by spawnSync itself): the outer head stays the published
+	// command through the nested 2 s sleep, and the nested sh reads the outer's marker line.
+	await phase("nested-accessor", "head", () => {
+		let inner = null;
+		const argv = ["/usr/bin/head", "-c", "200"];
+		Object.defineProperty(argv, 3, { enumerable: true, get() {
+			inner = Bun.spawnSync(["/bin/sh", "-c", 'cat "$0"; exec /bin/sleep 2', marker]);
+			return marker;
+		} });
+		const r = Bun.spawnSync(argv);
+		return { outer: r.stdout.toString(), outerExit: r.exitCode, inner: inner.stdout.toString(), innerExit: inner.exitCode };
+	});
+	// The node path reads its args before it reaches Bun.spawnSync, so a call from that accessor is the outermost one then.
+	await phase("nested-node", null, () => {
+		let inner = null;
+		const args = ["-c", "200"];
+		Object.defineProperty(args, 2, { enumerable: true, get() {
+			inner = Bun.spawnSync(["/bin/cat", marker]).stdout.toString();
+			return marker;
+		} });
+		return { outer: cp.execFileSync("/usr/bin/head", args).toString(), inner };
+	});
 	const uchg = Bun.spawnSync(["/usr/bin/chflags", "uchg", marker]).exitCode;
 	await idle();
 	try {
@@ -991,7 +1072,7 @@ test("qualifies", async () => {
 `;
 
 describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
-	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, return and throw what they would unwrapped, an immutable marker only stops publication, and the marker fd is not inherited", () => {
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), publish only the outermost of nested calls, an immutable marker only stops publication, and the marker fd is not inherited", () => {
 		const b = box("stuck-qual", DETECT);
 		prepared(b, "tr-sq1", {
 			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
@@ -1041,6 +1122,24 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(byName.fields!.out).toEqual(plain);
 		expect(plain.missingBun.threw).toBe(true);
 		expect(plain.missingExecFileSync.threw).toBe(true);
+		// The accessor, proxy and nested shapes really ran test code (once per getter, a one-shot throw surfacing), so equality
+		// above means the wrapper invoked none of it itself and swallowed none of its errors.
+		expect([plain.argv0Getter.hits, plain.cmdGetter.hits, plain.argv0Throws.hits, plain.cmdThrows.hits, plain.nestedBun.hits, plain.nestedNode.hits]).toEqual([1, 1, 1, 1, 1, 1]);
+		expect([plain.argv0Throws.out.message, plain.cmdThrows.out.message]).toEqual(["as2test one-shot getter", "as2test one-shot getter"]);
+		expect(plain.proxyOptions.hits).toBeGreaterThan(0);
+		expect(plain.nestedNode.out).toBe("n0 deep\n");
+		// Nested inside the call: the outer head alone was published (the generic window check above saw only "head"), and the
+		// nested sh read that same line while it ran.
+		const nested = byName["nested-accessor"]!.out as { outer: string; outerExit: number; inner: string; innerExit: number };
+		expect(nested).toMatchObject({ outerExit: 0, innerExit: 0 });
+		expect(nested.outer).toMatch(/^\d+\thead\n$/);
+		expect(nested.inner).toBe(nested.outer);
+		// From the node path's accessor, before node reaches Bun.spawnSync: the cat was the outermost call then and published
+		// itself, and the head after it published its own, later line.
+		const viaNode = byName["nested-node"]!.out as { outer: string; inner: string };
+		expect(viaNode.inner).toMatch(/^\d+\tcat\n$/);
+		expect(viaNode.outer).toMatch(/^\d+\thead\n$/);
+		expect(Number(viaNode.outer.split("\t")[0])).toBeGreaterThanOrEqual(Number(viaNode.inner.split("\t")[0]));
 		// Immutable marker: chflags worked, every call still returned what it would, and no marker was active in its window.
 		const imm = byName.immutable!;
 		expect(imm.out).toEqual({ uchg: 0, sleep: 0, node: 0, fields: plain });
@@ -1157,8 +1256,13 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		// D5's cap path is unchanged: its stuck capture, then the group's kill.
 		expect(Object.keys(stuckSections(readFileSync(join(work, "full.stuck.log"), "utf8")))).toEqual(["1", "2", "3", "4"]);
 		// The cap kills the leader's group as before. A --parallel worker has its own group, which a groups sweep does not
-		// know; a spinning one never notices its leader's death, so the test ends it here.
-		process.kill(worker, "SIGKILL");
+		// know; a spinning one usually outlives its leader, so the test ends it here. It may already have gone (observed under
+		// a concurrent load): whether it survives the leader is bun's, not the detector's, so ESRCH is fine here.
+		try {
+			process.kill(worker, "SIGKILL");
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+		}
 		expect(await until(() => !alive(worker), 3_000)).toBe(true);
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);

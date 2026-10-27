@@ -37,7 +37,10 @@
 // before the release); worst and p95 (nearest rank) over the decisions that have the times. Wall-cap timeouts with no
 // decision, executor-stalled, containment-failed and admission-refused runs, detector-off parts and runs and Bun versions
 // are counts, never decisions. Every total carries its denominator. An interval with no decision says
-// "no hang observed: no latency evidence". Exit 0 with the report; exit 2 on a bad argument or an unreadable root.
+// "no hang observed: no latency evidence" when every run was readable, else "evidence incomplete: N of M runs unreadable;
+// no hang observed in the readable runs"; each unreadable input (runner.log or result.json missing, unreadable or malformed)
+// is listed in `## Input problems`. Exit 0 with the report (and a stderr warning when a run was unreadable); exit 2 on a bad
+// argument or an unreadable root.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ptParts } from "../src/chaos";
@@ -209,6 +212,8 @@ export interface RunRecord {
 	verdict: string | null;
 	reason: string | null;
 	resultError: string | null;
+	/** Every input this run could not be read from: runner.log missing or unreadable, result.json missing or malformed. */
+	inputProblems: { file: string; error: string }[];
 	/** Stuck lines that are not the pinned form. */
 	malformed: number;
 	/** Stuck lines about a (part, worker, zombie) with no signature before them. */
@@ -221,7 +226,7 @@ const PREFLIGHT_BUN = /\bbun ([0-9A-Za-z.+-]+?),/;
 export function parseRun(runId: string, log: string, resultText: string | null): RunRecord {
 	const rec: RunRecord = {
 		runId, requestMs: requestMsOf(runId), lockAt: null, releasedAt: null, parts: [], episodes: [], executorStalled: false,
-		containmentFailed: false, admissionRefused: false, bun: null, verdict: null, reason: null, resultError: null, malformed: 0, orphans: 0,
+		containmentFailed: false, admissionRefused: false, bun: null, verdict: null, reason: null, resultError: null, inputProblems: [], malformed: 0, orphans: 0,
 	};
 	const parts = new Map<string, PartRecord>();
 	const partOf = (stem: string): PartRecord => {
@@ -340,6 +345,7 @@ export function parseRun(runId: string, log: string, resultText: string | null):
 			rec.resultError = `result.json unreadable (${e instanceof Error ? e.message : String(e)})`;
 		}
 	}
+	if (rec.resultError !== null) rec.inputProblems.push({ file: "result.json", error: rec.resultError });
 	// result.json's reason names the same run-level errors when the runner.log line is missing (PLAN D4 reasons).
 	const reason = rec.reason ?? "";
 	if (reason.includes("executor stalled during stuck detection")) rec.executorStalled = true;
@@ -395,6 +401,9 @@ export interface Summary {
 	containmentFailed: string[];
 	admissionRefused: string[];
 	malformed: number;
+	/** The runs with at least one unreadable input, and each problem. */
+	unreadableRuns: number;
+	inputProblems: { runId: string; file: string; error: string }[];
 	orphans: number;
 }
 
@@ -406,11 +415,13 @@ export function summarize(runs: readonly RunRecord[], all: readonly RunRecord[] 
 	const s: Summary = {
 		runs: [...runs], parts: 0, partsBySub: { full: 0, solo: 0, "base-solo": 0, unknown: 0 }, detectorOffParts: 0, detectorOffRuns: 0,
 		episodes: [], decisions: [], cappedParts: 0, unmatchedCaps: [], executorStalled: [], containmentFailed: [], admissionRefused: [],
-		malformed: 0, orphans: 0,
+		malformed: 0, orphans: 0, unreadableRuns: 0, inputProblems: [],
 	};
 	for (const run of runs) {
 		s.malformed += run.malformed;
 		s.orphans += run.orphans;
+		if (run.inputProblems.length > 0) s.unreadableRuns++;
+		for (const p of run.inputProblems) s.inputProblems.push({ runId: run.runId, ...p });
 		if (run.executorStalled) s.executorStalled.push(run.runId);
 		if (run.containmentFailed) s.containmentFailed.push(run.runId);
 		if (run.admissionRefused) s.admissionRefused.push(run.runId);
@@ -503,10 +514,16 @@ export function renderReport(s: Summary, o: ReportOptions): string[] {
 		`- Bun versions (runs): ${versions(s.runs, (r) => r.bun ?? "unknown")} (of ${n} runs)`,
 		`- Bun versions (signatures): ${versions(s.episodes, (e) => `${e.episode.bun} ${e.episode.revision}`)} (of ${c} signatures)`,
 	];
+	lines.push(`- runs with unreadable evidence: ${of(s.unreadableRuns, n, "runs")}`);
 	if (s.malformed + s.orphans > 0) lines.push(`- unread stuck lines: ${s.malformed} not in the pinned form, ${s.orphans} with no signature before them`);
 
+	if (s.inputProblems.length > 0) {
+		lines.push("", "## Input problems", "");
+		for (const p of s.inputProblems) lines.push(`- ${p.runId} ${p.file}: ${p.error}`);
+	}
+
 	lines.push("", "## Post-signature slot time", "");
-	if (d === 0) lines.push(NO_DECISION);
+	if (d === 0) lines.push(s.unreadableRuns > 0 ? `evidence incomplete: ${of(s.unreadableRuns, n, "runs")} unreadable; no hang observed in the readable runs` : NO_DECISION);
 	else {
 		latency(lines, "lock released − first signature", s.decisions, (r) => r.slotMs, d);
 		latency(lines, "next run took the lock − first signature (a run was waiting)", s.decisions, (r) => r.nextStartMs, d);
@@ -551,19 +568,34 @@ export function renderReport(s: Summary, o: ReportOptions): string[] {
 
 // ---- the root and the CLI -------------------------------------------------------------------------
 
-const readText = (path: string): string | null => {
+type Read = { text: string; error: null } | { text: null; error: string };
+
+/** A file's text, or why it could not be read (`missing` for no such file); never a silent null. */
+const readText = (path: string): Read => {
 	try {
-		return readFileSync(path, "utf8");
-	} catch {
-		return null;
+		return { text: readFileSync(path, "utf8"), error: null };
+	} catch (e) {
+		const code = (e as NodeJS.ErrnoException).code;
+		return { text: null, error: code === "ENOENT" ? "missing" : `unreadable (${e instanceof Error ? e.message : String(e)})` };
 	}
 };
 
-/** Every run under `root`, oldest request first. */
+/** Every run under `root`, oldest request first. A runner.log that is missing or unreadable is an input problem of its run. */
 export function readRuns(root: string): RunRecord[] {
 	return readdirSync(root)
 		.filter((n) => RUN_ID_RE.test(n) && n.length >= 12)
-		.map((id) => parseRun(id, readText(join(root, id, "runner.log")) ?? "", readText(join(root, id, "result.json"))))
+		.map((id) => {
+			const log = readText(join(root, id, "runner.log"));
+			const result = readText(join(root, id, "result.json"));
+			const rec = parseRun(id, log.text ?? "", result.text);
+			if (log.error !== null) rec.inputProblems.unshift({ file: "runner.log", error: log.error });
+			if (result.error !== null && result.error !== "missing") {
+				rec.resultError = `result.json ${result.error}`;
+				rec.inputProblems = rec.inputProblems.filter((p) => p.file !== "result.json");
+				rec.inputProblems.push({ file: "result.json", error: result.error });
+			}
+			return rec;
+		})
 		.sort((a, b) => a.requestMs - b.requestMs || (a.runId < b.runId ? -1 : 1));
 }
 
@@ -573,11 +605,22 @@ export function inInterval(run: RunRecord, since: string | null, until: string |
 	return (since === null || day >= since) && (until === null || day <= until);
 }
 
-/** The whole report for a root and an interval. */
-export function fieldReport(o: ReportOptions): string {
+/** The report for a root and an interval, with the summary it was rendered from. */
+export interface FieldReport {
+	text: string;
+	summary: Summary;
+}
+
+export function fieldReportOf(o: ReportOptions): FieldReport {
 	const all = readRuns(o.root);
 	const runs = all.filter((r) => inInterval(r, o.since, o.until));
-	return `${renderReport(summarize(runs, all), o).join("\n")}\n`;
+	const summary = summarize(runs, all);
+	return { text: `${renderReport(summary, o).join("\n")}\n`, summary };
+}
+
+/** The whole report for a root and an interval. */
+export function fieldReport(o: ReportOptions): string {
+	return fieldReportOf(o).text;
 }
 
 export function parseArgs(argv: readonly string[], env: Record<string, string | undefined> = process.env): ReportOptions | string {
@@ -606,14 +649,17 @@ function main(argv: string[]): number {
 		console.error(`stuck-report: ${o}\n${USAGE}`);
 		return 2;
 	}
-	let report: string;
+	let out: FieldReport;
 	try {
-		report = fieldReport(o);
+		out = fieldReportOf(o);
 	} catch (e) {
 		console.error(`stuck-report: could not read ${o.root} (${e instanceof Error ? e.message : String(e)})`);
 		return 2;
 	}
-	process.stdout.write(report);
+	process.stdout.write(out.text);
+	if (out.summary.unreadableRuns > 0) {
+		console.error(`stuck-report: warning: ${out.summary.unreadableRuns} of ${out.summary.runs.length} runs have unreadable evidence (see "## Input problems" in the report)`);
+	}
 	return 0;
 }
 

@@ -2540,6 +2540,47 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 	}
 });
 
+// Review r1 finding 4: release() used to clear `held` before its delete, so a failed delete left the row held and the finally's
+// release returned at once; the next run then waited for the row's heartbeat to go stale.
+test("a lock-row delete that first fails (runs.db held) is retried within the release deadline: the row goes, and the queued next run takes the lock, not as a stale takeover", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	const db = lockDbOf(w);
+	arm(w, runId, "release");
+	const kids: Child[] = [spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS: "10000" })];
+	let holding = false;
+	try {
+		await reached(w, runId, "release");
+		const next = waiter(w, 0);
+		kids.push(spawnRun(w, next.id));
+		await until("the next run is queued behind the holder", () => marks(w, next.id, "queued").length > 0, 60_000);
+		db.exec("BEGIN IMMEDIATE");
+		holding = true;
+		go(w, runId, "release");
+		await until("the first delete fails", () => marks(w, runId, "release-failed").length > 0, 10_000);
+		db.exec("ROLLBACK");
+		holding = false;
+		await kids[0]!.exited;
+		expect(kids[0]!.exitCode).toBe(0);
+		const log = runnerLog(w, runId);
+		expect(log).toMatch(/ the lock release failed: .+; retrying until \S+\n/);
+		expect(log).toContain(" lock released\n");
+		expect(log).not.toContain("the lock was not released");
+		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
+		await kids[1]!.exited;
+		// displaced null: the row was gone when it took the lock, never waited out as a stale holder's
+		expect(marks(w, next.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+		expect((await resultOf(w, next.wl, next.id)).verdict).toBe("stale");
+		expect(lockRow(db)).toBeNull();
+	} finally {
+		if (holding) db.exec("ROLLBACK");
+		go(w, runId, "release");
+		await reap(kids);
+		db.close();
+	}
+});
+
 // ---- the stuck-worker detector's runner side (PLAN wl-mvq8x4pkjmx69s D4) -----------------------------------
 
 /**
@@ -2801,6 +2842,80 @@ exit 125`);
 		expect(deadline - started).toBeLessThanOrEqual(1500);
 		expect(logAt(log, / lock released$/) - stuckAt).toBeLessThan(1500 + 1500 + 2000);
 	});
+
+	// Review r1 finding 2: the post-stuck sweep's ownership checkpoint used to wait out publishIfOwner's busyLoop (12 busy_timeouts,
+	// about 60 s at the production 5 s) before the shared sweep deadline was even read.
+	test("runs.db held from the stuck part's end through its sweep's ownership checkpoint: the checkpoint gives up at the sweep deadline, and the lock is released within the sweep deadline + STUCK_FINALIZE_MS + slack", async () => {
+		const w = world({ stuckStop: "enforce" });
+		const { wl, slice } = workload(w);
+		standIn(w, `while [ ! -f "$here/held" ]; do sleep 0.05; done
+stp 4242 4243
+exit 125`);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		const sweepMs = 1500;
+		const finalizeMs = 1500;
+		const db = lockDbOf(w);
+		// The production busy_timeout, so a checkpoint that waits on runs.db synchronously waits far past every deadline here.
+		const child = spawnRun(w, runId, {
+			...STUCK_KNOBS, AGENT_SYSTEM_TEST_RUNNER_STUCK_SWEEP_MS: String(sweepMs), AGENT_SYSTEM_TEST_RUNNER_STUCK_FINALIZE_MS: String(finalizeMs), AGENT_SYSTEM_TEST_RUNNER_BUSY_MS: "5000",
+		});
+		const gaveUp = / the sweep after full: runs\.db stayed busy through \d+ ownership checkpoint attempts until the deadline \S+; going on without it$/m;
+		let holding = false;
+		try {
+			await until("the stand-in started", () => existsSync(join(w.root, "standin.pid")), 60_000);
+			db.exec("BEGIN IMMEDIATE");
+			holding = true;
+			writeFileSync(join(w.root, "held"), "");
+			await until("the runner saw the stuck exit", () => / full tr-[a-z0-9]+ → exit 125$/m.test(runnerLog(w, runId)), 60_000);
+			// Held until the checkpoint gives up, or for the whole bound when it never does.
+			const heldUntil = Date.now() + sweepMs + finalizeMs + 2000;
+			await until("the checkpoint gives up or the bound passes", () => gaveUp.test(runnerLog(w, runId)) || Date.now() >= heldUntil, 60_000);
+			db.exec("ROLLBACK");
+			holding = false;
+			await child.exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toStartWith(`full: ${STOP_REASON}`);
+			const log = runnerLog(w, runId);
+			const stuckAt = logAt(log, / full tr-[a-z0-9]+ → exit 125$/);
+			expect(logAt(log, / lock released$/) - stuckAt).toBeLessThan(sweepMs + finalizeMs + 2000);
+			expect(log).toMatch(gaveUp);
+			expect(logAt(log, gaveUp) - stuckAt).toBeLessThan(sweepMs + 1000);
+			expect(marks(w, runId, "checkpoint-busy").length).toBeGreaterThan(0);
+			// no sweep ran after the stuck part: its deadline passed in the checkpoint; the containment check judged what was left
+			expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish"]);
+			expect(log).toContain("contained after full: no live _as2test process");
+			expect(lockRow(db)).toBeNull();
+		} finally {
+			if (holding) db.exec("ROLLBACK");
+			writeFileSync(join(w.root, "held"), "");
+			await child.exited;
+			db.close();
+		}
+	});
+
+	// Review r1 finding 3 (R5, whatever the wrapper's ending): a stuck call the wrapper then ended 70 or 64 used to import nothing.
+	for (const code of [WRAPPER_EXIT.failed, WRAPPER_EXIT.refused]) {
+		test(`a stop line then exit ${code}: the partial junit's gates/test failure is kept and security-red sent; error with the stuck reason`, async () => {
+			const w = world({ stuckStop: "enforce" });
+			const { wl, slice } = workload(w);
+			standIn(w, `"$@"
+stp 4242 4243
+exit ${code}`);
+			const runId = request(w, wl, slice, PR.gate, fx.head.gate);
+			await spawnRun(w, runId, STUCK_KNOBS).exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "error", reason: `full: ${STOP_REASON}` });
+			expect(run.full).toMatchObject({ exit: code, error: STOP_REASON });
+			expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", "gates/test/gate.test.ts > refuses a forged approve"]]);
+			expect(heldMessages(w, wl).filter((m) => m.body.startsWith("security-red: ")).map((m) => m.body)).toEqual([
+				`security-red: ${wl} ${slice} ${runId} ${fx.head.gate} 1 gates/test/gate.test.ts > refuses a forged approve`,
+			]);
+			expect(readFileSync(join(w.runs, runId, "full.xml"), "utf8")).toContain("refuses a forged approve");
+			expect(partsOf(w, runId)).toEqual(["probe", "prepare", "full"]);
+			expect(runnerLog(w, runId)).toMatch(new RegExp(` full tr-[a-z0-9]+ → exit ${code}\\n`));
+		});
+	}
 
 	test("containment (groups render): a survivor left by the stand-in is found by the check, killed by the retry after the stalled sweep was abandoned, then contained", async () => {
 		const w = world({ stuckStop: "enforce" });
