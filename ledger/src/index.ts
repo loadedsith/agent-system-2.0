@@ -88,6 +88,8 @@ export function processAlive(pid: number): boolean {
 
 /** In each namespace directory: the canonical path of the ledger its copies are of. */
 export const BACKUP_SOURCE_FILE = "SOURCE";
+/** `backupIfDue`'s temporary SOURCE before it is linked into place: `.SOURCE.<writer pid>-<random>.tmp`. */
+const SOURCE_TEMP_NAME = /^\.SOURCE\.(\d+)-[0-9a-z]*\.tmp$/;
 
 /**
  * The backup subdirectory for the ledger at canonical path `source`: its file name without the
@@ -1120,7 +1122,20 @@ export class Ledger {
 		mkdirSync(policy.dir, { recursive: true });
 		const source = join(policy.dir, BACKUP_SOURCE_FILE);
 		assertNotLiveLedgerUnderTest(source);
-		if (!existsSync(source)) writeFileSync(source, `${this.path}\n`);
+		// SOURCE appears whole or not at all: written under a temporary name, then linked into place,
+		// so a concurrent opener's backups() never reads it empty or partial.
+		if (!existsSync(source)) {
+			const tmp = join(policy.dir, `.${BACKUP_SOURCE_FILE}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
+			try {
+				writeFileSync(tmp, `${this.path}\n`);
+				linkSync(tmp, source); // fails if SOURCE appeared meanwhile; never replaces it
+			} catch (e) {
+				// Another connection published SOURCE first; backups() below still checks whose it is.
+				if (!(e instanceof Error && "code" in e && e.code === "EEXIST")) throw e;
+			} finally {
+				rmSync(tmp, { force: true });
+			}
+		}
 		try {
 			this.backup(dest);
 		} catch (e) {
@@ -1133,10 +1148,10 @@ export class Ledger {
 		for (const old of all.slice(0, Math.max(0, all.length - Math.max(1, policy.keep)))) {
 			for (const suffix of ["", "-wal", "-shm"]) rmSync(old.path + suffix, { force: true });
 		}
-		// A writer killed between VACUUM INTO and its `finally` leaves its temporary snapshot behind.
-		// Reclaim those whose writer is gone; a live writer's (or a reused pid's) is left alone.
+		// A writer killed between writing a temporary file (SOURCE or a VACUUM INTO snapshot) and its
+		// `finally` leaves it behind. Reclaim those whose writer is gone; a live writer's (or a reused pid's) is left alone.
 		for (const name of readdirSync(policy.dir)) {
-			const m = BACKUP_TEMP_NAME.exec(name);
+			const m = BACKUP_TEMP_NAME.exec(name) ?? SOURCE_TEMP_NAME.exec(name);
 			if (m && !processAlive(Number(m[1]))) rmSync(join(policy.dir, name), { force: true });
 		}
 		return dest;
