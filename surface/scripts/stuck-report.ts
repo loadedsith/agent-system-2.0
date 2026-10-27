@@ -10,8 +10,8 @@
 //
 // Inputs (the workload's CONTRACT.md): the executor's `stuck-*` stdout lines, which the runner echoes into runner.log
 // (found anywhere in a line, each carrying its own ISO time and `part <stem>`); the runner's own lines (`<ts> took the
-// lock`, `<ts> lock released`, `<ts> stuck-containment-failed part …`, `<ts> executor-stalled part …`, `<ts> admission
-// refused: …`); the runner's wrapper-call lines (`<ts> <exec> <full|solo|base-solo> <run id>[ <file>]: started pid <n>` and
+// lock`, `<ts> lock released`, `<ts> the lock was not released: …`, `<ts> stuck-containment-failed part …`, `<ts>
+// executor-stalled part …`, `<ts> admission refused: …`); the runner's wrapper-call lines (`<ts> <exec> <full|solo|base-solo> <run id>[ <file>]: started pid <n>` and
 // `… → exit <code>` or `→ <signal>`, ` (after the outlive sweep)` when the outlive sweep fired, ` (abandoned by the stuck
 // backstop)` when the enforce backstop gave up on the call), with the exec's echoed
 // `part <stem>` line and its `as2test: timeout: the part passed its cap of <ms> ms` stderr line between them; and
@@ -35,7 +35,7 @@
 // end of the part). Post-signature slot time per decision is `lock released` minus the first
 // signature; next-start is the next run's `took the lock` minus the first signature when a run was waiting (requested
 // before the release); worst and p95 (nearest rank) over the decisions that have the times. Wall-cap timeouts with no
-// decision, executor-stalled, containment-failed and admission-refused runs, detector-off parts and runs and Bun versions
+// decision, executor-stalled, containment-failed, admission-refused and lock-release-failed runs, detector-off parts and runs and Bun versions
 // are counts, never decisions. Every total carries its denominator. An interval with no decision says
 // "no hang observed: no latency evidence" when every run was readable, else "evidence incomplete: N of M runs unreadable;
 // no hang observed in the readable runs"; each unreadable input (runner.log or result.json missing, unreadable or malformed)
@@ -119,7 +119,7 @@ export function parseStuckLine(line: string): StuckEvent | "malformed" | null {
 
 export type PartSub = "full" | "solo" | "base-solo";
 export type RunnerEvent =
-	| { kind: "lock" | "released"; at: number }
+	| { kind: "lock" | "released" | "release-failed"; at: number }
 	| { kind: "containment-failed"; at: number; part: string; pids: string }
 	| { kind: "executor-stalled"; at: number; part: string; worker: number }
 	| { kind: "admission-refused"; at: number; why: string }
@@ -133,6 +133,7 @@ const RELEASED_LINE = new RegExp(`^${TS} lock released$`);
 const CONTAIN_LINE = new RegExp(`^${TS} stuck-containment-failed part (\\S+) pids (\\S+)`);
 const STALLED_LINE = new RegExp(`^${TS} executor-stalled part (\\S+) worker (\\d+)`);
 const ADMISSION_LINE = new RegExp(`^${TS} admission refused: (.*)$`);
+const RELEASE_FAILED_LINE = new RegExp(`^${TS} the lock was not released: `);
 const CALL = String.raw`\S+ (full|solo|base-solo) tr-[a-z0-9]+(?: (\S+))?`;
 const CALL_START = new RegExp(`^${TS} ${CALL}: started pid \\d+$`);
 const CALL_END = new RegExp(`^${TS} ${CALL} → (exit (-?\\d+|null)|[A-Z0-9]+)( \\(after the outlive sweep\\))?( \\(abandoned by the stuck backstop\\))?$`);
@@ -144,6 +145,7 @@ export function parseRunnerLine(line: string): RunnerEvent | null {
 	let m: RegExpExecArray | null;
 	if ((m = LOCK_LINE.exec(line))) return { kind: "lock", at: Date.parse(m[1]!) };
 	if ((m = RELEASED_LINE.exec(line))) return { kind: "released", at: Date.parse(m[1]!) };
+	if ((m = RELEASE_FAILED_LINE.exec(line))) return { kind: "release-failed", at: Date.parse(m[1]!) };
 	if ((m = CONTAIN_LINE.exec(line))) return { kind: "containment-failed", at: Date.parse(m[1]!), part: m[2]!, pids: m[3]! };
 	if ((m = STALLED_LINE.exec(line))) return { kind: "executor-stalled", at: Date.parse(m[1]!), part: m[2]!, worker: Number(m[3]) };
 	if ((m = ADMISSION_LINE.exec(line))) return { kind: "admission-refused", at: Date.parse(m[1]!), why: m[2]! };
@@ -207,6 +209,8 @@ export interface RunRecord {
 	executorStalled: boolean;
 	containmentFailed: boolean;
 	admissionRefused: boolean;
+	/** The runner.log has `the lock was not released`: a release ended with the row still held. */
+	releaseFailed: boolean;
 	/** The install's Bun version from result.json's preflight (`bun <version>`), null when there is none. */
 	bun: string | null;
 	verdict: string | null;
@@ -226,7 +230,7 @@ const PREFLIGHT_BUN = /\bbun ([0-9A-Za-z.+-]+?),/;
 export function parseRun(runId: string, log: string, resultText: string | null): RunRecord {
 	const rec: RunRecord = {
 		runId, requestMs: requestMsOf(runId), lockAt: null, releasedAt: null, parts: [], episodes: [], executorStalled: false,
-		containmentFailed: false, admissionRefused: false, bun: null, verdict: null, reason: null, resultError: null, inputProblems: [], malformed: 0, orphans: 0,
+		containmentFailed: false, admissionRefused: false, releaseFailed: false, bun: null, verdict: null, reason: null, resultError: null, inputProblems: [], malformed: 0, orphans: 0,
 	};
 	const parts = new Map<string, PartRecord>();
 	const partOf = (stem: string): PartRecord => {
@@ -306,6 +310,9 @@ export function parseRun(runId: string, log: string, resultText: string | null):
 				break;
 			case "admission-refused":
 				rec.admissionRefused = true;
+				break;
+			case "release-failed":
+				rec.releaseFailed = true;
 				break;
 			case "call-start":
 				call = { sub: r.sub, file: r.file, startAt: r.at, stem: r.sub === "full" ? "full" : null, capMs: null };
@@ -400,6 +407,7 @@ export interface Summary {
 	executorStalled: string[];
 	containmentFailed: string[];
 	admissionRefused: string[];
+	releaseFailed: string[];
 	malformed: number;
 	/** The runs with at least one unreadable input, and each problem. */
 	unreadableRuns: number;
@@ -414,7 +422,7 @@ export interface Summary {
 export function summarize(runs: readonly RunRecord[], all: readonly RunRecord[] = runs): Summary {
 	const s: Summary = {
 		runs: [...runs], parts: 0, partsBySub: { full: 0, solo: 0, "base-solo": 0, unknown: 0 }, detectorOffParts: 0, detectorOffRuns: 0,
-		episodes: [], decisions: [], cappedParts: 0, unmatchedCaps: [], executorStalled: [], containmentFailed: [], admissionRefused: [],
+		episodes: [], decisions: [], cappedParts: 0, unmatchedCaps: [], executorStalled: [], containmentFailed: [], admissionRefused: [], releaseFailed: [],
 		malformed: 0, orphans: 0, unreadableRuns: 0, inputProblems: [],
 	};
 	for (const run of runs) {
@@ -425,6 +433,7 @@ export function summarize(runs: readonly RunRecord[], all: readonly RunRecord[] 
 		if (run.executorStalled) s.executorStalled.push(run.runId);
 		if (run.containmentFailed) s.containmentFailed.push(run.runId);
 		if (run.admissionRefused) s.admissionRefused.push(run.runId);
+		if (run.releaseFailed) s.releaseFailed.push(run.runId);
 		if (run.parts.some((p) => p.detectorOff !== null)) s.detectorOffRuns++;
 		const next = run.releasedAt === null ? null : all
 			.filter((o) => o.runId !== run.runId && o.requestMs <= run.releasedAt! && o.lockAt !== null && o.lockAt >= run.releasedAt!)
@@ -511,6 +520,7 @@ export function renderReport(s: Summary, o: ReportOptions): string[] {
 		`- executor-stalled runs: ${of(s.executorStalled.length, n, "runs")}`,
 		`- containment-failed runs: ${of(s.containmentFailed.length, n, "runs")}`,
 		`- admission-refused runs: ${of(s.admissionRefused.length, n, "runs")}`,
+		`- lock release failed: ${of(s.releaseFailed.length, n, "runs")}`,
 		`- Bun versions (runs): ${versions(s.runs, (r) => r.bun ?? "unknown")} (of ${n} runs)`,
 		`- Bun versions (signatures): ${versions(s.episodes, (e) => `${e.episode.bun} ${e.episode.revision}`)} (of ${c} signatures)`,
 	];

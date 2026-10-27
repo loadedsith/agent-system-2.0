@@ -2,7 +2,7 @@
 // run dirs (runner.log with the executor's echoed stuck-* lines and the runner's own lines, result.json) read into every
 // category: cleared-before-match, no decision, decisions with each outcome (recovered, part-ended, capped with minutes to
 // the cap, stopped), post-signature slot time and next-start with worst and p95, unmatched wall-cap timeouts,
-// executor-stalled, containment-failed and admission-refused runs, detector-off parts and runs, Bun versions, each total
+// executor-stalled, containment-failed, admission-refused and lock-release-failed runs, detector-off parts and runs, Bun versions, each total
 // with its denominator; one incident per (run, part, worker, zombie) when the shadow capture clears and re-signs the same
 // pair; an interval with no decision; the --since/--until interval; the CLI run for real.
 import { describe, expect, test } from "bun:test";
@@ -216,6 +216,34 @@ describe("the fixture root", () => {
 		expect(s.unmatchedCaps).toEqual([{ runId: w.ids.unmatched!, part: "full" }]);
 		expect([s.executorStalled, s.containmentFailed, s.admissionRefused]).toEqual([[w.ids.stalled!], [w.ids.contain!], [w.ids.refused!]]);
 		expect([s.malformed, s.orphans]).toEqual([1, 1]);
+	});
+
+	// Review r2 finding 2: a release that ended with the row still held is a run count (`the lock was not released`, test-runner.ts `release`).
+	test("lock release failed: runs whose runner.log has `the lock was not released`, once a run, among the run counts", () => {
+		const root = tmp("stuck-report-release");
+		const t = T0 + 200 * MIN;
+		const failed = newId(t);
+		const retried = newId(t + 10 * MIN);
+		const clean = newId(t + 20 * MIN);
+		const busy = "database is locked";
+		write(root, failed, [
+			`${iso(t + S)} took the lock`,
+			`${iso(t + 30 * S)} the lock release failed: ${busy}; retrying until ${iso(t + 75 * S)}`,
+			`${iso(t + 76 * S)} the lock was not released: ${busy} (1200 attempts; the row's heartbeatAt ${iso(t + 15 * S)} is stale for a waiter since ${iso(t + 75 * S)}); the row holds this run until a waiter takes it`,
+			`${iso(t + 77 * S)} the lock was not released: ${busy} (1201 attempts; the row's heartbeatAt ${iso(t + 15 * S)} is stale for a waiter since ${iso(t + 75 * S)}); the row holds this run until a waiter takes it`,
+		]);
+		write(root, retried, [`${iso(t + 10 * MIN + S)} took the lock`, `${iso(t + 10 * MIN + 30 * S)} the lock release failed: ${busy}; retrying until ${iso(t + 11 * MIN)}`, `${iso(t + 10 * MIN + 34 * S)} lock released`]);
+		write(root, clean, [`${iso(t + 20 * MIN + S)} took the lock`, `${iso(t + 20 * MIN + 30 * S)} lock released`]);
+		expect(parseRunnerLine(`${iso(t)} the lock was not released: ${busy} (3 attempts)`)).toEqual({ kind: "release-failed", at: t });
+		expect(parseRunnerLine(`${iso(t)} the lock release failed: ${busy}; retrying until ${iso(t)}`)).toBeNull();
+		const r = summarize(readRuns(root));
+		expect(r.releaseFailed).toEqual([failed]);
+		expect(r.runs.find((x) => x.runId === retried)!.releasedAt).toBe(t + 10 * MIN + 34 * S);
+		const report = renderReport(r, { root, since: null, until: null });
+		expect(report).toContain("- lock release failed: 1 of 3 runs");
+		expect(report.indexOf("- lock release failed: 1 of 3 runs")).toBe(report.indexOf("- admission-refused runs: 0 of 3 runs") + 1);
+		expect(text).toContain("- lock release failed: 0 of 9 runs");
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	test("the report states every category with its denominator", () => {

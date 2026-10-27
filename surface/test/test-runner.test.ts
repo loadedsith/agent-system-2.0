@@ -2541,14 +2541,18 @@ test("publication retries a transient ledger lock within the post-sweep deadline
 });
 
 // Review r1 finding 4: release() used to clear `held` before its delete, so a failed delete left the row held and the finally's
-// release returned at once; the next run then waited for the row's heartbeat to go stale.
-test("a lock-row delete that first fails (runs.db held) is retried within the release deadline: the row goes, and the queued next run takes the lock, not as a stale takeover", async () => {
+// release returned at once. Review r2 finding 2: release then gave up after a 2 s deadline. Either way the next run waited for the
+// row's heartbeat to go stale. Both tests run the production release settings (no knob): the release retries until the row would
+// be stale for a waiter.
+test("runs.db held for 4 s from the first lock-row delete (past the old 2 s deadline): the row goes within 200 ms of the hold's end, and the queued next run takes it within its 2 s poll, not as a stale takeover", async () => {
 	const w = world();
 	const { wl, slice } = workload(w);
 	const runId = request(w, wl, slice, PR.green, fx.head.green);
 	const db = lockDbOf(w);
+	// the test's own BEGIN IMMEDIATE may meet the waiter's short acquire transaction
+	db.exec("PRAGMA busy_timeout = 5000");
 	arm(w, runId, "release");
-	const kids: Child[] = [spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS: "10000" })];
+	const kids: Child[] = [spawnRun(w, runId)];
 	let holding = false;
 	try {
 		await reached(w, runId, "release");
@@ -2558,8 +2562,13 @@ test("a lock-row delete that first fails (runs.db held) is retried within the re
 		db.exec("BEGIN IMMEDIATE");
 		holding = true;
 		go(w, runId, "release");
-		await until("the first delete fails", () => marks(w, runId, "release-failed").length > 0, 10_000);
+		const first = await until("the first delete fails", () => marks(w, runId, "release-failed")[0], 10_000);
+		// A genuine 4 s hold: the subject is the runner process's own clock against a real SQLite lock, which fake timers in this
+		// process cannot move; the hold ends 4 s after the runner's first failed delete (its own mark time), not a guessed delay.
+		await Bun.sleep(Number(first.at) + 4_000 - Date.now());
+		const failedInHold = marks(w, runId, "release-failed").length;
 		db.exec("ROLLBACK");
+		const heldEnd = Date.now();
 		holding = false;
 		await kids[0]!.exited;
 		expect(kids[0]!.exitCode).toBe(0);
@@ -2567,10 +2576,68 @@ test("a lock-row delete that first fails (runs.db held) is retried within the re
 		expect(log).toMatch(/ the lock release failed: .+; retrying until \S+\n/);
 		expect(log).toContain(" lock released\n");
 		expect(log).not.toContain("the lock was not released");
+		// retried every 50 ms through the whole hold, past where the 2 s deadline gave up
+		expect(failedInHold).toBeGreaterThan(40);
+		const releasedAt = logAt(log, / lock released$/);
+		console.info(`release after a 4 s hold: the row went ${releasedAt - heldEnd} ms after the hold ended`);
+		expect(releasedAt - heldEnd).toBeLessThan(200);
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 		await kids[1]!.exited;
 		// displaced null: the row was gone when it took the lock, never waited out as a stale holder's
-		expect(marks(w, next.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+		const took = marks(w, next.id, "acquired");
+		expect(took).toEqual([expect.objectContaining({ displaced: null })]);
+		expect(Number(took[0]!.at) - releasedAt).toBeLessThan(2_000 + 1_000);
+		expect((await resultOf(w, next.wl, next.id)).verdict).toBe("stale");
+		expect(lockRow(db)).toBeNull();
+	} finally {
+		if (holding) db.exec("ROLLBACK");
+		go(w, runId, "release");
+		await reap(kids);
+		db.close();
+	}
+});
+
+test("the release horizon reached while runs.db stays held (the row's heartbeatAt written 59 s back at the release hook): `the lock was not released` at the horizon, the run exits START_EXIT.failed with its status posted, and the queued run then takes the stale row", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	const db = lockDbOf(w);
+	db.exec("PRAGMA busy_timeout = 5000");
+	arm(w, runId, "release");
+	const kids: Child[] = [spawnRun(w, runId)];
+	let holding = false;
+	try {
+		await reached(w, runId, "release");
+		const next = waiter(w, 0);
+		kids.push(spawnRun(w, next.id));
+		await until("the next run is queued behind the holder", () => marks(w, next.id, "queued").length > 0, 60_000);
+		// From the release hook on, the run's heartbeat leaves the row alone, so this heartbeatAt is the one release reads.
+		// 59 s back: still live to the waiter until the hold is in place.
+		const beatAt = Date.now() - 59_000;
+		expect(db.query("UPDATE lock SET heartbeatAt = ? WHERE runId = ?").run(beatAt, runId).changes).toBe(1);
+		db.exec("BEGIN IMMEDIATE");
+		holding = true;
+		go(w, runId, "release");
+		await kids[0]!.exited;
+		expect(kids[0]!.exitCode).toBe(START_EXIT.failed);
+		const log = runnerLog(w, runId);
+		const horizon = beatAt + 60_000;
+		expect(log).toContain(` the lock release failed: `);
+		expect(log).toContain(`; retrying until ${new Date(horizon).toISOString()}\n`);
+		expect(log).toMatch(/ the lock was not released: .+ \(\d+ attempts; the row's heartbeatAt \S+ is stale for a waiter since \S+\); the row holds this run until a waiter takes it\n/);
+		expect(log).not.toContain(" lock released\n");
+		const gaveUp = logAt(log, / the lock was not released: /);
+		// never before a waiter could take the row, and not long after
+		expect(gaveUp).toBeGreaterThan(horizon);
+		expect(gaveUp - horizon).toBeLessThan(500);
+		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
+		expect(lockRow(db)).toMatchObject({ runId, heartbeatAt: beatAt });
+		db.exec("ROLLBACK");
+		holding = false;
+		await kids[1]!.exited;
+		expect(marks(w, next.id, "acquired")).toEqual([expect.objectContaining({ displaced: runId })]);
+		expect(runnerLog(w, next.id)).toContain(` took the lock from the stale holder ${runId}\n`);
 		expect((await resultOf(w, next.wl, next.id)).verdict).toBe("stale");
 		expect(lockRow(db)).toBeNull();
 	} finally {

@@ -727,8 +727,13 @@ const STUCK_PRELOAD = String.raw`// agent-system 2.0 test runner: the stuck-work
 // one part and removes it when the part ends. It wraps Bun.spawnSync (node's sync child_process APIs route through it): for
 // each outermost call it writes "<since ms>\t<command>\n" to $AS2TEST_STUCK_MARKERS/<pid> and holds an flock on that file for
 // exactly the call. The call returns or throws exactly what it would have; the wrapper's own fs and ffi errors only stop
-// publication (a missed detection, never a false one). The command is read without running test code: only own data
-// properties of non-proxy objects, through functions bound at load, so no getter, proxy trap or replaced builtin runs here.
+// publication (a missed detection, never a false one). It publishes only a call whose every input is plain data, so a held
+// marker means the native call itself is running, never test code the call runs while it reads its arguments (review r2
+// finding 1): argv a dense, non-proxy array of own data strings; options, when given, a non-proxy object with prototype
+// Object.prototype or null whose own properties are all data properties holding a primitive, bytes (an ArrayBuffer or a view),
+// a dense array of those (stdio; node puts its input Buffer there), or for env a plain object of own data primitives. A
+// function, a getter, a hole, a proxy or any other object runs the call unpublished. It reads only descriptors, through
+// functions bound at load, so no getter, proxy trap or replaced builtin runs here.
 import fs from "node:fs";
 import { types } from "node:util";
 import { dlopen, FFIType } from "bun:ffi";
@@ -746,7 +751,12 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 		const apply = Reflect.apply;
 		const ownDescriptor = Object.getOwnPropertyDescriptor;
 		const hasOwn = Object.hasOwn;
+		const ownKeys = Reflect.ownKeys;
+		const protoOf = Object.getPrototypeOf;
+		const OBJECT_PROTO = Object.prototype;
 		const isArray = Array.isArray;
+		const isView = ArrayBuffer.isView;
+		const isAnyArrayBuffer = types.isAnyArrayBuffer;
 		const isProxy = types.isProxy;
 		const strSlice = String.prototype.slice;
 		const strIndexOf = String.prototype.indexOf;
@@ -767,28 +777,61 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 			const d = ownDescriptor(o, key);
 			return d !== undefined && hasOwn(d, "value") ? d.value : undefined;
 		};
-		// The marker command of a call's first argument (argv or { cmd }), or "" when it cannot be read without test code:
-		// a proxy, an accessor, an inherited or missing property, or an argv0 that is not a primitive string.
-		const commandOf = (a) => {
-			if (a === null || typeof a !== "object" || isProxy(a)) return "";
-			let cmd = a;
-			if (!isArray(a)) {
-				cmd = own(a, "cmd");
-				if (cmd === null || typeof cmd !== "object" || isProxy(cmd) || !isArray(cmd)) return "";
+		// Whether o's own property key is a data property whose value passes ok(value, key).
+		const dataPasses = (o, key, ok) => {
+			const d = ownDescriptor(o, key);
+			return d !== undefined && hasOwn(d, "value") && ok(d.value, key);
+		};
+		const primitive = (v) => v === null || (typeof v !== "object" && typeof v !== "function");
+		const isString = (v) => typeof v === "string";
+		// Bytes the native call reads from internal slots, never through a getter (probe, bun 1.3.14: a Uint8Array subclass's
+		// length, byteLength and buffer getters do not run).
+		const bytes = (v) => v !== null && typeof v === "object" && !isProxy(v) && (isView(v) || isAnyArrayBuffer(v));
+		const element = (v) => primitive(v) || bytes(v);
+		// A non-proxy real array with an own data property passing ok at every index (a hole is read through Array.prototype).
+		const denseArray = (a, ok) => {
+			if (a === null || typeof a !== "object" || isProxy(a) || !isArray(a)) return false;
+			const n = own(a, "length");
+			for (let i = 0; i < n; i++) if (!dataPasses(a, i, ok)) return false;
+			return true;
+		};
+		const plainObject = (o) => o !== null && typeof o === "object" && !isProxy(o) && !isArray(o) && (protoOf(o) === OBJECT_PROTO || protoOf(o) === null);
+		// Every own property of o (string and symbol keys) a data property whose value passes ok.
+		const allOwnData = (o, ok) => {
+			const keys = ownKeys(o);
+			for (let i = 0; i < keys.length; i++) if (!dataPasses(o, keys[i], ok)) return false;
+			return true;
+		};
+		const optionValue = (v, key) => element(v) || denseArray(v, element) || (key === "env" && plainObject(v) && allOwnData(v, primitive));
+		// The marker command of a call (argv[, options] or { cmd, ... }), or "" when any input the original reads is not plain
+		// data, or argv0 names no usable command.
+		const commandOf = (args) => {
+			const n = args.length;
+			if (n < 1 || n > 2) return "";
+			const first = args[0];
+			let options = n === 2 ? args[1] : undefined;
+			if (first === null || typeof first !== "object" || isProxy(first)) return "";
+			let argv = first;
+			if (!isArray(first)) {
+				if (options !== undefined) return "";
+				options = first;
+				argv = own(first, "cmd");
 			}
-			const argv0 = own(cmd, "0");
+			if (!denseArray(argv, isString)) return "";
+			if (options !== undefined && !(plainObject(options) && allOwnData(options, optionValue))) return "";
+			const argv0 = own(argv, "0");
 			if (typeof argv0 !== "string") return "";
 			const command = apply(strSlice, apply(strSlice, argv0, [apply(strLastIndexOf, argv0, ["/"]) + 1]), [0, 16]);
 			return command.length > 0 && apply(strIndexOf, command, ["\t"]) === -1 && apply(strIndexOf, command, ["\n"]) === -1 ? command : "";
 		};
 		// The fd holding this call's lock, or -1 when the call runs unpublished. Lock first (LOCK_EX|LOCK_NB: a held lock or the
 		// observer's momentary shared lock means this call runs unpublished), then the content; a write that fails unpublishes.
-		const publish = (a) => {
+		const publish = (args) => {
 			if (off) return -1;
 			let fd = -1;
 			let locked = false;
 			try {
-				const command = commandOf(a);
+				const command = commandOf(args);
 				if (command === "") return -1;
 				fd = openSync(path, FLAGS, 0o600);
 				if (flock(fd, LOCK_EX | LOCK_NB) !== 0) throw 0;
@@ -817,12 +860,13 @@ if (typeof dir === "string" && dir.startsWith("/") && process.platform === "darw
 			} catch {}
 		};
 		const spawnSync = function spawnSync(...args) {
-			// A nested call is not published again.
+			// A nested call (only test code inside an outer call's arguments makes one, so the outer is unpublished) is not
+			// published either.
 			if (depth > 0) return apply(original, this, args);
 			depth++;
 			let fd = -1;
 			try {
-				fd = publish(args[0]);
+				fd = publish(args);
 				return apply(original, this, args);
 			} finally {
 				depth--;

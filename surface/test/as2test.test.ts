@@ -997,12 +997,31 @@ function callFields(cp: typeof childProcess) {
 			bunFields(Bun.spawnSync(withGetter(["/bin/echo", "outer"], 0, () => (hit(), Bun.spawnSync(["/bin/echo", "/bin/echo"]).stdout.toString().trim())))),
 		),
 		nestedNode: counted((hit) => cp.execFileSync("/bin/echo", withGetter(["n0", "n1"], 1, () => (hit(), Bun.spawnSync(["/bin/echo", "deep"]).stdout.toString().trim()))).toString()),
+		// Test code the original itself runs: a later argv element, an option and an env value as getters, a holey argv
+		// (its hole is read through Array.prototype), and a function option.
+		laterArgvGetter: counted((hit) => bunFields(Bun.spawnSync(withGetter(["/bin/echo", "l0", "l1"], 2, () => (hit(), "l2"))))),
+		cwdGetter: counted((hit) => bunFields(Bun.spawnSync(["/bin/pwd"], { get cwd() {
+			hit();
+			return "/";
+		} }))),
+		envGetter: counted((hit) => bunFields(Bun.spawnSync(["/usr/bin/env"], { env: { get AS2TEST_E() {
+			hit();
+			return "e";
+		} } }))),
+		holeyArgv: counted(() => {
+			const a = ["/bin/echo", "h0"];
+			a.length = 3;
+			return bunFields(Bun.spawnSync(a));
+		}),
+		functionOption: counted((hit) => bunFields(Bun.spawnSync(["/bin/echo", "f"], { onExit: () => hit() }))),
+		plainOptions: bunFields(Bun.spawnSync(["/bin/cat"], { cwd: "/", env: { PATH: "/bin" }, stdin: Buffer.from("in"), stdout: "pipe", stderr: "pipe" })),
 	};
 }
 
 /**
  * The real preload's qualification fixture (PLAN sl-sd-exec). Each phase logs its window to ../qual.jsonl and idles 1 s after,
- * so the trace's 250 ms ticks see the marker during the call and its absence after.
+ * so the trace's 250 ms ticks see the marker during the call and its absence after. A phase whose command is "" must run with
+ * no marker of this worker active at all: the call's arguments ran test code, so it is unpublished.
  */
 const QUAL_TEST = `import { test } from "bun:test";
 import * as cp from "node:child_process";
@@ -1010,6 +1029,11 @@ import { appendFileSync } from "node:fs";
 const callFields = ${callFields.toString()};
 const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
 const idle = (ms = 1_000) => Bun.sleep(ms);
+// A real hot computation on the real clock: the detector samples this process's CPU over real 250 ms ticks, so no fake time.
+const spin = (ms) => {
+	const end = Date.now() + ms;
+	while (Date.now() < end) {}
+};
 async function phase(name, command, f) {
 	const start = Date.now();
 	const out = f();
@@ -1022,13 +1046,35 @@ test("qualifies", async () => {
 	log({ name: "start", pid: process.pid, preloadGlobal: globalThis.__fixturePreload ?? null, wrapped: Bun.spawnSync[Symbol.for("as2test.stuck-marker")] === true });
 	await idle();
 	await phase("bun", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"]).exitCode);
+	// Plain data in every option (helpers.ts's sh shape, a spread of process.env, a Buffer stdin): published. process.env itself
+	// is not plain data in bun (TZ and the proxy variables are accessors), so a call given it runs unpublished.
+	await phase("bun-options", "sleep", () => Bun.spawnSync(["/bin/sleep", "2"], { cwd: "/", env: { ...process.env }, stdin: Buffer.from("x"), stdout: "pipe", stderr: "pipe" }).exitCode);
 	await phase("node-spawnSync", "sleep", () => cp.spawnSync("/bin/sleep", ["2"]).status);
 	await phase("node-execSync", "sh", () => cp.execSync("/bin/sleep 2; echo slept").toString());
 	await phase("node-execFileSync", "sleep", () => cp.execFileSync("/bin/sleep", ["2"]).toString());
+	// node's own options object with input (a Buffer in its stdio array), cwd, env, timeout: published.
+	await phase("node-options", "sleep", () => cp.spawnSync("/bin/sleep", ["2"], { cwd: "/", env: { PATH: "/bin" }, input: "x", timeout: 30_000, encoding: "utf8" }).status);
+	// Test code the original runs while it reads its arguments: a hot 1.2 s getter, then the 1 s sleep itself, all unpublished.
+	await phase("argv-getter", "", () => {
+		const argv = ["/bin/sleep"];
+		Object.defineProperty(argv, 1, { enumerable: true, get() {
+			spin(1_200);
+			return "1";
+		} });
+		return Bun.spawnSync(argv).exitCode;
+	});
+	await phase("cwd-getter", "", () => Bun.spawnSync(["/bin/sleep", "1"], { get cwd() {
+		spin(1_200);
+		return "/";
+	} }).exitCode);
+	await phase("env-getter", "", () => Bun.spawnSync(["/bin/sleep", "1"], { env: { get PATH() {
+		spin(1_200);
+		return "/bin";
+	} } }).exitCode);
 	await phase("fields", null, () => callFields(cp));
-	// A nested call from inside the call's own argv accessor (read by spawnSync itself): the outer head stays the published
-	// command through the nested 2 s sleep, and the nested sh reads the outer's marker line.
-	await phase("nested-accessor", "head", () => {
+	// A nested call from inside the call's own argv accessor (read by spawnSync itself): neither the outer head nor the nested
+	// sh publishes, so both read the same, earlier marker line.
+	await phase("nested-accessor", "", () => {
 		let inner = null;
 		const argv = ["/usr/bin/head", "-c", "200"];
 		Object.defineProperty(argv, 3, { enumerable: true, get() {
@@ -1072,14 +1118,14 @@ test("qualifies", async () => {
 `;
 
 describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
-	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), publish only the outermost of nested calls, an immutable marker only stops publication, and the marker fd is not inherited", () => {
+	test("the real preload: a bunfig preload still runs beside it; Bun.spawnSync and node's spawnSync, execSync and execFileSync publish a marker during the call and none after, plain-data options included, return and throw what they would unwrapped, run test-owned accessors and proxy traps exactly as often as unwrapped (a throwing one included), run a call whose argv or options hold a getter unpublished (during the getter and the call), publish no call nested in such a getter, an immutable marker only stops publication, and the marker fd is not inherited", () => {
 		const b = box("stuck-qual", DETECT);
 		prepared(b, "tr-sq1", {
 			"bunfig.toml": `[test]\npreload = ["./setup.ts"]\n`,
 			"setup.ts": "(globalThis as Record<string, unknown>).__fixturePreload = 1;\n",
 			"qual.test.ts": QUAL_TEST,
 			"a.test.ts": OK_TEST,
-		}, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+		}, { fullCapMin: 2, soloCapMin: 2, fullWorkers: 2, stuckStop: "enforce" });
 		const r = call(b, { sub: "full", runId: "tr-sq1" });
 		const work = workOf(b, "tr-sq1");
 		expect(r.stderr).toBe("");
@@ -1104,7 +1150,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
 				expect(during.length).toBeGreaterThanOrEqual(3);
 				for (const t of during) {
-					expect({ phase: p.name, at: t.at, markers: mine(t).map((m) => m.command) }).toEqual({ phase: p.name, at: t.at, markers: [p.command] });
+					expect({ phase: p.name, at: t.at, markers: mine(t).map((m) => m.command) }).toEqual({ phase: p.name, at: t.at, markers: p.command === "" ? [] : [p.command] });
+					if (p.command === "") continue;
 					expect(mine(t)[0]!.since).toBeGreaterThanOrEqual(p.start);
 					expect(mine(t)[0]!.since).toBeLessThanOrEqual(p.end);
 				}
@@ -1114,6 +1161,9 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			for (const t of after) expect({ phase: p.name, at: t.at, markers: mine(t) }).toEqual({ phase: p.name, at: t.at, markers: [] });
 		}
 		expect(byName.bun!.out).toBe(0);
+		expect(byName["bun-options"]!.out).toBe(0);
+		expect(byName["node-options"]!.out).toBe(0);
+		expect([byName["argv-getter"]!.out, byName["cwd-getter"]!.out, byName["env-getter"]!.out]).toEqual([0, 0, 0]);
 		expect(byName["node-spawnSync"]!.out).toBe(0);
 		expect(byName["node-execSync"]!.out).toBe("slept\n");
 		expect(byName["node-execFileSync"]!.out).toBe("");
@@ -1125,15 +1175,19 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		// The accessor, proxy and nested shapes really ran test code (once per getter, a one-shot throw surfacing), so equality
 		// above means the wrapper invoked none of it itself and swallowed none of its errors.
 		expect([plain.argv0Getter.hits, plain.cmdGetter.hits, plain.argv0Throws.hits, plain.cmdThrows.hits, plain.nestedBun.hits, plain.nestedNode.hits]).toEqual([1, 1, 1, 1, 1, 1]);
+		expect([plain.laterArgvGetter.hits, plain.cwdGetter.hits, plain.envGetter.hits]).toEqual([1, 1, 1]);
+		expect([plain.laterArgvGetter.out.stdout, plain.cwdGetter.out.stdout, plain.envGetter.out.stdout, plain.plainOptions.stdout]).toEqual(["l0 l2\n", "/\n", "AS2TEST_E=e\n", "in"]);
 		expect([plain.argv0Throws.out.message, plain.cmdThrows.out.message]).toEqual(["as2test one-shot getter", "as2test one-shot getter"]);
 		expect(plain.proxyOptions.hits).toBeGreaterThan(0);
 		expect(plain.nestedNode.out).toBe("n0 deep\n");
-		// Nested inside the call: the outer head alone was published (the generic window check above saw only "head"), and the
-		// nested sh read that same line while it ran.
-		const nested = byName["nested-accessor"]!.out as { outer: string; outerExit: number; inner: string; innerExit: number };
-		expect(nested).toMatchObject({ outerExit: 0, innerExit: 0 });
-		expect(nested.outer).toMatch(/^\d+\thead\n$/);
-		expect(nested.inner).toBe(nested.outer);
+		// Nested inside a call's own argv accessor: neither the outer head nor the nested sh published (the generic window check
+		// above saw no marker), so both read the same marker line, written before the phase began.
+		const nested = byName["nested-accessor"]!;
+		const nestedOut = nested.out as { outer: string; outerExit: number; inner: string; innerExit: number };
+		expect(nestedOut).toMatchObject({ outerExit: 0, innerExit: 0 });
+		expect(nestedOut.outer).toMatch(/^\d+\t[^\t\n]+\n$/);
+		expect(nestedOut.inner).toBe(nestedOut.outer);
+		expect(Number(nestedOut.outer.split("\t")[0])).toBeLessThan(nested.start);
 		// From the node path's accessor, before node reaches Bun.spawnSync: the cat was the outermost call then and published
 		// itself, and the head after it published its own, later line.
 		const viaNode = byName["nested-node"]!.out as { outer: string; inner: string };
@@ -1152,7 +1206,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		// The part's marker dir and preload are gone; the trace and nothing else of the detector's is left.
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
-	}, 120_000);
+	}, 180_000);
 
 	test("enforce: the spin fixture gets a signature line, stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125 within persist + capture + teardown + slack; capture tools, marker dir and preload are gone", async () => {
 		const b = box("stuck-enforce", DETECT);
@@ -1365,6 +1419,24 @@ test("c", () => {
 }, 60_000);
 `,
 			},
+			// Review r2 finding 1: healthy test code inside the call's own argv getter (an async /usr/bin/true born at once, then a
+			// hot computation past the persistence) while the original Bun.spawnSync(["/usr/bin/true", …]) reads its arguments.
+			"argv-getter": {
+				"c.test.ts": `import { test } from "bun:test";
+import { writeFileSync } from "node:fs";
+test("c", () => {
+	writeFileSync("../w.pid", String(process.pid));
+	const argv = ["/usr/bin/true"];
+	Object.defineProperty(argv, 1, { enumerable: true, get() {
+		Bun.spawn(["/usr/bin/true"]);
+		const end = Date.now() + ${DETECT.detectPersistMs + 3 * DETECT.detectTickMs};
+		while (Date.now() < end) {}
+		return "x";
+	} });
+	if (Bun.spawnSync(argv).exitCode !== 0) throw new Error("true failed");
+}, 60_000);
+`,
+			},
 		};
 		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
 		let all: Promise<Record<string, Done>> | null = null;
@@ -1406,6 +1478,12 @@ test("c", () => {
 			const { trace, w } = await settled("immutable-marker");
 			expect(zombieOf(trace, w)).toBe(true);
 			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
+		}, 90_000);
+
+		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
+			const { trace, w } = await settled("argv-getter");
+			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
+			expect(zombieTicks.filter((t) => !activeAt(t).some((m) => m.pid === w)).length).toBeGreaterThanOrEqual(5);
 		}, 90_000);
 
 		test("a long async test", async () => {

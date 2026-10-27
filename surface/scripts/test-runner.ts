@@ -33,7 +33,8 @@
 //       full suite never runs on base). After a call that timed out, the wrapper's stuck capture `<part>.stuck.log` is imported
 //       into the run dir under the report checks; a missing or refused capture is one runner.log line and changes nothing. Then
 //       the head re-check, one `test-run:` entry and the settle
-//       in one ledger transaction; then the lock released (`<ts> lock released`) and, when the fetch confirmed the requested
+//       in one ledger transaction; then the lock released (`<ts> lock released`; a release that ends with the row still held logs
+//       `the lock was not released` and the run exits 3, START_EXIT.failed) and, when the fetch confirmed the requested
 //       sha, the `as2/full-suite` commit status on
 //       that sha for any PR (green and red-main success, red failure, error error; stale and superseded post none; PLAN
 //       wl-mv8s8srodefytc rev 17.1 D2, D8). No `pending` is posted: a missing status already blocks a
@@ -49,7 +50,8 @@
 //       abandons a call STUCK_BACKSTOP_MS after a `stuck-signature` no stop line followed) ends the run with an error, its junit and
 //       log imported whatever the wrapper's ending: one bounded sweep (its runs.db ownership checkpoint under the same deadline,
 //       nonblocking), a spawn-free containment check of `_as2test`'s processes (retried up to STUCK_CONTAIN_MS, then
-//       `stuck-containment-failed`), the shorter STUCK_FINALIZE_MS and the release (retried until RELEASE_MS). Shadow never arms the
+//       `stuck-containment-failed`), the shorter STUCK_FINALIZE_MS and the release (retried until the row would be stale for a
+//       waiter, HEARTBEAT_STALE_MS past its last heartbeatAt; `release`). Shadow never arms the
 //       backstop. After a `stuck-captured` line the run imports `<stem>.signature.log`; each run logs `stuck detector <mode>`. Every
 //       run checks containment after its first sweep and runs no part while a survivor lives (`admission refused` after ADMIT_MS).
 //
@@ -77,7 +79,6 @@
 //                                           test install's check counts only live members of a `<as2test root>/runs/*/groups` pgid
 //   AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS     how long a part's wrapper may outlive its cap before the runner sweeps (default 60 s)
 //   AGENT_SYSTEM_TEST_RUNNER_BUSY_MS        runs.db busy_timeout (default 5 s); a stuck run's halt, its publication and its release use 0
-//   AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS     one deadline over the lock row's delete attempts (default 2 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS    the refresh helper's cap (default REFRESH_CAP_S plus a minute, 15 min)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS  its SIGTERM-to-SIGKILL grace (default 10 s)
 //   AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS   how long it then waits for sudo to exit (default 30 s)
@@ -103,7 +104,7 @@ import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, trainHold, trainPr
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, executedFiles, executorStalledReason,
-	fullSuiteSlice, HEARTBEAT_EVERY_MS, heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
+	fullSuiteSlice, HEARTBEAT_EVERY_MS, HEARTBEAT_STALE_MS, heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
 	partResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf,
 	runnerDiedRun, type RunRecord, runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, StuckWatch, stuckReason, type TestRequested, type TestRun, testRequestedBody,
 	testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict, soloPlan, type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
@@ -150,8 +151,6 @@ const CONTAIN_RETRY_MS = 5_000;
 const ADMIT_MS = 30_000;
 /** The post-sweep finalization deadline of a run that was not stuck (AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS). */
 const FINALIZE_MS = 150_000;
-/** One deadline over every attempt to delete the run's lock row, the finally's last attempt past it included (AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS). */
-const RELEASE_MS = 2_000;
 
 const msEnv = (name: string, fallback: number): number => {
 	const n = Number(process.env[name]);
@@ -786,8 +785,14 @@ class Runner {
 	private timer: Timer | undefined;
 	/** The run holds the lock row as far as it knows: set when it takes the row, cleared only once `release` deleted it or found it held by another run. */
 	private held = false;
-	/** One deadline over every attempt of `release`, set at its first attempt (RELEASE_MS); from then on the heartbeat leaves the row alone. */
-	private releaseBy: number | null = null;
+	/** Set at `release`'s first call: from then on the heartbeat leaves the row alone, so its heartbeatAt only ages. */
+	private releasing = false;
+	/** The heartbeatAt this run last wrote to its row (taking it, then each heartbeat that updated it): the release horizon's base. */
+	private rowBeatAt = 0;
+	/** The run's failed release deletes so far, over every call (the first one logs `the lock release failed`). */
+	private releaseFailures = 0;
+	/** A release's read of the row failed other than busy, and said so (once a run). */
+	private releaseReadFailed = false;
 	/** runs.db's busy_timeout on `lockDb` now (`lockBusy`): AGENT_SYSTEM_TEST_RUNNER_BUSY_MS until a deadline-bound step sets 0. */
 	private lockBusyMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_BUSY_MS", 5_000);
 	/** The run learnt it no longer holds the row (heartbeat or checkpoint) or its request. */
@@ -839,12 +844,14 @@ class Runner {
 		} catch (e) {
 			this.log(`heartbeat file not written: ${errText(e)}`);
 		}
-		if (!this.held || this.superseded || this.releaseBy !== null) return;
+		if (!this.held || this.superseded || this.releasing) return;
 		hookSync(this.id, "heartbeat-update");
 		try {
-			const changes = this.lockDb.query("UPDATE lock SET heartbeatAt = ? WHERE runId = ?").run(Date.now(), this.id).changes;
+			const at = Date.now();
+			const changes = this.lockDb.query("UPDATE lock SET heartbeatAt = ? WHERE runId = ?").run(at, this.id).changes;
 			hookMark(this.id, "heartbeat", { changes });
 			if (changes === 0) this.lose("the lock row no longer holds this run (heartbeat updated no row)");
+			else this.rowBeatAt = at;
 		} catch (e) {
 			this.log(`lock heartbeat not written: ${errText(e)}`);
 		}
@@ -878,6 +885,7 @@ class Runner {
 		try {
 			for (;;) {
 				let took: { displaced: string | null } | null = null;
+				let beatAt = 0;
 				try {
 					took = this.lockDb.transaction(() => {
 						this.lockDb.query("INSERT OR IGNORE INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(this.id, this.wl, this.requestedAt);
@@ -885,8 +893,9 @@ class Runner {
 						const row = lockRow(this.lockDb);
 						if (row && row.runId !== this.id && !lockHolderStale(row.heartbeatAt, Date.now())) return null;
 						if (blocker !== null) return null;
+						beatAt = Date.now();
 						this.lockDb.query("INSERT OR REPLACE INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, ?, ?, ?, ?, ?)")
-							.run(this.id, process.pid, process.pid, this.runDir, Date.now());
+							.run(this.id, process.pid, process.pid, this.runDir, beatAt);
 						this.lockDb.query("DELETE FROM queue WHERE runId = ?").run(this.id);
 						writeCurrent(this.stageRoot, this.id);
 						hookSync(this.id, "acquire-tx");
@@ -898,6 +907,7 @@ class Runner {
 				}
 				if (took) {
 					this.held = true;
+					this.rowBeatAt = beatAt;
 					hookMark(this.id, "acquired", took);
 					this.log(took.displaced ? `took the lock from the stale holder ${took.displaced}` : "took the lock");
 					this.beat();
@@ -1715,14 +1725,15 @@ class Runner {
 				this.writeResult(run);
 				return START_EXIT.failed;
 			}
-			// The lock goes before the status post (PLAN wl-mvq8x4pkjmx69s D4): the next run's slot does not wait on gh.
-			await this.release();
+			// The lock goes before the status post (PLAN wl-mvq8x4pkjmx69s D4): the next run's slot does not wait on gh. A release
+			// that ends with the row still held is a failed run (START_EXIT.failed), its status still posted.
+			const released = await this.release();
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
 			// postFullSuite never throws and kills gh after 15 s. A run whose containment failed says so in the description.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
 			const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
 			if (state) await postFullSuite(this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}${contained}`, (s) => this.log(s));
-			return 0;
+			return released ? 0 : START_EXIT.failed;
 		} finally {
 			clearInterval(this.timer);
 			await this.release();
@@ -1735,35 +1746,57 @@ class Runner {
 	 * Delete this run's lock row and log `lock released` (the field report's slot end, PLAN wl-mvq8x4pkjmx69s D5). The run
 	 * lock goes even when a refresh helper this run started may outlive it (installCheck's `live`): releasing it proves nothing about
 	 * that helper. Refreshes are serialised by the helper's own lockf lock on refresh.d/lock, which the next run's refresh waits on
-	 * (exit 69, lock, while the old helper holds it). Each attempt is nonblocking (busy_timeout 0), retried every 50 ms until one
-	 * deadline (RELEASE_MS from the first attempt). The run stays `held` until a delete succeeds (or finds the row held by another
-	 * run), so main's finally calls this again for one attempt more past that deadline; each call that ends without the delete logs
-	 * `the lock was not released`, and the row then holds until a waiter finds its heartbeat stale (the heartbeat stops touching it).
+	 * (exit 69, lock, while the old helper holds it). From the first call the heartbeat leaves the row alone. Each attempt is one
+	 * nonblocking delete (busy_timeout 0), retried every 50 ms until it deletes the row, the row is found not to hold this run, or
+	 * the row would be stale for a waiter (`lockHolderStale`: HEARTBEAT_STALE_MS past its heartbeatAt), when a waiter may take it
+	 * anyway. The horizon's heartbeatAt is this run's own last write, replaced by what a nonblocking read of the row finds after
+	 * each failed delete (a read can go through while another writer holds runs.db). Nothing in the loop awaits but the sleep; the
+	 * `release` hook before it is inert outside tests. The run stays `held` until the row is gone, so main's finally calls this
+	 * again for one attempt more; each call that ends with the row held logs `the lock was not released` and returns false.
 	 */
-	private async release(): Promise<void> {
-		if (!this.held) return;
-		if (this.releaseBy === null) {
+	private async release(): Promise<boolean> {
+		if (!this.held) return true;
+		if (!this.releasing) {
+			this.releasing = true;
 			await hook(this.id, "release");
-			this.releaseBy = Date.now() + msEnv("AGENT_SYSTEM_TEST_RUNNER_RELEASE_MS", RELEASE_MS);
 		}
-		const by = this.releaseBy;
+		this.lockBusy(0);
+		let beatAt = this.rowBeatAt;
 		for (let attempt = 1; ; attempt++) {
+			let failed: unknown;
 			try {
-				this.lockBusy(0);
 				const { changes } = this.lockDb.query("DELETE FROM lock WHERE runId = ?").run(this.id);
 				this.held = false;
 				this.log(changes > 0 ? "lock released" : "lock released: the row no longer held this run");
-				return;
+				return true;
 			} catch (e) {
-				hookMark(this.id, "release-failed", { attempt, error: errText(e) });
-				const left = by - Date.now();
-				if (left <= 0) {
-					this.log(`the lock was not released: ${errText(e)} (${attempt} attempts; the release deadline ${new Date(by).toISOString()} has passed); the row holds this run until a waiter finds its heartbeat stale`);
-					return;
-				}
-				if (attempt === 1) this.log(`the lock release failed: ${errText(e)}; retrying until ${new Date(by).toISOString()}`);
-				await Bun.sleep(Math.min(50, left));
+				failed = e;
 			}
+			this.releaseFailures++;
+			hookMark(this.id, "release-failed", { attempt, error: errText(failed) });
+			try {
+				const row = lockRow(this.lockDb);
+				if (row === null || row.runId !== this.id) {
+					this.held = false;
+					this.log("lock released: the row no longer held this run");
+					return true;
+				}
+				beatAt = row.heartbeatAt;
+			} catch (e) {
+				// busy is the hold the delete met; anything else is said once, and the horizon keeps the last heartbeatAt known.
+				if (!isBusy(e) && !this.releaseReadFailed) {
+					this.releaseReadFailed = true;
+					this.log(`the lock row was not read during its release: ${errText(e)}; the release horizon stays on heartbeatAt ${new Date(beatAt).toISOString()}`);
+				}
+			}
+			const horizon = beatAt + HEARTBEAT_STALE_MS;
+			if (this.releaseFailures === 1) this.log(`the lock release failed: ${errText(failed)}; retrying until ${new Date(horizon).toISOString()}`);
+			const now = Date.now();
+			if (lockHolderStale(beatAt, now)) {
+				this.log(`the lock was not released: ${errText(failed)} (${this.releaseFailures} attempts; the row's heartbeatAt ${new Date(beatAt).toISOString()} is stale for a waiter since ${new Date(horizon).toISOString()}); the row holds this run until a waiter takes it`);
+				return false;
+			}
+			await Bun.sleep(Math.min(50, horizon - now + 1));
 		}
 	}
 }
