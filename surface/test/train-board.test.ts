@@ -14,7 +14,7 @@ import {
 } from "../src/launch";
 import {
 	actionable, AUTOBOARD_WINDOW_MS, autoboardCutover, boardLanding, isTrainOrFix, type Landing, landingReady, openTrains, protectionGap, TRAIN_DONE, trainAutoboardBody, trainMembers,
-	trainPrs, trainSliceId,
+	trainPrs, trainSignoff, trainSliceId,
 } from "../src/merge-train";
 import { makeRunId, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
@@ -162,6 +162,21 @@ describe("landingReady, the ledger half of D1 (R1, R2)", () => {
 		expect(boardLanding(w.ledger, l)).toMatchObject({ boarded: true, opened: true });
 		expect(w.ledger.workload(wl)!.status).toBe("open");
 		expect(landingReady(w.ledger, lane(w, { pr: 119, verdict: "stale", scope: "fast", close: false }), CTX)).toMatchObject({ ready: false, reason: expect.stringMatching(/ is stale$/) });
+	});
+
+	test("production fast green needs Jo's train word, not full scope: signoff on, refused off, never auto-boarded", () => {
+		const w = world();
+		landFirst(w);
+		const wl = lane(w, { pr: 120, stakes: "production", scope: "fast" });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "stakes production" });
+		const command = interpret(w.ledger, "train 120");
+		if (command?.kind !== "train") throw new Error("train 120 was not interpreted as a train");
+		const train = applyTrain(w.ledger, command, w.repo).workloadId;
+		const view = { number: 120, headRefName: `wl/${wl}`, headRefOid: G, isCrossRepository: false, headRepository: { name: "product" }, headRepositoryOwner: { login: "thewolff" } };
+		expect(trainSignoff(w.ledger, train, 120, view, ORIGIN, { state: "ok" })).toMatchObject({ ok: true, pr: 120, head: G });
+		landFirst(w, false);
+		expect(trainSignoff(w.ledger, train, 120, view, ORIGIN, { state: "ok" })).toMatchObject({ ok: false, reason: expect.stringContaining("land-first is off") });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "stakes production" });
 	});
 
 	test("released admission keeps strict off-mode, live-owner, unfinished-work and pending-test guards", () => {

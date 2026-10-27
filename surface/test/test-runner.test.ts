@@ -22,10 +22,10 @@ import {
 	childLayout, fastPlanBody, fastPlanOf, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	withFullSuitePublication, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
-import { landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
+import { FULL_SUITE_STATUS, landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { admitMain, citedRuns, importPart, importReport, lockRow, openLockDb, postGate, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
-import { bootstrapRefusal, mainResults, mainVerdicts, parseRunnerPreflight } from "../src/main-state";
+import { admitMain, citedRuns, importPart, importReport, lockRow, openLockDb, postGate, postStatus, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, revokeOpen, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
+import { bootstrapRefusal, mainResults, mainVerdicts, parseRunnerPreflight, SUSPECT_MAX_MS } from "../src/main-state";
 import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { alive, tmp, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
@@ -2696,6 +2696,15 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		api(w, `compare/${fx.main}...${sha}`, { status: "ahead" });
 		return owner;
 	}
+	function suspectMain(w: World, date = new Date().toISOString()): void {
+		api(w, "git/ref/heads/main", { object: { sha: fx.head.red } });
+		api(w, `git/commits/${fx.head.red}`, {
+			sha: fx.head.red, tree: { sha: g(w.origin, "rev-parse", `${fx.head.red}^{tree}`) },
+			committer: { date }, parents: [{ sha: fx.main }],
+		});
+		api(w, `commits/${fx.head.red}/pulls`, [{ number: PR.red }]);
+		api(w, `compare/${fx.head.red}...${fx.head.green}`, { status: "ahead" });
+	}
 	function artifact(w: World, sha: string, mode: "green" | "red" | "missing"): void {
 		const dir = join(w.root, "artifact");
 		mkdirSync(dir);
@@ -2816,7 +2825,10 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 				: fx.head.green;
 			if (mode === "tree carry") g(w.origin, "update-ref", `refs/pull/${PR.green}/head`, head);
 			const { wl, slice } = bind(w, PR.green, head);
-			if (mode === "full") w.ledger.setStakes(wl, { by: SURFACE_BY, stakes: "production" });
+			if (mode === "full") {
+				const config = w.env.AGENT_SYSTEM_TEST_RUNNER_CONFIG!;
+				writeFileSync(config, `${readFileSync(config, "utf8")}  fullBeforeMerge:\n    - a.test.ts\n`);
+			}
 			if (mode === "hosted") artifact(w, head, "green");
 			if (mode === "fallback") writeFileSync(join(w.root, "post", `repos_${OWNER_REPO.replaceAll("/", "_")}_actions_workflows_as2-fast.yml_dispatches.fail`), "dispatch denied\n");
 			// This boundary is outside the carry transaction and shared by normal publication.
@@ -2885,6 +2897,26 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		expect(existsSync(join(w.root, "status-ok.log"))).toBe(false);
 		expect(existsSync(join(w.runs, "mirrors"))).toBe(false);
 	});
+
+	for (const production of ["requesting workload", "PR owner"] as const) {
+		test(`production ${production}: runner admission still selects and executes the fast plan`, async () => {
+			const w = landWorld();
+			const owner = bind(w, PR.green, fx.head.green);
+			const requester = workload(w);
+			joTrains(w, requester.wl, [PR.green]);
+			w.ledger.setStakes(production === "requesting workload" ? requester.wl : owner.wl, { by: SURFACE_BY, stakes: "production" });
+			artifact(w, fx.head.green, "green");
+			const id = runIdOf(start(w, requester.wl, PR.green, ["--slice", requester.slice]));
+			const result = await finalized(w, requester.wl, id);
+			expect(fastPlanOf(w.ledger.entries(requester.wl), id)).toEqual({
+				ref: `wl/${owner.wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [],
+			});
+			expect(result).toMatchObject({ verdict: "green", scope: "fast", host: "linux", exec: { files: 1, tests: 1, treeFiles: 1 } });
+			expect(dispatches(w)).toHaveLength(1);
+			expect(marks(w, id, "acquired")).toEqual([]);
+			expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
+		});
+	}
 
 	for (const mode of ["green", "red", "missing"] as const) {
 		test(`hosted ${mode}: pending first, recorded plan, tagged dispatch, executed counts and gate verdict without a Mac slot`, async () => {
@@ -3054,6 +3086,104 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			expect(await holderError).toContain("holder deadline");
 			expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("status-failed:"))).toEqual([]);
 		} finally { Atomics.notify(new Int32Array(signal), 0); worker.terminate(); }
+	});
+
+	for (const initial of ["pending", "success"] as const) test(`cached gate success cannot resurrect after main stop and completed ${initial} revocation`, () => {
+		const w = landWorld();
+		const { wl } = bind(w, PR.green, fx.head.green);
+		suspectMain(w);
+		const events: string[] = [];
+		let status: string = initial;
+		let compareReads = 0;
+		const gh: Gh = (args, timeoutMs) => {
+			if (args[1] === "-X") {
+				expect(timeoutMs).toBeGreaterThan(0);
+				expect(timeoutMs).toBeLessThanOrEqual(15_000);
+				status = args.find((a) => a.startsWith("state="))!.slice(6);
+				events.push(`post ${status}`);
+				return { code: 0, stdout: "{}", stderr: "" };
+			}
+			if (args[0] === "pr") return { code: 0, stdout: JSON.stringify([{ number: PR.green, headRefOid: fx.head.green }]), stderr: "" };
+			if (args[1]!.endsWith("/statuses")) return { code: 0, stdout: JSON.stringify([{ context: FULL_SUITE_STATUS, state: status, description: "fast check green" }]), stderr: "" };
+			if (args[1]!.includes("/compare/")) {
+				compareReads++;
+				// readMain has snapshotted an open state. Commit the stop, then finish the real revocation scan before publication.
+				mainRun(w.ledger, "tr-laterstop", fx.head.red, "red");
+				events.push("main stop");
+				const revoked = revokeOpen(gh, OWNER_REPO, "main red", () => {}, (head) => withFullSuitePublication(w.runs, OWNER_REPO, () => postStatus(gh, OWNER_REPO, "failure", head, "landing stopped: main red", () => {})));
+				expect(revoked).toEqual({ revoked: initial === "success" ? [PR.green] : [], failed: [] });
+				events.push("revocation complete");
+			}
+			return { code: 0, stdout: readFileSync(join(w.root, "api", args[1]!.replaceAll("/", "_")), "utf8"), stderr: "" };
+		};
+		const result = postGate({
+			gh, ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green,
+			need: "fast", result: { verdict: "green", sha: fx.head.green, scope: "fast", host: "linux" }, wl, runId: "tr-stalestop", log: () => {},
+		});
+		expect(result).toMatchObject({ state: "failure", error: null, description: expect.stringContaining("authority changed") });
+		expect(status).toBe("failure");
+		expect(events).toEqual(initial === "success"
+			? ["main stop", "post failure", "revocation complete", "post failure"]
+			: ["main stop", "revocation complete", "post failure"]);
+		expect(compareReads).toBe(1);
+	});
+
+	for (const change of ["off/on", "incident", "unrelated"] as const) test(`gate authority at publication tracks ${change} without whole-ledger invalidation`, () => {
+		const w = landWorld();
+		const { wl } = bind(w, PR.green, fx.head.green);
+		const posts: string[][] = [];
+		let compareReads = 0;
+		const gh: Gh = (args) => {
+			if (args[1] === "-X") { posts.push(args); return { code: 0, stdout: "{}", stderr: "" }; }
+			if (args[1]!.includes("/compare/")) {
+				compareReads++;
+				if (change === "off/on") {
+					landFirst(w.ledger, OWNER_REPO, false);
+					landFirst(w.ledger, OWNER_REPO, true);
+				} else {
+					if (change === "unrelated") {
+						w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: "unrelated standing audit" });
+						landFirst(w.ledger, "other/product", true);
+					}
+					w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(change === "incident" ? OWNER_REPO : "other/product", {
+						event: "stop-raised", kind: "regression", tip: fx.head.red, g: fx.main, suspects: [PR.red], failing: 1,
+					}) });
+				}
+			}
+			return { code: 0, stdout: readFileSync(join(w.root, "api", args[1]!.replaceAll("/", "_")), "utf8"), stderr: "" };
+		};
+		const state = change === "unrelated" ? "success" : "failure";
+		expect(postGate({
+			gh, ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green,
+			need: "fast", result: { verdict: "green", sha: fx.head.green, scope: "fast", host: "linux" }, wl, runId: "tr-generation", log: () => {},
+		})).toMatchObject({ state, error: null });
+		expect(posts).toHaveLength(1);
+		expect(posts[0]).toContain(`state=${state}`);
+		expect(compareReads).toBe(1);
+	});
+
+	for (const advance of [0, 1]) test(`gate authority revalidates the exact main age boundary plus ${advance}ms before POST`, () => {
+		const w = landWorld();
+		const { wl } = bind(w, PR.green, fx.head.green);
+		const originalNow = Date.now;
+		let now = originalNow();
+		suspectMain(w, new Date(now - SUSPECT_MAX_MS).toISOString());
+		const posts: string[][] = [];
+		const gh: Gh = (args) => {
+			if (args[1] === "-X") { posts.push(args); return { code: 0, stdout: "{}", stderr: "" }; }
+			if (args[1]!.includes("/compare/")) now += advance;
+			return { code: 0, stdout: readFileSync(join(w.root, "api", args[1]!.replaceAll("/", "_")), "utf8"), stderr: "" };
+		};
+		try {
+			Date.now = () => now;
+			const state = advance === 0 ? "success" : "failure";
+			expect(postGate({
+				gh, ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green,
+				need: "fast", result: { verdict: "green", sha: fx.head.green, scope: "fast", host: "linux" }, wl, runId: "tr-ageboundary", log: () => {},
+			})).toMatchObject({ state, error: null });
+			expect(posts).toHaveLength(1);
+			expect(posts[0]).toContain(`state=${state}`);
+		} finally { Date.now = originalNow; }
 	});
 
 	test("gate computation does not spend the short publication holder budget and its final post is clipped", () => {

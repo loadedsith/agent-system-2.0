@@ -1987,11 +1987,11 @@ export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | 
  * (2) `branchWorkload` (prStakes' D1 lookup) finds the PR's workload W, W's stakes are production, W has no plan hold
  *     (`planHold`: Jo's `halt`, or the auto-start's) and no plan pending (`planFirst`: `plan: first` with no `plan: approved`);
  * (3) W's review is settled and passed (`reviewSettledPassed`);
- * (4) the newest full-suite run on `pr` with a result, on the train or on W (`testRuns`; their requests in the ledger's own
- *     order across both workloads, created_at then rowid), is a full-scope green (`isFullSuiteGreen`: a fast green earned
- *     before the stakes rose never passes, PLAN wl-mvq4edbaf13vnk § 2 Exceptions, R30) at the PR's current head
- *     `view.headRefOid`; a full-scope red-main passes too, but only while land-first is off for `trainRepo` (`landFirstOn`):
- *     on a land-first repository the gate posts failure on a red-main;
+ * (4) the newest runner request on `pr` with a result, on the train or on W (`testRuns`; their requests in the ledger's own
+ *     order across both workloads, created_at then rowid), is green at the PR's current head `view.headRefOid`: full scope,
+ *     or fast scope while land-first is on for `trainRepo` (`landFirstOn`). Production stakes alone do not require full scope.
+ *     A full-scope red-main passes too, but only while land-first is off: on a land-first repository the gate posts failure
+ *     on a red-main;
  * (5) `protection` is ok.
  * The lane tool calls it inside the `ledger.write` that decides or raises, so a stop, a halt or a question recorded while gh
  * was read is seen here. It is asked only on the PR's disposition slice (`trainSliceId`), the slice the action completes.
@@ -2029,9 +2029,11 @@ export function trainSignoff(ledger: Ledger, train: string, pr: number, view: Ta
 	const newest = runs.reduce<RunRecord | null>((a, r) => (a === null || at(r) > at(a) ? r : a), null);
 	if (newest === null) return no(`no full-suite run on #${pr} has a result`);
 	const result = newest.result!;
-	const redMainOk = result.verdict === "red-main" && result.scope === "full" && !landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), trainRepo);
-	if (!isFullSuiteGreen(result) && !redMainOk) {
-		return no(`the newest run ${result.runId} on #${pr} is ${result.scope === "fast" ? `a fast-check ${result.verdict}` : result.verdict}, not a full-scope green: production signoff needs the full suite at its head`);
+	const enabled = landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), trainRepo);
+	const greenOk = isFullSuiteGreen(result) || (enabled && result.scope === "fast" && result.verdict === "green");
+	const redMainOk = result.verdict === "red-main" && result.scope === "full" && !enabled;
+	if (!greenOk && !redMainOk) {
+		return no(`the newest run ${result.runId} on #${pr} is ${result.scope === "fast" ? `a fast-check ${result.verdict}` : result.verdict}, not ${enabled ? "green" : "a full-scope green or red-main (land-first is off)"}`);
 	}
 	if (result.sha !== view.headRefOid) return no(`the newest run ${result.runId} on #${pr} tested ${result.sha}, not its head ${view.headRefOid}`);
 	if (protection.state !== "ok") return no(`main's protection on ${trainRepo} is ${protection.state}: ${protection.text}`);

@@ -200,10 +200,10 @@ const schemaVersionLine = (src: string | null): string | null => (src === null ?
 /**
  * Every exception that takes the full suite before merge (§ 2 Exceptions), in this order: a schema migration (a change to
  * `ledger/schema.sql`, or to the `SCHEMA_VERSION` line of `ledger/src/index.ts` between the merge-base and X), a change to a
- * file whose basename is in `fullBeforeMerge`, production stakes. Empty when the fast check applies.
+ * file whose basename is in `fullBeforeMerge`. Empty when the fast check applies.
  */
 export function fullExceptions(
-	changed: readonly string[], read: ReadFile, readBase: ReadFile, cfg: Pick<FastConfig, "fullBeforeMerge">, production: boolean,
+	changed: readonly string[], read: ReadFile, readBase: ReadFile, cfg: Pick<FastConfig, "fullBeforeMerge">,
 ): string[] {
 	const reasons: string[] = [];
 	if (changed.includes(SCHEMA_SQL)) reasons.push(`schema migration: ${SCHEMA_SQL} changed`);
@@ -212,7 +212,6 @@ export function fullExceptions(
 	}
 	const deps = changed.filter((p) => cfg.fullBeforeMerge.includes(baseOf(p)));
 	if (deps.length > 0) reasons.push(`dependencies or toolchain: ${deps.join(", ")} changed (testRunner.fullBeforeMerge)`);
-	if (production) reasons.push("production stakes");
 	return reasons;
 }
 
@@ -223,9 +222,9 @@ export function fullExceptions(
  * config error, never dropped.
  */
 export function fastSet(
-	changed: readonly string[], tree: readonly string[], read: ReadFile, readBase: ReadFile, cfg: FastConfig, production: boolean,
+	changed: readonly string[], tree: readonly string[], read: ReadFile, readBase: ReadFile, cfg: FastConfig,
 ): FastRun | FullRun {
-	const reasons = fullExceptions(changed, read, readBase, cfg, production);
+	const reasons = fullExceptions(changed, read, readBase, cfg);
 	if (reasons.length > 0) return { kind: "full", reasons };
 	const inTree = new Set(tree);
 	const missing = cfg.fastSmoke.filter((s) => !inTree.has(s));

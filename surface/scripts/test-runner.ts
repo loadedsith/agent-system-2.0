@@ -130,7 +130,7 @@ import {
 import { repoOf } from "../src/decision-log";
 import { FastSetError, type FastRun, type FullRun, fastSet, parseCheck, type ReadFile } from "../src/fast-set";
 import { ensureStandingWorkload } from "../src/identity";
-import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, worktreePath } from "../src/launch";
+import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, sameRepo, worktreePath } from "../src/launch";
 import {
 	attemptBlock, attribute, CHAIN_MAX, type ChainCommit, type GateDecision, type GateFacts, ghMainChain, mainResults, type MainState, mainState, mainVerdicts, type MainVerdictKind, mergeGate,
 	runnerPreflightBody,
@@ -798,8 +798,16 @@ export interface GateInput {
 	result: GateFacts["result"];
 }
 
+/** Main facts captured outside the publication mutex; age is re-evaluated against these same facts before POST. */
+export interface MainSnapshot {
+	tip: string;
+	chain: ChainCommit[];
+	state: MainState;
+	results: ResultRecord[];
+}
+
 /** Main as the gate reads it now: GitHub's tip of `repo`, its first-parent chain back to G (`ghMainChain`) and main state (`mainState`) over the runner's main results. Throws when GitHub cannot answer. */
-export function readMain(gh: Gh, ledger: Ledger, repo: string): { tip: string; chain: ChainCommit[]; state: MainState; results: ResultRecord[] } {
+export function readMain(gh: Gh, ledger: Ledger, repo: string): MainSnapshot {
 	const ghJson = (args: string[]) => ghJsonOf(gh, args);
 	const results = mainResults(ledger.entries(STANDING_WORKLOAD_ID));
 	const greens = new Set([...mainVerdicts(results).values()].filter((v) => v.verdict === "green").map((v) => v.sha));
@@ -811,13 +819,38 @@ export function readMain(gh: Gh, ledger: Ledger, repo: string): { tip: string; c
 }
 
 /**
+ * Only durable inputs that can change this gate's authority. Main results are global in mainState (including its believability
+ * baseline); activation and stop-episode rows are repo-specific. Keep row ids, not a hash of unrelated standing-ledger activity.
+ * Capture before network computation and compare again under the publication mutex, so even an off/on cycle invalidates it.
+ */
+function gateAuthority(ledger: Ledger, repo: string): { on: boolean; watermark: string } {
+	const entries = ledger.entries(STANDING_WORKLOAD_ID);
+	const instructions = ledger.instructions(STANDING_WORKLOAD_ID);
+	const activation = controlEntries(entries).filter((c) =>
+		(c.prefix === "land-first" || c.prefix === "land-first-off-pending" || c.prefix === "land-first-off-complete")
+		&& sameRepo(c.rest.split(" ")[0]!, repo)).map((c) => c.id);
+	const words = instructions.filter((i) => {
+		const m = /^land-first (\S+) (on|off)$/.exec(i.body);
+		return m !== null && sameRepo(m[1]!, repo);
+	}).map((i) => i.id);
+	const incident = landFirstRows(entries, repo).filter((r) => r.event.startsWith("stop-")).map((r) => r.entryId);
+	return { on: landFirstOn(entries, instructions, repo), watermark: JSON.stringify([mainResults(entries).map((r) => r.entryId), activation, words, incident]) };
+}
+
+/**
  * The merge gate's decision on `head` (§ 2 The merge gate), re-read now from the ledger and GitHub: main's tip, its chain back to G
  * and state (`readMain`), whether the head contains the tip (GitHub's compare), and whether it is the incident's repair (a
  * `train/revert-…` head whose tree is G's, or the fix the incident's issue names). Throws when GitHub cannot answer.
  */
 export function gateDecision(i: GateInput): GateDecision {
+	return gateSnapshot(i).decision;
+}
+
+/** Bulk GitHub facts plus the main snapshot whose age must still be valid at the serialized POST. */
+function gateSnapshot(i: GateInput): { decision: GateDecision; main: MainSnapshot } {
 	const ghJson = (args: string[]) => ghJsonOf(i.gh, args);
-	const { tip, chain, state } = readMain(i.gh, i.ledger, i.repo);
+	const main = readMain(i.gh, i.ledger, i.repo);
+	const { tip, chain, state } = main;
 	let containsTip = tip === i.head;
 	if (!containsTip) {
 		const status = field(ghJson(["api", `repos/${i.repo}/compare/${tip}...${i.head}`]), "status");
@@ -832,12 +865,14 @@ export function gateDecision(i: GateInput): GateDecision {
 		if (typeof headTree !== "string") throw new Error(`gh api repos/${i.repo}/git/commits/${i.head} returned no tree`);
 		treeEqualsG = gTree !== null && headTree === gTree;
 	}
-	return mergeGate({ head: i.head, containsTip, state, need: i.need, result: i.result, repair, treeEqualsG });
+	return { decision: mergeGate({ head: i.head, containsTip, state, need: i.need, result: i.result, repair, treeEqualsG }), main };
 }
 
 /**
- * Post the gate's state on the head (D4, through #320's mechanism), re-reading activation at publication: off refuses fast/tree
- * plans and applies FULL_SUITE_STATE only to a full Mac result at the head; on uses mergeGate's live main policy. An unreadable gate posts failure (F7).
+ * Post the gate's state on the head (D4, through #320's mechanism), re-reading activation and authority at publication: off refuses fast/tree
+ * plans and applies FULL_SUITE_STATE only to a full Mac result at the head; on uses mergeGate's main policy. Stale snapshots fail closed.
+ * Main-result/incident/activation watermarks and mainState's age policy are revalidated locally under the short lock; bulk network stays outside.
+ * An unreadable gate posts failure (F7).
  * A post GitHub refuses records `status-failed: <run id> <state> on <sha>: <error>` (F6), leaving the head pending.
  * Lock acquisition/deadline failures instead record status-failed without posting a false test failure. The optional ref resolver
  * runs only for on-mode gate computation, outside the lock; offDescription retains a full result's original publication wording.
@@ -845,9 +880,15 @@ export function gateDecision(i: GateInput): GateDecision {
 export function postGate(i: Omit<GateInput, "ref"> & { ref: string | (() => string); root: string; wl: string; runId: string; log: (s: string) => void; offDescription?: string }): { state: "success" | "failure" | "error"; description: string; error: string | null } {
 	// Main-chain/compare/repair reads scale independently of a single status post; never hold the publication mutex for them.
 	let onDecision: { state: "success" | "failure"; description: string } | null = null;
+	let authority: string | null = null;
+	let mainSnapshot: MainSnapshot | null = null;
 	try {
-		if (landFirstNow(i.ledger, i.repo)) {
-			const d = gateDecision({ ...i, ref: typeof i.ref === "function" ? i.ref() : i.ref });
+		const initial = gateAuthority(i.ledger, i.repo);
+		if (initial.on) {
+			authority = initial.watermark;
+			const snapshot = gateSnapshot({ ...i, ref: typeof i.ref === "function" ? i.ref() : i.ref });
+			mainSnapshot = snapshot.main;
+			const d = snapshot.decision;
 			onDecision = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
 		}
 	} catch (e) {
@@ -858,14 +899,29 @@ export function postGate(i: Omit<GateInput, "ref"> & { ref: string | (() => stri
 		outcome = withFullSuitePublication(i.root, i.repo, (remainingMs) => {
 			let decided: { state: "success" | "failure" | "error"; description: string };
 			try {
-				if (!landFirstNow(i.ledger, i.repo)) {
+				const current = gateAuthority(i.ledger, i.repo);
+				if (!current.on) {
 					if (i.need === "fast") decided = { state: "failure", description: "land-first is off: a fast/tree plan is not a full-suite result; request the full suite" };
 					else if (i.result?.sha === i.head && i.result.scope === "full" && i.result.host === "mac") {
 						decided = { state: FULL_SUITE_STATE[i.result.verdict] ?? "failure", description: i.offDescription ?? `full suite ${i.result.verdict}` };
 					} else decided = { state: "failure", description: "land-first is off: a full-suite Mac result at this head is required" };
-				} else decided = onDecision ?? { state: "failure", description: "land-first activated during publication: request a fresh gate decision" };
+				} else if (onDecision === null) {
+					decided = { state: "failure", description: "land-first activated during publication: request a fresh gate decision" };
+				} else if (authority !== null && authority !== current.watermark) {
+					decided = { state: "failure", description: "gate authority changed during publication (main results, incident or activation); request a fresh gate decision" };
+				} else {
+					// No network under the mutex: reapply the existing age policy to exactly the facts the decision used.
+					let ageChanged = false;
+					if (mainSnapshot !== null) {
+						const fresh = mainState(mainSnapshot.chain, mainSnapshot.results, Date.parse(i.ledger.now()));
+						ageChanged = fresh.open !== mainSnapshot.state.open || fresh.stop !== mainSnapshot.state.stop || fresh.unknown !== mainSnapshot.state.unknown;
+					}
+					decided = ageChanged
+						? { state: "failure", description: "main age validity changed during publication; request a fresh gate decision" }
+						: onDecision;
+				}
 			} catch (e) {
-				decided = { state: "failure", description: `the gate could not read activation: ${errText(e)}` };
+				decided = { state: "failure", description: `the gate could not read publication authority: ${errText(e)}` };
 			}
 			i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
 			const boundedGh: Gh = (args, timeoutMs = 30_000) => i.gh(args, Math.min(timeoutMs, remainingMs()));
@@ -1487,7 +1543,7 @@ export interface LandAdmission {
  * The mirror refs are dropped before it returns. A head that moved since the PR view, or a fast set the config cannot compute, refuses.
  */
 function landAdmission(o: {
-	ledger: Ledger; root: string; ownerRepo: string; url: string; runId: string; pr: number; head: string; ref: string; production: boolean; config: TestRunnerConfig;
+	ledger: Ledger; root: string; ownerRepo: string; url: string; runId: string; pr: number; head: string; ref: string; config: TestRunnerConfig;
 	log: (s: string) => void;
 }): LandAdmission {
 	const env = mirrorEnv(o.root);
@@ -1524,7 +1580,7 @@ function landAdmission(o: {
 		const base = treeAt(mirror, mergeBase, env, false);
 		let s: FastRun | FullRun;
 		try {
-			s = fastSet(changed, tree.files, tree.read, base.read, o.config, o.production);
+			s = fastSet(changed, tree.files, tree.read, base.read, o.config);
 		} catch (e) {
 			if (e instanceof FastSetError) throw new Fail(e.message, START_EXIT.refused);
 			throw e;
@@ -1587,9 +1643,7 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 	if (landFirstNow(ledger, ownerRepo)) {
 		const why = postStatus(realGh, ownerRepo, "pending", view.headRefOid, `as2 check requested, run ${runId}`, say);
 		if (why !== null) throw new Fail(`the pending status on ${view.headRefOid} was not posted (${why}); nothing was requested`, START_EXIT.refused);
-		const owner = view.headRefName.startsWith("wl/") ? ledger.workload(view.headRefName.slice(3)) : null;
-		const production = w.stakes === "production" || owner?.stakes === "production";
-		land = landAdmission({ ledger, root, ownerRepo, url, runId, pr, head: view.headRefOid, ref: view.headRefName, production, config, log: say });
+		land = landAdmission({ ledger, root, ownerRepo, url, runId, pr, head: view.headRefOid, ref: view.headRefName, config, log: say });
 	}
 	const { slice, carried } = ledger.write(() => {
 		if (candidate !== null) hookSync(wl, "carry-open");

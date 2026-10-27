@@ -796,8 +796,8 @@ function landPass(
 }
 
 /**
- * List and classify outside the publication mutex. Each fast/tree revocation serializes only a
- * fresh activation read and one deadline-clipped POST; completion serializes only the known ids.
+ * Discover workloads and their repositories outside the publication mutex. Each head serializes a
+ * fresh ledger-only provenance/activation read and one deadline-clipped POST; completion only the known ids.
  * Scheduled ticks are the only retry layer: three attempts per newest off instruction, then held
  * until repair and an explicit new `land-first <repo> off` word. Off receipts never count as
  * landingPass revocation failures.
@@ -853,37 +853,20 @@ export function reconcileLandFirstOff(
 		const workloads = ledger.db.query<{ workload_id: string }, []>(
 			"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE 'test-requested: %'",
 		).all();
-		const classification = new Map<string, "fast" | "full" | "unknown">();
-		for (const { workload_id: wl } of workloads) {
-			const rows = ledger.entries(wl);
-			const matching = testRuns(rows).filter((r) => r.result !== null && open.get(r.request.pr) === r.request.sha);
-			if (matching.length === 0) continue;
-			const origin = repoOf(wl);
-			if (origin !== null && !sameRepo(origin, repo)) continue;
-			const plans = fastPlans(rows);
-			for (const r of matching) {
-				const key = `${r.request.pr} ${r.request.sha}`;
-				const plan = plans.get(r.request.runId);
-				const full = r.result!.scope === "full" && r.result!.host === "mac" && plan?.scope !== "tree" && plan?.scope !== "fast";
-				// A real full result at this identical head remains usable even if a later fast run exists.
-				if (origin === null) {
-					if (!classification.has(key)) classification.set(key, "unknown");
-				} else if (full && (r.result!.verdict === "green" || r.result!.verdict === "red-main")) classification.set(key, "full");
-				else if (classification.get(key) !== "full" && (plan?.scope === "tree" || plan?.scope === "fast" || r.result!.scope === "fast")) classification.set(key, "fast");
-			}
-		}
+		const origins = new Map(workloads.map(({ workload_id: wl }) => [wl, repoOf(wl)]));
 		let failed = false;
 		for (const [pr, head] of open) {
 			try {
 				if (newestGateStatus(repo, head, ghJson, true)?.state !== "success") continue;
-				const kind = classification.get(`${pr} ${head}`);
-				if (kind === "full") continue;
-				if (kind !== "fast") throw new Error(`cannot identify whether #${pr} ${head}'s success is a full result or fast/tree plan; repair its runner provenance`);
+				// Discovery is not authority: a full run can settle and publish while statuses are read.
 				const revoked = withFullSuitePublication(root, repo, (remainingMs) => {
 					const entries = ledger.entries(STANDING_WORKLOAD_ID);
 					const instructions = ledger.instructions(STANDING_WORKLOAD_ID);
 					const current = landFirstOffPending(entries, instructions, repo);
 					if (!ids.some((id) => current.includes(id)) || landFirstOn(entries, instructions, repo)) return false;
+					const kind = offHeadAuthority(ledger, repo, pr, head, origins);
+					if (kind === "full") return false;
+					if (kind !== "fast") throw new Error(`cannot identify whether #${pr} ${head}'s success is a full result or fast/tree plan; repair its runner provenance`);
 					const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", "description=land-first off: fast/tree success revoked; request the full suite"], remainingMs());
 					if (r.code !== 0) throw new GhError(`gh status revoke #${pr} ${head} exited ${r.code}: ${lastLine(r)}`);
 					return true;
@@ -927,6 +910,77 @@ export function reconcileLandFirstOff(
 		}
 		return false;
 	}
+}
+
+/**
+ * Read only this head's runner authority at serialization. Repository discovery stays outside the
+ * lock; a newly appearing workload has unknown origin until the next scheduled pass, never stale
+ * fast authority. Copied full/Mac counts must trace to a genuine full source, not a tree/fast plan.
+ */
+function offHeadAuthority(ledger: Ledger, repo: string, pr: number, head: string, origins: ReadonlyMap<string, string | null>): "fast" | "full" | "unknown" {
+	const owners = ledger.db.query<{ workload_id: string }, [string]>(
+		"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE ?",
+	).all(`test-requested: % pr=${pr} sha=${head} %`);
+	let kind: "fast" | "unknown" = "unknown";
+	let uncertain = false;
+	for (const { workload_id: wl } of owners) {
+		const origin = origins.get(wl);
+		if (origin === undefined || origin === null) {
+			uncertain = true;
+			continue;
+		}
+		if (!sameRepo(origin, repo)) continue;
+		const rows = ledger.entries(wl);
+		const records = testRuns(rows);
+		const plans = fastPlans(rows);
+		for (const run of records) {
+			if (run.request.pr !== pr || run.request.sha !== head || run.result === null) continue;
+			let source = run.result;
+			let plan = plans.get(source.runId);
+			const seen = new Set<string>();
+			for (;;) {
+				if (plan?.scope === "tree" || plan?.scope === "fast" || source.scope === "fast" || source.reason?.startsWith("carried from main run ")) {
+					kind = "fast";
+					break;
+				}
+				if (source.scope !== "full" || source.host !== "mac" || (source.verdict !== "green" && source.verdict !== "red-main") || seen.has(source.runId)) {
+					uncertain = true;
+					break;
+				}
+				seen.add(source.runId);
+				const carried = /^carried from (tr-[a-z0-9]+) at [0-9a-f]{40} \(decision-log only\)$/.exec(source.reason ?? "");
+				if (carried === null) {
+					if (!source.reason?.startsWith("carried from ")) return "full";
+					uncertain = true;
+					break;
+				}
+				// Source requests may live on a different workload. Only previously discovered,
+				// same-repository owners establish provenance; missing/cyclic chains fail closed.
+				const sources = ledger.db.query<{ workload_id: string }, [string]>(
+					"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE ?",
+				).all(`test-requested: ${carried[1]} %`);
+				if (sources.length !== 1) {
+					uncertain = true;
+					break;
+				}
+				const owner = sources[0]!.workload_id;
+				const sourceOrigin = origins.get(owner);
+				if (sourceOrigin === undefined || sourceOrigin === null || !sameRepo(sourceOrigin, repo)) {
+					uncertain = true;
+					break;
+				}
+				const sourceRows = ledger.entries(owner);
+				const previous = testRuns(sourceRows).find((r) => r.request.runId === carried[1])?.result;
+				if (!previous) {
+					uncertain = true;
+					break;
+				}
+				source = previous;
+				plan = fastPlans(sourceRows).get(source.runId);
+			}
+		}
+	}
+	return uncertain ? "unknown" : kind;
 }
 
 /**
@@ -1064,6 +1118,10 @@ function landingPass(
 	results: readonly ResultRecord[], res: LandResult,
 ): string | null {
 	const { ledger } = d;
+	// Preserve the decision's ledger dependencies through discovery, without holding a network lock.
+	const activation = controlEntries(ledger.entries(STANDING_WORKLOAD_ID))
+		.filter((c) => c.prefix === "land-first" && sameRepo(c.rest.split(" ")[0]!, repo)).map((c) => c.id).join(" ");
+	const watermark = results.at(-1)?.entryId ?? null;
 	const rows = () => landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo);
 	const sha7 = (s: string) => s.slice(0, 7);
 	const suspects = [...new Set(state.suspects.flatMap((s) => s.prs))].sort((a, b) => a - b);
@@ -1132,14 +1190,30 @@ function landingPass(
 		// Older off reconcilers used this event too; their failures are not landing-stop attempts.
 		const tried = rows().filter((r) => r.event === "revoke-failed" && r.pr === n && r.head === head && !r.error.startsWith("off reconciliation pending:")).length;
 		if (tried >= REVOKE_ATTEMPTS) continue;
-		const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`]);
-		if (r.code === 0) {
-			say(`land-first ${repo}: revoked #${n} at ${sha7(head)}: ${description}`);
-			continue;
+		try {
+			const revoked = withFullSuitePublication(d.land!.runsRoot ?? runsRoot(process.env), repo, (remainingMs) => {
+				const entries = ledger.entries(STANDING_WORKLOAD_ID);
+				const currentActivation = controlEntries(entries)
+					.filter((c) => c.prefix === "land-first" && sameRepo(c.rest.split(" ")[0]!, repo)).map((c) => c.id).join(" ");
+				if (!landFirstOn(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo)
+					|| currentActivation !== activation || (mainResults(entries).at(-1)?.entryId ?? null) !== watermark) {
+					say(`land-first ${repo}: skipped stale landing revocation #${n} ${head}; activation or main authority changed, next tick recomputes`);
+					return false;
+				}
+				const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`], remainingMs());
+				if (r.code !== 0) throw new GhError(`gh status revoke #${n} ${head} exited ${r.code}: ${lastLine(r)}`);
+				return true;
+			});
+			if (revoked) say(`land-first ${repo}: revoked #${n} at ${sha7(head)}: ${description}`);
+		} catch (err) {
+			const error = errText(err);
+			try {
+				landNote(d, say, repo, { event: "revoke-failed", pr: n, head, attempt: tried + 1, error });
+				if (tried + 1 >= REVOKE_ATTEMPTS) landNote(d, say, repo, { event: "revoke-gave-up", pr: n, head, error });
+			} catch (receiptError) {
+				throw new AggregateError([err, receiptError], `landing revocation #${n} ${head} failed: ${error}; failure receipt also failed: ${errText(receiptError)}`);
+			}
 		}
-		const error = lastLine(r);
-		landNote(d, say, repo, { event: "revoke-failed", pr: n, head, attempt: tried + 1, error });
-		if (tried + 1 >= REVOKE_ATTEMPTS) landNote(d, say, repo, { event: "revoke-gave-up", pr: n, head, error });
 	}
 	return repair;
 }

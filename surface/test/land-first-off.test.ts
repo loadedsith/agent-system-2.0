@@ -88,6 +88,95 @@ describe("land-first off reconciliation", () => {
 		} finally { x.ledger.close(); }
 	});
 
+	for (const verdict of ["green", "red-main"] as const) test(`a genuine full Mac ${verdict} settled after off classification survives serialized revocation`, () => {
+		const x = fixture();
+		try {
+			x.recover();
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			let settled = false;
+			const complete = reconcileLandFirstOff({ ledger: x.ledger, gh: (args) => {
+				if (!settled && args[1]?.endsWith(`/${HEAD}/statuses`)) {
+					settled = true;
+					withFullSuitePublication(x.root, REPO, () => {
+						const runId = "tr-offfreshfull";
+						const entry = (body: string) => x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body });
+						entry(testRequestedBody({ runId, pr: 1, sha: HEAD, slice: "sl-offfreshfull", by: "lane-off" }));
+						entry(fastPlanBody(runId, { ref: "wl/test", scope: "full", reasons: ["schema"] }));
+						entry(testRunBody({ runId, pr: 1, sha: HEAD, verdict, reason: null, headAtEnd: HEAD, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: "full", host: "mac", main: false, exec: null,
+							...(verdict === "red-main" ? { baseCompare: { sha: OTHER, parts: [{ part: "./a.test.ts", failing: ["a > x"], baseFailing: ["a > x"], baseError: null }] } } : {}),
+						}));
+						x.states.set(HEAD, "success");
+					});
+				}
+				return x.gh(args);
+			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s));
+			expect(settled).toBe(true);
+			expect(complete).toBe(true);
+			expect(x.pending()).toEqual([]);
+			expect(x.posts).not.toContain(HEAD);
+			expect(x.states.get(HEAD)).toBe("success");
+			expect(x.states.get(OTHER)).toBe("failure"); // A copied full/Mac tree result is still revoked.
+		} finally { x.ledger.close(); }
+	});
+
+	test("a newly discovered workload cannot be overwritten using another workload's stale fast authority", () => {
+		const x = fixture();
+		try {
+			x.recover();
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			let settled = false;
+			expect(reconcileLandFirstOff({ ledger: x.ledger, gh: (args) => {
+				if (!settled && args[1]?.endsWith(`/${HEAD}/statuses`)) {
+					settled = true;
+					const wl = x.ledger.openWorkload({ by: SURFACE_BY, brief: "new full owner", stakes: "normal", mode: "autonomous" });
+					const entry = (body: string) => x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body });
+					withFullSuitePublication(x.root, REPO, () => {
+						entry(testRequestedBody({ runId: "tr-newowner", pr: 1, sha: HEAD, slice: "sl-newowner", by: "lane-off" }));
+						entry(fastPlanBody("tr-newowner", { ref: "wl/test", scope: "full", reasons: ["schema"] }));
+						entry(testRunBody({ runId: "tr-newowner", pr: 1, sha: HEAD, verdict: "green", reason: null, headAtEnd: HEAD, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: "full", host: "mac", main: false, exec: null }));
+						x.states.set(HEAD, "success");
+					});
+				}
+				return x.gh(args);
+			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s))).toBe(false);
+			expect(x.posts).not.toContain(HEAD);
+			expect(x.states.get(HEAD)).toBe("success");
+			expect(x.pending()).toHaveLength(1);
+			expect(x.logs.join("\n")).toContain("repair its runner provenance");
+			expect(x.reconcile()).toBe(true); // Next scheduled pass discovers its repository outside the lock.
+			expect(x.states.get(HEAD)).toBe("success");
+			expect(x.pending()).toEqual([]);
+		} finally { x.ledger.close(); }
+	});
+
+	for (const source of ["tree", "fast", "full", "missing", "cycle"] as const) test(`off traces copied full/Mac decision-log authority to its ${source} source`, () => {
+		const x = fixture();
+		try {
+			x.recover();
+			x.states.delete(HEAD);
+			x.states.delete(FULL);
+			// Leave only PR #1 at OTHER, with no direct genuine full result at that head.
+			const states = new Map([[OTHER, "success"]]);
+			const entry = (body: string) => x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: x.wl, kind: "assumption", body });
+			if (source !== "missing") {
+				entry(testRequestedBody({ runId: "tr-source", pr: 1, sha: FULL, slice: "sl-source", by: "lane-off" }));
+				entry(fastPlanBody("tr-source", source === "tree" ? { ref: "wl/test", scope: "tree", g: HEAD, run: "tr-main" } : source === "fast" ? { ref: "wl/test", scope: "fast", files: ["a.test.ts"], parse: [], macOnly: [] } : { ref: "wl/test", scope: "full", reasons: ["schema"] }));
+				entry(testRunBody({ runId: "tr-source", pr: 1, sha: FULL, verdict: "green", reason: source === "cycle" ? `carried from tr-copy at ${OTHER} (decision-log only)` : null, headAtEnd: FULL, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: source === "fast" ? "fast" : "full", host: source === "fast" ? "linux" : "mac", main: false, exec: null }));
+			}
+			entry(testRequestedBody({ runId: "tr-copy", pr: 1, sha: OTHER, slice: "sl-copy", by: "lane-off" }));
+			entry(testRunBody({ runId: "tr-copy", pr: 1, sha: OTHER, verdict: "green", reason: `carried from tr-source at ${FULL} (decision-log only)`, headAtEnd: OTHER, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: "full", host: "mac", main: false, exec: null }));
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const complete = reconcileLandFirstOff({ ledger: x.ledger, gh: (args) => {
+				if (args[1]?.includes("/pulls?")) return { code: 0, stdout: JSON.stringify([[{ number: 1, head: { sha: OTHER } }]]), stderr: "" };
+				if (args[1] === "-X") states.set(OTHER, "failure");
+				return x.gh(args);
+			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s));
+			expect(complete).toBe(source !== "missing" && source !== "cycle");
+			expect(states.get(OTHER)).toBe(source === "tree" || source === "fast" ? "failure" : "success");
+			expect(x.pending()).toHaveLength(complete ? 0 : 1);
+		} finally { x.ledger.close(); }
+	});
+
 	test("a later on cannot erase pending off; completing an older request cannot clear a repeated off", () => {
 		const x = fixture();
 		try {
@@ -223,7 +312,7 @@ describe("land-first off reconciliation", () => {
 		} finally { x.ledger.close(); }
 	});
 
-	test("listing, status reads and provenance classification do not hold the publication mutex; each POST does and receives its remaining budget", () => {
+	test("listing, status reads and repository discovery do not hold the publication mutex; each POST does and receives its remaining budget", () => {
 		const x = fixture();
 		try {
 			x.recover();

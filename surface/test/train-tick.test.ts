@@ -8,12 +8,15 @@
 // Temp ledgers, temp git checkouts with a fake GitHub origin, a fake gh, a fake launcher and a fake notification only
 // (surface/test/train-world.ts).
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
-import { applyTrain, interpret } from "../src/input";
+import { apply, applyTrain, interpret } from "../src/input";
 import {
 	controlEntries, decideLaunch, laneExitBody, laneReadyBody, launchFailedBody, launchRequestedBody, landFirstBody, landFirstInstructionBody, mainRetryBody, mainRetryInstructionBody,
 	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
@@ -23,13 +26,14 @@ import {
 	trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
-import { makeRunId, testRequestedBody, testRunBody, testRuns } from "../src/test-run";
+import { fastPlanBody, makeRunId, testRequestedBody, testRunBody, testRuns, withFullSuitePublication } from "../src/test-run";
 import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
 	boardWorld, carry305, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE,
 	world,
 } from "./train-world";
+import { tmp } from "./helpers";
 
 describe("settles and deliveries (D8, D10)", () => {
 	test("a settle is written once across two ticks", () => {
@@ -1285,7 +1289,10 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 			postFails: false, posts: [] as string[][],
 		};
 		const answer = (v: unknown): GhResult => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
-		const fakeGh = (args: string[]): GhResult => {
+		const publicationRoot = tmp("tick-publication");
+		const onGh = { fn: (_args: string[], _timeoutMs?: number) => {} };
+		const fakeGh = (args: string[], timeoutMs?: number): GhResult => {
+			onGh.fn(args, timeoutMs);
 			const p = `repos/${REPO}/`;
 			const [noun, verb] = args;
 			if (noun === "api" && verb === `${p}git/ref/heads/main`) return answer({ object: { sha: gh.tip } });
@@ -1314,12 +1321,12 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		const onLog = { fn: (_l: string) => {} };
 		const pass = () => tick({
 			ledger: w.ledger, gh: fakeGh, launch: () => ({ code: 1, line: "not launched" }), notify: () => true, config: { repos: [{ origin: REPO, command: "bun test" }] },
-			land: { runner: (a) => (runnerCalls.push(a), runner.answer(a)), root: () => root }, log: (l) => (logs.push(l), onLog.fn(l)),
+			land: { runner: (a) => (runnerCalls.push(a), runner.answer(a)), root: () => root, runsRoot: publicationRoot }, log: (l) => (logs.push(l), onLog.fn(l)),
 		});
 		const rows = () => landFirstRows(w.ledger.entries(STANDING_WORKLOAD_ID), REPO);
 		const reconciled = () => latestTrainReconciled(w.ledger.entries(STANDING_WORKLOAD_ID), REPO);
 		const at = (m: number) => w.c.at(new Date(Date.parse(gh.landed) + m * MIN).toISOString());
-		return { ...w, gh, mainRun, jo, runnerCalls, runner, root, logs, onLog, pass, rows, reconciled, at };
+		return { ...w, gh, mainRun, jo, runnerCalls, runner, root, logs, onLog, onGh, publicationRoot, pass, rows, reconciled, at };
 	};
 	const mainCalls = (x: ReturnType<typeof lf>) => x.runnerCalls.filter((a) => a[0] === "main");
 
@@ -1369,6 +1376,106 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		x.pass();
 		expect(mainCalls(x)).toHaveLength(3);
 		expect(errorLines(x.ledger).map((l) => l.line).filter((l) => l.startsWith("main runs exhausted"))).toEqual([]);
+	});
+
+	test("landing revocation holds the bounded publication mutex only for the final POST, not bulk discovery", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green" });
+		withFullSuitePublication(x.publicationRoot, REPO, () => {});
+		const path = join(x.publicationRoot, readdirSync(x.publicationRoot).find((name) => name.includes(".publication-"))!);
+		let reads = 0;
+		let posts = 0;
+		x.onGh.fn = (args, timeoutMs) => {
+			const post = args[1] === "-X" && args[3] === `repos/${REPO}/statuses/${HX}`;
+			const read = (args[0] === "pr" && args[1] === "list") || args[1] === `repos/${REPO}/commits/${HX}/statuses`;
+			if (!post && !read) return;
+			const db = new Database(path);
+			try {
+				db.exec("PRAGMA busy_timeout = 1");
+				if (post) {
+					expect(() => db.exec("BEGIN IMMEDIATE")).toThrow();
+					expect(timeoutMs).toBeGreaterThan(0);
+					expect(timeoutMs).toBeLessThanOrEqual(30_000);
+					posts++;
+				} else {
+					db.exec("BEGIN IMMEDIATE");
+					expect(timeoutMs).toBeUndefined();
+					reads++;
+				}
+			} finally { db.close(); }
+		};
+		x.pass();
+		expect(reads).toBeGreaterThan(0);
+		expect(posts).toBe(1);
+		expect(x.gh.posts).toHaveLength(1);
+	});
+
+	for (const point of ["listing", "status"] as const) test(`off during landing ${point} discovery preserves a newly settled full green`, () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green" });
+		let changed = false;
+		x.onGh.fn = (args) => {
+			if (changed || !(point === "listing" ? args[0] === "pr" && args[1] === "list" : args[1] === `repos/${REPO}/commits/${HX}/statuses`)) return;
+			changed = true;
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const wl = x.ledger.openWorkload({ by: SURFACE_BY, brief: "full result during off", stakes: "normal", mode: "autonomous" });
+			const entry = (body: string) => x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body });
+			withFullSuitePublication(x.publicationRoot, REPO, () => {
+				entry(testRequestedBody({ runId: "tr-tickfull", pr: 202, sha: HX, slice: "sl-tickfull", by: "lane-test" }));
+				entry(fastPlanBody("tr-tickfull", { ref: "wl/test", scope: "full", reasons: ["schema"] }));
+				entry(testRunBody({ runId: "tr-tickfull", pr: 202, sha: HX, verdict: "green", reason: null, headAtEnd: HX, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: "full", host: "mac", main: false, exec: null }));
+				x.gh.status.set(HX, { state: "success", description: "genuine full green" });
+			});
+		};
+		x.pass();
+		expect(changed).toBe(true);
+		expect(x.gh.posts).toEqual([]);
+		expect(x.gh.status.get(HX)?.description).toBe("genuine full green");
+		expect(x.rows().filter((r) => r.event === "revoke-failed")).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("skipped stale landing revocation"));
+	});
+
+	test("a new activation generation during landing discovery invalidates the old on-mode revocation", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "new activation green" });
+		let changed = false;
+		x.onGh.fn = (args) => {
+			if (!changed && args[1] === `repos/${REPO}/commits/${HX}/statuses`) {
+				changed = true;
+				x.jo(landFirstInstructionBody(REPO, true), (id) => landFirstBody(REPO, true, id));
+			}
+		};
+		x.pass();
+		expect(changed).toBe(true);
+		expect(x.gh.posts).toEqual([]);
+		expect(x.rows().filter((r) => r.event === "revoke-failed")).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("skipped stale landing revocation"));
+	});
+
+	test("main recovery during landing discovery invalidates the old stop at serialized POST", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "green after main recovery" });
+		let recovered = false;
+		x.onGh.fn = (args) => {
+			if (!recovered && args[1] === `repos/${REPO}/commits/${HX}/statuses`) {
+				recovered = true;
+				x.mainRun(T, "green");
+			}
+		};
+		x.pass();
+		expect(recovered).toBe(true);
+		expect(x.gh.posts).toEqual([]);
+		expect(x.reconciled()).toBeNull();
+		expect(x.rows().filter((r) => r.event === "revoke-failed")).toEqual([]);
+		expect(x.logs).toContainEqual(expect.stringContaining("skipped stale landing revocation"));
 	});
 
 	test("legacy off failures never consume a later landing-stop revocation block at the same head", () => {
