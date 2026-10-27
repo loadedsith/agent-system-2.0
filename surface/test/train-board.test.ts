@@ -10,7 +10,7 @@ import { trainPrsOn } from "../src/close-entry";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
 import {
-	boundPrs, controlEntries, parseTrainBoard, planFirstBody, planQuestionBody, reservedPrefix, trainBoardBody, trainFixBody,
+	boundPrs, controlEntries, landFirstBody, landFirstInstructionBody, parseTrainBoard, planFirstBody, planQuestionBody, reservedPrefix, trainBoardBody, trainFixBody,
 } from "../src/launch";
 import {
 	actionable, AUTOBOARD_WINDOW_MS, autoboardCutover, boardLanding, isTrainOrFix, type Landing, landingReady, openTrains, protectionGap, TRAIN_DONE, trainAutoboardBody, trainMembers,
@@ -54,6 +54,11 @@ function world(cutover = true): World {
 	c.plusHours(0.01);
 	return { c, ledger, repo };
 }
+function landFirst(w: World, on = true): void {
+	const id = w.ledger.recordInstruction({ ...JO, workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(ORIGIN, on) });
+	w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(ORIGIN, on, id) });
+}
+
 
 interface LaneOpts {
 	stakes?: "throwaway" | "normal" | "production";
@@ -150,8 +155,36 @@ describe("landingReady, the ledger half of D1 (R1, R2)", () => {
 
 	test("R22: the fast check's green boards like a full green; a stale fast run does not", () => {
 		const w = world();
-		expect(ready(landingReady(w.ledger, lane(w, { pr: 118, scope: "fast" }), CTX)).pr).toBe(118);
-		expect(landingReady(w.ledger, lane(w, { pr: 119, verdict: "stale", scope: "fast" }), CTX)).toMatchObject({ ready: false, reason: expect.stringMatching(/ is stale$/) });
+		landFirst(w);
+		const wl = lane(w, { pr: 118, scope: "fast", close: false });
+		const l = ready(landingReady(w.ledger, wl, CTX));
+		expect(l.pr).toBe(118);
+		expect(boardLanding(w.ledger, l)).toMatchObject({ boarded: true, opened: true });
+		expect(w.ledger.workload(wl)!.status).toBe("open");
+		expect(landingReady(w.ledger, lane(w, { pr: 119, verdict: "stale", scope: "fast", close: false }), CTX)).toMatchObject({ ready: false, reason: expect.stringMatching(/ is stale$/) });
+	});
+
+	test("released admission keeps strict off-mode, live-owner, unfinished-work and pending-test guards", () => {
+		const w = world();
+		const wl = lane(w, { scope: "fast", close: false });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "the workload is open" });
+		landFirst(w);
+		const admitted = ready(landingReady(w.ledger, wl, CTX));
+		expect(landingReady(w.ledger, lane(w, { close: false }), CTX)).toMatchObject({ ready: false, reason: "the workload is open" });
+		const holder = "lane-resumed";
+		expect(w.ledger.claimWorkload(wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: expect.stringContaining("held live") });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: expect.stringContaining("held live") });
+		w.ledger.releaseWorkload(wl, { by: holder, holder });
+		const sl = w.ledger.addSlice({ by: SURFACE_BY, workloadId: wl, task: "more", doneCondition: "done", inputs: "code" });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: "the workload has open or paused slices" });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: "the workload has open or paused slices" });
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId: "tr-pending", pr: 101, sha: G, slice: sl, by: holder }) });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: expect.stringContaining("waits on its test run") });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: expect.stringContaining("waits on its test run") });
+		w.ledger.completeSlice(sl, { by: SURFACE_BY, artifact: "done" });
+		expect(landingReady(w.ledger, wl, CTX)).toMatchObject({ ready: false, reason: expect.stringContaining("has no result") });
+		expect(boardLanding(w.ledger, admitted)).toMatchObject({ boarded: false, reason: expect.stringContaining("has no result") });
 	});
 
 	test("R2: each failing rule is not-ready with its reason", () => {

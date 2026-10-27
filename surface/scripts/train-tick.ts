@@ -48,8 +48,8 @@
 //     lookup reads every as2-train issue (`ISSUE_LIST_ARGS`, every page); a lookup that fails or reads an unexpected shape throws,
 //     so nothing is created and no `closed` is written on a partial answer: the action stays due for the next pass.
 // 3b. Boarding (PLAN wl-mvbjiettjrfpxc D1, D3, D4). The first pass writes the cutover, `train-autoboard: on <iso>`, once on the
-//     standing workload. Then every workload closed within 14 days on a repository the test runner serves (`autoboardCandidates`,
-//     newest close first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
+//     standing workload. Then every recent closed workload or released landing receipt on a served repository (`autoboardCandidates`,
+//     newest readiness first; a train, a fix workload, a W a board still covers and a W whose PR ended are not read) gets `landingReady`,
 //     and a ready one the live half: `gh pr view <n> --json <TASK_VIEW_FIELDS>,state,baseRefName,isDraft` (OPEN, no draft, base
 //     main, head branch exactly wl/<W> on the same repository, `prStakes` normal) and, when the head is not the green sha G,
 //     `ghCompare(G, head)` judged by `decisionLogFault`: the head descends from G through single-parent commits each touching only
@@ -527,8 +527,8 @@ interface Boardable {
 }
 
 /**
- * Step 3b (D1, D3, D4): scan the candidates, newest close first, through `landingReady` and the live half (`liveHalf`), then board
- * the ready ones oldest close first (`boardLanding`). A candidate that cannot board gets `train-board-skip:` once per (W, pr, head,
+ * Step 3b (D1, D3, D4): scan the candidates, newest readiness first, through `landingReady` and the live half (`liveHalf`), then board
+ * the ready ones oldest readiness first (`boardLanding`). A candidate that cannot board gets `train-board-skip:` once per (W, pr, head,
  * reason); a gh failure is logged only (retried next pass). Returns the PRs that passed both halves, boarded or not.
  */
 function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (line: string) => void): Boardable[] {
@@ -567,7 +567,7 @@ function boardingPass(d: TickDeps, ghJson: (args: string[]) => unknown, say: (li
 			say(`${wl}: board #${l.pr}: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
-	ready.sort((a, b) => a.l.closedAt.localeCompare(b.l.closedAt) || a.l.workloadId.localeCompare(b.l.workloadId));
+	ready.sort((a, b) => a.l.readyAt.localeCompare(b.l.readyAt) || a.l.workloadId.localeCompare(b.l.workloadId));
 	for (const b of ready) {
 		const r = boardLanding(ledger, b.l, { head: b.head });
 		if (r.boarded) say(`${r.train}: #${b.l.pr} of ${b.l.workloadId} boarded at ${b.head}${r.opened ? ", train opened" : ""} (${r.entryId})`);
@@ -846,7 +846,7 @@ function promotePass(d: TickDeps, land: LandDeps, ops: IssueOps, say: (line: str
 		if (root.currentHead === g && tag === g) return;
 		const rows = landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo);
 		const settled = rows.findLast((r) => r.event === "promote-schema" || r.event === "promote-ok");
-		if (settled?.event === "promote-schema" && settled.current === root.currentHead) return;
+		if (settled?.event === "promote-schema" && settled.current === root.currentHead && settled.g === g) return;
 		const fails = rows.filter((r) => r.event === "promote-failed" && r.g === g).length;
 		if (fails >= PROMOTE_ATTEMPTS) return;
 		const r = land.runner(["promote", "--sha", g]);
@@ -860,13 +860,13 @@ function promotePass(d: TickDeps, land: LandDeps, ops: IssueOps, say: (line: str
 		}
 		if (r.code === 0 && m?.[1] === "schema") {
 			const sha = m[2]!;
-			const url = fileNotice(ops, `<!-- train-notice land-first ${repo} promote-schema ${sha} -->`, `verifier: promotion on ${repo} waits on a schema change at ${sha.slice(0, 7)}`, [
+			const url = fileNotice(ops, `<!-- train-notice land-first ${repo} promote-schema ${sha} target ${g} -->`, `verifier: promotion on ${repo} waits on a schema change at ${sha.slice(0, 7)}`, [
 				`Commit ${sha} on ${repo} changes a schema-migration path (ledger/schema.sql or the SCHEMA_VERSION line of ledger/src/index.ts).`,
 				`Promotion stopped before it: verified/current stays at ${root.currentHead ?? "(none)"}, so the control plane keeps running on the old schema; G is ${g}.`,
 				"",
-				`Jo's reserved step: stop the tick, migrate the live ledger, run \`bun surface/scripts/promote-verified.ts ${sha}\`, restart.`,
+				`Jo's reserved step: stop the tick, migrate the live ledger through verified target ${g} (including schema barrier ${sha}), run \`bun surface/scripts/promote-verified.ts ${g}\`, restart.`,
 			].join("\n"));
-			landNote(d, say, repo, { event: "promote-schema", sha, current: root.currentHead, issue: url });
+			landNote(d, say, repo, { event: "promote-schema", sha, g, current: root.currentHead, issue: url });
 			return;
 		}
 		const error = r.code === 0 ? `unexpected answer: ${line}` : `exit ${r.code}: ${line}`;

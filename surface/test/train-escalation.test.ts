@@ -246,11 +246,18 @@ describe("land-first's render lines, from the ledger alone (PLAN wl-mvq4edbaf13v
 		c.plusHours(0.26);
 		expect(lines()).toContainEqual(expect.stringMatching(new RegExp(`^train tick has not reconciled main since .* on ${REPO}`)));
 		tickRow(landFirstNoticeBody("*", { event: "tick-refused", reason: "tracked files modified: x.ts" }));
-		tickRow(landFirstNoticeBody(REPO, { event: "promote-schema", sha: "8".repeat(40), current: G, issue: null }));
+		tickRow(landFirstNoticeBody(REPO, { event: "promote-schema", sha: "8".repeat(40), g: T, current: G, issue: null }));
 		expect(lines()).toEqual(expect.arrayContaining([
 			expect.stringMatching(/^verifier: the train tick refuses to run: tracked files modified: x\.ts/),
 			expect.stringMatching(new RegExp(`^verifier: promotion waits on Jo: 8888888 on ${REPO} changes the ledger schema`)),
 		]));
+		expect(lines()).toContainEqual(expect.stringContaining(`verified target ${T} — stop the tick, migrate the live ledger through ${T}, run bun surface/scripts/promote-verified.ts ${T}, restart`));
+		// Retained old notices must remain visible, but must not turn an untested barrier into a promotion command.
+		tickRow(`train-notice: land-first ${REPO} promote-schema ${"8".repeat(40)} current ${G} issue none`);
+		const legacy = lines().find((line) => line.startsWith("verifier: promotion waits on Jo:"))!;
+		expect(legacy).toContain("verified target missing");
+		expect(legacy).toContain("rerun the train tick");
+		expect(legacy).not.toContain("promote-verified.ts");
 		// a forged writer's copy renders nothing
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstNoticeBody(REPO, { event: "stop-cleared", why: "forged" }) });
 		expect(lines()).toContainEqual(expect.stringMatching(/^landing stopped at 2222222/));

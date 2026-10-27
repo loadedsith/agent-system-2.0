@@ -521,7 +521,10 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 	for (const r of promotions.values()) {
 		if (r.event === "promote-gave-up") push(r.entryId, `verifier: promotion of ${sha7(r.g)} on ${r.repo} failed 3 times: ${short(r.error, 120)} — the control plane keeps running from the older verified root`);
 		else if (r.event === "promote-schema") {
-			push(r.entryId, `verifier: promotion waits on Jo: ${sha7(r.sha)} on ${r.repo} changes the ledger schema — stop the tick, migrate the live ledger, run bun surface/scripts/promote-verified.ts ${r.sha}, restart${r.issue ? ` (${r.issue})` : ""}`);
+			const recovery = r.g === null
+				? "verified target missing from the retained notice — rerun the train tick to reconcile it before migration or promotion"
+				: `verified target ${r.g} — stop the tick, migrate the live ledger through ${r.g}, run bun surface/scripts/promote-verified.ts ${r.g}, restart`;
+			push(r.entryId, `verifier: promotion waits on Jo: ${sha7(r.sha)} on ${r.repo} changes the ledger schema; ${recovery}${r.issue ? ` (${r.issue})` : ""}`);
 		}
 	}
 	return out;

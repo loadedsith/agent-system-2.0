@@ -8,18 +8,24 @@
 // `pr list --state all` per head branch from `prs/<branch>.json`, and a testRunner config through
 // `$AGENT_SYSTEM_TEST_RUNNER_CONFIG`.
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { reviewLoopEndBody, reviewRoundBody, UNKNOWN } from "../../classifier/src/rounds";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { tick as trainTick } from "../scripts/train-tick";
+import { promoteMain } from "../scripts/test-runner";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain } from "../src/input";
-import { branchName, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
+import { branchName, landFirstBody, landFirstInstructionBody, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
+import { autoboardCandidates, landFirstRows, openTrains, trainAutoboardBody, trainPrs } from "../src/merge-train";
 import { type ExecCounts, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
-import { STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
+import { fakeGh, REPO as TICK_REPO } from "./train-world";
 
 // Every test spawns real git and the fake gh many times (3-4 s idle); on a loaded runner the 5 s
 // bun default killed them mid-check (tr-0mvqeuifhqv87ca: 4 timeouts, the close check reading -1).
@@ -1329,6 +1335,69 @@ const fastUncovered = (x: Closable, h: string, m: string) =>
 	`PR #7 merged at ${s7(h)} (merge commit ${s7(m)}) with only test-run tr-1, a fast green at ${s7(h)}, and no green, believable main run on main holds it yet: it passes once the main run of ${s7(m)} or of a later main commit is green and believable, or on Jo's \`waive-pr ${x.wl} 7\``;
 
 describe("PLAN wl-mvq4edbaf13vnk D9, R23: a fast green at a merged head is covered at close by a green believable main run on its merge commit or later", () => {
+	test("released reviewed fast-green auto-boards through the real tick scan, stays open until merge and believable main coverage, then closes", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		ensureStandingWorkload(x.ledger);
+		x.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: trainAutoboardBody(x.now()) });
+		const word = x.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(OWNER_REPO, true) });
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(OWNER_REPO, true, word) });
+		const holder = "lane-a";
+		expect(x.ledger.claimWorkload(x.wl, { by: LANE_STARTER_BY, holder, leaseMs: 600_000 }).won).toBe(true);
+		const sl = x.ledger.addSlice({ by: holder, workloadId: x.wl, task: "fix", doneCondition: "reviewed green", inputs: "code" });
+		const { sha: h } = laneWithCode(w, x);
+		prs(w, x.branch, [{ number: 7, state: "OPEN", headRefOid: h }]);
+		requested(x, "tr-1", 7, h);
+		ran(x, "tr-1", 7, h, "green", { fast: true });
+		x.ledger.recordEntry({ by: holder, workloadId: x.wl, sliceId: sl, kind: "assumption", body: reviewRoundBody({ slice: sl, round: 1, token: "dt-flow", group: "dg-flow", verdict: "accepted", findings: UNKNOWN }) });
+		x.ledger.recordEntry({ by: holder, workloadId: x.wl, sliceId: sl, kind: "assumption", body: reviewLoopEndBody(sl, "pass") });
+		x.ledger.completeSlice(sl, { by: holder, artifact: "reviewed fast green" });
+		x.tick();
+		x.ledger.recordEntry({ by: holder, workloadId: x.wl, kind: "assumption", body: "done-because: fix reviewed and fast green; ready to land" });
+		expect(x.ledger.releaseWorkload(x.wl, { by: holder, holder }).released).toBe(true);
+		expect(autoboardCandidates(x.ledger)).toContain(x.wl);
+		const early = await close(w, x);
+		expect(early.closed).toBe(false);
+		expect(early.text).toContain("passes close only once the PR has merged");
+		expect(x.ledger.workload(x.wl)!.status).toBe("open");
+
+		const gh = fakeGh();
+		gh.prs.set(7, { head: h, branch: x.branch });
+		trainTick({
+			ledger: x.ledger, config: { repos: [{ origin: OWNER_REPO, command: "bun test" }] },
+			gh: (args) => {
+				const r = gh.gh(args.map((a) => a.replace(OWNER_REPO, TICK_REPO)));
+				if (r.code === 0 && args[0] === "pr" && args[1] === "view") {
+					const view = JSON.parse(r.stdout);
+					view.headRepository = { name: "repo" };
+					view.headRepositoryOwner = { login: "example" };
+					return { ...r, stdout: JSON.stringify(view) };
+				}
+				return r;
+			},
+			launch: () => ({ code: 6, line: "fixture cap" }), notify: () => true,
+		});
+		const trains = openTrains(x.ledger);
+		expect(trains).toHaveLength(1);
+		expect(trainPrs(x.ledger.entries(trains[0]!), x.ledger.instructions(trains[0]!))).toEqual([7]);
+		expect(x.ledger.workload(x.wl)!.status).toBe("open");
+
+		const other = otherClone(w);
+		commitFile(w, other, "o.txt", "main advances");
+		g(w, other, "merge", "-q", "--no-ff", "--no-edit", h);
+		const m = g(w, other, "rev-parse", "HEAD");
+		g(w, other, "push", "-q", "origin", "main");
+		prs(w, x.branch, [{ number: 7, state: "MERGED", headRefOid: h, mergeCommit: m }]);
+		expectRefused(w, x, await close(w, x), fastUncovered(x, h, m), h);
+		mainRan(x, "tr-0main1", m, "green");
+		const final = await close(w, x);
+		expect(final.closed).toBe(true);
+		expect(final.text).toContain(`main run tr-0main1 green and believable at ${s7(m)}`);
+		expect(x.ledger.workload(x.wl)!.status).toBe("closed");
+		expectPublishedOn(w, x, h);
+	}, 40_000);
+
 	test("a main run green and believable on the merge commit, or on a later main commit, covers it and the close publishes on the merged head", async () => {
 		for (const later of [false, true]) {
 			const w = world();
@@ -1436,3 +1505,72 @@ function onMain(w: World, other: string): string {
 	g(w, other, "push", "-q", "origin", "main");
 	return n;
 }
+
+describe("schema recovery through the tick and real verified promotion", () => {
+	test("a coalesced descendant-only verdict generates commands that promote the verified target, never the untested schema barrier", () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const base = g(w, w.work, "rev-parse", "HEAD");
+		const barrier = commitFile(w, w.work, "ledger/schema.sql", "schema transition");
+		const target = commitFile(w, w.work, "README.md", "coalesced verified descendant");
+		g(w, w.work, "push", "-q", "origin", "main");
+		mainRan(x, "tr-0base", base, "green");
+		mainRan(x, "tr-0tip", target, "green"); // Intentionally no verdict for the intervening barrier.
+		const directory = join(w.root, "verified");
+		let tag: string | null = null;
+		const answer = (v: unknown) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
+		const tagGh = (args: string[]) => {
+			if (args[1] === "-X") {
+				tag = args.find((s) => s.startsWith("sha="))!.slice(4);
+				return answer({});
+			}
+			return tag === null ? { code: 1, stdout: "", stderr: "HTTP 404 Not Found" } : answer({ object: { type: "commit", sha: tag } });
+		};
+		const logs: string[] = [];
+		const promote = (sha: string, manual = false) => promoteMain(x.ledger, OWNER_REPO, sha, (line) => logs.push(line), { directory, origin: w.origin, gh: tagGh, manual });
+		expect(promote(base)).toEqual({ ok: true, sha: base, schema: null });
+		const notices = fakeGh();
+		const tickLogs = trainTick({
+			ledger: x.ledger, config: { repos: [{ origin: OWNER_REPO, command: "bun test" }] },
+			launch: () => ({ code: 6, line: "fixture cap" }), notify: () => true,
+			gh: (args) => {
+				const p = `repos/${OWNER_REPO}/`;
+				if (args[0] === "api" && args[1] === `${p}git/ref/heads/main`) return answer({ object: { sha: target } });
+				if (args[0] === "api" && args[1] === `${p}git/ref/tags/as2-verified`) return tagGh(args);
+				if (args[0] === "api" && args[1]?.startsWith(`${p}git/commits/`)) {
+					const sha = args[1].slice(`${p}git/commits/`.length);
+					const parents = g(w, w.work, "show", "-s", "--format=%P", sha).split(" ").filter(Boolean).map((sha) => ({ sha }));
+					return answer({ sha, tree: { sha: g(w, w.work, "rev-parse", `${sha}^{tree}`) }, committer: { date: x.now() }, parents });
+				}
+				if (args[0] === "api" && args[1]?.startsWith(`${p}commits/`) && args[1].endsWith("/pulls")) return answer([]);
+				return notices.gh(args);
+			},
+			land: {
+				root: () => ({ root: join(directory, base.slice(0, 12)), head: base, modified: [], current: join(directory, base.slice(0, 12)), currentHead: base, repo: OWNER_REPO }),
+				runner: (args) => {
+					if (args[0] !== "promote") return { code: 0, stdout: "", stderr: "" };
+					const r = promote(args[2]!);
+					return r.ok ? { code: 0, stdout: r.schema === null ? `promoted ${r.sha}\n` : `schema ${r.schema}\n`, stderr: "" }
+						: { code: 1, stdout: "", stderr: r.reason };
+				},
+			},
+		});
+		expect(tickLogs.some((line) => line.includes("not reconciled"))).toBe(false);
+		const row = landFirstRows(x.ledger.entries(STANDING_WORKLOAD_ID), OWNER_REPO).find((r) => r.event === "promote-schema");
+		expect(row).toMatchObject({ sha: barrier, g: target, current: base });
+		expect(notices.issues).toHaveLength(1);
+		const notice = notices.issues[0]!.body;
+		const render = errorLines(x.ledger).find((l) => l.line.startsWith("verifier: promotion waits on Jo:"))!.line;
+		expect(notice).toContain(`schema barrier ${barrier}`);
+		expect(render).toContain(s7(barrier));
+		expect(promote(barrier, true)).toMatchObject({ ok: false, reason: expect.stringContaining("no green believable main verdict") });
+		for (const recovery of [notice, render]) {
+			const command = /promote-verified\.ts ([0-9a-f]{40})/.exec(recovery);
+			expect(command?.[1]).toBe(target);
+			expect(promote(command![1]!, true)).toEqual({ ok: true, sha: target, schema: null });
+		}
+		expect(tag).toBe(target);
+		expect(g(w, realpathSync(join(directory, "current")), "rev-parse", "HEAD")).toBe(target);
+	}, 40_000);
+});

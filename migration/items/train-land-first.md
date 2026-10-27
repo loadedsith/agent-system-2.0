@@ -2,7 +2,7 @@
 title: Fast PR checks gate merges while the full suite verifies main after landing
 status: building
 workload: wl-mvq4edbaf13vnk
-pr: https://github.com/thewolff/agent-system-2.0/pull/369
+pr: 369
 ---
 
 **Purpose.** Land-first changes the merge train from repeated full-suite PR checks to a small hosted check before merge and a full Mac suite on main after landing. This item records the operator contract and its activation sequence.
@@ -23,7 +23,12 @@ The strict `as2/full-suite` ruleset is unchanged. `lane_full_test` keeps its nam
 
 ## Activation and recovery
 
-Activation is a ledger word, not a profile flag. First run in shadow mode until a green believable main verdict establishes verified commit G and the `as2-verified` tag. **Only then** Jo reruns `install/as2test-setup.sh`; then Jo runs `install/install.sh --control-root=verified`; only after both succeed does Jo say `land-first agent-system-2.0 on`. A setup rerun before the tag exists breaks the refresh sequence. Never infer that live setup ran from a documentation change.
+Activation is a ledger word, not a profile flag. After this workflow lands, keep land-first off and run shadow mode until a real green believable main verdict establishes verified commit G and the `as2-verified` tag; retain the main-run receipt. **Only then** Jo reruns `install/as2test-setup.sh` and runs `install/install.sh --control-root=verified`. A setup rerun before the tag exists breaks the refresh sequence. Never infer that live setup ran from a documentation change.
+
+Before Jo says `land-first agent-system-2.0 on`, complete the proof deferred from the build by Jo's `in-mvr66z3o61b7qe`:
+- Dispatch the real hosted fast workflow against a real PR head through the verified ref, retain its run URL and artifact, and judge its JUnit against the selected Linux set.
+- Measure the fast sets for the last 20 code landings and retain their actual Linux execution seconds. A changed-path replay on the current graph or selection milliseconds is not Linux runtime evidence.
+- Retain the real shadow-main verdict, setup/install outputs, verified root/tag/bundle/preflight checks, and hosted/timing receipts together. Keep land-first off if a proof fails or evidence is missing; fix the named failure and repeat the affected proof before enabling.
 
 If setup, tag refresh, verified-root promotion, preflight, or installation fails, fail loudly: retain the command output and run evidence, keep land-first off (or let the existing hold refuse activation), fix the named failure, then restart the appropriate setup/promotion step and verify the tag, `verified/current`, bundle source and runner preflight before issuing the activation word. Do not conceal failure with a fallback or manually fabricate a green/tag. `main-retry <repo>` is for an exhausted inconclusive infrastructure block after repair, not for red verdicts.
 

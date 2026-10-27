@@ -176,9 +176,12 @@ describe("the merge gate (R5)", () => {
 	test("landing stopped: only the incident's one repair passes; anything else fails naming the stop", () => {
 		expect(mergeGate(facts({ state: red, repair: "revert", treeEqualsG: true, result: null }))).toEqual({ state: "success", description: "repair: revert to G's tree" });
 		expect(mergeGate(facts({ state: red, repair: "fix", result: { verdict: "green", sha: X, scope: "full", host: "mac" } }))).toEqual({ state: "success", description: "repair: fix, full suite green" });
+		expect(mergeGate(facts({ state: red, repair: "revert", treeEqualsG: false, result: { verdict: "green", sha: X, scope: "full", host: "mac" } }))).toEqual({ state: "success", description: "repair: partial revert, full suite green" });
 		const stop = `landing stopped (regression): ${red.reasons.join("; ")}`;
 		expect(mergeGate(facts({ state: red }))).toEqual({ state: "failure", reasons: [stop, "9999999 is not the incident's repair"] });
-		expect(mergeGate(facts({ state: red, repair: "revert", treeEqualsG: false }))).toEqual({ state: "failure", reasons: [stop, "the revert 9999999's tree is not G's tree"] });
+		expect(mergeGate(facts({ state: red, repair: "revert", treeEqualsG: false }))).toEqual({ state: "failure", reasons: [stop, "the partial revert 9999999 has no full-suite green on the Mac at its head"] });
+		expect(mergeGate(facts({ state: red, repair: "revert", result: { verdict: "green", sha: X, scope: "full", host: "linux" } })).state).toBe("failure");
+		expect(mergeGate(facts({ state: red, repair: "revert", result: { verdict: "green", sha: S3, scope: "full", host: "mac" } })).state).toBe("failure");
 		expect(mergeGate(facts({ state: red, repair: "fix" }))).toEqual({ state: "failure", reasons: [stop, "the fix 9999999 has no full-suite green on the Mac at its head"] });
 		expect(mergeGate(facts({ state: red, repair: "revert", treeEqualsG: true, containsTip: false })).state).toBe("failure");
 		// a full green is no pass while stopped unless the head is the repair

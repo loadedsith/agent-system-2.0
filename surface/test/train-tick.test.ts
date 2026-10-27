@@ -1467,14 +1467,24 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		expect(errorLines(x.ledger).map((l) => l.line)).toContainEqual(expect.stringMatching(/^verifier: promotion of 1111111 on thewolff\/product failed 3 times: exit 1: fetch failed/));
 		const y = lf();
 		y.gh.tag = null;
+		y.mainRun(T, "green"); // The verified target is a descendant, not the schema barrier returned by promotion.
 		y.runner.answer = (a) => (a[0] === "promote" ? { code: 0, stdout: `schema ${"8".repeat(40)}\n`, stderr: "" } : { code: 0, stdout: "", stderr: "" });
 		y.pass();
 		y.c.plusHours(0.1);
 		y.pass();
 		expect(y.runnerCalls.filter((a) => a[0] === "promote")).toHaveLength(1);
-		expect(y.rows().filter((r) => r.event === "promote-schema")).toHaveLength(1);
+		expect(y.rows().filter((r) => r.event === "promote-schema")).toEqual([expect.objectContaining({ sha: "8".repeat(40), g: T, current: G })]);
 		expect(y.creates()).toHaveLength(1);
-		expect(errorLines(y.ledger).map((l) => l.line)).toContainEqual(expect.stringMatching(/^verifier: promotion waits on Jo: 8888888 on thewolff\/product changes the ledger schema/));
+		expect(y.g.issues[0]!.body).toContain(`schema barrier ${"8".repeat(40)}`);
+		expect(y.g.issues[0]!.body).toContain(`promote-verified.ts ${T}`);
+		expect(y.g.issues[0]!.body).not.toContain(`promote-verified.ts ${"8".repeat(40)}`);
+		expect(errorLines(y.ledger).map((l) => l.line)).toContainEqual(expect.stringContaining(`verified target ${T} — stop the tick, migrate the live ledger through ${T}, run bun surface/scripts/promote-verified.ts ${T}, restart`));
+		// A newer verified target behind the same barrier must replace the old recovery, not be suppressed by current alone.
+		y.gh.tip = HX;
+		y.mainRun(HX, "green");
+		y.pass();
+		expect(y.rows().filter((r) => r.event === "promote-schema")).toHaveLength(2);
+		expect(y.g.issues.at(-1)!.body).toContain(`promote-verified.ts ${HX}`);
 	});
 });
 

@@ -1809,7 +1809,7 @@ export function raiseTwiceFailed(ledger: Ledger, wl: string, d: TwiceFailed): st
 
 // ---- part 3: a green, reviewed lane PR boards a train on its own (PLAN wl-mvbjiettjrfpxc D1-D3) -------------------------
 
-/** D1: a workload closed longer ago than this is no longer scanned (the scan stays bounded). */
+/** D1: a close or released landing receipt older than this is no longer scanned (the scan stays bounded). */
 export const AUTOBOARD_WINDOW_MS = 14 * 86_400_000;
 
 /** `train-autoboard: on <iso>`: the cutover the train tick writes once on the standing workload (MERGE_TRAIN_BY); receipts before it never board. */
@@ -1836,12 +1836,12 @@ export function isTrainOrFix(entries: readonly EntryRow[], instructions: readonl
 
 /** D1's verdict on workload W: ready to board at a green sha, or why not (the reason the tick's `train-board-skip:` names). */
 export type Landing =
-	| { ready: true; workloadId: string; pr: number; sha: string; run: string; review: string; checkout: string; repo: string; closedAt: string }
+	| { ready: true; workloadId: string; pr: number; sha: string; run: string; review: string; checkout: string; repo: string; readyAt: string }
 	| { ready: false; workloadId: string; pr: number | null; sha: string | null; reason: string };
 
 /** What `landingReady` reads beyond the ledger: the test runner's config, and how a checkout names its GitHub repository (git; injected in tests). */
 export interface LandingContext {
-	config: Pick<TestRunnerConfig, "repos">;
+	config: { repos: readonly Pick<TestRunnerConfig["repos"][number], "origin">[] };
 	ownerRepo?: (checkout: string) => string | null;
 }
 
@@ -1876,12 +1876,11 @@ function reviewPassed(ledger: Ledger, wl: string, entries: readonly EntryRow[], 
 }
 
 /**
- * D1's ledger half for workload `wl`: ready when W is closed (within AUTOBOARD_WINDOW_MS), autonomous, at normal stakes, neither
- * the standing workload nor a merge train nor a fix workload (`isTrainOrFix`), not superseded (`supersededBy`) and not cancelled
- * (a `plan: first` never approved), on a repository the test runner serves; its holder's `done-because:` stands (`doneBecause`)
- * and is newer than the tick's `train-autoboard:` cutover; the newest run (`testRuns`) names PR n and its result is a green gate
- * result at sha G: `green` of either scope, the fast check or the full suite (PLAN wl-mvq4edbaf13vnk D9, R22), never a red-main;
- * and the review rule holds (`reviewPassed`). Otherwise the first failing rule, as a reason. The tick adds the live half (gh).
+ * D1's ledger half for workload `wl`: ready when W is closed within AUTOBOARD_WINDOW_MS, or released with a fast green on
+ * a land-first repository (D9). Released readiness is not closure: no holder, unfinished slices, questions or pending tests
+ * may remain, and close still waits for merged/main coverage. W must be autonomous, normal stakes, neither standing nor a
+ * train/fix, not superseded/cancelled, on a served repository, with a holder done-because newer than the cutover and a passed
+ * review. The newest result must be a green gate (fast only while land-first is on), never red-main. The tick adds gh's live half.
  */
 export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): Landing {
 	let pr: number | null = null;
@@ -1890,9 +1889,14 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	const w = ledger.workload(wl);
 	if (!w) return no("no such workload");
 	if (wl === STANDING_WORKLOAD_ID) return no("the standing workload");
-	if (w.status !== "closed" || w.closed_at === null) return no("the workload is open");
+	const open = w.status === "open";
 	if (w.mode !== "autonomous") return no(`the workload is ${w.mode}`);
 	if (w.stakes !== "normal") return no(`stakes ${w.stakes}`);
+	const busy = ownerBusy(ledger, wl);
+	if (busy !== null) return no(busy);
+	if (open && w.holder !== null) return no("the workload has not been released");
+	if (open && ledger.slices(wl).some((s) => s.state === "open" || s.state === "paused")) return no("the workload has open or paused slices");
+	if (open && ledger.questions(wl).some((q) => q.state === "open")) return no("the workload has open questions");
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const runs = testRuns(entries);
@@ -1907,20 +1911,25 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	if (checkout === null) return no("no repo: entry");
 	const repo = (ctx.ownerRepo ?? checkoutOwnerRepo)(checkout);
 	if (repo === null || !ctx.config.repos.some((r) => r.origin.toLowerCase() === repo.toLowerCase())) return no(`the test runner does not serve ${repo ?? checkout}`);
+	const enabled = landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
+	if (open && !enabled) return no("the workload is open");
 	if (doneBecause(entries, holders) === null) return no("no holder done-because");
 	const receipt = entries.findLast((e) => e.kind === "assumption" && holders.includes(e.created_by) && e.body.trim().startsWith("done-because:"))!;
 	const cutover = autoboardCutover(ledger);
 	if (cutover === null) return no("no train-autoboard cutover yet");
 	if (receipt.created_at <= cutover.createdAt) return no(`done-because ${receipt.id} predates the train-autoboard cutover ${cutover.entryId}`);
-	if (Date.parse(ledger.now()) - Date.parse(w.closed_at) > AUTOBOARD_WINDOW_MS) return no("closed more than 14 days ago");
+	const readyAt = w.closed_at ?? receipt.created_at;
+	if (Date.parse(ledger.now()) - Date.parse(readyAt) > AUTOBOARD_WINDOW_MS) return no(open ? "released more than 14 days ago" : "closed more than 14 days ago");
 	if (newestRun === null) return no("no full-suite run");
 	const result = newestRun.result;
 	if (result === null) return no(`the newest run ${newestRun.request.runId} on #${pr} has no result`);
 	if (result.verdict !== "green") return no(`the newest run ${newestRun.request.runId} on #${pr} is ${result.verdict}`);
+	if (result.scope === "fast" && !enabled) return no("land-first is off: a fast green is not a full-suite result");
+	if (open && result.scope !== "fast") return no("the workload is open");
 	sha = result.sha;
 	const review = reviewPassed(ledger, wl, entries, holders);
 	if (!review.ok) return no(review.reason);
-	return { ready: true, workloadId: wl, pr: pr!, sha: sha!, run: newestRun.request.runId, review: review.entryId, checkout, repo, closedAt: w.closed_at };
+	return { ready: true, workloadId: wl, pr: pr!, sha: sha!, run: newestRun.request.runId, review: review.entryId, checkout, repo, readyAt };
 }
 
 /**
@@ -2063,7 +2072,13 @@ export function boardLanding(
 	const no = (reason: string): BoardResult => ({ boarded: false, reason });
 	return ledger.write(() => {
 		const w = ledger.workload(l.workloadId);
-		if (!w || w.status !== "closed") return no(`${l.workloadId} is not closed`);
+		if (!w) return no(`${l.workloadId} no longer exists`);
+		// GH was read outside this transaction. A reclaim, new slice, run, review or activation change must prevent boarding.
+		const fresh = landingReady(ledger, l.workloadId, { config: { repos: [{ origin: l.repo }] } });
+		if (!fresh.ready) return no(fresh.reason);
+		if (fresh.pr !== l.pr || fresh.sha !== l.sha || fresh.run !== l.run || fresh.review !== l.review || fresh.checkout !== l.checkout || fresh.repo !== l.repo) {
+			return no(`${l.workloadId}'s landing changed after the live PR read; retry next pass`);
+		}
 		const cutover = autoboardCutover(ledger);
 		if (cutover === null) return no("no train-autoboard cutover yet");
 		const trains = everyTrain(ledger).filter((t) => {
@@ -2118,11 +2133,20 @@ export function boardSkips(ledger: Pick<Ledger, "entries">): { bodies: Set<strin
 	return { bodies, ended };
 }
 
-/** D1's scan: every workload closed within AUTOBOARD_WINDOW_MS, the standing one excepted, newest close first. */
+/** D1/D9's scan: recent closed workloads and released open workloads with a recent landing receipt, newest readiness first. */
 export function autoboardCandidates(ledger: Ledger): string[] {
 	const since = new Date(Date.parse(ledger.now()) - AUTOBOARD_WINDOW_MS).toISOString();
 	return ledger.db.query<{ id: string }, [string, string]>(
-		`SELECT id FROM workloads WHERE status = 'closed' AND closed_at >= ?1 AND id <> ?2 ORDER BY closed_at DESC, id DESC`,
+		`SELECT w.id FROM workloads w
+		 WHERE w.id <> ?2 AND (
+		   (w.status = 'closed' AND w.closed_at >= ?1) OR
+		   (w.status = 'open' AND w.holder IS NULL AND EXISTS (
+		     SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption'
+		       AND e.body LIKE 'done-because:%' AND e.created_at >= ?1
+		   ))
+		 )
+		 ORDER BY COALESCE(w.closed_at, (SELECT MAX(e.created_at) FROM entries e
+		   WHERE e.workload_id = w.id AND e.kind = 'assumption' AND e.body LIKE 'done-because:%')) DESC, w.id DESC`,
 	).all(since, STANDING_WORKLOAD_ID).map((r) => r.id);
 }
 
@@ -2536,8 +2560,8 @@ export const RECONCILED_STALE_MS = 15 * 60_000;
  * - `stop-raised` / `stop-updated <kind> tip <sha> g <sha|none> suspects <#n,…|none> failing <n|none>`: a stop episode opens or
  *   changes kind or tip; `stop-filed <issue url>` its jo-issues issue (regression or infrastructure); `stop-cleared <why>` ends it;
  * - `repair-woken <tip> train <wl|none>` (D7, once per episode) and `repair-failed <tip> woken <iso>` 30 minutes on;
- * - `promote-failed <g> attempt <k> <error>`, `promote-gave-up <g> <error>`, `promote-schema <sha> current <sha|none> issue
- *   <url|none>` (promotion waits on Jo before schema-changing commit `sha`) and `promote-ok <g>`;
+ * - `promote-failed <g> attempt <k> <error>`, `promote-gave-up <g> <error>`, `promote-schema <barrier> target <g> current
+ *   <sha|none> issue <url|none>` (schema barrier and the actual verified target; old rows have no target) and `promote-ok <g>`;
  * - `tick-refused <reason>`: the tick's self-check refused while land-first is on.
  */
 export type LandFirstEvent =
@@ -2552,7 +2576,7 @@ export type LandFirstEvent =
 	| { event: "repair-failed"; tip: string; woken: string }
 	| { event: "promote-failed"; g: string; attempt: number; error: string }
 	| { event: "promote-gave-up"; g: string; error: string }
-	| { event: "promote-schema"; sha: string; current: string | null; issue: string | null }
+	| { event: "promote-schema"; sha: string; g: string | null; current: string | null; issue: string | null }
 	| { event: "promote-ok"; g: string }
 	| { event: "tick-refused"; reason: string };
 export type LandFirstRow = LandFirstEvent & { repo: string; entryId: string; createdAt: string };
@@ -2577,7 +2601,7 @@ export function landFirstNoticeBody(repo: string, e: LandFirstEvent): string {
 			case "repair-failed": return `${e.tip} woken ${e.woken}`;
 			case "promote-failed": return `${e.g} attempt ${e.attempt} ${oneLine(e.error)}`;
 			case "promote-gave-up": return `${e.g} ${oneLine(e.error)}`;
-			case "promote-schema": return `${e.sha} current ${none(e.current)} issue ${none(e.issue)}`;
+			case "promote-schema": return `${e.sha} target ${none(e.g)} current ${none(e.current)} issue ${none(e.issue)}`;
 			case "promote-ok": return e.g;
 			case "tick-refused": return oneLine(e.reason);
 		}
@@ -2602,7 +2626,7 @@ const LF_EVENT_RE: Record<LandFirstEvent["event"], RegExp> = {
 	"repair-failed": new RegExp(`^${SHA} woken (\\S+)$`),
 	"promote-failed": new RegExp(`^${SHA} attempt ([1-9]\\d*) (.+)$`),
 	"promote-gave-up": new RegExp(`^${SHA} (.+)$`),
-	"promote-schema": new RegExp(`^${SHA} current ${SHA_OR_NONE} issue (https:\\/\\/\\S+|none)$`),
+	"promote-schema": new RegExp(`^${SHA}(?: target ${SHA_OR_NONE})? current ${SHA_OR_NONE} issue (https:\\/\\/\\S+|none)$`),
 	"promote-ok": new RegExp(`^${SHA}$`),
 	"tick-refused": /^(.+)$/,
 };
@@ -2633,7 +2657,7 @@ function parseLandFirst(rest: string): (LandFirstEvent & { repo: string }) | nul
 		case "repair-failed": return { repo, event, tip: m[1]!, woken: m[2]! };
 		case "promote-failed": return { repo, event, g: m[1]!, attempt: Number(m[2]), error: m[3]! };
 		case "promote-gave-up": return { repo, event, g: m[1]!, error: m[2]! };
-		case "promote-schema": return { repo, event, sha: m[1]!, current: orNull(m[2]!), issue: orNull(m[3]!) };
+		case "promote-schema": return { repo, event, sha: m[1]!, g: m[2] === undefined ? null : orNull(m[2]), current: orNull(m[3]!), issue: orNull(m[4]!) };
 		case "promote-ok": return { repo, event, g: m[1]! };
 		case "tick-refused": return { repo, event, reason: m[1]! };
 	}

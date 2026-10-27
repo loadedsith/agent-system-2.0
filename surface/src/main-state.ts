@@ -249,9 +249,9 @@ export interface GateFacts {
 	need: "fast" | "full";
 	/** The newest result at X, null when none. */
 	result: (Pick<TestRun, "verdict" | "sha"> & { scope: TestScope; host: TestHost }) | null;
-	/** X is the incident's one repair: a revert, or a PR the incident names as its fix; null otherwise. */
+	/** X is the incident's designated revert or named fix; null otherwise. A non-tree revert needs a full Mac green. */
 	repair: "revert" | "fix" | null;
-	/** A revert's tree equals G's tree (it carries G's green, no run). */
+	/** A designated revert's tree equals G's tree (a distinct carry, no run); false for a partial revert. */
 	treeEqualsG: boolean;
 }
 export type GateDecision = { state: "success"; description: string } | { state: "failure"; reasons: string[] };
@@ -262,7 +262,7 @@ const fullGreenAt = (f: GateFacts): boolean => f.result !== null && f.result.sha
 /**
  * The merge gate (§ 2 The merge gate): success on X only when X contains T and either landing is open and X passed its check
  * (a fast or full green at X for `fast`, a full Mac green for `full`), or landing is stopped and X is the incident's one
- * repair (a revert whose tree equals G's, or a named fix with a full Mac green). Anything else is failure naming every reason;
+ * repair (a revert whose tree equals G's, or a partial revert or named fix with a full Mac green). Anything else is failure naming every reason;
  * a red-main is a failure.
  */
 export function mergeGate(f: GateFacts): GateDecision {
@@ -278,11 +278,14 @@ export function mergeGate(f: GateFacts): GateDecision {
 		return { state: "success", description: f.need === "full" || r!.scope === "full" ? "full suite green" : "fast check green" };
 	}
 	reasons.push(`landing stopped (${f.state.stop}): ${f.state.reasons.join("; ")}`);
-	if (f.repair === "revert" && !f.treeEqualsG) reasons.push(`the revert ${sha7(f.head)}'s tree is not G's tree`);
+	if (f.repair === "revert" && !f.treeEqualsG && !fullGreenAt(f)) reasons.push(`the partial revert ${sha7(f.head)} has no full-suite green on the Mac at its head`);
 	if (f.repair === "fix" && !fullGreenAt(f)) reasons.push(`the fix ${sha7(f.head)} has no full-suite green on the Mac at its head`);
 	if (f.repair === null) reasons.push(`${sha7(f.head)} is not the incident's repair`);
-	const repaired = (f.repair === "revert" && f.treeEqualsG) || (f.repair === "fix" && fullGreenAt(f));
-	if (f.containsTip && repaired) return { state: "success", description: f.repair === "revert" ? "repair: revert to G's tree" : "repair: fix, full suite green" };
+	const repaired = (f.repair === "revert" && (f.treeEqualsG || fullGreenAt(f))) || (f.repair === "fix" && fullGreenAt(f));
+	if (f.containsTip && repaired) return {
+		state: "success", description: f.repair === "fix" ? "repair: fix, full suite green"
+			: f.treeEqualsG ? "repair: revert to G's tree" : "repair: partial revert, full suite green",
+	};
 	return { state: "failure", reasons };
 }
 
