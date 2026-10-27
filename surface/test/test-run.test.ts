@@ -11,7 +11,7 @@ import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
@@ -533,6 +533,23 @@ describe("verdict and settle", () => {
 		const g = buildTestRun(r, facts(), decideRun(facts()), { base: B, mergeBase: C, runDir: "/runs/tr-0abc12", preflight: "ok" });
 		expect(settleArtifact(g)).toBe(`test-run tr-0abc12: green at ${A} on PR #17; full 10/0/0; alone: ./x.test.ts 10/0; /runs/tr-0abc12`);
 		expect(() => settleArtifact(t)).toThrow(TestRunShapeError);
+	});
+	// PLAN wl-mvpwkpqobyp20w D4c: a train's carried green records where it came from, in its reason and its slice's artifact.
+	test("a real green's reason is null, so its artifact has no suffix; a carried green keeps R's counts and run dir, parses, and its artifact appends its reason", () => {
+		const g = buildTestRun(request("tr-0abc12", 17, A), facts(), decideRun(facts()), { base: B, mergeBase: C, runDir: "/runs/tr-0abc12", preflight: "ok" });
+		expect(g.reason).toBeNull();
+		const c = carriedRun(request("tr-0carry", 17, B), g);
+		expect(c).toEqual({
+			runId: "tr-0carry", verdict: "green", sha: B, pr: 17, reason: `carried from tr-0abc12 at ${A} (decision-log only)`, headAtEnd: null, base: B, mergeBase: C,
+			full: g.full, solo: g.solo, failures: [], runDir: "/runs/tr-0abc12", preflight: null,
+		});
+		expect(parseTestRun(testRunBody(c))).toEqual(c);
+		expect(settleArtifact(c)).toBe(`test-run tr-0carry: green at ${B} on PR #17; full 10/0/0; alone: ./x.test.ts 10/0; /runs/tr-0abc12; carried from tr-0abc12 at ${A} (decision-log only)`);
+		// carrying again from a carried green names the green it carried from
+		expect(carriedRun(request("tr-0again", 17, B), c).reason).toBe(`carried from tr-0carry at ${B} (decision-log only)`);
+		// only a green on the same PR carries
+		expect(() => carriedRun(request("tr-0x", 18, B), g)).toThrow(TestRunShapeError);
+		expect(() => carriedRun(request("tr-0x", 17, B), { ...g, verdict: "red" })).toThrow(TestRunShapeError);
 	});
 	test("the orchestrator hears a non-green, owned result only when no lane holds the workload live", () => {
 		expect(notifiesOrchestrator("red", false)).toBe(true);

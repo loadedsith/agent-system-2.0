@@ -608,13 +608,13 @@ function controlOf(ledger: Ledger, wl: string): ControlEntry[] {
 	return controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
 }
 
-/** The open workloads carrying an entry by `by` whose body starts with `prefix`, oldest first. */
-function openWithEntry(ledger: Ledger, by: string, prefix: string): string[] {
-	return ledger.db.query<{ id: string }, [string, string]>(
-		`SELECT w.id AS id FROM workloads w WHERE w.status = 'open' AND EXISTS (
+/** The workloads carrying an entry by `by` whose body starts with `prefix`, open ones only unless `closed`, oldest first. */
+function withEntry(ledger: Ledger, by: string, prefix: string, closed = false): string[] {
+	return ledger.db.query<{ id: string }, [string, string, number]>(
+		`SELECT w.id AS id FROM workloads w WHERE (?3 OR w.status = 'open') AND EXISTS (
 		   SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption' AND e.created_by = ?1 AND substr(e.body, 1, length(?2)) = ?2)
 		 ORDER BY w.created_at, w.id`,
-	).all(by, prefix).map((r: { id: string }) => r.id);
+	).all(by, prefix, closed ? 1 : 0).map((r: { id: string }) => r.id);
 }
 
 /** Every open merge train: an open workload with a surface `train:` or a merge-train `train-board:` that is a valid member (`trainMembers`). */
@@ -673,31 +673,33 @@ export function onOtherTrain(ledger: Ledger, repo: string, prs: readonly number[
 	return null;
 }
 
-/** One `train-fix:` on an open fix workload. */
+/** One `train-fix:` on a fix workload. */
 export interface FixBinding extends TrainFix {
 	workloadId: string;
 	entryId: string;
 }
 
-/** Every `train-fix:` on an open workload (the tick's, MERGE_TRAIN_BY), oldest workload first. */
-export function fixBindings(ledger: Ledger): FixBinding[] {
-	return openWithEntry(ledger, MERGE_TRAIN_BY, "train-fix:").flatMap((wl) =>
+/** Every `train-fix:` on an open workload (the tick's, MERGE_TRAIN_BY), oldest workload first; on closed ones too with `closed`. */
+export function fixBindings(ledger: Ledger, opts: { closed?: boolean } = {}): FixBinding[] {
+	return withEntry(ledger, MERGE_TRAIN_BY, "train-fix:", opts.closed).flatMap((wl) =>
 		controlEntries(ledger.entries(wl)).flatMap((c) => {
 			const f = c.prefix === "train-fix" ? parseTrainFix(c.rest) : null;
 			return f ? [{ ...f, workloadId: wl, entryId: c.id }] : [];
 		}));
 }
 
+/** Fix binding `f` binds PR `pr` on `train`: it names both, and its `train-entry` is a membership entry on that train listing the PR (`trainBindings`), as `boundPrs` rules. */
+export function fixBinds(ledger: Pick<Ledger, "entries" | "instructions">, f: FixBinding, train: string, pr: number): boolean {
+	return f.train === train && f.pr === pr && trainBindings(ledger.entries(train), ledger.instructions(train)).some((b) => b.entryId === f.trainEntry && b.prs.includes(pr));
+}
+
 /**
  * The workloads that own task `t`: its D1 owner, and every fix workload bound to its train and PR (owner none, or an owner closed
- * since). A fix binding counts only when its `train-entry` is a membership entry on that train listing the PR (`trainBindings`), as `boundPrs` rules.
+ * since; `fixBinds`).
  */
 function taskOwners(ledger: Ledger, t: TrainTask, fixes: readonly FixBinding[]): string[] {
 	const out = t.owner === null ? [] : [t.owner];
-	for (const f of fixes) {
-		if (f.train !== t.train || f.pr !== t.pr || out.includes(f.workloadId)) continue;
-		if (trainBindings(ledger.entries(f.train), ledger.instructions(f.train)).some((b) => b.entryId === f.trainEntry && b.prs.includes(f.pr))) out.push(f.workloadId);
-	}
+	for (const f of fixes) if (!out.includes(f.workloadId) && fixBinds(ledger, f, t.train, t.pr)) out.push(f.workloadId);
 	return out;
 }
 

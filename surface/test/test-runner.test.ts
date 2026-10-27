@@ -17,14 +17,16 @@ import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
+import { trainFixBody } from "../src/launch";
 import {
 	childLayout, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
-import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
+import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
+import { carry305 } from "./train-world";
 
 setDefaultTimeout(180_000);
 
@@ -150,11 +152,13 @@ beforeAll(() => {
 
 // ---- a world: ledger, runs root, as2test root, install, fake gh and sudo --------------------------------
 
-// `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
+// `gh api <path>` answers `<root>/api/<path, / as _>` when a test saved one (`saveApi`: the starter's compare and commit reads);
+// any other `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
 const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ -f "$dir/api/$(printf '%s' "$2" | tr / _)" ]; then cat "$dir/api/$(printf '%s' "$2" | tr / _)"; exit 0; fi
 if [ "$1" = api ] && [ ! -f "$dir/status-fails" ]; then echo '{}'; exit 0; fi
 if [ "$1" = api ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
 echo "no pull requests found" >&2
@@ -164,7 +168,7 @@ exit 1
 const statusPosts = (w: World): string[] => {
 	const log = join(w.root, "gh.log");
 	if (!existsSync(log)) return [];
-	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api ")).map((c) => {
+	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api -X ")).map((c) => {
 		const m = /^api -X POST repos\/(\S+)\/statuses\/([0-9a-f]{40}) -f state=(\S+) -f context=as2\/full-suite -f description=/.exec(c);
 		if (!m || m[1] !== OWNER_REPO) throw new Error(`unexpected gh api call: ${c}`);
 		return `${m[3]} ${m[2]}`;
@@ -226,6 +230,8 @@ interface World {
 	ledger: Ledger;
 	/** Run `fn` with the ledger clock `ms` in the past. */
 	ago: <T>(ms: number, fn: () => T) => T;
+	/** Run `fn` with the ledger clock stopped at `iso`: every row it writes has that created_at. */
+	pin: <T>(iso: string, fn: () => T) => T;
 }
 
 function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number } = {}): World {
@@ -242,13 +248,22 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	writeFileSync(join(home, ".config", "git", "config"), evil);
 	const ledgerPath = join(home, ".agent-system-2", "ledger.db");
 	let offset = 0;
-	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false, clock: () => new Date(Date.now() - offset).toISOString() });
+	let pinned: string | null = null;
+	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false, clock: () => pinned ?? new Date(Date.now() - offset).toISOString() });
 	const ago = <T>(ms: number, fn: () => T): T => {
 		offset = ms;
 		try {
 			return fn();
 		} finally {
 			offset = 0;
+		}
+	};
+	const pin = <T>(iso: string, fn: () => T): T => {
+		pinned = iso;
+		try {
+			return fn();
+		} finally {
+			pinned = null;
 		}
 	};
 
@@ -308,7 +323,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
-	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago };
+	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago, pin };
 }
 
 /** An open autonomous workload on the world's checkout, with one open slice. */
@@ -406,6 +421,12 @@ function staleRow(w: World): void {
 }
 
 // ---- the starter -------------------------------------------------------------------------------------
+
+/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it; returns that entry's id. */
+function joTrains(w: World, wl: string, prs: number[]): string {
+	const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: trainInstructionBody(wl, prs), author: "jo", channel: "surface" });
+	return w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+}
 
 describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 	test("a fork PR and a closed PR are refused; an unbound branch is refused, then accepted once a push-dest: binds it; every gh call names -R", async () => {
@@ -530,12 +551,6 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 
 	// PLAN wl-mv8s8srodefytc § 1 D4: the merge train's stop hold, evaluated by the starter inside its reservation transaction. The train's rows are
 	// written as the surface writes them (Jo's instruction, then the `train:` naming it); questions are the lane's, answers Jo's.
-	/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it. */
-	function joTrains(w: World, wl: string, prs: number[]): string {
-		const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: trainInstructionBody(wl, prs), author: "jo", channel: "surface" });
-		w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
-		return id;
-	}
 	/** The lane's question on slice `id` (added when missing). */
 	function trainAsk(w: World, wl: string, id: string, options: string[]): string {
 		if (!w.ledger.slice(id)) w.ledger.addSlice({ by: LANE, workloadId: wl, id, task: `train slice ${id}`, doneCondition: "Jo answered", inputs: "the PR" });
@@ -643,6 +658,239 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		const before = ghCalls().length;
 		expect((await admitted(w, other, B)).verdict).toBe("stale");
 		expect(ghCalls().slice(before).filter((c) => c.endsWith("--json state"))).toEqual([]);
+	});
+});
+
+// PLAN wl-mvpwkpqobyp20w D4-D5: a merge train's request at a head that descends from the PR's last green only by decision-log
+// commits is green at once, with no run. Requests and results are seeded as the runner writes them; GitHub's compare and
+// get-a-commit answers are saved for the fake gh (`saveApi`). Every head that falls through is fx.main, which the PR's ref is
+// not, so its run ends stale at once.
+describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
+	const P = PR.green;
+	const S = "5".repeat(40);
+	const LOG = ".ai/decision-log/2026-10-26--1200--jev--a-close.md";
+	const saveApi = (w: World, path: string, json: unknown) => {
+		mkdirSync(join(w.root, "api"), { recursive: true });
+		writeFileSync(join(w.root, "api", path.replaceAll("/", "_")), JSON.stringify(json));
+	};
+	/** GitHub's compare of `from`...`to` on OWNER_REPO, each commit with its own files (a merge with two parents lists none read). */
+	function compare(w: World, from: string, to: string, commits: { sha: string; parents?: number; files?: string[] }[]): void {
+		saveApi(w, `repos/${OWNER_REPO}/compare/${from}...${to}`, {
+			status: "ahead", total_commits: commits.length,
+			commits: commits.map((c) => ({ sha: c.sha, parents: Array.from({ length: c.parents ?? 1 }, (_, i) => ({ sha: String(i).repeat(40) })) })),
+		});
+		for (const c of commits) saveApi(w, `repos/${OWNER_REPO}/commits/${c.sha}`, [{ sha: c.sha, files: (c.files ?? []).map((filename) => ({ filename, status: "added" })) }]);
+	}
+	type Seeded = "green" | "red" | "error" | "pending";
+	/** A request for PR P at `sha` on `wl`, and its result as the runner writes it (full 7/0/0, or 6/1/0 for a red), unless pending. */
+	function seed(w: World, wl: string, sha: string, verdict: Seeded, agoMs = 0): string {
+		const slice = w.ledger.slices(wl)[0]!.id;
+		const runId = request(w, wl, slice, P, sha, agoMs);
+		if (verdict !== "pending") finish(w, wl, runId, sha, verdict, Math.max(agoMs - 1000, 0));
+		return runId;
+	}
+	function finish(w: World, wl: string, runId: string, sha: string, verdict: Exclude<Seeded, "pending">, agoMs = 0): void {
+		const red = verdict === "red";
+		const run: TestRun = {
+			runId, verdict, sha, pr: P, reason: verdict === "green" || red ? null : `seeded ${verdict}`, headAtEnd: sha, base: fx.main, mergeBase: fx.main,
+			full: verdict === "error" ? null : { pass: red ? 6 : 7, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 5, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "t > x", firstError: "error: x" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+		};
+		const slice = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.request.slice;
+		w.ago(agoMs, () => w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRunBody(run) }));
+	}
+	/** A train on P whose PR head is `head` on branch `wl/<owner>` (an owner workload on the same checkout), with no request yet. */
+	function trainWorld(head: string) {
+		const w = world();
+		const { wl: train } = workload(w);
+		const { wl: owner } = workload(w);
+		const entry = joTrains(w, train, [P]);
+		setPr(w, P, { sha: head, headRefName: `wl/${owner}` });
+		return { w, train, owner, entry };
+	}
+	/** A fix workload bound to P on `train` through its `train:` entry, as the tick opens one. */
+	function fixOf(w: World, train: string, entry: string): string {
+		const { wl } = workload(w);
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainFixBody({ repo: OWNER_REPO, pr: P, train, trainEntry: entry }) });
+		return wl;
+	}
+	const runIdOf = (out: string): string => /^test-run (tr-[a-z0-9]+) /.exec(out)![1]!;
+	/** A start that carries R: exit 0, no runner, the line ending ` carried <R>`, a green at the head with R's counts, its slice done on it. */
+	function carried(w: World, train: string, from: string, fromSha: string, head: string, extra: string[] = []): TestRun & { entryId: string } {
+		const r = start(w, train, P, extra);
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toMatch(new RegExp(`^test-run tr-[a-z0-9]+ runner none sha ${head} slice sl-\\S+ log none bound-by in-[a-z0-9]+ carried ${from}$`));
+		const id = runIdOf(r.out);
+		const rec = testRuns(w.ledger.entries(train)).find((x) => x.request.runId === id)!;
+		// testRuns parsed the green's body: a carried green is a shape parseTestRun accepts.
+		const res = rec.result!;
+		expect(res).toMatchObject({ verdict: "green", sha: head, reason: `carried from ${from} at ${fromSha} (decision-log only)`, headAtEnd: null, full: { pass: 7, fail: 0, skip: 0 } });
+		const slice = w.ledger.slice(rec.request.slice)!;
+		expect(slice.state).toBe("done");
+		expect(slice.artifact).toContain(`test-run ${id}: green at ${head} on PR #${P}`);
+		expect(slice.artifact).toEndWith(`; carried from ${from} at ${fromSha} (decision-log only)`);
+		expect(existsSync(join(w.runs, id))).toBe(false);
+		return res;
+	}
+	/** A start that falls through to a run: a runner is spawned, and its run ends stale (the head is not the PR's ref). */
+	async function ran(w: World, train: string, extra: string[] = []): Promise<void> {
+		const r = start(w, train, P, extra);
+		expect(r.err).toBe("");
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toMatch(/^test-run tr-[a-z0-9]+ runner \d+ sha [0-9a-f]{40} slice sl-\S+ log \/\S+( bound-by in-[a-z0-9]+)?$/);
+		expect((await resultOf(w, train, runIdOf(r.out))).verdict).toBe("stale");
+	}
+
+	test("a green at S and one decision-log commit to H: a green at H, success posted on H, no runner; again at H carries from that green (identical, no compare)", () => {
+		const H = fx.main;
+		const { w, train } = trainWorld(H);
+		const R = seed(w, train, S, "green", 5000);
+		compare(w, S, H, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const c = carried(w, train, R, S, H);
+		expect(statusPosts(w)).toEqual([`success ${H}`]);
+		expect(readFileSync(join(w.root, "gh.log"), "utf8")).toContain(`-f description=carried from run ${R} at ${S.slice(0, 7)} (decision-log only)`);
+		expect(readdirSync(w.runs)).toEqual([]);
+		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").length;
+		carried(w, train, c.runId, H, H);
+		const after = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").slice(calls);
+		expect(after.filter((l) => l.includes("/compare/"))).toEqual([]);
+		expect(statusPosts(w)).toEqual([`success ${H}`, `success ${H}`]);
+	});
+
+	test("a commit touching another path, and a merge commit touching only .ai/decision-log/, each fall through to a run", async () => {
+		for (const commits of [[{ sha: "6".repeat(40), files: [LOG] }, { sha: "7".repeat(40), files: [LOG, "surface/src/x.ts"] }], [{ sha: "8".repeat(40), parents: 2, files: [LOG] }]]) {
+			const { w, train } = trainWorld(fx.main);
+			seed(w, train, S, "green", 5000);
+			compare(w, S, fx.main, commits);
+			await ran(w, train);
+			expect(statusPosts(w)).toEqual([]);
+		}
+	});
+
+	test("the #305 fixture: a green at aebe37a4 and GitHub's saved answers for cde03460 carry", () => {
+		const c305 = carry305(OWNER_REPO);
+		const { w, train } = trainWorld(c305.head);
+		const R = seed(w, train, c305.green, "green", 5000);
+		for (const [path, json] of Object.entries(c305.answers)) saveApi(w, path, json);
+		carried(w, train, R, c305.green, c305.head);
+		expect(statusPosts(w)).toEqual([`success ${c305.head}`]);
+	});
+
+	test("a newer red, a newer error, and a still-pending request after the green each block the carry", async () => {
+		for (const newer of ["red", "error", "pending"] as const) {
+			const { w, train, owner } = trainWorld(fx.main);
+			seed(w, train, S, "green", 10_000);
+			compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+			// on the owner, so a pending request does not hold the train's reservation
+			seed(w, owner, S, newer, 5000);
+			await ran(w, train);
+		}
+	});
+
+	test("reversed completion: an older request finishing green after a newer one finished red does not carry", async () => {
+		const { w, train, owner } = trainWorld(fx.main);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const older = seed(w, train, S, "pending", 20_000);
+		seed(w, owner, S, "red", 15_000);
+		finish(w, train, older, S, "green", 5000);
+		await ran(w, train);
+	});
+
+	test("a green on a closed fix workload carries while the closed owner's older result is red", () => {
+		const { w, train, owner, entry } = trainWorld(fx.main);
+		seed(w, owner, S, "red", 20_000);
+		const fix = fixOf(w, train, entry);
+		const R = seed(w, fix, S, "green", 10_000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		for (const wl of [owner, fix]) {
+			for (const s of w.ledger.slices(wl)) w.ledger.cancelSlice(s.id, { by: LANE });
+			w.ledger.closeWorkload(wl, { by: SURFACE_BY });
+		}
+		carried(w, train, R, S, fx.main);
+	});
+
+	test("equal created_at stamps pick the later-inserted request, within one workload and across the train, owner and fix workloads", async () => {
+		const at = new Date(Date.now() - 60_000).toISOString();
+		const pinned = (w: World, wl: string, verdict: "green" | "red") => w.pin(at, () => seed(w, wl, S, verdict));
+		for (const [first, second] of [["train", "train"], ["owner", "fix"], ["fix", "train"], ["train", "owner"]] as const) {
+			for (const order of [["red", "green"], ["green", "red"]] as const) {
+				const t = trainWorld(fx.main);
+				const wls = { train: t.train, owner: t.owner, fix: fixOf(t.w, t.train, t.entry) };
+				compare(t.w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+				pinned(t.w, wls[first], order[0]);
+				const later = pinned(t.w, wls[second], order[1]);
+				if (order[1] === "green") carried(t.w, t.train, later, S, fx.main);
+				else await ran(t.w, t.train);
+			}
+		}
+	});
+
+	test("a source change between D4b and D4c falls through to the run", async () => {
+		const { w, train, entry } = trainWorld(fx.main);
+		seed(w, train, S, "green", 10_000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const fix = fixOf(w, train, entry);
+		arm(w, train, "carry-evidence");
+		const p = Bun.spawn([process.execPath, RUNNER, "start", train, String(P), "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		await reached(w, train, "carry-evidence");
+		// a newer green at another sha on a fix workload: a different authority than the one compared
+		seed(w, fix, "9".repeat(40), "green");
+		go(w, train, "carry-evidence");
+		const [code, out] = [await p.exited, (await new Response(p.stdout).text()).trim()];
+		expect(code).toBe(START_EXIT.ok);
+		expect(out).toMatch(/ runner \d+ /);
+		expect(out).not.toContain(" carried ");
+		expect(marks(w, train, "carry-open")).toHaveLength(1);
+		expect(marks(w, train, "carry-written")).toEqual([]);
+		expect((await resultOf(w, train, runIdOf(out))).verdict).toBe("stale");
+	});
+
+	test("the fake gh records no call while the carry transaction is open", async () => {
+		const { w, train } = trainWorld(fx.main);
+		const R = seed(w, train, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const calls = () => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").length;
+		arm(w, train, "carry-open");
+		arm(w, train, "carry-written");
+		const p = Bun.spawn([process.execPath, RUNNER, "start", train, String(P), "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		await reached(w, train, "carry-open");
+		const open = calls();
+		go(w, train, "carry-open");
+		await reached(w, train, "carry-written");
+		expect(calls()).toBe(open);
+		go(w, train, "carry-written");
+		expect(await p.exited).toBe(START_EXIT.ok);
+		expect((await new Response(p.stdout).text()).trim()).toEndWith(` carried ${R}`);
+		expect(calls()).toBe(open + 1);
+		expect(statusPosts(w)).toEqual([`success ${fx.main}`]);
+	});
+
+	test("a failed status post keeps the carried green; a second request at the same H on a new slice posts again with no run", () => {
+		const { w, train } = trainWorld(fx.main);
+		const R = seed(w, train, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		writeFileSync(join(w.root, "status-fails"), "");
+		const r = start(w, train, P);
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toEndWith(` carried ${R}`);
+		expect(r.err).toContain(`status as2/full-suite success on ${fx.main} not posted: gh: Validation Failed (HTTP 422)`);
+		const first = testRuns(w.ledger.entries(train)).find((x) => x.request.runId === runIdOf(r.out))!.result!;
+		expect(first).toMatchObject({ verdict: "green", sha: fx.main });
+		rmSync(join(w.root, "status-fails"));
+		w.ledger.addSlice({ by: LANE, workloadId: train, id: "sl-repost", task: "the suite again", doneCondition: "a green", inputs: "the PR" });
+		carried(w, train, first.runId, fx.main, fx.main, ["--slice", "sl-repost"]);
+		expect(statusPosts(w)).toEqual([`success ${fx.main}`, `success ${fx.main}`]);
+		expect(readdirSync(w.runs)).toEqual([]);
+	});
+
+	test("a non-train request at such a head still spawns a run", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, P, { sha: fx.main, headRefName: `wl/${wl}` });
+		seed(w, wl, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		await ran(w, wl);
+		expect(readFileSync(join(w.root, "gh.log"), "utf8")).not.toContain("/compare/");
 	});
 });
 
