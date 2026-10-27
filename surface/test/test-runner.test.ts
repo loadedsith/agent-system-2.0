@@ -9,20 +9,24 @@
 // wrapper and reports every answer closed (the real denial is proved at S8, plan § 8). Boundaries
 // are paused through the runner's AGENT_SYSTEM_TEST_HOOKS files and the wrapper's rendered `hooks`.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import type { Subprocess } from "bun";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { renderExecWrapper } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
+import { trainFixBody } from "../src/launch";
 import {
-	childLayout, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
+	childLayout, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
 	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
-import { ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
-import { importPart, importReport, lockRow, openLockDb, publishIfOwner, START_EXIT } from "../scripts/test-runner";
+import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
+import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
+import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
 import { alive, tmp, until } from "./helpers";
+import { carry305 } from "./train-world";
 
 setDefaultTimeout(180_000);
 
@@ -50,6 +54,8 @@ const sha256 = (p: string): string => createHash("sha256").update(readFileSync(p
 // ---- the fixture repository: main plus one PR per scenario -------------------------------------------
 
 const PASS = (name: string) => `import { expect, test } from "bun:test";\ntest(${JSON.stringify(name)}, () => { expect(1 + 1).toBe(2); });\n`;
+/** A file whose only case is skipped: the full part runs no test of it, so it runs alone (PLAN wl-mvq4edh02r5z40 D1). */
+const SKIPPED = (name: string) => `import { test } from "bun:test";\ntest.skip(${JSON.stringify(name)}, () => {});\n`;
 const RED = `import { test } from "bun:test";
 for (let i = 1; i <= 25; i++) {
 	const n = String(i).padStart(2, "0");
@@ -88,8 +94,20 @@ test("hangs", async () => {
 const EXITS = `import { test } from "bun:test";
 test("exits before the report", () => { process.exit(0); });
 `;
+// HANG after 6 MiB of output: the part's log passes the world's 5 MB report cap, so its import is refused. The sleep is the
+// hang the part's cap must end; it runs in the code under test, not in this file's own tests.
+const HANG_LOUD = `import { test } from "bun:test";
+test("hangs loudly", async () => {
+	for (let i = 0; i < 6; i++) process.stdout.write(\`\${"x".repeat(1 << 20)}\\n\`);
+	await Bun.sleep(10_000_000);
+}, 100_000_000);
+`;
+// A failing security test (surface/src/test-run.ts SECURITY_TEST_PATHS): a gate test the PR breaks (fix round 1, F4).
+const GATE_RED = `import { test } from "bun:test";
+test("refuses a forged approve", () => { throw new Error("the gate let it through"); });
+`;
 
-const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7 } as const;
+const PR = { green: 1, red: 2, solo: 3, env: 4, hang: 5, exit: 6, space: 7, gate: 8, skipped: 9, loud: 10 } as const;
 type PrName = keyof typeof PR;
 const PR_FILES: Record<PrName, Record<string, string>> = {
 	green: { "a.test.ts": PASS("a") },
@@ -98,8 +116,11 @@ const PR_FILES: Record<PrName, Record<string, string>> = {
 	env: { "env.test.ts": ENV_DUMP },
 	hang: { "hang.test.ts": HANG },
 	exit: { "exits.test.ts": EXITS },
-	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling.
-	space: { " a.test.ts": PASS("space a"), "a.test.ts": PASS("a") },
+	// git lists ` a.test.ts` first (a space sorts before `a`); trimmed, it would name its sibling. Only the skipped one runs alone.
+	space: { " a.test.ts": SKIPPED("space a"), "a.test.ts": PASS("a") },
+	gate: { "gates/test/gate.test.ts": GATE_RED },
+	skipped: { "a.test.ts": SKIPPED("a skipped") },
+	loud: { "loud.test.ts": HANG_LOUD },
 };
 
 interface Fixture {
@@ -126,7 +147,10 @@ beforeAll(() => {
 	const head = {} as Record<PrName, string>;
 	for (const name of Object.keys(PR) as PrName[]) {
 		g(work, "checkout", "-q", "--detach", main);
-		for (const [f, text] of Object.entries(PR_FILES[name])) writeFileSync(join(work, f), text);
+		for (const [f, text] of Object.entries(PR_FILES[name])) {
+			mkdirSync(dirname(join(work, f)), { recursive: true });
+			writeFileSync(join(work, f), text);
+		}
 		g(work, "add", "-A");
 		g(work, "commit", "-q", "-m", `pr ${name}`);
 		head[name] = g(work, "rev-parse", "HEAD");
@@ -140,13 +164,28 @@ beforeAll(() => {
 
 // ---- a world: ledger, runs root, as2test root, install, fake gh and sudo --------------------------------
 
+// `gh api <path>` answers `<root>/api/<path, / as _>` when a test saved one (`saveApi`: the starter's compare and commit reads);
+// any other `gh api` (the runner's `as2/full-suite` status post) answers `{}`, or fails while `<root>/status-fails` exists.
 const GH = `#!/bin/sh
 dir="$(cd "$(dirname "$0")/.." && pwd)"
 printf '%s\\n' "$*" >> "$dir/gh.log"
 if [ "$1 $2" = "pr view" ] && [ -f "$dir/prs/$3.json" ]; then cat "$dir/prs/$3.json"; exit 0; fi
+if [ "$1" = api ] && [ -f "$dir/api/$(printf '%s' "$2" | tr / _)" ]; then cat "$dir/api/$(printf '%s' "$2" | tr / _)"; exit 0; fi
+if [ "$1" = api ] && [ ! -f "$dir/status-fails" ]; then echo '{}'; exit 0; fi
+if [ "$1" = api ]; then echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; fi
 echo "no pull requests found" >&2
 exit 1
 `;
+/** The fake gh's `as2/full-suite` status posts, in order: `<state> <sha>`. */
+const statusPosts = (w: World): string[] => {
+	const log = join(w.root, "gh.log");
+	if (!existsSync(log)) return [];
+	return readFileSync(log, "utf8").trim().split("\n").filter((c) => c.startsWith("api -X ")).map((c) => {
+		const m = /^api -X POST repos\/(\S+)\/statuses\/([0-9a-f]{40}) -f state=(\S+) -f context=as2\/full-suite -f description=/.exec(c);
+		if (!m || m[1] !== OWNER_REPO) throw new Error(`unexpected gh api call: ${c}`);
+		return `${m[3]} ${m[2]}`;
+	});
+};
 // Every call is logged to sudo.log, one line each: `refresh`, or the wrapper subcommand and its run id.
 const SUDO = `#!/bin/sh
 log="$(dirname "$0")/../sudo.log"
@@ -203,9 +242,11 @@ interface World {
 	ledger: Ledger;
 	/** Run `fn` with the ledger clock `ms` in the past. */
 	ago: <T>(ms: number, fn: () => T) => T;
+	/** Run `fn` with the ledger clock stopped at `iso`: every row it writes has that created_at. */
+	pin: <T>(iso: string, fn: () => T) => T;
 }
 
-function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number } = {}): World {
+function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number } = {}): World {
 	const root = realpathSync(tmp("trun"));
 	roots.push(root);
 	const gid = statSync(root).gid;
@@ -219,13 +260,22 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	writeFileSync(join(home, ".config", "git", "config"), evil);
 	const ledgerPath = join(home, ".agent-system-2", "ledger.db");
 	let offset = 0;
-	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false, clock: () => new Date(Date.now() - offset).toISOString() });
+	let pinned: string | null = null;
+	const ledger = Ledger.open(ledgerPath, { create: true, backup: false, backupOnOpen: false, clock: () => pinned ?? new Date(Date.now() - offset).toISOString() });
 	const ago = <T>(ms: number, fn: () => T): T => {
 		offset = ms;
 		try {
 			return fn();
 		} finally {
 			offset = 0;
+		}
+	};
+	const pin = <T>(iso: string, fn: () => T): T => {
+		pinned = iso;
+		try {
+			return fn();
+		} finally {
+			pinned = null;
 		}
 	};
 
@@ -272,7 +322,8 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 
 	const cap = o.capMin ?? 2;
 	const config = join(root, "config.yml");
-	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n`);
+	const workers = o.fullWorkers === undefined ? "" : `  fullWorkers: ${o.fullWorkers}\n`;
+	writeFileSync(config, `testRunner:\n  repos:\n    - origin: ${OWNER_REPO}\n      command: bun test\n  fullCapMin: ${cap}\n  soloCapMin: ${cap}\n  reportCapMb: 5\n  queueMaxMin: ${o.queueMaxMin ?? 60}\n${workers}`);
 
 	const env: Record<string, string> = {
 		PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "en_US.UTF-8", USER: process.env.USER ?? "jo",
@@ -284,7 +335,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
-	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago };
+	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago, pin };
 }
 
 /** An open autonomous workload on the world's checkout, with one open slice. */
@@ -296,9 +347,9 @@ function workload(w: World): { wl: string; slice: string } {
 }
 
 /** What the fake gh answers for `pr view <N>`. */
-function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean }): void {
+function setPr(w: World, n: number, o: { sha: string; headRefName: string; state?: string; isCrossRepository?: boolean; baseRefName?: string; body?: string }): void {
 	writeFileSync(join(w.root, "prs", `${n}.json`), JSON.stringify({
-		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: "main", isCrossRepository: o.isCrossRepository ?? false,
+		number: n, state: o.state ?? "OPEN", headRefOid: o.sha, headRefName: o.headRefName, baseRefName: o.baseRefName ?? "main", isCrossRepository: o.isCrossRepository ?? false, body: o.body ?? "",
 	}));
 }
 
@@ -345,10 +396,10 @@ async function resultOf(w: World, wl: string, runId: string, timeoutMs = 120_000
 }
 
 /**
- * `<run dir>/result.json` as a FIFO: the runner's write of it blocks, after its `test-run:`
- * transaction has committed, until the returned function reads it.
+ * Seed result.json as a FIFO. Atomic publication must replace it without blocking; the
+ * returned reader observes the regular result file after the ledger entry is visible.
  */
-function holdResultJson(w: World, runId: string): () => Promise<string> {
+function seedResultFifo(w: World, runId: string): () => Promise<string> {
 	const dir = join(w.runs, runId);
 	mkdirSync(dir, { recursive: true });
 	const fifo = join(dir, "result.json");
@@ -383,6 +434,12 @@ function staleRow(w: World): void {
 
 // ---- the starter -------------------------------------------------------------------------------------
 
+/** Jo's `train <wl> <prs>` as the surface writes it: the instruction, then the surface's `train:` naming it; returns that entry's id. */
+function joTrains(w: World, wl: string, prs: number[]): string {
+	const id = w.ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, body: trainInstructionBody(wl, prs), author: "jo", channel: "surface" });
+	return w.ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(prs, id) });
+}
+
 describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 	test("a fork PR and a closed PR are refused; an unbound branch is refused, then accepted once a push-dest: binds it; every gh call names -R", async () => {
 		const w = world();
@@ -411,9 +468,12 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		const runId = /^test-run (tr-[a-z0-9]+) /.exec(bound.out)![1]!;
 		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
 
-		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		// The run's own `as2/full-suite` status posts (statusPosts, which checks they name -R's repo too) are the only other gh calls.
+		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").filter((c) => !c.startsWith("api "));
 		expect(calls).toHaveLength(4);
-		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository`);
+		for (const c of calls) expect(c).toBe(`pr view ${PR.green} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`);
+		await until("the green's status", () => statusPosts(w).length === 1);
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
 	});
 
 	test("a repo the profile does not serve is refused before any gh call", () => {
@@ -500,6 +560,387 @@ describe("start: which PRs run (§ 2.2 steps 1–2)", () => {
 		expect(r.err).toContain("plumb/x is not one this workload is bound to");
 		expect(testRuns(w.ledger.entries(wl))).toEqual([]);
 	});
+
+	// PLAN wl-mv8s8srodefytc § 1 D4: the merge train's stop hold, evaluated by the starter inside its reservation transaction. The train's rows are
+	// written as the surface writes them (Jo's instruction, then the `train:` naming it); questions are the lane's, answers Jo's.
+	/** The lane's question on slice `id` (added when missing). */
+	function trainAsk(w: World, wl: string, id: string, options: string[]): string {
+		if (!w.ledger.slice(id)) w.ledger.addSlice({ by: LANE, workloadId: wl, id, task: `train slice ${id}`, doneCondition: "Jo answered", inputs: "the PR" });
+		return w.ledger.raiseQuestion({ by: LANE, workloadId: wl, sliceId: id, body: `about ${id}`, options });
+	}
+	const joAnswers = (w: World, q: string, answer: string) => w.ledger.answerQuestion(q, { by: SURFACE_BY, author: "jo", channel: "surface", answer });
+	/** A start the starter must admit; its run is awaited to its `test-run:`, so the reservation is free for the next start. */
+	async function admitted(w: World, wl: string, pr: number, extra: string[] = []): Promise<TestRun> {
+		const r = start(w, wl, pr, extra);
+		expect(r.err).toBe("");
+		expect(r.code).toBe(START_EXIT.ok);
+		return resultOf(w, wl, /^test-run (tr-[a-z0-9]+) /.exec(r.out)![1]!);
+	}
+	/** A start the train holds: refused naming why, and no `test-requested:` written. */
+	function held(w: World, wl: string, pr: number, why: string): void {
+		const before = testRuns(w.ledger.entries(wl)).length;
+		const r = start(w, wl, pr);
+		expect(r.err).toBe(`test-runner start: ${why}`);
+		expect(r.code).toBe(START_EXIT.refused);
+		expect(testRuns(w.ledger.entries(wl))).toHaveLength(before);
+	}
+	// Each admitted run here is asked at a sha the PR's head is not (gh names origin/main), so it ends stale at once.
+	const A = PR.green;
+	const B = PR.red;
+	const C = PR.solo;
+
+	test("train (D4): an open merged/skip/stop or resolve/skip/stop question on #A's slice no longer holds #B; #A is admitted too", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B]);
+		for (const options of [["merged", "skip", "stop"], ["resolve", "skip", "stop"]]) {
+			trainAsk(w, wl, trainSliceId(wl, A), options);
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+			expect((await admitted(w, wl, A)).verdict).toBe("stale");
+		}
+	});
+
+	test("train: a stop (on either ask, or a red run's rerun/skip/stop) holds every PR until a newer train:, even after a later merged; a -full-2 run after a green -full-1 is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		for (const n of [A, B]) setPr(w, n, { sha: fx.main, headRefName: `plumb/${n}` });
+		joTrains(w, wl, [A, B, C]);
+		const asks: [string[], string][] = [
+			[["merged", "skip", "stop"], trainSliceId(wl, A)], [["resolve", "skip", "stop"], trainSliceId(wl, A)], [["rerun", "skip", "stop"], trainFullSliceId(wl, A, 1)],
+		];
+		for (const [k, [options, sl]] of asks.entries()) {
+			// Each round's rows are stamped k minutes ahead, a second apart, so its stop is strictly newer than the last round's resume and older than its own.
+			const at = (s: number) => -(k * 60_000 + s * 1000);
+			const q = w.ago(at(0), () => trainAsk(w, wl, sl, options));
+			w.ago(at(1), () => joAnswers(w, q, "stop"));
+			const stopped = `merge train stopped by Jo at #${A} (${q}); \`train ${wl} <N…>\` resumes it`;
+			held(w, wl, B, stopped);
+			held(w, wl, A, stopped);
+			const later = w.ago(at(2), () => trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]));
+			w.ago(at(3), () => joAnswers(w, later, "merged"));
+			held(w, wl, B, stopped);
+			w.ago(at(4), () => joTrains(w, wl, [900 + k]));
+			expect((await admitted(w, wl, B)).verdict).toBe("stale");
+		}
+		// A green on -full-1 completes it; the PR's next run goes on a new -full-2.
+		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 1)])).verdict).toBe("green");
+		await until("the settle of -full-1", () => w.ledger.slice(trainFullSliceId(wl, A, 1))?.state === "done");
+		w.ledger.addSlice({ by: LANE, workloadId: wl, id: trainFullSliceId(wl, A, 2), task: "suite #A again", doneCondition: "a green", inputs: "the PR" });
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		expect((await admitted(w, wl, A, ["--slice", trainFullSliceId(wl, A, 2)])).verdict).toBe("stale");
+	});
+
+	test("train: a workload with no train: entry is never held, whatever its slices are named", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, B, { sha: fx.main, headRefName: `plumb/${B}` });
+		joBinds(w, wl, [A, B]);
+		const stop = trainAsk(w, wl, trainSliceId(wl, A), ["merged", "skip", "stop"]);
+		joAnswers(w, stop, "stop");
+		trainAsk(w, wl, trainSliceId(wl, C), ["merged", "skip", "stop"]);
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+	});
+
+	// PLAN wl-mv8s8srodefytc § 1b: on a train, the starter lands dependencies first, on gh, before the reservation.
+	test("train: #B whose body says Depends-on: #A is refused naming #A while #A is OPEN, admitted once #A is MERGED; a base other than main is refused; off a train the same PR is admitted", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		const ghCalls = () => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n");
+		const stacked = { sha: fx.main, headRefName: `plumb/${B}`, body: `Stacked on the API.\nDepends-on: #${A}\n` };
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		setPr(w, B, stacked);
+		joTrains(w, wl, [B, A]);
+		held(w, wl, B, `#${B} depends on #${A} (OPEN): land #${A} first`);
+		expect(ghCalls().slice(-2)).toEqual([
+			`pr view ${B} -R ${OWNER_REPO} --json number,state,headRefOid,headRefName,baseRefName,isCrossRepository,body`, `pr view ${A} -R ${OWNER_REPO} --json state`,
+		]);
+
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}`, state: "MERGED" });
+		expect((await admitted(w, wl, B)).verdict).toBe("stale");
+
+		setPr(w, B, { ...stacked, baseRefName: `plumb/${A}` });
+		held(w, wl, B, `#${B} targets plumb/${A}; retarget it to main once its dependency has landed`);
+
+		// Off a train: the same PR, its dependency OPEN again and its base still the dependency's head, runs as today, with no dependency lookup.
+		setPr(w, A, { sha: fx.main, headRefName: `plumb/${A}` });
+		const other = workload(w).wl;
+		joBinds(w, other, [B]);
+		const before = ghCalls().length;
+		expect((await admitted(w, other, B)).verdict).toBe("stale");
+		expect(ghCalls().slice(before).filter((c) => c.endsWith("--json state"))).toEqual([]);
+	});
+
+	// jo-issues #213: a merge train's run never ends on the lock-wait cap; a dead holder is caught by lockHolderStale, not by the cap.
+	test("train: a merge train's run waits past queueMaxMin behind a live holder without ending queued too long, then takes the lock once it is free and settles", async () => {
+		const w = world({ queueMaxMin: 0.01 });
+		const { wl, slice } = workload(w);
+		setPr(w, A, { sha: fx.head.green, headRefName: `plumb/${A}` });
+		joTrains(w, wl, [A]);
+		const capMs = 0.01 * 60_000;
+		const db = lockDbOf(w);
+		db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000);
+		const kids: Child[] = [];
+		try {
+			// Requested at a sha the PR head is not, so once it holds the lock it ends stale quickly.
+			const runId = request(w, wl, slice, A, fx.main);
+			const child = spawnRun(w, runId);
+			kids.push(child);
+			const first = (await until("the first queued poll", () => marks(w, runId, "queued")[0]))!.at as number;
+			// The run's wait began before its first queued mark, so a mark past first + the cap is past the cap; three caps is well past it.
+			await until("three queued polls past three caps", () => {
+				const s = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)?.results[0];
+				if (s) throw new Error(`the train run settled while the holder was live: ${s.verdict} ${s.reason ?? ""}\n--- runner.log ---\n${runnerLog(w, runId)}`);
+				return marks(w, runId, "queued").filter((m) => (m.at as number) > first + 3 * capMs).length >= 3;
+			});
+			expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toEqual([]);
+			expect(queueRows(w).map((q) => q.runId)).toEqual([runId]);
+			expect(lockRow(db)!.runId).toBe("tr-otherholder");
+			db.query("DELETE FROM lock").run();
+			const run = await resultOf(w, wl, runId);
+			expect(run.reason).not.toBe("queued too long");
+			expect(run.verdict).toBe("stale");
+			expect(marks(w, runId, "acquired")).toHaveLength(1);
+			await child.exited;
+		} finally {
+			await reap(kids);
+			db.close();
+		}
+	});
+});
+
+// PLAN wl-mvpwkpqobyp20w D4-D5: a merge train's request at a head that descends from the PR's last green only by decision-log
+// commits is green at once, with no run. Requests and results are seeded as the runner writes them; GitHub's compare and
+// get-a-commit answers are saved for the fake gh (`saveApi`). Every head that falls through is fx.main, which the PR's ref is
+// not, so its run ends stale at once.
+describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
+	const P = PR.green;
+	const S = "5".repeat(40);
+	const LOG = ".ai/decision-log/2026-10-26--1200--jev--a-close.md";
+	const saveApi = (w: World, path: string, json: unknown) => {
+		mkdirSync(join(w.root, "api"), { recursive: true });
+		writeFileSync(join(w.root, "api", path.replaceAll("/", "_")), JSON.stringify(json));
+	};
+	/** GitHub's compare of `from`...`to` on OWNER_REPO, each commit with its own files (a merge with two parents lists none read). */
+	function compare(w: World, from: string, to: string, commits: { sha: string; parents?: number; files?: string[] }[]): void {
+		saveApi(w, `repos/${OWNER_REPO}/compare/${from}...${to}`, {
+			status: "ahead", total_commits: commits.length,
+			commits: commits.map((c) => ({ sha: c.sha, parents: Array.from({ length: c.parents ?? 1 }, (_, i) => ({ sha: String(i).repeat(40) })) })),
+		});
+		for (const c of commits) saveApi(w, `repos/${OWNER_REPO}/commits/${c.sha}`, [{ sha: c.sha, files: (c.files ?? []).map((filename) => ({ filename, status: "added" })) }]);
+	}
+	type Seeded = "green" | "red" | "error" | "pending";
+	/** A request for PR P at `sha` on `wl`, and its result as the runner writes it (full 7/0/0, or 6/1/0 for a red), unless pending. */
+	function seed(w: World, wl: string, sha: string, verdict: Seeded, agoMs = 0): string {
+		const slice = w.ledger.slices(wl)[0]!.id;
+		const runId = request(w, wl, slice, P, sha, agoMs);
+		if (verdict !== "pending") finish(w, wl, runId, sha, verdict, Math.max(agoMs - 1000, 0));
+		return runId;
+	}
+	function finish(w: World, wl: string, runId: string, sha: string, verdict: Exclude<Seeded, "pending">, agoMs = 0): void {
+		const red = verdict === "red";
+		const run: TestRun = {
+			runId, verdict, sha, pr: P, reason: verdict === "green" || red ? null : `seeded ${verdict}`, headAtEnd: sha, base: fx.main, mergeBase: fx.main,
+			full: verdict === "error" ? null : { pass: red ? 6 : 7, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 5, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "t > x", firstError: "error: x" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+		};
+		const slice = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.request.slice;
+		w.ago(agoMs, () => w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRunBody(run) }));
+	}
+	/** A train on P whose PR head is `head` on branch `wl/<owner>` (an owner workload on the same checkout), with no request yet. */
+	function trainWorld(head: string) {
+		const w = world();
+		const { wl: train } = workload(w);
+		const { wl: owner } = workload(w);
+		const entry = joTrains(w, train, [P]);
+		setPr(w, P, { sha: head, headRefName: `wl/${owner}` });
+		return { w, train, owner, entry };
+	}
+	/** A fix workload bound to P on `train` through its `train:` entry, as the tick opens one. */
+	function fixOf(w: World, train: string, entry: string): string {
+		const { wl } = workload(w);
+		w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: trainFixBody({ repo: OWNER_REPO, pr: P, train, trainEntry: entry }) });
+		return wl;
+	}
+	const runIdOf = (out: string): string => /^test-run (tr-[a-z0-9]+) /.exec(out)![1]!;
+	/** A start that carries R: exit 0, no runner, the line ending ` carried <R>`, a green at the head with R's counts, its slice done on it. */
+	function carried(w: World, train: string, from: string, fromSha: string, head: string, extra: string[] = []): TestRun & { entryId: string } {
+		const r = start(w, train, P, extra);
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toMatch(new RegExp(`^test-run tr-[a-z0-9]+ runner none sha ${head} slice sl-\\S+ log none bound-by in-[a-z0-9]+ carried ${from}$`));
+		const id = runIdOf(r.out);
+		const rec = testRuns(w.ledger.entries(train)).find((x) => x.request.runId === id)!;
+		// testRuns parsed the green's body: a carried green is a shape parseTestRun accepts.
+		const res = rec.result!;
+		expect(res).toMatchObject({ verdict: "green", sha: head, reason: `carried from ${from} at ${fromSha} (decision-log only)`, headAtEnd: null, full: { pass: 7, fail: 0, skip: 0 } });
+		const slice = w.ledger.slice(rec.request.slice)!;
+		expect(slice.state).toBe("done");
+		expect(slice.artifact).toContain(`test-run ${id}: green at ${head} on PR #${P}`);
+		expect(slice.artifact).toEndWith(`; carried from ${from} at ${fromSha} (decision-log only)`);
+		expect(existsSync(join(w.runs, id))).toBe(false);
+		return res;
+	}
+	/** A start that falls through to a run: a runner is spawned, and its run ends stale (the head is not the PR's ref). */
+	async function ran(w: World, train: string, extra: string[] = []): Promise<void> {
+		const r = start(w, train, P, extra);
+		expect(r.err).toBe("");
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toMatch(/^test-run tr-[a-z0-9]+ runner \d+ sha [0-9a-f]{40} slice sl-\S+ log \/\S+( bound-by in-[a-z0-9]+)?$/);
+		expect((await resultOf(w, train, runIdOf(r.out))).verdict).toBe("stale");
+	}
+
+	test("a green at S and one decision-log commit to H: a green at H, success posted on H, no runner; again at H carries from that green (identical, no compare)", () => {
+		const H = fx.main;
+		const { w, train } = trainWorld(H);
+		const R = seed(w, train, S, "green", 5000);
+		compare(w, S, H, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const c = carried(w, train, R, S, H);
+		expect(statusPosts(w)).toEqual([`success ${H}`]);
+		expect(readFileSync(join(w.root, "gh.log"), "utf8")).toContain(`-f description=carried from run ${R} at ${S.slice(0, 7)} (decision-log only)`);
+		expect(readdirSync(w.runs)).toEqual([]);
+		const calls = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").length;
+		carried(w, train, c.runId, H, H);
+		const after = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").slice(calls);
+		expect(after.filter((l) => l.includes("/compare/"))).toEqual([]);
+		expect(statusPosts(w)).toEqual([`success ${H}`, `success ${H}`]);
+	});
+
+	test("a commit touching another path, and a merge commit touching only .ai/decision-log/, each fall through to a run", async () => {
+		for (const commits of [[{ sha: "6".repeat(40), files: [LOG] }, { sha: "7".repeat(40), files: [LOG, "surface/src/x.ts"] }], [{ sha: "8".repeat(40), parents: 2, files: [LOG] }]]) {
+			const { w, train } = trainWorld(fx.main);
+			seed(w, train, S, "green", 5000);
+			compare(w, S, fx.main, commits);
+			await ran(w, train);
+			expect(statusPosts(w)).toEqual([]);
+		}
+	});
+
+	test("the #305 fixture: a green at aebe37a4 and GitHub's saved answers for cde03460 carry", () => {
+		const c305 = carry305(OWNER_REPO);
+		const { w, train } = trainWorld(c305.head);
+		const R = seed(w, train, c305.green, "green", 5000);
+		for (const [path, json] of Object.entries(c305.answers)) saveApi(w, path, json);
+		carried(w, train, R, c305.green, c305.head);
+		expect(statusPosts(w)).toEqual([`success ${c305.head}`]);
+	});
+
+	test("a newer red, a newer error, and a still-pending request after the green each block the carry", async () => {
+		for (const newer of ["red", "error", "pending"] as const) {
+			const { w, train, owner } = trainWorld(fx.main);
+			seed(w, train, S, "green", 10_000);
+			compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+			// on the owner, so a pending request does not hold the train's reservation
+			seed(w, owner, S, newer, 5000);
+			await ran(w, train);
+		}
+	});
+
+	test("reversed completion: an older request finishing green after a newer one finished red does not carry", async () => {
+		const { w, train, owner } = trainWorld(fx.main);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const older = seed(w, train, S, "pending", 20_000);
+		seed(w, owner, S, "red", 15_000);
+		finish(w, train, older, S, "green", 5000);
+		await ran(w, train);
+	});
+
+	test("a green on a closed fix workload carries while the closed owner's older result is red", () => {
+		const { w, train, owner, entry } = trainWorld(fx.main);
+		seed(w, owner, S, "red", 20_000);
+		const fix = fixOf(w, train, entry);
+		const R = seed(w, fix, S, "green", 10_000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		for (const wl of [owner, fix]) {
+			for (const s of w.ledger.slices(wl)) w.ledger.cancelSlice(s.id, { by: LANE });
+			w.ledger.closeWorkload(wl, { by: SURFACE_BY });
+		}
+		carried(w, train, R, S, fx.main);
+	});
+
+	test("equal created_at stamps pick the later-inserted request, within one workload and across the train, owner and fix workloads", async () => {
+		const at = new Date(Date.now() - 60_000).toISOString();
+		const pinned = (w: World, wl: string, verdict: "green" | "red") => w.pin(at, () => seed(w, wl, S, verdict));
+		for (const [first, second] of [["train", "train"], ["owner", "fix"], ["fix", "train"], ["train", "owner"]] as const) {
+			for (const order of [["red", "green"], ["green", "red"]] as const) {
+				const t = trainWorld(fx.main);
+				const wls = { train: t.train, owner: t.owner, fix: fixOf(t.w, t.train, t.entry) };
+				compare(t.w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+				pinned(t.w, wls[first], order[0]);
+				const later = pinned(t.w, wls[second], order[1]);
+				if (order[1] === "green") carried(t.w, t.train, later, S, fx.main);
+				else await ran(t.w, t.train);
+			}
+		}
+	});
+
+	test("a source change between D4b and D4c falls through to the run", async () => {
+		const { w, train, entry } = trainWorld(fx.main);
+		seed(w, train, S, "green", 10_000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const fix = fixOf(w, train, entry);
+		arm(w, train, "carry-evidence");
+		const p = Bun.spawn([process.execPath, RUNNER, "start", train, String(P), "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		await reached(w, train, "carry-evidence");
+		// a newer green at another sha on a fix workload: a different authority than the one compared
+		seed(w, fix, "9".repeat(40), "green");
+		go(w, train, "carry-evidence");
+		const [code, out] = [await p.exited, (await new Response(p.stdout).text()).trim()];
+		expect(code).toBe(START_EXIT.ok);
+		expect(out).toMatch(/ runner \d+ /);
+		expect(out).not.toContain(" carried ");
+		expect(marks(w, train, "carry-open")).toHaveLength(1);
+		expect(marks(w, train, "carry-written")).toEqual([]);
+		expect((await resultOf(w, train, runIdOf(out))).verdict).toBe("stale");
+	});
+
+	test("the fake gh records no call while the carry transaction is open", async () => {
+		const { w, train } = trainWorld(fx.main);
+		const R = seed(w, train, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		const calls = () => readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").length;
+		arm(w, train, "carry-open");
+		arm(w, train, "carry-written");
+		const p = Bun.spawn([process.execPath, RUNNER, "start", train, String(P), "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		await reached(w, train, "carry-open");
+		const open = calls();
+		go(w, train, "carry-open");
+		await reached(w, train, "carry-written");
+		expect(calls()).toBe(open);
+		go(w, train, "carry-written");
+		expect(await p.exited).toBe(START_EXIT.ok);
+		expect((await new Response(p.stdout).text()).trim()).toEndWith(` carried ${R}`);
+		expect(calls()).toBe(open + 1);
+		expect(statusPosts(w)).toEqual([`success ${fx.main}`]);
+	});
+
+	test("a failed status post keeps the carried green; a second request at the same H on a new slice posts again with no run", () => {
+		const { w, train } = trainWorld(fx.main);
+		const R = seed(w, train, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		writeFileSync(join(w.root, "status-fails"), "");
+		const r = start(w, train, P);
+		expect(r.code).toBe(START_EXIT.ok);
+		expect(r.out).toEndWith(` carried ${R}`);
+		expect(r.err).toContain(`status as2/full-suite success on ${fx.main} not posted: gh: Validation Failed (HTTP 422)`);
+		const first = testRuns(w.ledger.entries(train)).find((x) => x.request.runId === runIdOf(r.out))!.result!;
+		expect(first).toMatchObject({ verdict: "green", sha: fx.main });
+		rmSync(join(w.root, "status-fails"));
+		w.ledger.addSlice({ by: LANE, workloadId: train, id: "sl-repost", task: "the suite again", doneCondition: "a green", inputs: "the PR" });
+		carried(w, train, first.runId, fx.main, fx.main, ["--slice", "sl-repost"]);
+		expect(statusPosts(w)).toEqual([`success ${fx.main}`, `success ${fx.main}`]);
+		expect(readdirSync(w.runs)).toEqual([]);
+	});
+
+	test("a non-train request at such a head still spawns a run", async () => {
+		const w = world();
+		const { wl } = workload(w);
+		setPr(w, P, { sha: fx.main, headRefName: `wl/${wl}` });
+		seed(w, wl, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		await ran(w, wl);
+		expect(readFileSync(join(w.root, "gh.log"), "utf8")).not.toContain("/compare/");
+	});
 });
 
 describe("start: the reservation (§ 2.2 step 3)", () => {
@@ -578,7 +1019,7 @@ describe("start: the reservation (§ 2.2 step 3)", () => {
 // ---- whole runs ------------------------------------------------------------------------------------------
 
 describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
-	test("green: start prints its line, the run settles the slice it added; ./ exact path; the bundle clone has history and the trusted-main tag; no smudge filter ran; a sweep after each part; no message", async () => {
+	test("green: start prints its line, the run settles the slice it added; the changed file the full part ran gets no solo part; the bundle clone has history and the trusted-main tag; no smudge filter ran; a sweep after each part; no message", async () => {
 		const w = world();
 		const { wl } = workload(w);
 		setPr(w, PR.green, { sha: fx.head.green, headRefName: `wl/${wl}` });
@@ -597,17 +1038,21 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const run = await resultOf(w, wl, runId!);
 		expect(run).toMatchObject({ verdict: "green", sha: fx.head.green, headAtEnd: fx.head.green, base: fx.main, mergeBase: fx.main, runDir: join(w.runs, runId!) });
 		expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-		// `./a.test.ts` alone runs a.test.ts only: xa.test.ts, which `a.test.ts` as a substring would also match, is not in it.
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./a.test.ts", pass: 1, fail: 0, exit: 0, error: null })]);
+		// PLAN wl-mvq4edh02r5z40 D1: the full part ran a test of the changed a.test.ts, so it does not run alone.
+		expect(run.solo).toEqual([]);
+		expect(subsOf(w, runId!)).not.toContain("solo");
+		expect(runnerLog(w, runId!)).toContain("solo parts: none");
 		expect(run.preflight).toContain("probe:");
 		await until("the settle", () => w.ledger.slice(slice!)?.state === "done");
-		expect(w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: ./a.test.ts 1/0; ${join(w.runs, runId!)}`);
+		expect(w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: none; ${join(w.runs, runId!)}`);
+		// The ledger settles before result.json is published and the run lock is released.
+		await until(`runner ${pid} gone`, () => !alive(Number(pid)));
 		expect(JSON.parse(readFileSync(join(w.runs, runId!, "result.json"), "utf8"))).toMatchObject({ runId, verdict: "green", sha: fx.head.green });
-		for (const f of ["full.xml", "full.log", "solo-1.xml", "solo-1.log"]) expect(existsSync(join(w.runs, runId!, f))).toBe(true);
+		for (const f of ["full.xml", "full.log"]) expect(existsSync(join(w.runs, runId!, f))).toBe(true);
 		expect(heldMessages(w, wl)).toEqual([]);
 
 		expect(existsSync(join(w.root, "SMUDGED"))).toBe(false);
-		expect(marks(w, runId!, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./a.test.ts"]);
+		expect(marks(w, runId!, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
 
 		// The handoff: `_as2test`'s clone from the bundle is a real repository.
 		const clone = join(workDirOf(runId!, w.as2), "repo");
@@ -631,11 +1076,12 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 	test("every wrapper call starts in the as2test root, never the 0700 run dir _as2test cannot read (item 24, Jo's diagnosis)", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
-		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		// A red PR, so a solo part and base's parts run too.
+		const runId = request(w, wl, slice, PR.red, fx.head.red);
 		await spawnRun(w, runId).exited;
-		expect((await resultOf(w, wl, runId)).verdict).toBe("green");
+		expect((await resultOf(w, wl, runId)).verdict).toBe("red");
 		const calls = readFileSync(join(w.root, "sudo-cwd.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId);
-		expect(calls.map(([sub]) => sub).filter((s, i, all) => all.indexOf(s) === i).sort()).toEqual(["full", "prepare", "probe", "solo", "sweep"]);
+		expect(calls.map(([sub]) => sub).filter((s, i, all) => all.indexOf(s) === i).sort()).toEqual(["base-prepare", "base-solo", "full", "prepare", "probe", "solo", "sweep"]);
 		for (const [sub, , cwd] of calls) expect({ sub, cwd }).toEqual({ sub, cwd: w.as2 });
 	});
 
@@ -645,12 +1091,44 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const runId = request(w, wl, slice, PR.space, fx.head.space);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
-		expect(run.solo).toEqual([
-			expect.objectContaining({ file: "./ a.test.ts", pass: 1, fail: 0, error: null }),
-			expect.objectContaining({ file: "./a.test.ts", pass: 1, fail: 0, error: null }),
-		]);
+		// ` a.test.ts` only skips, so it alone runs alone: its one skipped case, never its passing sibling's case.
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./ a.test.ts", pass: 0, fail: 0, skip: 1, error: null })]);
 		expect(run.verdict).toBe("green");
 	});
+
+	test("PLAN wl-mvq4edh02r5z40 D1: all-pass with a changed file whose cases all skip runs that file alone, by its exact ./ path", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.skipped, fx.head.skipped);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.full).toMatchObject({ pass: 1, fail: 0, skip: 1, exit: 0, error: null });
+		// `./a.test.ts` alone runs a.test.ts only: xa.test.ts, which `a.test.ts` as a substring would also match, is not in it.
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./a.test.ts", pass: 0, fail: 0, skip: 1, exit: 0, error: null })]);
+		expect(subsOf(w, runId).filter((s) => s === "solo")).toHaveLength(1);
+		expect(run.verdict).toBe("green");
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./a.test.ts"]);
+	});
+
+	test("fullWorkers (wl-mvg2kzuvwngdmo): the trusted phase writes it into caps.json, and runner.log carries `full workers <n>` after the lock and before the PR full part; absent, n is 1", async () => {
+		for (const [workers, n] of [[3, 3], [undefined, 1]] as const) {
+			const w = world({ fullWorkers: workers });
+			const { wl, slice } = workload(w);
+			const runId = request(w, wl, slice, PR.green, fx.head.green);
+			await spawnRun(w, runId).exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run.verdict).toBe("green");
+			expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
+			expect(JSON.parse(readFileSync(join(w.as2, "stage", runId, "caps.json"), "utf8"))).toEqual({ fullCapMin: 2, soloCapMin: 2, fullWorkers: n });
+			const lines = runnerLog(w, runId).split("\n");
+			const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
+			const workersLine = at(/ full workers \d+$/);
+			expect(lines.filter((l) => / full workers /.test(l))).toHaveLength(1);
+			expect(lines[workersLine]).toMatch(new RegExp(`^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z full workers ${n}$`));
+			expect(at(/ took the lock$/)).toBeLessThan(workersLine);
+			expect(at(new RegExp(` full ${runId} → exit `))).toBeGreaterThan(workersLine);
+		}
+	}, 120_000);
 
 	test("red keeps the slice open with every failing name and its whole first error line (25 of them), and messages the orchestrator when no lane holds the workload", async () => {
 		const w = world();
@@ -688,17 +1166,69 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(heldMessages(w, wl)).toEqual([]);
 	});
 
-	test("a changed _spec.ts file failing alone with the suite green is red", async () => {
+	test("fix round 1 (F4), PLAN wl-mvq4edh02r5z40 D1: a run failing a gates/test/ test is red with no rerun of it, and while a lane holds the workload under a live lease sends exactly one security-red: and no test-run-failed:", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
+		expect(w.ledger.liveLaneHolders().some((h) => h.workloadId === wl)).toBe(true);
+		const runId = request(w, wl, slice, PR.gate, fx.head.gate);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("red");
+		// a security failure is never rerun, on the PR or on base
+		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", "gates/test/gate.test.ts > refuses a forged approve"]]);
+		expect(run.solo).toEqual([]);
+		expect(subsOf(w, runId).filter((s) => s === "solo" || s.startsWith("base-"))).toEqual([]);
+		expect(heldMessages(w, wl)).toEqual([{
+			body: `security-red: ${wl} ${slice} ${runId} ${fx.head.gate} 1 gates/test/gate.test.ts > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
+		}]);
+	});
+
+	// PLAN wl-mv8s8srodefytc rev 17.1 D2: every PR's run, train or not, posts `as2/full-suite` on exactly its sha; branch protection reads it.
+	test("the as2/full-suite status: only a terminal state on the sha the fetch confirmed (success, failure, error), none for stale; a failed post is logged and the verdict stands", async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const green = request(w, wl, slice, PR.green, fx.head.green);
+		await spawnRun(w, green).exited;
+		expect((await resultOf(w, wl, green)).verdict).toBe("green");
+		expect(statusPosts(w)).toEqual([`success ${fx.head.green}`]);
+		expect(runnerLog(w, green)).toContain(`status as2/full-suite success on ${fx.head.green} posted`);
+
+		writeFileSync(join(w.root, "status-fails"), "");
+		const other = workload(w);
+		const red = request(w, other.wl, other.slice, PR.red, fx.head.red);
+		await spawnRun(w, red).exited;
+		expect((await resultOf(w, other.wl, red)).verdict).toBe("red");
+		expect(statusPosts(w).slice(1)).toEqual([`failure ${fx.head.red}`]);
+		expect(runnerLog(w, red)).toContain(`status as2/full-suite failure on ${fx.head.red} not posted: gh: Validation Failed (HTTP 422)`);
+		expect(w.ledger.slice(other.slice)!.state).toBe("open");
+
+		const third = workload(w);
+		const error = request(w, third.wl, third.slice, PR.exit, fx.head.exit);
+		await spawnRun(w, error).exited;
+		expect((await resultOf(w, third.wl, error)).verdict).toBe("error");
+		expect(statusPosts(w).slice(2)).toEqual([`error ${fx.head.exit}`]);
+
+		// A stale run (the PR head is not the requested sha) tested nothing and posts nothing.
+		const fourth = workload(w);
+		const stale = request(w, fourth.wl, fourth.slice, PR.green, fx.main);
+		await spawnRun(w, stale).exited;
+		expect((await resultOf(w, fourth.wl, stale)).verdict).toBe("stale");
+		expect(statusPosts(w)).toHaveLength(3);
+	});
+
+	// PLAN wl-mvq4edh02r5z40 tradeoff 1 (Jo's (2)): coverage only guarantees the file ran, so a failure only alone goes unseen.
+	test("PLAN wl-mvq4edh02r5z40 D1: an all-pass full part that ran the changed _spec.ts file runs no solo part, so a failure only alone is not run", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.solo, fx.head.solo);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
 		expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0, error: null });
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./order_spec.ts", pass: 0, fail: 1 })]);
-		expect(run.verdict).toBe("red");
-		expect(run.failures).toEqual([{ part: "./order_spec.ts", name: "order_spec.ts > needs a clean clone", firstError: "error: state leaked by an earlier run is still here" }]);
-		expect(w.ledger.slice(slice)!.state).toBe("open");
+		expect(run.solo).toEqual([]);
+		expect(subsOf(w, runId)).not.toContain("solo");
+		expect(run.verdict).toBe("green");
+		expect(run.failures).toEqual([]);
 	});
 
 	test("the head moved mid-run: stale, nothing settled", async () => {
@@ -728,7 +1258,6 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(run.reason).toContain("nothing was tested");
 		expect(marks(w, runId, "spawn-prepare")).toEqual([]);
 		expect(marks(w, runId, "spawn-full")).toEqual([]);
-		expect(existsSync(workDirOf(runId, w.as2))).toBe(false);
 		expect(w.ledger.slice(slice)!.state).toBe("open");
 	});
 
@@ -752,13 +1281,13 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(heldMessages(w, wl)).toEqual([]);
 	});
 
-	// result.json is written after the `test-run:` transaction: held there, the run has decided and
-	// committed, and whatever lands now is the gap an after-the-fact settle would have raced.
+	// result.json is published after the test-run transaction. A successor/pause after that
+	// entry is visible must find the slice already settled; even a FIFO must not block release.
 	test("the settle commits with the test-run: entry: a successor request landing once the entry is visible finds the slice done, and the old green writes nothing after it", async () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
-		const release = holdResultJson(w, runId);
+		const release = seedResultFifo(w, runId);
 		const child = spawnRun(w, runId);
 		const run = await resultOf(w, wl, runId);
 		const atEntry = w.ledger.slice(slice)!;
@@ -777,7 +1306,7 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		const w = world();
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
-		const release = holdResultJson(w, runId);
+		const release = seedResultFifo(w, runId);
 		const child = spawnRun(w, runId);
 		await resultOf(w, wl, runId);
 		const atEntry = w.ledger.slice(slice)!;
@@ -825,21 +1354,62 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 		expect(dump.descendantGit).toBe(join(childLayout(workDir).shimDir, "git"));
 		const leftover = Number(readFileSync(join(workDir, "repo", "leftover.pid"), "utf8"));
 		expect(alive(leftover)).toBe(false);
-		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full", "./env.test.ts"]);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
 	});
 
-	test("a part past its cap: the wrapper kills its group and the part is error timeout", async () => {
+	/** The wrapper calls of a run that are a solo part or anything on base. */
+	const soloOrBase = (w: World, runId: string) => subsOf(w, runId).filter((s) => s === "solo" || s.startsWith("base-"));
+
+	test("PLAN wl-mvq4edh02r5z40 D0/D1: a full part past its cap ends the run: no solo or base part, its sweep and the head re-check still run, error naming the timeout, the stuck capture imported", async () => {
 		const w = world({ capMin: 0.05 });
 		const { wl, slice } = workload(w);
 		const runId = request(w, wl, slice, PR.hang, fx.head.hang);
 		await spawnRun(w, runId).exited;
 		const run = await resultOf(w, wl, runId);
-		expect(run.verdict).toBe("error");
+		expect(run).toMatchObject({ verdict: "error", reason: "full: timeout", headAtEnd: fx.head.hang });
 		expect(run.full).toMatchObject({ exit: WRAPPER_EXIT.timeout, error: "timeout" });
-		expect(run.solo).toEqual([expect.objectContaining({ file: "./hang.test.ts", error: "timeout" })]);
+		expect(run.solo).toEqual([]);
+		expect(soloOrBase(w, runId)).toEqual([]);
+		expect(marks(w, runId, "sweep").map((x) => x.after)).toEqual(["publish", "full"]);
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full part timed out: no solo or base parts");
+		expect(log).toContain("full.stuck.log imported");
+		expect(readFileSync(join(w.runs, runId, "full.stuck.log"), "utf8").length).toBeGreaterThan(0);
 		const pid = Number(readFileSync(join(workDirOf(runId, w.as2), "repo", "hang.pid"), "utf8"));
 		expect(alive(pid)).toBe(false);
-	});
+		expect(w.ledger.slice(slice)!.state).toBe("open");
+	}, 120_000);
+
+	test("PLAN wl-mvq4edh02r5z40 D0: a full part past its cap whose log import is refused (over the report cap) is still a timeout: no solo or base part", async () => {
+		const w = world({ capMin: 0.05 });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.loud, fx.head.loud);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toStartWith("full: timeout; report import refused: full.log is over the");
+		expect(run.full!.error).toStartWith("timeout; report import refused: full.log is over the");
+		expect(run.solo).toEqual([]);
+		expect(soloOrBase(w, runId)).toEqual([]);
+		expect(runnerLog(w, runId)).toContain("full part timed out: no solo or base parts");
+	}, 120_000);
+
+	test("PLAN wl-mvq4edh02r5z40 D0: the outlive sweep firing on the full part's call is a timeout whatever the wrapper's later exit: no solo or base part, error naming the timeout", async () => {
+		const w = world({ capMin: 0.05 });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.hang, fx.head.hang);
+		// The test knob: the runner sweeps 1 ms past the cap, before the wrapper's own cap path has ended the part.
+		await spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_OUTLIVE_MS: "1" }).exited;
+		const run = await resultOf(w, wl, runId);
+		const log = runnerLog(w, runId);
+		expect(log).toContain("full outlived its cap by 0.001 s; sweeping");
+		expect(log).toMatch(/ full tr-[a-z0-9]+ → (exit \d+|SIG[A-Z]+) \(after the outlive sweep\)/);
+		expect(log).toContain("full part timed out: no solo or base parts");
+		expect(run.verdict).toBe("error");
+		expect(run.reason).toStartWith("full: timeout");
+		expect(run.solo).toEqual([]);
+		expect(soloOrBase(w, runId)).toEqual([]);
+	}, 120_000);
 
 	test("retention: past the newest 10, a run loses its stage dir, its work dir (through the fenced cleanup) and its run dir's scratch files; logs, reports and result.json stay", async () => {
 		const w = world();
@@ -869,6 +1439,194 @@ describe("run: verdicts and the settle (§ 2.3 steps 2–8)", () => {
 			expect(existsSync(join(w.runs, id, "heartbeat"))).toBe(true);
 		}
 		expect(marks(w, runId, "spawn-cleanup")).toHaveLength(2);
+	});
+});
+
+// ---- red main: failing files rerun alone on base (PLAN wl-mv8s8srodefytc rev 17.1 D8, PLAN wl-mvq4edh02r5z40 D3) ---------
+
+const BROKEN = `import { test } from "bun:test";
+test("main is red", () => { throw new Error("broken on main"); });
+test("passes", () => {});
+`;
+// A pair that fails in the suite and passes alone: each records its load in the process, and the one loaded second fails.
+const ALONE = `import { test } from "bun:test";
+const g = globalThis as { __alone?: number };
+g.__alone = (g.__alone ?? 0) + 1;
+const me = g.__alone;
+test("passes alone", () => { if (me > 1) throw new Error("the other file of the pair ran first in this process"); });
+`;
+const TOUCHED = "// touched by the PR\n";
+
+/**
+ * The world's GitHub with a red main: main gains `mainFiles` (broken.test.ts, one failing test, by default), then each PR is one
+ * commit on that main at refs/pull/<N>/head, its files written over main's.
+ */
+function redMain(w: World, prs: Record<number, Record<string, string>>, mainFiles: Record<string, string> = { "broken.test.ts": BROKEN }): { main: string; head: Record<number, string> } {
+	const work = join(w.root, "red-main");
+	g(w.root, "clone", "-q", w.origin, work);
+	for (const [f, text] of Object.entries(mainFiles)) {
+		mkdirSync(dirname(join(work, f)), { recursive: true });
+		writeFileSync(join(work, f), text);
+	}
+	g(work, "add", "-A");
+	g(work, "commit", "-q", "-m", "main goes red");
+	const main = g(work, "rev-parse", "HEAD");
+	g(work, "push", "-q", "origin", "HEAD:refs/heads/main");
+	const head: Record<number, string> = {};
+	for (const [n, over] of Object.entries(prs)) {
+		g(work, "checkout", "-q", "--detach", main);
+		for (const [f, text] of Object.entries(over)) writeFileSync(join(work, f), text);
+		g(work, "add", "-A");
+		g(work, "commit", "-q", "-m", `pr ${n}`);
+		head[Number(n)] = g(work, "rev-parse", "HEAD");
+		g(work, "push", "-q", "origin", `+HEAD:refs/pull/${n}/head`);
+	}
+	return { main, head };
+}
+/** The wrapper subcommands one run made, in order (the fake sudo's log). */
+const subsOf = (w: World, runId: string): string[] =>
+	readFileSync(join(w.root, "sudo.log"), "utf8").trim().split("\n").map((l) => l.split(" ")).filter(([, id]) => id === runId).map(([sub]) => sub!);
+const cachePath = (w: World, sha: string, part: string): string => join(w.runs, "base-cache", sha, `${encodeURIComponent(part)}.json`);
+const cached = (w: World, sha: string, part: string): boolean => existsSync(cachePath(w, sha, part));
+
+describe("red main: each failing file rerun alone on base (PLAN wl-mv8s8srodefytc rev 17.1 D8, PLAN wl-mvq4edh02r5z40 D3)", () => {
+	test("red: only the failing file runs alone; base runs that file alone (never the full suite) and fails the same: red-main, settled, status success, no message; base's result is cached and a second PR reuses it; a `full` cache entry is never read", async () => {
+		const w = world();
+		const r = redMain(w, { 22: { "broken.test.ts": BROKEN + TOUCHED, "ok.test.ts": PASS("ok") }, 23: { "broken.test.ts": `${BROKEN}// again\n` } });
+		// What an older runner cached for base's full suite: never read again.
+		const seeded = JSON.stringify({ pass: 0, fail: 0, skip: 0, exit: 0, ms: 1, error: null, failures: [] });
+		mkdirSync(dirname(cachePath(w, r.main, "full")), { recursive: true });
+		writeFileSync(cachePath(w, r.main, "full"), seeded);
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 22, r.head[22]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+		expect(run.full).toMatchObject({ fail: 1, error: null });
+		// the changed ok.test.ts passed in the full part: it does not run alone
+		expect(run.solo).toEqual([expect.objectContaining({ file: "./broken.test.ts", fail: 1, error: null })]);
+		expect(subsOf(w, first).filter((s) => s === "solo")).toHaveLength(1);
+		expect(subsOf(w, first)).toEqual(expect.arrayContaining(["base-prepare", "base-solo"]));
+		expect(subsOf(w, first)).not.toContain("base-full");
+		expect(run.baseCompare).toEqual({ sha: r.main, parts: [{ part: "./broken.test.ts", failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"], baseError: null }] });
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
+		expect(readFileSync(cachePath(w, r.main, "full"), "utf8")).toBe(seeded);
+		expect(runnerLog(w, first)).not.toContain("base full");
+		await until("the settle", () => w.ledger.slice(one.slice)?.state === "done");
+		expect(w.ledger.slice(one.slice)!.artifact).toStartWith(`test-run ${first}: red-main at ${r.head[22]} on PR #22;`);
+		expect(w.ledger.slice(one.slice)!.artifact).toContain(r.main);
+		expect(statusPosts(w)).toEqual([`success ${r.head[22]}`]);
+		expect(heldMessages(w, one.wl)).toEqual([]);
+
+		// PR #23 fails the same test: base's solo result of that file comes from the cache, so nothing runs on base
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 23, r.head[23]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red-main");
+		expect(run2.baseCompare!.parts).toEqual([{ part: "./broken.test.ts", failing: ["broken.test.ts > main is red"], baseFailing: ["broken.test.ts > main is red"], baseError: null }]);
+		expect(runnerLog(w, second)).toContain(`base ./broken.test.ts at ${r.main}: cached`);
+		expect(subsOf(w, second).filter((s) => s.startsWith("base-"))).toEqual([]);
+		expect(statusPosts(w)).toEqual([`success ${r.head[22]}`, `success ${r.head[23]}`]);
+	});
+
+	test("red when the failing file passes alone: the full failure stays in the entry, the reason names the file, and nothing runs on base", async () => {
+		const w = world();
+		const r = redMain(w, { 25: { "alone_a.test.ts": ALONE + TOUCHED, "alone_b.test.ts": ALONE + TOUCHED } }, { "alone_a.test.ts": ALONE, "alone_b.test.ts": ALONE });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, 25, r.head[25]!);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run.verdict).toBe("red");
+		expect(run.full).toMatchObject({ fail: 1, error: null });
+		const failing = run.failures.filter((f) => f.part === "full");
+		expect(failing).toHaveLength(1);
+		const file = failing[0]!.name.split(" > ")[0]!;
+		expect(failing[0]!.name).toBe(`${file} > passes alone`);
+		// only the failing file of the pair runs alone, and passes
+		expect(run.solo).toEqual([expect.objectContaining({ file: `./${file}`, pass: 1, fail: 0, error: null })]);
+		expect(run.failures).toEqual(failing);
+		expect(run.reason).toBe(`failing in the full part; passed alone: ./${file}`);
+		expect(subsOf(w, runId).filter((s) => s === "solo")).toHaveLength(1);
+		expect(subsOf(w, runId).filter((s) => s.startsWith("base-"))).toEqual([]);
+		expect(run.baseCompare ?? null).toBeNull();
+		expect(w.ledger.slice(slice)!.state).toBe("open");
+		expect(statusPosts(w)).toEqual([`failure ${r.head[25]}`]);
+	});
+
+	test("fix round 1 (F4), PLAN wl-mvq4edh02r5z40 D3: a gates/test/ test that fails on base too is red, never red-main: not rerun on the PR or on base, and exactly one security-red: (no test-run-failed:)", async () => {
+		const w = world();
+		const gate = "gates/test/gate.test.ts";
+		const r = redMain(w, { 23: { [gate]: GATE_RED + TOUCHED } }, { [gate]: GATE_RED });
+		const { wl, slice } = workload(w);
+		w.ledger.claimWorkload(wl, { by: LANE, holder: LANE, leaseMs: 600_000 });
+		const runId = request(w, wl, slice, 23, r.head[23]!);
+		await spawnRun(w, runId).exited;
+		const run = await resultOf(w, wl, runId);
+		expect(run).toMatchObject({ verdict: "red", base: r.main });
+		expect(run.failures.map((f) => [f.part, f.name])).toEqual([["full", `${gate} > refuses a forged approve`]]);
+		expect(subsOf(w, runId).filter((s) => s === "solo" || s.startsWith("base-"))).toEqual([]);
+		expect(heldMessages(w, wl)).toEqual([{
+			body: `security-red: ${wl} ${slice} ${runId} ${r.head[23]} 1 ${gate} > refuses a forged approve`, sender: TEST_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, state: "held",
+		}]);
+	});
+
+	test("a base-prepare that fails gives red and caches nothing; a failure base's solo run lacks gives red; neither posts success", async () => {
+		const w = world();
+		// The PR's own test plants runs/<id>/base, so base cannot be prepared beside its clone.
+		const PLANT = `import { test } from "bun:test";\nimport { mkdirSync } from "node:fs";\ntest("main is red", () => { throw new Error("broken on main"); });\ntest("passes", () => { mkdirSync("../base", { recursive: true }); });\n`;
+		const NEW_RED = `${BROKEN}test("new failure", () => { throw new Error("the PR broke it"); });\n`;
+		const r = redMain(w, { 23: { "broken.test.ts": NEW_RED }, 24: { "broken.test.ts": PLANT } });
+
+		const one = workload(w);
+		const first = request(w, one.wl, one.slice, 24, r.head[24]!);
+		await spawnRun(w, first).exited;
+		const run = await resultOf(w, one.wl, first);
+		expect(run.verdict).toBe("red");
+		expect(runnerLog(w, first)).toContain("base-prepare failed");
+		expect(run.baseCompare!.parts).toEqual([{ part: "./broken.test.ts", failing: ["broken.test.ts > main is red"], baseFailing: null, baseError: "not run on base" }]);
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(false);
+		expect(w.ledger.slice(one.slice)!.state).toBe("open");
+
+		const two = workload(w);
+		const second = request(w, two.wl, two.slice, 23, r.head[23]!);
+		await spawnRun(w, second).exited;
+		const run2 = await resultOf(w, two.wl, second);
+		expect(run2.verdict).toBe("red");
+		const part = run2.baseCompare!.parts[0]!;
+		expect(part).toMatchObject({ part: "./broken.test.ts", baseError: null });
+		expect(part.failing).toEqual(["broken.test.ts > main is red", "broken.test.ts > new failure"]);
+		expect(part.baseFailing).toEqual(["broken.test.ts > main is red"]);
+		expect(cached(w, r.main, "./broken.test.ts")).toBe(true);
+		expect(w.ledger.slice(two.slice)!.state).toBe("open");
+		expect(statusPosts(w)).toEqual([`failure ${r.head[24]}`, `failure ${r.head[23]}`]);
+	});
+
+	test("base reruns longer than the finalize deadline still settle red-main: the post-sweep deadline starts after base runs", async () => {
+		const w = world();
+		const r = redMain(w, { 25: { "broken.test.ts": BROKEN + TOUCHED } });
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, 25, r.head[25]!);
+		arm(w, runId, "phase-base-prepare");
+		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+		try {
+			await reached(w, runId, "phase-base-prepare");
+			// A real delay: the runner is a spawned process timing its deadline with its own Date.now(), out of reach
+			// of fake timers. Holding base-prepare past the 2 s finalize window is what the ordering must survive; 2 s
+			// leaves finalization itself (a hook, a local git ls-remote, the result hook) ample room on a loaded machine.
+			await Bun.sleep(3000);
+			go(w, runId, "phase-base-prepare");
+			await child.exited;
+			const run = await resultOf(w, wl, runId);
+			expect(run).toMatchObject({ verdict: "red-main", base: r.main });
+			expect(run.baseCompare!.parts.map((p) => p.part)).toEqual(["./broken.test.ts"]);
+			await until("the settle", () => w.ledger.slice(slice)?.state === "done");
+			expect(statusPosts(w)).toEqual([`success ${r.head[25]}`]);
+		} finally {
+			go(w, runId, "phase-base-prepare");
+			await child.exited;
+		}
 	});
 });
 
@@ -1251,6 +2009,280 @@ describe("the runs lock and current", () => {
 	});
 });
 
+// ---- the lock queue: oldest request first (plan of wl-mvfutg9edknu2o) ------------------------------------------
+
+type Child = Subprocess<"ignore", number, number>;
+interface Waiter {
+	id: string;
+	wl: string;
+	slice: string;
+}
+
+/** A request on its own workload, `agoMs` in the past, for a sha the PR does not have: once the run holds the lock it ends at once as stale. */
+function waiter(w: World, agoMs: number): Waiter {
+	const { wl, slice } = workload(w);
+	const id = request(w, wl, slice, PR.green, fx.main, agoMs);
+	// The next run id takes a later clock reading: run ids are strictly ordered by creation.
+	Bun.sleepSync(5);
+	return { id, wl, slice };
+}
+
+/** C, then B, then A, requested 10, 20 and 30 s ago: run-id order (C < B < A) is the opposite of request order (A < B < C). */
+function requestsCBA(w: World): { A: Waiter; B: Waiter; C: Waiter } {
+	const C = waiter(w, 10_000);
+	const B = waiter(w, 20_000);
+	const A = waiter(w, 30_000);
+	expect([A.id, B.id, C.id].toSorted()).toEqual([C.id, B.id, A.id]);
+	return { A, B, C };
+}
+
+/** `fn` on the world's runs.db, waiting up to 2 s for a runner's transaction. */
+function runsDb<T>(w: World, fn: (db: Database) => T): T {
+	const db = openLockDb(w.runs, 2_000);
+	try {
+		return fn(db);
+	} finally {
+		db.close();
+	}
+}
+
+/** Another run holds the lock with a heartbeat ten minutes ahead: live for the whole test, until the test changes it. */
+const holdLock = (w: World): void => {
+	runsDb(w, (db) => db.query("INSERT INTO lock (id, runId, pid, pgid, runDir, heartbeatAt) VALUES (1, 'tr-otherholder', 1, 1, '/nowhere', ?)").run(Date.now() + 600_000));
+};
+
+const queueRows = (w: World) =>
+	runsDb(w, (db) => db.query<{ runId: string; workloadId: string; requestedAt: number }, []>("SELECT runId, workloadId, requestedAt FROM queue ORDER BY requestedAt, runId").all());
+
+function heartbeatAt(w: World, runId: string): number | null {
+	try {
+		return parseHeartbeat(readFileSync(join(w.runs, runId, "heartbeat"), "utf8"), runId);
+	} catch {
+		return null;
+	}
+}
+
+function writeHeartbeat(w: World, runId: string, atMs: number): void {
+	mkdirSync(join(w.runs, runId), { recursive: true });
+	writeFileSync(join(w.runs, runId, "heartbeat"), heartbeatText(runId, atMs));
+}
+
+/** The request's own `created_at` in ms: the key its queue row carries. */
+const requestedAtOf = (w: World, r: Waiter): number => Date.parse(testRuns(w.ledger.entries(r.wl)).find((x) => x.request.runId === r.id)!.request.createdAt);
+
+/** A queue row the test writes for a waiter that is no process. */
+function queueRow(w: World, runId: string, workloadId: string, requestedAt: number): void {
+	runsDb(w, (db) => db.query("INSERT INTO queue (runId, workloadId, requestedAt) VALUES (?, ?, ?)").run(runId, workloadId, requestedAt));
+}
+
+/** The request settled as a later starter settles a dead runner's: `test-run: … error runner died`. */
+function settleDead(w: World, r: Waiter): void {
+	w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: r.wl, sliceId: r.slice, kind: "assumption", body: testRunBody(runnerDiedRun({ runId: r.id, pr: PR.green, sha: fx.main, slice: r.slice, by: LANE })) });
+}
+
+/**
+ * The child is stopped once its heartbeat file has not changed for over two heartbeat periods (the world's 500 ms): a running
+ * runner rewrites it every period. (`ps` cannot be spawned in every sandbox this suite runs in.)
+ */
+async function seenStopped(w: World, runId: string): Promise<void> {
+	const quietMs = 2 * Number(w.env.AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS) + 100;
+	let seen = heartbeatAt(w, runId);
+	let since = Date.now();
+	await until(`${runId} stopped (its heartbeat unchanged for ${quietMs} ms)`, () => {
+		const now = heartbeatAt(w, runId);
+		if (now !== seen) {
+			seen = now;
+			since = Date.now();
+		}
+		return Date.now() - since > quietMs;
+	}, 20_000);
+}
+
+/**
+ * Stop `child` outside any runs.db transaction: wait for its heartbeat under 1 s old, SIGSTOP it, and see it stopped; then a
+ * probe connection (busy_timeout 300 ms) runs BEGIN IMMEDIATE; COMMIT. A busy probe means the child froze inside its acquiring
+ * transaction: SIGCONT, sleep one poll, try again (at most 10 times). Every wait is bounded at 20 s, under the 60 s stale threshold.
+ */
+async function stopOutsideTx(w: World, child: Child, runId: string): Promise<void> {
+	for (let attempt = 0; attempt < 10; attempt++) {
+		await until(`a heartbeat of ${runId} under 1 s old`, () => Date.now() - (heartbeatAt(w, runId) ?? 0) < 1_000, 20_000);
+		process.kill(child.pid, "SIGSTOP");
+		await seenStopped(w, runId);
+		const probe = new Database(join(w.runs, "runs.db"));
+		try {
+			probe.exec("PRAGMA busy_timeout = 300");
+			probe.exec("BEGIN IMMEDIATE");
+			probe.exec("COMMIT");
+			return;
+		} catch (e) {
+			if (!(e instanceof Error && "code" in e && String(e.code).startsWith("SQLITE_BUSY"))) throw e;
+		} finally {
+			probe.close();
+		}
+		process.kill(child.pid, "SIGCONT");
+		// One runner poll (the world's 200 ms) before the next stop, so the child can finish the transaction it froze in.
+		await Bun.sleep(200);
+	}
+	throw new Error(`${runId} froze inside a runs.db transaction on every one of 10 stops`);
+}
+
+/** Every child resumed, killed and awaited: a failing assertion leaves no stopped process behind. */
+async function reap(children: Child[]): Promise<void> {
+	for (const c of children) {
+		if (c.exitCode === null && c.signalCode === null) {
+			try {
+				process.kill(c.pid, "SIGCONT");
+			} catch {
+				// already gone
+			}
+			c.kill("SIGKILL");
+		}
+		await c.exited;
+	}
+}
+
+const queuedCount = (w: World, r: Waiter): number => marks(w, r.id, "queued").length;
+const acquiredAt = (w: World, r: Waiter): number => marks(w, r.id, "acquired")[0]!.at as number;
+
+describe("the lock queue: queued runs take the lock oldest request first", () => {
+	test("T1: on a stale-holder takeover, younger waiters B and C wait for the oldest, A, while A is stopped; then A, B, C acquire in request order", async () => {
+		const w = world();
+		const { A, B, C } = requestsCBA(w);
+		holdLock(w);
+		const kids: Child[] = [];
+		try {
+			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
+			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
+			await stopOutsideTx(w, kids[0]!, A.id);
+			runsDb(w, (db) => db.query("UPDATE lock SET heartbeatAt = ?").run(Date.now() - 61_000));
+			const b0 = queuedCount(w, B);
+			const c0 = queuedCount(w, C);
+			await until("B and C three more attempts each, or one acquired",
+				() => (queuedCount(w, B) >= b0 + 3 && queuedCount(w, C) >= c0 + 3) || marks(w, B.id, "acquired").length + marks(w, C.id, "acquired").length > 0, 20_000);
+			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
+			expect(runsDb(w, (db) => lockRow(db)?.runId)).toBe("tr-otherholder");
+			process.kill(kids[0]!.pid, "SIGCONT");
+			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			expect(marks(w, A.id, "acquired")).toEqual([expect.objectContaining({ displaced: "tr-otherholder" })]);
+			expect(marks(w, B.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+			expect(marks(w, C.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+			expect(acquiredAt(w, A)).toBeLessThan(acquiredAt(w, B));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+		} finally {
+			await reap(kids);
+		}
+	});
+
+	test("T2: dead waiters ahead (stale heartbeat, settled request, no request, no heartbeat past the startup lease) never block and are pruned", async () => {
+		const w = world();
+		holdLock(w);
+		const kids: Child[] = [];
+		try {
+			// D and E queue for real, older than A, and are killed while queued.
+			const D = waiter(w, 60_000);
+			const E = waiter(w, 50_000);
+			const cd = spawnRun(w, D.id);
+			const ce = spawnRun(w, E.id);
+			kids.push(cd, ce);
+			await until("D and E queued", () => queuedCount(w, D) >= 1 && queuedCount(w, E) >= 1);
+			expect(queueRows(w).map((q) => q.runId)).toEqual([D.id, E.id]);
+			cd.kill("SIGKILL");
+			ce.kill("SIGKILL");
+			await Promise.all([cd.exited, ce.exited]);
+			writeHeartbeat(w, D.id, Date.now() - 61_000);
+			settleDead(w, E);
+			// F: a row whose run the ledger has no request for. G: a request 200 s old that never beat.
+			const F = newRunId();
+			queueRow(w, F, workload(w).wl, Date.now() - 45_000);
+			const G = waiter(w, 200_000);
+			queueRow(w, G.id, G.wl, requestedAtOf(w, G));
+			expect(queueRows(w).map((q) => q.runId)).toEqual([G.id, D.id, E.id, F]);
+			const { A, B, C } = requestsCBA(w);
+			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
+			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
+			// Pruning happens on every attempt, while another run holds the lock too.
+			await until("D, E, F and G pruned", () => queueRows(w).every((q) => [A.id, B.id, C.id].includes(q.runId)), 20_000);
+			expect(queueRows(w).map((q) => q.runId)).toEqual([A.id, B.id, C.id]);
+			expect(queueRows(w).map((q) => q.requestedAt)).toEqual([A, B, C].map((r) => requestedAtOf(w, r)));
+			runsDb(w, (db) => db.query("DELETE FROM lock").run());
+			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			for (const r of [A, B, C]) expect(marks(w, r.id, "acquired")).toEqual([expect.objectContaining({ displaced: null })]);
+			expect(acquiredAt(w, A)).toBeLessThan(acquiredAt(w, B));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+			expect(queueRows(w)).toEqual([]);
+		} finally {
+			await reap(kids);
+		}
+	});
+
+	test("T2b: live waiters that are no process block: a fresh heartbeat on a 10-minute-old request, then no heartbeat inside the startup lease", async () => {
+		const w = world();
+		const kids: Child[] = [];
+		try {
+			const I = waiter(w, 600_000);
+			writeHeartbeat(w, I.id, Date.now());
+			queueRow(w, I.id, I.wl, requestedAtOf(w, I));
+			const H = waiter(w, 5_000);
+			queueRow(w, H.id, H.wl, requestedAtOf(w, H));
+			const B = waiter(w, 2_000);
+			const C = waiter(w, 1_000);
+			for (const r of [B, C]) kids.push(spawnRun(w, r.id));
+			await until("B and C three attempts each", () => queuedCount(w, B) >= 3 && queuedCount(w, C) >= 3, 20_000);
+			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
+			expect(queueRows(w).map((q) => q.runId)).toEqual([I.id, H.id, B.id, C.id]);
+			// I's heartbeat goes stale: I is pruned, and H, inside its startup lease, blocks.
+			writeHeartbeat(w, I.id, Date.now() - 61_000);
+			const b0 = queuedCount(w, B);
+			const c0 = queuedCount(w, C);
+			await until("I pruned and B and C three more attempts each",
+				() => !queueRows(w).some((q) => q.runId === I.id) && queuedCount(w, B) >= b0 + 3 && queuedCount(w, C) >= c0 + 3, 20_000);
+			expect({ B: marks(w, B.id, "acquired"), C: marks(w, C.id, "acquired") }).toEqual({ B: [], C: [] });
+			expect(queueRows(w).map((q) => q.runId)).toEqual([H.id, B.id, C.id]);
+			settleDead(w, H);
+			for (const r of [B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+			expect(queueRows(w)).toEqual([]);
+		} finally {
+			await reap(kids);
+		}
+	});
+
+	test("T3: a waiter pruned while it was stopped re-joins with its original place when it resumes, and acquires before younger waiters", async () => {
+		const w = world();
+		const { A, B, C } = requestsCBA(w);
+		holdLock(w);
+		const kids: Child[] = [];
+		try {
+			for (const r of [A, B, C]) kids.push(spawnRun(w, r.id));
+			await until("A, B and C queued", () => [A, B, C].every((r) => queuedCount(w, r) >= 1));
+			const original = queueRows(w).find((q) => q.runId === A.id)!.requestedAt;
+			expect(original).toBe(requestedAtOf(w, A));
+			await stopOutsideTx(w, kids[0]!, A.id);
+			writeHeartbeat(w, A.id, Date.now() - 61_000);
+			await until("A's row pruned", () => !queueRows(w).some((q) => q.runId === A.id), 20_000);
+			expect(runsDb(w, (db) => lockRow(db)?.runId)).toBe("tr-otherholder");
+			process.kill(kids[0]!.pid, "SIGCONT");
+			const back = () => queueRows(w).find((q) => q.runId === A.id)?.requestedAt === original && Date.now() - (heartbeatAt(w, A.id) ?? 0) < 5_000;
+			await until("A back in the queue at its original place with a fresh heartbeat", back, 20_000);
+			// Any attempt of B or C that read A's old heartbeat has ended once each has queued twice more.
+			const b0 = queuedCount(w, B);
+			const c0 = queuedCount(w, C);
+			await until("B and C two more attempts each", () => queuedCount(w, B) >= b0 + 2 && queuedCount(w, C) >= c0 + 2, 20_000);
+			expect(back()).toBe(true);
+			runsDb(w, (db) => db.query("DELETE FROM lock").run());
+			for (const r of [A, B, C]) expect((await resultOf(w, r.wl, r.id)).verdict).toBe("stale");
+			await Promise.all(kids.map((k) => k.exited));
+			expect(acquiredAt(w, A)).toBeLessThan(acquiredAt(w, B));
+			expect(acquiredAt(w, B)).toBeLessThan(acquiredAt(w, C));
+		} finally {
+			await reap(kids);
+		}
+	});
+});
+
 describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 	/**
 	 * A's sweep holds the sweep lock, paused at `point`; A's row goes stale; B takes over, publishes and
@@ -1280,8 +2312,9 @@ describe("exclusive sweeps (§ 2.3 step 1, the order of a run)", () => {
 		const rb = await resultOf(w, b.wl, B);
 		expect(ra.verdict).toBe("superseded");
 		expect(w.ledger.slice(a.slice)!.state).toBe("open");
-		// B retried its sweep once, got the lock only after A's sweep ended, and its preflight and parts ran unharmed after that.
-		expect(marks(w, B, "sweep").map((m) => [m.after, m.attempt])).toEqual([["publish", 0], ["publish", 1], ["full", 0], ["./a.test.ts", 0]]);
+		// B retried its sweep once, got the lock only after A's sweep ended, and its preflight and full part ran unharmed after that
+		// (green, so no solo part: PLAN wl-mvq4edh02r5z40 D1).
+		expect(marks(w, B, "sweep").map((m) => [m.after, m.attempt])).toEqual([["publish", 0], ["publish", 1], ["full", 0]]);
 		expect(runnerLog(w, B)).toContain(`ended by ${signal}; retry 1 of 3`);
 		expect(marks(w, B, "spawn-probe")[0]!.at as number).toBeGreaterThan(resumedAt);
 		expect(rb).toMatchObject({ verdict: "green" });
@@ -1350,4 +2383,118 @@ describe("the runs lock under test (Guard A, MIGRATION.md item 114)", () => {
 		}
 		expect(readFileSync(target).equals(bytes)).toBe(true);
 	});
+});
+
+// A subprocess can be gone while its inherited stdout is still open in a descendant.
+// The helper exits naturally; no signal or live database is used by this reproduction.
+test("command completion does not wait for an exited child's inherited pipes", async () => {
+	const root = realpathSync(tmp("runner-pipe"));
+	roots.push(root);
+	const helper = join(root, "holder.ts");
+	writeFileSync(helper, 'await Bun.sleep(1500);');
+	const started = Date.now();
+	const result = await run([process.execPath, "-e", `Bun.spawn([process.execPath, ${JSON.stringify(helper)}], {stdout: "inherit", stderr: "inherit", stdin: "ignore"}).unref(); console.log("done");`], {
+		cwd: root, env: GIT_ENV, timeoutMs: 200,
+	});
+	expect(result).toMatchObject({ code: 0, out: "done\n", err: "" });
+	expect(Date.now() - started).toBeLessThan(1000);
+	// Let the finite helper finish before afterAll removes its directory.
+	await Bun.sleep(1600);
+});
+
+for (const point of ["head-recheck", "result"]) {
+	test(`post-sweep guard records error and releases the lock when ${point} never resumes`, async () => {
+		const w = world();
+		const { wl, slice } = workload(w);
+		const runId = request(w, wl, slice, PR.green, fx.head.green);
+		arm(w, runId, point);
+		const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "300" });
+		try {
+			await reached(w, runId, point);
+			const run = await resultOf(w, wl, runId, 2500);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toContain("post-sweep deadline exceeded");
+			await until("guarded runner exits", () => child.exitCode !== null, 2500);
+			expect(child.exitCode).toBe(0);
+			expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "error" });
+			expect(w.ledger.slice(slice)!.state).toBe("open");
+			const db = lockDbOf(w);
+			try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+			// Resuming an expired hook must never publish a late green result.
+			go(w, runId, point);
+			expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(1);
+		} finally {
+			go(w, runId, point);
+			await child.exited;
+		}
+	});
+}
+
+test("publication contention leaves a local error verdict and releases the run lock", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	arm(w, runId, "result");
+	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+	await reached(w, runId, "result");
+	const deadline = Date.parse(/post-sweep finalization started; deadline (.+)/.exec(runnerLog(w, runId))![1]!);
+	w.ledger.db.exec("BEGIN IMMEDIATE");
+	try {
+		// The runner is another process, so spend its real clock budget at the hook;
+		// publication must inherit the remainder rather than start a fresh timeout.
+		await until("most of the shared finalization budget is spent", () => Date.now() >= deadline - 500, 2000);
+		const resumedAt = Date.now();
+		go(w, runId, "result");
+		await until("publication fails within the post-sweep deadline", () => child.exitCode !== null, 3000);
+		const exitedAt = Date.now();
+		expect(exitedAt).toBeGreaterThanOrEqual(deadline);
+		expect(exitedAt).toBeLessThan(deadline + 1000);
+		console.info(`publication under held ledger: exited ${exitedAt - resumedAt} ms after resume, ${exitedAt - deadline} ms after the shared deadline`);
+		expect(child.exitCode).toBe(START_EXIT.failed);
+		const result = JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"));
+		expect(result.verdict).toBe("error");
+		expect(result.reason).toContain("result publication failed:");
+		expect(result.reason).toContain("post-sweep deadline exceeded during publication");
+		const db = lockDbOf(w);
+		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+	} finally {
+		w.ledger.db.exec("ROLLBACK");
+		go(w, runId, "result");
+		await child.exited;
+	}
+	expect(testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results).toHaveLength(0);
+	expect(w.ledger.slice(slice)!.state).toBe("open");
+});
+
+test("publication retries a transient ledger lock within the post-sweep deadline and settles atomically", async () => {
+	const w = world();
+	const { wl, slice } = workload(w);
+	const runId = request(w, wl, slice, PR.green, fx.head.green);
+	arm(w, runId, "result");
+	const child = spawnRun(w, runId, { AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "2000" });
+	try {
+		await reached(w, runId, "result");
+		w.ledger.db.exec("BEGIN IMMEDIATE");
+		try {
+			go(w, runId, "result");
+			await until("publication attempts the held ledger", () => marks(w, runId, "publication-busy").length > 0);
+			expect(child.exitCode).toBeNull();
+			expect(existsSync(join(w.runs, runId, "result.json"))).toBe(false);
+		} finally {
+			w.ledger.db.exec("ROLLBACK");
+			go(w, runId, "result");
+		}
+		await until("publication succeeds after the ledger lock clears", () => child.exitCode !== null, 3000);
+		expect(child.exitCode).toBe(0);
+		const results = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.results;
+		expect(results).toHaveLength(1);
+		expect(results[0]!.verdict).toBe("green");
+		expect(w.ledger.slice(slice)!.state).toBe("done");
+		expect(JSON.parse(readFileSync(join(w.runs, runId, "result.json"), "utf8"))).toMatchObject({ verdict: "green" });
+		const db = lockDbOf(w);
+		try { expect(lockRow(db)).toBeNull(); } finally { db.close(); }
+	} finally {
+		go(w, runId, "result");
+		await child.exited;
+	}
 });

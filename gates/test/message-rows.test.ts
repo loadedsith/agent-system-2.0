@@ -61,6 +61,19 @@ describe("row 1: turn shape to Jo", () => {
 		expect(checkTurnShape("**CLAIM**\n```ts\nconst x = 1;\n```", "orchestrator")).toBeNull();
 		expect(checkTurnShape("**CLAIM**\nThe tree is clean: `git status` printed nothing to commit.", "orchestrator")).toBeNull();
 	});
+	// PLAN wl-mvb9mw00ycfjeo D7 (2026-10-17; migration/items/pair-offer-own-line.md, MIGRATION.md item
+	// 52): the one command the orchestrator may give Jo is the by-hand `as2 lane wl-…` line, in prose
+	// or inline code, on its own line before the closing ask. Inside a shell fence it is still refused.
+	test("orchestrator: `as2 lane wl-x` passes in prose and inline code, and is refused in a shell fence", () => {
+		const lead = "**CLAIM**\nYou took pair on the login page (q-x); its lane has ended. Continue it in another terminal:";
+		const ask = "**QUESTION**\nShould I close it when you are done? Recommend yes.";
+		expect(checkTurnShape(`${lead}\nas2 lane wl-x\n\n${ask}`, "orchestrator")).toBeNull();
+		expect(checkTurnShape(`${lead}\n\`as2 lane wl-x\`\n\n${ask}`, "orchestrator")).toBeNull();
+		for (const fence of ["bash", "sh", "zsh", "shell", "console"]) {
+			const r = checkTurnShape(`${lead}\n\`\`\`${fence}\nas2 lane wl-x\n\`\`\`\n\n${ask}`, "orchestrator");
+			expect(r?.reason).toContain(`it hands Jo a command (\`as2 lane wl-x\`); ${ORCH_REFUSAL}`);
+		}
+	});
 	test("refuses a needs-you block that is not first, and an ask that is not last", () => {
 		expect(checkTurnShape("**CLAIM**\nStuff happened.\n## Needs you\n**GUESS**\nx")?.reason).toContain("needs-you block is not first");
 		expect(checkTurnShape("**QUESTION**\nA or B?\n**CLAIM**\nmore after")?.reason).toContain("closing ask is not last");

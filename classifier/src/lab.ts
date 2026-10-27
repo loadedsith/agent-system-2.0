@@ -404,13 +404,14 @@ export function parkQuestionBody(sliceId: string, builders: Builders, reasons: r
 // ---- The row a review plans on ---------------------------------------------------------------
 
 /**
- * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on gpt-6-sol, never
- * gpt-6-astra. Jo chose to build it here, not in the tier table (in-mv5qfm8910ycjk): gpt-6-sol is
- * already the strong row's OpenAI entry, and `tierTableFromConfig` refuses one model in two tiers
- * (a fallback to it would pull up a tier), so the deep row and profile/config.yml stay unchanged
- * and non-review deep spawns keep the deep row. Each entry names a lab whose review entries on the
- * deep row come from the named tier's row instead. It holds until the review-cost framework
- * workload lands or Jo says otherwise; ending it is deleting the entry.
+ * Jo's standing rule (in-mv5qdfvskukmbk): a review that routes to OpenAI runs on the strong row's
+ * OpenAI model, never gpt-6-astra; that entry is gpt-6.1-sol since Jo's in-mv8qzqym1ihmv4
+ * (2026-10-14; gpt-6-sol before). Jo chose to build it here, not in the tier table
+ * (in-mv5qfm8910ycjk): gpt-6.1-sol is the strong row's OpenAI entry, and `tierTableFromConfig`
+ * refuses one model in two tiers (a fallback to it would pull up a tier), so the deep row stays
+ * unchanged and non-review deep spawns keep the deep row. Each entry names a lab whose review
+ * entries on the deep row come from the named tier's row instead. It holds until the review-cost
+ * framework workload lands or Jo says otherwise; ending it is deleting the entry.
  */
 export const REVIEW_ROW_FROM: Readonly<Partial<Record<Lab, Tier>>> = { openai: "strong" };
 
@@ -448,10 +449,11 @@ export function reviewRow(table: TierTable, tier: Tier): string[] {
 
 /**
  * Jo's standing rule (input in-mv5xafhywe3w8w, 2026-10-13): a review that parks only because Kimi is out goes same-lab with
- * no question (PLAN wl-mv5xay6bjp0268). It ends at the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT)
- * or on Jo's word, whichever is first; ending it early is setting `endsAt` to the moment of Jo's word, merging, and relaunching
- * the lanes. `rowOmission`: the installed tier rows dropped moonshot for this outage (2026-10-12 14:28 PDT), so a review row
- * with no kimi entry counts as Kimi out while the rule is active.
+ * no question (PLAN wl-mv5xay6bjp0268). Its record is the `kimi-out` ruling of gates/src/rulings.ts `STANDING_RULINGS`, which
+ * dates it by `endsAt`: the end of 2026-10-31 America/Los_Angeles (2026-11-01T00:00-07:00, PDT), or at once on Jo's
+ * `end-ruling kimi-out` (the classifier reads both through `rulingActive`). `kimiOutRuleActive` is the date alone, for the
+ * ledger-less checks: quota marking and honouring a 429 refusal. `rowOmission`: the installed tier rows dropped moonshot for
+ * this outage (2026-10-12 14:28 PDT), so a review row with no kimi entry counts as Kimi out while the rule is active.
  */
 export const KIMI_OUT_RULE = { input: "in-mv5xafhywe3w8w", endsAt: Date.parse("2026-11-01T00:00:00-07:00"), rowOmission: true } as const;
 export const kimiOutRuleActive = (now: number) => now < KIMI_OUT_RULE.endsAt;
@@ -562,4 +564,44 @@ export function reviewPlan(input: ReviewPlanInput): ReviewPlan {
 			? `production review fans out to ${otherLabs.join(", ")} only${unavailable.length > 0 ? ` (${unavailable.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`).join(", ")})` : ""}`
 			: null;
 	return { kind: "single", models: others, allow: allowOthers, excluded, sameLab: false, short };
+}
+
+// ---- Three-lab panels (PLAN wl-mv5m7qvgkxhpj4 § 3.4 rule 1; classifier/src/panel.ts) ---------
+
+/**
+ * A panel member's spawn row: only `lab`'s entries, builder lab or not. A panel is not a gate review,
+ * so the builder exclusion and the D5 fan-out do not apply to it; the pin alone keeps every other
+ * lab off the member, so no other lab is ever substituted. `reasons` say why the lab has no usable
+ * entry (empty when `models` is not).
+ */
+export function panelPin(input: { row: readonly string[]; usable: readonly string[]; lab: Lab; skipped?: Readonly<Record<string, string>> }): {
+	models: string[];
+	allow: string[];
+	reasons: string[];
+} {
+	const mine = input.row.filter(s => labOf(s) === input.lab);
+	const models = input.usable.filter(s => labOf(s) === input.lab);
+	const reasons =
+		mine.length === 0
+			? [`no ${input.lab} entry in the row`]
+			: models.length > 0
+				? []
+				: mine.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`);
+	return { models, allow: mine.map(modelIdentity), reasons };
+}
+
+/**
+ * The lab a panel's synthesis hand runs on: the first lab in row order with a usable entry that is
+ * not a builder; when there is none (every lab a builder, or the others down), the first usable
+ * builder lab, named as one (`builderLab`). Synthesis is not a gate review, so it never parks; with
+ * no usable lab at all it gets `reasons` and is dispatched again later.
+ */
+export function synthLab(input: { row: readonly string[]; usable: readonly string[]; builders: Builders; skipped?: Readonly<Record<string, string>> }):
+	| { lab: Lab; builderLab: boolean }
+	| { reasons: string[] } {
+	const labs = input.usable.flatMap(s => labOf(s) ?? []);
+	const other = labs.find(lab => !isBuilder(input.builders, lab));
+	if (other) return { lab: other, builderLab: false };
+	if (labs.length > 0) return { lab: labs[0]!, builderLab: true };
+	return { reasons: input.row.map(s => `${s} (${input.skipped?.[s] ?? "not usable"})`) };
 }

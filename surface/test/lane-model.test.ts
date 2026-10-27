@@ -101,7 +101,7 @@ describe("T3/T8: the session is resumed only on the model it ran on", () => {
 		expect(resumePlan(c, "lane-m-2", [], X)).toEqual({ resume: null, skipped: `/one ran on ${A}` });
 		expect(resumePlan(c, "lane-m-2", [], A)).toEqual({ resume: "/one", skipped: null });
 		expect(resumePlan(c, "lane-m-2", [], null)).toEqual({ resume: null, skipped: `/one ran on ${A}` });
-		expect(interactiveArgv({ ...SPEC, model: X, resume: null })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "--model", X]);
+		expect(interactiveArgv({ ...SPEC, model: X, resume: null, firstPromptPath: "/l/prompt.md" })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "--model", X, "@/l/prompt.md"]);
 	});
 
 	test("T3b: a session only lane-parked: recorded keeps its lane's model; with no lane-started: at all it is unknown", () => {
@@ -140,7 +140,7 @@ describe("T3/T8: the session is resumed only on the model it ran on", () => {
 		expect(argv).not.toContain("--model");
 		expect(argv).not.toContain("--resume");
 		expect(argv).not.toContain("default");
-		expect(interactiveArgv({ ...SPEC, model, resume: plan.resume })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p"]);
+		expect(interactiveArgv({ ...SPEC, model, resume: plan.resume, firstPromptPath: "/l/prompt.md" })).toEqual(["--cwd", "/w", "--session-dir", "/s", "--append-system-prompt", "/p", "@/l/prompt.md"]);
 	});
 
 	test("T8b: named then cleared, the X launch failing before a session: default resumes the default-era s1", () => {
@@ -171,6 +171,19 @@ describe("T4: get_state must report exactly the named provider/id", () => {
 		expect(stateModelCheck(X, { id: "state", type: "response", command: "get_state", success: false })).toEqual({ ok: false, reason: `named ${X}, get_state failed: no error given` });
 		expect(stateModelOf({ success: false })).toBeNull();
 		expect(stateModelOf(state({ id: "fake" }))).toBeNull();
+	});
+});
+
+describe("PLAN wl-mv71x5rwdu7eo0 § 4: lane-headroom: is the runner's record, never Jo's word", () => {
+	// A literal (surface/src/launch.ts laneHeadroomBody's shape), so this file still loads on a baseline without it.
+	const body = `lane-headroom: lane-m-1 ${A} -> openai-codex/gpt-6.1-sol (anthropic 5h 0.85 used > 0.80)`;
+
+	test("honoured from the runner only, lane-scoped; laneModel reads lane-model: alone, so a move never names the workload's model", () => {
+		const c = controlEntries([named(X), entry(LANE_RUNNER_BY, body)]);
+		expect(c.map((e) => [e.prefix, e.laneId, e.createdBy])).toEqual([["lane-model", null, SURFACE_BY], ["lane-headroom", "lane-m-1", LANE_RUNNER_BY]]);
+		expect(laneModel(c)).toBe(X);
+		expect(laneModel(controlEntries([entry(LANE_RUNNER_BY, body)]))).toBeNull();
+		for (const forger of [SURFACE_BY, LANE_STARTER_BY, "lane-m-1"]) expect(controlEntries([entry(forger, body)], ["lane-m-1"])).toEqual([]);
 	});
 });
 

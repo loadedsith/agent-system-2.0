@@ -10,6 +10,9 @@
 // ledger path, and writes nothing else; and it fails closed (review r2, openai #3): only exit 113
 // with "Could not find service" counts as absent, and a missing launchctl, any other print failure
 // or a failed bootout exits 1 with the plist kept.
+// And --daily-report (wl-mvbcjageg7o2yo R14), against the same fake launchctl: the job's plist lints, runs
+// surface/scripts/daily-report.ts at 07:00 with the profile in its environment and is bootstrapped; its =off form
+// boots it out and deletes the plist before any install step and writes nothing else.
 import { beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +27,7 @@ let root: string;
 let copy: string;
 let manifest: string;
 let original: string;
+let installPath: string;
 
 /** Run the scratch copy's installer the way a fresh machine would: PATH, a temp HOME, and `env`. */
 function install(label: string, env: Record<string, string> = {}): { exitCode: number; out: string; db: string; home: string } {
@@ -31,7 +35,7 @@ function install(label: string, env: Record<string, string> = {}): { exitCode: n
 	mkdirSync(home, { recursive: true });
 	const db = env.AGENT_SYSTEM_LEDGER_DB ?? join(home, ".agent-system-2", "ledger.db");
 	const r = Bun.spawnSync(["bash", join(copy, "install", "install.sh")], {
-		env: { PATH: process.env.PATH ?? "", HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
+		env: { PATH: installPath, HOME: home, ...env }, stdout: "pipe", stderr: "pipe",
 	});
 	return { exitCode: r.exitCode ?? -1, out: r.stdout.toString() + r.stderr.toString(), db, home };
 }
@@ -53,10 +57,18 @@ function manifestWith(...pairs: [string, string][]): void {
 }
 
 /** Every top-level directory install/manifest.tsv has rows under (b3e06bb added the M3/M4 ones; M6 added skills/ and bin/). */
-const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "bin", "surface", "contract", "voice"];
+const MANIFEST_DIRS = ["ledger", "install", "profile", "tiers", "classifier", "gates", "skills", "plugins", "bin", "surface", "contract", "voice"];
 
 beforeAll(() => {
 	root = mkdtempSync(join(process.env.LEDGER_TEST_TMP ?? tmpdir(), "ledger-install-"));
+	// Do not inherit herdr/ctx from the developer's PATH: installer runs must never register a real
+	// plugin. Only Bun and system utilities are needed for these ledger/manifest tests.
+	const bin = join(root, "bin");
+	mkdirSync(bin);
+	symlinkSync(process.execPath, join(bin, "bun"));
+	installPath = `${bin}:/usr/bin:/bin`;
+	expect(Bun.which("herdr", { PATH: installPath })).toBeNull();
+	expect(Bun.which("ctx", { PATH: installPath })).toBeNull();
 	copy = join(root, "repo");
 	for (const dir of MANIFEST_DIRS) cpSync(join(REPO, dir), join(copy, dir), { recursive: true });
 	for (const d of MANIFEST_DIRS) {
@@ -75,6 +87,44 @@ describe("install: the baseline copy installs", () => {
 		expect(r.exitCode).toBe(0);
 		expect(existsSync(r.db)).toBe(true);
 		expect(copiesOf(r.db).length).toBe(1);
+	});
+});
+
+describe("install: the tracing switch (wl-mv65t5d34lts00 PLAN.md § 8.1)", () => {
+	const configOf = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+	const phoenixOf = (home: string): unknown => {
+		const doc: unknown = Bun.YAML.parse(readFileSync(configOf(home), "utf8"));
+		const block = doc && typeof doc === "object" && "observability" in doc ? doc.observability : undefined;
+		return block && typeof block === "object" && "phoenix" in block ? block.phoenix : undefined;
+	};
+	const linesOf = (out: string, re: RegExp) => out.split("\n").filter((l) => re.test(l));
+
+	test("a fresh profile starts at all; a re-install keeps an installed off; a temp HOME never installs the Phoenix LaunchAgent", () => {
+		const first = install("tracing");
+		expect(first.exitCode).toBe(0);
+		expect(linesOf(first.out, /^tracing:/)).toEqual([expect.stringMatching(/^tracing: no installed config at .*; the template's all is used$/)]);
+		expect(phoenixOf(first.home)).toBe("all");
+		// launchd has one gui/<uid> domain per user: an install into a temp HOME must not replace the real job.
+		if (process.platform === "darwin") expect(linesOf(first.out, /Phoenix/)).toEqual([expect.stringContaining(`==> Phoenix: HOME (${first.home}) is not this user's home directory`)]);
+		expect(existsSync(join(first.home, "Library", "LaunchAgents", "com.agent-system-2.phoenix.plist"))).toBe(false);
+
+		const config = configOf(first.home);
+		writeFileSync(config, readFileSync(config, "utf8").replace(/^ {2}phoenix: all/m, "  phoenix: off"));
+		const again = install("tracing");
+		expect(again.exitCode).toBe(0);
+		expect(again.out).toContain(`tracing: observability.phoenix: off kept from ${config}`);
+		expect(phoenixOf(again.home)).toBe("off");
+		if (process.platform === "darwin") expect(again.out).toContain("==> Phoenix: observability.phoenix is off");
+	});
+
+	test.skipIf(process.platform !== "darwin")("phoenix-agent.sh on|off from a temp HOME with the real launchctl: refused with exit 2 before launchctl runs", () => {
+		const home = join(root, "home-agent-guard");
+		mkdirSync(home, { recursive: true });
+		for (const word of ["on", "off"]) {
+			const r = Bun.spawnSync(["bash", join(copy, "install", "phoenix-agent.sh"), word], { env: { PATH: process.env.PATH ?? "", HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect({ word, code: r.exitCode, err: r.stderr.toString() }).toEqual({ word, code: 2, err: expect.stringContaining(`HOME (${home}) is not this user's home directory`) });
+		}
+		expect(readdirSync(home)).toEqual([]);
 	});
 });
 
@@ -223,6 +273,45 @@ describe("install: every machinery file has exactly one manifest row (P-11 manif
 		expect(existsSync(r.db)).toBe(false);
 	});
 
+	test("membership is literal for spaces, backslashes and glob characters, not a pattern match", () => {
+		const listed = "ledger/src/manifest literal-\\[ab]*?.md";
+		const unlisted = "ledger/src/manifest literal-\\a-expanded.md";
+		writeFileSync(join(copy, listed), "listed\n");
+		writeFileSync(join(copy, unlisted), "unlisted\n");
+		writeFileSync(manifest, `${original}${listed}${T}doc${T}-\n`);
+		try {
+			const r = install("literal-membership");
+			expect(r.out).toContain(`have no manifest row:\n  ${unlisted}\n`);
+			expect(r.out).not.toContain(`\n  ${listed}\n`);
+			expect(r.exitCode).toBe(2);
+			expect(existsSync(r.db)).toBe(false);
+		} finally {
+			writeFileSync(manifest, original);
+			rmSync(join(copy, listed));
+			rmSync(join(copy, unlisted));
+		}
+	});
+
+	test("membership is case-sensitive even when BASH_ENV enables nocasematch", () => {
+		const lower = join(copy, "ledger", "schema.md");
+		// On a case-sensitive filesystem both files exist; on a case-insensitive one this is
+		// already SCHEMA.md. Either way, the lowercase row must not own the uppercase path.
+		const created = !existsSync(lower);
+		if (created) cpSync(join(copy, "ledger", "SCHEMA.md"), lower);
+		const bashEnv = join(root, "nocasematch.sh");
+		writeFileSync(bashEnv, "shopt -s nocasematch\n");
+		manifestWith([DOC_ROW, `ledger/schema.md${T}doc${T}-`]);
+		try {
+			const r = install("case-membership", { BASH_ENV: bashEnv });
+			expect(r.out).toContain("have no manifest row:\n  ledger/SCHEMA.md\n");
+			expect(r.exitCode).toBe(2);
+			expect(existsSync(r.db)).toBe(false);
+		} finally {
+			writeFileSync(manifest, original);
+			if (created) rmSync(lower);
+		}
+	});
+
 	test("a duplicated manifest row is refused, nothing written", () => {
 		writeFileSync(manifest, `${original}${DOC_ROW}\n`);
 		const r = install("duplicate-row");
@@ -230,6 +319,49 @@ describe("install: every machinery file has exactly one manifest row (P-11 manif
 		expect(r.out).toContain(`duplicate row for ledger/SCHEMA.md`);
 		expect(r.exitCode).toBe(2);
 		expect(existsSync(r.db)).toBe(false);
+	});
+
+	test("a malformed leading-TAB duplicate is refused before ledger or profile writes", () => {
+		writeFileSync(manifest, `${original}${T}${DOC_ROW}\n`);
+		try {
+			const r = install("leading-tab-duplicate");
+			expect(r.exitCode).toBe(2);
+			expect(r.out).toContain("need exactly three TAB-separated fields");
+			expect(existsSync(dirname(r.db))).toBe(false);
+			expect(existsSync(join(r.home, ".omp"))).toBe(false);
+		} finally {
+			writeFileSync(manifest, original);
+		}
+	});
+
+	test("a coverage awk failure refuses installation before ledger or profile writes", () => {
+		const bin = join(root, "coverage-awk-bin");
+		mkdirSync(bin);
+		const awk = Bun.which("awk", { PATH: installPath });
+		expect(awk).not.toBeNull();
+		writeFileSync(join(bin, "awk"), [
+			"#!/bin/bash",
+			'if [ "${@: -1}" = "-" ]; then',
+			"\tprintf '%s\\n' 'injected coverage awk failure' >&2",
+			"\texit 42",
+			"fi",
+			`exec ${JSON.stringify(awk)} "$@"`,
+			"",
+		].join("\n"));
+		chmodSync(join(bin, "awk"), 0o755);
+		const file = join(copy, "ledger", "src", "coverage-awk-unmanifested.ts");
+		writeFileSync(file, "export {};\n");
+		try {
+			const r = install("coverage-awk-failure", { PATH: `${bin}:${installPath}` });
+			expect(r.exitCode).toBe(2);
+			expect(r.out).toContain("manifest ok:");
+			expect(r.out).toContain("injected coverage awk failure");
+			expect(r.out).toContain("could not check manifest coverage under ledger");
+			expect(existsSync(dirname(r.db))).toBe(false);
+			expect(existsSync(join(r.home, ".omp"))).toBe(false);
+		} finally {
+			rmSync(file);
+		}
 	});
 });
 
@@ -260,6 +392,68 @@ describe("install: symbolic links under a machinery directory are refused (S5)",
 
 	test("after every refusal the untouched copy installs again", () => {
 		expect(install("after").exitCode).toBe(0);
+	});
+});
+
+describe("install: the vendored plugins' skills and loader (plugins/VENDOR.md)", () => {
+	const rendered = (home: string) => join(home, ".omp", "profiles", "agent-system-2", "agent", "config.yml");
+
+	test("the render lists <repo>/skills then the three plugin skill dirs, sorted, names exactly the 25 manifest skills, and loads plugins/index.ts last", () => {
+		const r = install("plugins-baseline");
+		expect(r.exitCode).toBe(0);
+		const doc = Bun.YAML.parse(readFileSync(rendered(r.home), "utf8")) as { extensions: string[]; skills: { customDirectories: string[]; includeSkills: string[] } };
+		expect(doc.skills.customDirectories).toEqual([`${copy}/skills`, `${copy}/plugins/ask-graham/skills`, `${copy}/plugins/i-have-audhd/skills`, `${copy}/plugins/paired-coding/skills`]);
+		const skillRows = original
+			.split("\n")
+			.filter((l) => l.split(T)[1] === "skill")
+			.map((l) => l.split(T)[0]!.replace(/\/SKILL\.md$/, "").replace(/^.*\//, ""));
+		expect(skillRows).toHaveLength(25);
+		expect([...doc.skills.includeSkills].sort()).toEqual(skillRows.sort());
+		for (const name of ["ask-graham", "i-have-audhd", "paired-coding"]) expect(doc.skills.includeSkills).toContain(name);
+		expect(doc.extensions.at(-1)).toBe(`${copy}/plugins/index.ts`);
+	});
+
+	// Which modules OMP's discovery then skips, with a seeded control plugin still loading, is in
+	// plugins/test/loader.test.ts and install/fresh-machine-test.sh step 3c.
+	test("disabledExtensions names exactly each vendored adapter's module, from its package.json omp.extensions", () => {
+		const r = install("plugins-disabled");
+		expect(r.exitCode).toBe(0);
+		const doc = Bun.YAML.parse(readFileSync(rendered(r.home), "utf8")) as { disabledExtensions: string[] };
+		const adapters = ["ask-graham", "i-have-audhd", "paired-coding"].flatMap((p) => {
+			const pkg: { omp: { extensions: string[] } } = JSON.parse(readFileSync(join(copy, "plugins", p, "package.json"), "utf8"));
+			return pkg.omp.extensions.map((e) => `extension-module:${e.replace(/^.*\//, "").replace(/\.ts$/, "")}`);
+		});
+		expect(adapters).toEqual(["extension-module:ask-graham-omp", "extension-module:i-have-audhd-omp", "extension-module:paired-coding-omp"]);
+		expect([...doc.disabledExtensions].sort()).toEqual(adapters);
+	});
+
+	test("a plugin skill row whose skills dir the config does not list is refused, nothing written", () => {
+		const path = join(copy, "profile", "config.yml");
+		const text = readFileSync(path, "utf8");
+		const line = `    - "{repo}/plugins/ask-graham/skills"\n`;
+		expect(text).toContain(line);
+		writeFileSync(path, text.replace(line, ""));
+		const r = install("plugins-dir-unlisted");
+		writeFileSync(path, text);
+		expect(r.out).toContain("skills.customDirectories must be exactly");
+		expect(r.out).toContain(`${copy}/plugins/ask-graham/skills`);
+		expect(r.exitCode).toBe(2);
+		expect(existsSync(rendered(r.home))).toBe(false);
+		expect(existsSync(r.db)).toBe(false);
+	});
+
+	test("a plugin skill whose name another skill row already has is refused, nothing written", () => {
+		const from = `plugins/ask-graham/skills/ask-graham/SKILL.md${T}skill${T}-`;
+		const dir = join(copy, "plugins", "ask-graham", "skills", "humanizer");
+		mkdirSync(dir);
+		cpSync(join(copy, "skills", "humanizer", "SKILL.md"), join(dir, "SKILL.md"));
+		writeFileSync(manifest, original.replace(`${from}\n`, `${from}\nplugins/ask-graham/skills/humanizer/SKILL.md${T}skill${T}-\n`));
+		const r = install("plugins-dup-name");
+		writeFileSync(manifest, original);
+		rmSync(dir, { recursive: true });
+		expect(r.out).toContain("skill name humanizer is provided twice: plugins/ask-graham/skills/humanizer and skills/humanizer");
+		expect(r.exitCode).toBe(2);
+		expect(existsSync(rendered(r.home))).toBe(false);
 	});
 });
 
@@ -421,5 +615,113 @@ describe("install: --chaos-nightly=off stops the chaos job before any install st
 		expect(r.exitCode).toBe(1);
 		expect(launchctl.calls()).toEqual([`print ${service}`, `bootout ${service}`]);
 		plistKept(home, plist);
+	});
+
+	test("--train-tick=off boots out the merge train's tick by its template's label and deletes its plist, before any install step", () => {
+		const tickLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.train-tick.plist"), "utf8"))?.[1] ?? "";
+		expect(tickLabel).toBe("com.agent-system-2.train-tick");
+		const tickService = `gui/${process.getuid?.() ?? 0}/${tickLabel}`;
+		const home = join(root, "home-train-tick-off");
+		const plist = join(home, "Library", "LaunchAgents", `${tickLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("train-tick-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--train-tick=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`train tick booted out: ${tickService}`);
+		expect(out).toContain(`train tick removed: ${plist}`);
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(existsSync(plist)).toBe(false);
+	});
+
+	test("--train-tick=off with an installing flag, or --train-tick twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-train-tick-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--train-tick=off", "--scratch-sweep"], ["--train-tick", "--train-tick=off"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
+	});
+
+	// The daily self-heal report's job (PLAN wl-mvbcjageg7o2yo § 2.6, R14), copied from the --train-tick=off cases above.
+	const reportLabel = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(join(REPO, "install", "com.agent-system-2.daily-report.plist"), "utf8"))?.[1] ?? "";
+	const reportService = `gui/${process.getuid?.() ?? 0}/${reportLabel}`;
+
+	test.if(process.platform === "darwin")("--daily-report writes a plist that lints, runs daily-report.ts at 07:00 with the profile in its environment, and bootstraps it", () => {
+		expect(reportLabel).toBe("com.agent-system-2.daily-report");
+		const home = join(root, "home-daily-report-on");
+		mkdirSync(home, { recursive: true });
+		const plist = join(home, "Library", "LaunchAgents", `${reportLabel}.plist`);
+		const launchctl = fakeLaunchctl("daily-report-on", false);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report"], {
+			env: { PATH: `${launchctl.bin}:${process.env.PATH ?? ""}`, HOME: home, AGENT_SYSTEM_PROFILE: "as2-report-test" }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain("daily report loaded: runs daily at 07:00 local time");
+		expect(r.exitCode).toBe(0);
+		expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
+		const job = JSON.parse(Bun.spawnSync(["/usr/bin/plutil", "-convert", "json", "-o", "-", plist]).stdout.toString());
+		const log = join(home, "agent-scratch", "agent-system-2.0", "self-heal", "launchd.log");
+		expect(job).toEqual({
+			Label: reportLabel,
+			ProgramArguments: [Bun.which("bun"), join(copy, "surface", "scripts", "daily-report.ts")],
+			EnvironmentVariables: { AGENT_SYSTEM_LEDGER_DB: join(home, ".agent-system-2", "ledger.db"), AGENT_SYSTEM_PROFILE: "as2-report-test", HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+			WorkingDirectory: copy,
+			StartCalendarInterval: { Hour: 7, Minute: 0 },
+			ProcessType: "Background",
+			StandardOutPath: log,
+			StandardErrorPath: log,
+		});
+		expect(existsSync(dirname(log))).toBe(true);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `bootstrap gui/${process.getuid?.() ?? 0} ${plist}`]);
+	});
+
+	test("--daily-report=off boots the job out and deletes its plist before any install step, with no bun on PATH, and writes nothing else", () => {
+		const home = join(root, "home-daily-report-off");
+		const plist = join(home, "Library", "LaunchAgents", `${reportLabel}.plist`);
+		mkdirSync(dirname(plist), { recursive: true });
+		writeFileSync(plist, "<plist/>\n");
+		const launchctl = fakeLaunchctl("daily-report-off", true);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		const out = r.stdout.toString() + r.stderr.toString();
+		expect(out).toContain(`daily report booted out: ${reportService}`);
+		expect(out).toContain(`daily report removed: ${plist}`);
+		expect(out).toContain("nothing else was run or written");
+		expect(out).not.toContain("bun not found");
+		expect(out).not.toContain("reading manifest");
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `bootout ${reportService}`]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+	});
+
+	test("--daily-report=off with another =off form removes both jobs in one run", () => {
+		const home = join(root, "home-daily-report-off-both");
+		const agents = join(home, "Library", "LaunchAgents");
+		mkdirSync(agents, { recursive: true });
+		writeFileSync(join(agents, `${reportLabel}.plist`), "<plist/>\n");
+		writeFileSync(join(agents, "com.agent-system-2.scratch-sweep.plist"), "<plist/>\n");
+		const launchctl = fakeLaunchctl("daily-report-off-both", false);
+		const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), "--daily-report=off", "--scratch-sweep=off"], {
+			env: { PATH: `${launchctl.bin}:${systemPath}`, HOME: home }, stdout: "pipe", stderr: "pipe",
+		});
+		expect(r.exitCode).toBe(0);
+		expect(launchctl.calls()).toEqual([`print ${reportService}`, `print gui/${process.getuid?.() ?? 0}/com.agent-system-2.scratch-sweep`]);
+		expect(tree(home)).toEqual(["Library", join("Library", "LaunchAgents")]);
+	});
+
+	test("--daily-report=off with an installing flag, --daily-report with an =off form, or the flag twice, is refused with exit 2 and writes nothing", () => {
+		const home = join(root, "home-daily-report-refused");
+		mkdirSync(home, { recursive: true });
+		for (const args of [["--daily-report=off", "--scratch-sweep"], ["--daily-report", "--train-tick=off"], ["--daily-report", "--daily-report=off"], ["--daily-report=on"]]) {
+			const r = Bun.spawnSync(["/bin/bash", join(copy, "install", "install.sh"), ...args], { env: { PATH: systemPath, HOME: home }, stdout: "pipe", stderr: "pipe" });
+			expect(r.exitCode).toBe(2);
+		}
+		expect(tree(home)).toEqual([]);
 	});
 });

@@ -95,6 +95,211 @@ const RULES: Rule[] = [
 ];
 
 /**
+ * The reserved actions that interrupt Jo (PLAN wl-mvg1vs0rhnu3gg § 1.2, § 1.3, open question 1 (b)): the `why`
+ * strings of the guard bypasses and the irreversible or shared-state rules — destructive SQL, a production database,
+ * infrastructure teardown, secret rotation, deploy, publish, workflow run, release, the `--admin` merge, push to a
+ * protected branch, remote ref deletion and history rewrite (force-push included). surface/src/errors.ts gives a
+ * waiting reserved request whose body opens with one of them `state: "now"`, and surface/src/batch.ts `onFire` pushes
+ * it at once. Blind "not known until it runs" requests, `rm`, local discards and local branch or tag deletion are not
+ * here: they wait for the window. Each string occurs literally in RULES, gitModel's tables (src/git-model.ts) or
+ * checkPush; gates/test/r06-reserved.test.ts fails when a rule is renamed out from under this list.
+ */
+export const NOW_RESERVED: readonly string[] = [
+	// destructive SQL
+	"destructive SQL (DROP)",
+	"destructive SQL (TRUNCATE)",
+	// production database (psql's own why extends this one)
+	"a database client against a production target",
+	"writes, resets or deletes a Supabase database",
+	// infrastructure teardown
+	"deletes a DigitalOcean resource",
+	"kubectl delete",
+	"infrastructure teardown (destroy)",
+	"deletes AWS resources",
+	"deletes a Google Cloud resource",
+	"destroys a Fly app",
+	"destroys a Heroku app",
+	"removes a docker volume (data loss)",
+	"gh repo delete/archive/rename",
+	"formats a filesystem",
+	"dd onto a block device",
+	// secret rotation
+	"sets or deletes a GitHub Actions secret",
+	"adds or deletes a deploy key",
+	"rotates or rewrites an AWS secret",
+	"rotates a Google Cloud secret",
+	"writes or deletes a Vault secret",
+	"rotates a platform secret",
+	"rewrites a deploy environment secret",
+	// deploy (the bare "deploy" also opens every "deploy (…)")
+	"deploy",
+	"infrastructure change (apply/up)",
+	// publish, workflow run, release
+	"publishes a package",
+	"gh workflow run triggers a workflow (deploy path)",
+	"gh release publishes or destroys a release",
+	// guard bypass: the --admin merge and a push to a protected branch (barePushOfProtected extends the latter)
+	"gh pr merge --admin bypasses branch protection",
+	"push to a protected branch",
+	"git push --all (pushes every branch, protected ones included)",
+	"git push --branches (pushes every branch, protected ones included)",
+	// remote ref deletion
+	"remote ref deletion (git push --delete / -d)",
+	"remote ref deletion (git push :ref)",
+	"git push --mirror (force-updates and deletes every remote ref)",
+	"git push --prune (deletes remote branches)",
+	// history rewrite
+	"force-push",
+	"git update-ref moves or deletes a ref directly (a history rewrite)",
+	"git filter-branch rewrites history",
+	"git replace substitutes objects (a history rewrite)",
+];
+
+/** The NOW_RESERVED entries that bypass a guard (§ 1.2): NOW (guard). Every other entry is NOW (irreversible) (§ 1.3). */
+const NOW_RESERVED_GUARD: Record<string, true> = {
+	"gh pr merge --admin bypasses branch protection": true,
+	"push to a protected branch": true,
+	"git push --all (pushes every branch, protected ones included)": true,
+	"git push --branches (pushes every branch, protected ones included)": true,
+};
+
+/**
+ * The NOW_RESERVED entry a reserved action (or a `reserved-request` body, `<action>: <call> (P-11 row 6 …)`) opens
+ * with and its NOW category (a word of gates/src/rulings.ts NOW_CATEGORIES), or null. An entry counts only whole: the
+ * text is it, or goes on with `:` or ` (` (`deploy (vercel)`, `push to a protected branch (current branch main)`,
+ * `force-push (+refspec)`), never a longer word or phrase.
+ */
+export function nowReserved(text: string): { why: string; category: "guard" | "irreversible" } | null {
+	const why = NOW_RESERVED.find((s) => text === s || text.startsWith(`${s}:`) || text.startsWith(`${s} (`));
+	return why === undefined ? null : { why, category: NOW_RESERVED_GUARD[why] ? "guard" : "irreversible" };
+}
+
+// The merge gate (PLAN wl-mv8s8srodefytc rev 17.1 D2): main's branch protection requires the `as2/full-suite` status only the test
+// runner posts, outside the fence. A lane that wrote a commit status, a check run or a check suite could forge that green, so ghApiModel
+// reads every `gh api` call, in the raw pass (quote-blind words) and the parsed pass (expanded words), where RULES would read a spelling.
+const GH_API_WHY = "(the merge gate's as2/full-suite is the test runner's alone)";
+/** gh api's options that take a value, short and long (https://cli.github.com/manual/gh_api, Options, read 2026-10-14); `-i` and `-h` take none. */
+const GH_API_SHORT_VALUE = "XfFHqtp";
+const GH_API_LONG_VALUE = ["method", "raw-field", "field", "header", "jq", "template", "preview", "input", "cache", "hostname"];
+const GH_API_SHORT_LONG: Record<string, string> = { X: "method", f: "raw-field", F: "field", H: "header", q: "jq", t: "template", p: "preview" };
+const STATUS_ENDPOINT = /statuses|check-runs|check-suites/;
+const STATUS_MUTATION = /createCommitStatus|createCheckRun|updateCheckRun|createCheckSuite|rerequestCheckSuite/i;
+
+/**
+ * A gh api word as GitHub reads it in a path: percent-decoded until stable (`%2573` is `%73` is `s`),
+ * lowercased, and without a scheme and host prefix. Null when a percent sequence does not decode,
+ * since the gate cannot say what GitHub will make of it.
+ */
+function ghApiWord(text: string): string | null {
+	let word = text;
+	for (;;) {
+		let next: string;
+		try {
+			next = decodeURIComponent(word);
+		} catch {
+			return null;
+		}
+		if (next === word) break;
+		word = next;
+	}
+	return word.toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/, "");
+}
+
+/** One gh api argument: its text, and whether its value is unknown until it runs (an opaque word or a glob). */
+interface GhApiArg {
+	text: string;
+	unread: boolean;
+}
+
+/**
+ * The words after `api` in a `gh` argv, or null when the subcommand is not `api`. Words before it are
+ * global options and their values, as GH reads them.
+ */
+function ghApiArgs<T extends { text: string }>(argv: T[]): T[] | null {
+	for (let i = 1; i < argv.length; i++) {
+		const t = argv[i]!.text;
+		if (t === "api") return argv.slice(i + 1);
+		if (t.startsWith("-") || (i > 1 && argv[i - 1]!.text.startsWith("-"))) continue;
+		return null;
+	}
+	return null;
+}
+
+/**
+ * The status-write model over gh api's arguments, or null. The effective method is the last explicit
+ * -X/--method; without one, a field or --input makes it POST, as gh does, and otherwise it is GET. Any
+ * method but GET writes to an endpoint holding `statuses`, `check-runs` or `check-suites` in any word,
+ * each word read as GitHub reads a path (ghApiWord), and a word that does not decode is refused.
+ * An unread word is refused outright: the expander does not record whether it was quoted, so it may
+ * split into several words and be the endpoint, a method, or shift a literal endpoint into an option's
+ * value. A graphql request is refused for a status or check mutation in any decoded word or in what it
+ * reads on stdin, and for a query or body read from a file, or from stdin the gate cannot see. `stdin` is the
+ * heredoc or here-string text the command reads, null when it reads a pipe or a file; the raw pass,
+ * which cannot see heredoc bodies, omits it and the parsed pass judges stdin.
+ */
+function ghApiModel(args: GhApiArg[], stdin?: string | null): string | null {
+	if (args.some((a) => a.unread)) return `gh api with a word not known until it runs, which could be a status or check-run endpoint or a method that writes one ${GH_API_WHY}`;
+	let method: string | null | undefined;
+	let writes = false;
+	let input: string | undefined;
+	const files: string[] = [];
+	const positionals: string[] = [];
+	const apply = (name: string, value: string | undefined): void => {
+		if (name === "method") method = value ?? null;
+		else if (name === "raw-field" || name === "field") {
+			writes = true;
+			const at = value === undefined ? -1 : value.indexOf("=@");
+			if (name === "field" && at >= 0 && value!.slice(0, at) === "query") files.push(value!.slice(at + 2));
+		} else if (name === "input") {
+			writes = true;
+			input = value ?? "";
+		}
+	};
+	let options = true;
+	for (let i = 0; i < args.length; i++) {
+		const t = args[i]!.text;
+		if (!options || t === "-" || !t.startsWith("-")) positionals.push(t);
+		else if (t === "--") options = false;
+		else if (t.startsWith("--")) {
+			const eq = t.indexOf("=");
+			const name = t.slice(2, eq < 0 ? undefined : eq);
+			if (GH_API_LONG_VALUE.includes(name)) apply(name, eq >= 0 ? t.slice(eq + 1) : args[++i]?.text);
+		} else {
+			for (let j = 1; j < t.length; j++) {
+				const c = t[j]!;
+				if (!GH_API_SHORT_VALUE.includes(c)) continue;
+				const rest = t.slice(j + 1).replace(/^=/, "");
+				apply(GH_API_SHORT_LONG[c]!, rest !== "" ? rest : args[++i]?.text);
+				break;
+			}
+		}
+	}
+	const effective = method !== undefined ? method : writes ? "POST" : "GET";
+	const words = args.map((a) => ghApiWord(a.text));
+	if (effective?.toUpperCase() !== "GET") {
+		if (words.includes(null)) return `gh api with a word whose percent-encoding does not decode, which could spell a status or check-run endpoint ${GH_API_WHY}`;
+		if (words.some((w) => STATUS_ENDPOINT.test(w!))) return `gh api writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	}
+	if (!positionals.some((p) => /graphql/i.test(p))) return null;
+	const scanned = [...words, ghApiWord(stdin ?? "")];
+	if (scanned.includes(null)) return `gh api graphql with a word whose percent-encoding does not decode, which could hide a status or check mutation ${GH_API_WHY}`;
+	if (scanned.some((w) => STATUS_MUTATION.test(w!))) return `gh api graphql with a mutation that writes a commit status, a check run or a check suite ${GH_API_WHY}`;
+	const reads = input !== undefined ? [...files, input] : files;
+	if (reads.some((f) => f !== "-") || (stdin === null && reads.includes("-"))) {
+		return `gh api graphql with a query read from a file or stdin the gate cannot see, which could write a commit status or a check run ${GH_API_WHY}`;
+	}
+	return null;
+}
+
+/** The heredoc and here-string text a parsed command reads on stdin; null when it reads a pipe, a file, or a body not known until it runs. */
+function stdinText(e: Exec): string | null {
+	if (e.source.stdinFrom) return null;
+	const reads = e.redirects.filter((r) => r.op.startsWith("<") && r.op !== "<&");
+	if (reads.some((r) => r.body === null || r.bodyOpaque)) return null;
+	return reads.map((r) => r.body).join("\n");
+}
+
+/**
  * Global options of the infrastructure CLIs whose reserved verbs RULES matches next to the program
  * name (M4 fix round 8, astra-8 B3: `kubectl --context production delete …` hid `kubectl delete`).
  * Each option's arity (0 a flag, 1 takes a value: `--context x`, `--context=x`, `-nx`, `-n=x`), and
@@ -284,7 +489,26 @@ export function reservedInShell(cmd: string, skipPrinters = false, scratch?: Scr
 	for (const seg of c.split(/[;&|\n]+/).map((s) => s.trim()).filter(Boolean)) {
 		if (skipPrinters && /^(echo|printf)(\s|$)/.test(seg)) continue;
 		if (isRecursiveForceRm(seg, scratch)) return "rm -rf (recursive force-delete)";
+		const gh = ghApiInText(seg);
+		if (gh) return gh;
 		for (const { re, why } of RULES) if (re.test(seg)) return why;
+	}
+	return null;
+}
+
+/**
+ * ghApiModel over each `gh … api` in a raw segment: its words split on spaces, quote-blind, with the
+ * quotes off a word quoted whole, and a word holding a substitution unread (isRecursiveForceRm's reading).
+ */
+function ghApiInText(seg: string): string | null {
+	for (const m of seg.matchAll(new RegExp(`${GH}api(?=\\s|$)`, "gi"))) {
+		const args = seg
+			.slice(m.index + m[0].length)
+			.split(" ")
+			.filter(Boolean)
+			.map((t) => ({ text: t.replace(/^(['"])(.*)\1$/, "$2"), unread: /`|\$\(/.test(t) }));
+		const why = ghApiModel(args);
+		if (why) return why;
 	}
 	return null;
 }
@@ -593,6 +817,11 @@ function reservedInExec(e: Exec, data?: Set<Word>, scratch?: Scratch): string | 
 	}
 	if (name === "psql") {
 		const why = checkProductionPsql(e);
+		if (why) return why;
+	}
+	if (name === "gh") {
+		const api = ghApiArgs(e.argv);
+		const why = api ? ghApiModel(api.map((w) => ({ text: w.text, unread: unread(w) })), stdinText(e)) : null;
 		if (why) return why;
 	}
 	const git = gitCall(e);

@@ -52,17 +52,27 @@
 // wake, Jo's turn, `orchestrator_ledger`), the needs-you block (the `surface-needs-you` aside and Jo's
 // turn) and each tick line as it is queued — carries an open plan question's path beneath each line
 // naming it (surface/src/plan-paths.ts), decorated once where it is produced.
+//
+// Jev rank (PLAN wl-mv8k039gvogt8g D5, D6): every render but a one-workload read carries the rank line under needs-you (surface/src/render.ts
+// `rankLines`, stored rows only, labelled with the rank mode in force), and every tick tries the weekly audit
+// (surface/src/rank-audit.ts `runAudit`), which never throws out of the tick.
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
+import { linkTerminal } from "../src/linked-api";
+import { laneCap } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
+import { trainMembers } from "../src/merge-train";
+import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
+import { preemptFor, readRankConfig } from "../src/rank-launch";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
+import type { ResultTextConstructor, ResultTextLoader } from "../src/types";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
-import { launchVerdict, triggerLaunch } from "./launch";
+import { launchVerdict, priorityPausingLine, triggerLaunch } from "./launch";
 import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
@@ -163,7 +173,7 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 		ensureStandingWorkload(ledger);
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
-		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering });
+		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
 		dropHold(s);
@@ -201,7 +211,12 @@ function pushKey(m: HostMessage): { surfaceKey: string; renderSeq: number; super
 	return { surfaceKey: d.surfaceKey, renderSeq: d.renderSeq, supersedes: Array.isArray(d.supersedes) ? d.supersedes.filter((k): k is string => typeof k === "string") : [] };
 }
 
-export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env): void {
+export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | undefined> = process.env, loadText?: ResultTextLoader): Promise<void> {
+	let Text: ResultTextConstructor | undefined;
+	let textError: unknown;
+	// The entry returns this preload to OMP's awaited factory, before restored results can paint.
+	// Offline sessions that never render stay inert; a read/render surfaces loader failure explicitly.
+	const textReady = Promise.resolve().then(() => loadText?.()).then((value) => { Text = value; }).catch((error: unknown) => { textError = error; });
 	const z = pi.zod;
 	pi.registerTool({
 		name: WAKE_READ_TOOL,
@@ -245,6 +260,10 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			workload: z.string().optional().describe("One workload id (wl-…) to render; omit for every open workload."),
 		}),
 		approval: "read",
+		renderResult(result) {
+			if (!Text) throw new Error(`The ledger result renderer could not load the host Text constructor: ${String(textError ?? "no Text loader was supplied")}`);
+			return new Text(linkTerminal(result.content.map((part) => part.text).join("\n")), 0, 0);
+		},
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const s = surfaceSession(ctx, env);
 			if (!s.active) return { content: [{ type: "text", text: "This session is not the orchestrator surface; nothing was read." }] };
@@ -257,7 +276,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 			const now = s.now();
 			recordLapsedLeases(ledger, SURFACE_BY, now);
-			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering });
+			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 			s.delivered.take(rendered.lines);
 			unhold(s, rendered.lines);
 			if (wl) consumeLines(ledger, rendered.lines);
@@ -378,12 +397,20 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * queue, pushed when the catch-up ends. The session's `cwd` is the close tool's fallback repository.
 	 * A withdrawn close the word could not finish (a git failure, an open PR Jo then closes) completes
 	 * here on a later poll with no new word.
+	 * Before the per-workload loop, `preemptFor` runs once (PLAN wl-mv8wzytml878b4 D3): in `order`, a
+	 * Jo-ruled workload waiting at cap gets one priority stop on the lowest-ranked running lane below it.
 	 */
 	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
+			try {
+				const pause = preemptFor(ledger, ledger.now(), laneCap(env), readRankConfig(env), SURFACE_BY).paused;
+				if (pause) tick(s, ctx, `tick: ${priorityPausingLine(pause)}`);
+			} catch (err) {
+				tick(s, ctx, `tick: the priority pause check failed: ${String(err)}`);
+			}
 			for (const w of ledger.inFlight()) {
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;
@@ -401,11 +428,14 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 						continue;
 					}
 					s.stuckFinished.delete(id);
+					// PLAN wl-mvbjiettjrfpxc D10 (R19): a merge train's merges are news only through the tick's notices and its questions,
+					// so its close is not pushed; an owner's close notice stays.
+					const isTrain = trainMembers(ledger.entries(id), ledger.instructions(id)).length > 0;
 					try {
 						const r = await closeWorkloadWithEntry(pi, ledger, env, id, { now: s.now(), cwd: ctx.cwd, receipt: null });
 						if (r.closed) {
 							s.refusedClose.delete(id);
-							tick(s, ctx, `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
+							if (!isTrain) tick(s, ctx, `tick: closed ${id}: ${(r.receipt ?? "").split("\n")[0]} — ${r.entry}`);
 						} else if (s.refusedClose.get(id) !== r.text) {
 							// Refused: retried every poll, told once per distinct refusal.
 							s.refusedClose.set(id, r.text);
@@ -427,6 +457,24 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		} finally {
 			s.launching = false;
 			pushNotices(s, ctx, false);
+		}
+	};
+
+	/**
+	 * The weekly Jev rank audit (PLAN wl-mv8k039gvogt8g D6), tried at every tick: `runAudit` writes the report and the
+	 * `rank-audit:` row when one is due and is a no-op otherwise. A written audit is a tick line; a failure never leaves
+	 * the tick and is told once per distinct text (`auditFailed`).
+	 */
+	let auditFailed: string | null = null;
+	const auditTick = (s: SurfaceSession, ctx: Ctx): void => {
+		try {
+			const a = runAudit(s.ledger(), s.now(), { reportDir: RANK_AUDIT_DIR });
+			auditFailed = null;
+			if (a) tick(s, ctx, `tick: Jev rank audit ${a.from}..${a.to}: ${a.picks} pick(s), ${a.scorable} scorable, Jev's #1 ${a.top1}, top 3 ${a.top3}; report ${a.report}`);
+		} catch (err) {
+			const why = `tick: the Jev rank audit failed: ${String(err)}`;
+			if (auditFailed !== why) tick(s, ctx, why);
+			auditFailed = why;
 		}
 	};
 
@@ -469,6 +517,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 				catchUp(s, ctx).catch((err: unknown) => {
 					process.stderr.write(`surface: the tick's catch-up failed: ${String(err)}\n`);
 				});
+				auditTick(s, ctx);
 			}, s.pollMs);
 		}
 		triggerWake(s, ctx, resumed ? "restart" : "session-start");
@@ -615,4 +664,5 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 		if (!s.active || !s.owed) return undefined;
 		return { decision: "block", reason: `wake (${s.owed.trigger}): the wake-read entry is still owed; call ${WAKE_READ_TOOL} with what you resume.` };
 	});
+	return textReady;
 }

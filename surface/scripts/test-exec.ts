@@ -3,25 +3,37 @@
 // `bun build --target=bun` bundle beside the wrapper; a test runs this file directly.
 //
 //   exec prepare <run id> <sha>        clone <stage>/<run id>/repo.bundle into runs/<run id>/repo, detached at <sha>
-//   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap
+//   exec full    <run id>              bun test, junit to runs/<run id>/full.xml, console to full.log, under the full cap;
+//                                      with `--parallel=<n>` when caps.json carries `fullWorkers` over 1 (profile/config.yml
+//                                      `testRunner.fullWorkers`; no key runs serially)
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
+//   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
+//   exec base-solo <run id> ./<file>   `solo` in the base clone, to base-solo-<i>.xml/.log
 //   exec sweep   <run id>              SIGTERM, then SIGKILL, to the run's processes, holding locks/sweep.db
 //   exec cleanup <run id> <old run id> delete runs/<old run id>
 //   exec probe   <run id> <path>...    whether this user can open or write each path (the preflight)
 //
 // The wrapper fixes the root, bun, the env and the sweep's reach in AS2TEST_EXEC_CONFIG; argv picks
 // only the subcommand and its operands. Every subcommand is fenced: it refuses unless
-// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full` and `solo`
+// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and `base-solo`
 // otherwise pass bun's own exit through (128 + the signal number when bun died by a signal).
+//
+// At a part's cap, before its group is killed, a bounded stuck capture (process tree, `sample` per bun process, `lsof` per
+// process, the log's last 200 lines) goes to `<part stem>.stuck.log` beside the part's log (PLAN wl-mvq4edh02r5z40 D5).
+//
+// Parallel files (workload wl-mvg2kzuvwngdmo): the worker count rides in caps.json, never in argv, so `full <run id>`
+// keeps its operand count and the installed wrapper needs no change. The runner logs `full workers <n>` before the PR
+// full part; surface/scripts/test-run-waits.ts reads it back per run. The reversal is `fullWorkers: 1` in the profile.
 import { Database } from "bun:sqlite";
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
-	accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync,
-	realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync,
+	accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync,
+	readFileSync, readSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync, writeSync,
 } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { type ExecConfig, probeAnswerLine, REAL_GIT, UID_SWEEP } from "../src/as2test";
+import { sweepLegacyNativeTemps } from "../src/as2test-temp";
 import {
 	AS2TEST_USER, childEnv, childGitconfigText, childLayout, gitShimText, isBunTestFile, RUN_ID_RE, SHA_RE, WRAPPER_EXIT,
 } from "../src/test-run";
@@ -51,11 +63,11 @@ function config(): Config {
 	const c = v as Record<string, unknown>;
 	const abs = (x: unknown): x is string => typeof x === "string" && isAbsolute(x) && normalize(x) === x;
 	const ms = (x: unknown): x is number => typeof x === "number" && Number.isSafeInteger(x) && x >= 0;
-	if (!abs(c.root) || !abs(c.bun) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs)) {
+	if (!abs(c.root) || !abs(c.bun) || (c.sweep !== "groups" && c.sweep !== UID_SWEEP) || !(c.hooks === null || abs(c.hooks)) || !ms(c.killGraceMs) || !ms(c.sweepLockWaitMs) || !ms(c.captureMs)) {
 		return refuse("wrapper config is malformed");
 	}
 	if (c.sweep !== "groups" && (c.hooks !== null)) return refuse("hooks are for a groups render only");
-	return { root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs };
+	return { root: c.root, bun: c.bun, sweep: c.sweep, hooks: c.hooks, killGraceMs: c.killGraceMs, sweepLockWaitMs: c.sweepLockWaitMs, captureMs: c.captureMs };
 }
 
 /** The canonical root and its three areas. */
@@ -116,12 +128,16 @@ function workDir(a: Areas, runId: string): string {
 	return work;
 }
 
-async function hook(cfg: Config, runId: string, point: string): Promise<void> {
+/**
+ * A test's pause point: when `<hooks>/<run>.<point>.pause` exists, write `.reached` (this pid, the time and `info`) and wait for
+ * `.go`, or until `stop` says so (the stuck capture's hooks stop at its deadline).
+ */
+async function hook(cfg: Config, runId: string, point: string, o: { stop?: () => boolean; info?: Record<string, unknown> } = {}): Promise<void> {
 	if (!cfg.hooks) return;
 	const base = join(cfg.hooks, `${runId}.${point}`);
 	if (!existsSync(`${base}.pause`)) return;
-	writeFileSync(`${base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now() }));
-	while (!existsSync(`${base}.go`)) await Bun.sleep(25);
+	writeFileSync(`${base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...o.info }));
+	while (!existsSync(`${base}.go`) && !o.stop?.()) await Bun.sleep(25);
 }
 
 // ---- process groups --------------------------------------------------------------------------------
@@ -154,6 +170,383 @@ async function killGroup(cfg: Config, pgid: number): Promise<void> {
 	signalGroup(pgid, "SIGKILL");
 }
 
+// ---- the stuck capture (PLAN wl-mvq4edh02r5z40 revision 3, D5) -------------------------------------------
+
+/** The most bytes a section of `<part>.stuck.log` holds; also a tool's stdout, a sample report read and the log tail read. */
+const CAPTURE_CAP = 1 << 20;
+/** ps lists every process; its stdout is filtered to the part's tree before the section cap applies. */
+const PS_CAP = 8 << 20;
+/** A tool that fails or is refused leaves the last this many bytes of its stderr. */
+const STDERR_TAIL = 2_048;
+const LOG_TAIL_LINES = 200;
+const PS = ["/bin/ps", "-ax", "-o", "pid=,ppid=,pgid=,state=,etime=,command="];
+
+/** Thrown inside the capture once it was cut or ended: the step after it never runs. */
+class Abandoned extends Error {}
+
+interface ToolRun {
+	argv: string[];
+	pid: number | undefined;
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	/** spawn's own failure (ENOENT, EPERM, …) when the tool never ran. */
+	error: string | null;
+	out: string;
+	err: string;
+	ms: number;
+}
+
+const errText = (e: unknown): string => (e as NodeJS.ErrnoException)?.code ?? (e instanceof Error ? e.message : String(e));
+
+/** One capture: its O_EXCL output file, its deadline, the capture tools still running (each the leader of its own group), its cap dir and the sample reports it named there. */
+class Capture {
+	private fd: number | null;
+	readonly started = Date.now();
+	readonly deadline: number;
+	/** The capture tools whose pipes have not closed, by process group. */
+	private readonly live = new Map<number, ChildProcess>();
+	capDir: string | null = null;
+	/** The `sample-<pid>.txt` paths this capture named in its cap dir: the only names cleanup unlinks before the kill. */
+	private readonly reports = new Set<string>();
+	/** Whether the stuck log already says the cap dir was left for after the kill. */
+	private capDirLeft = false;
+	/** Set at the cut or the end: nothing after it is spawned, read or written as a section. */
+	over = false;
+
+	constructor(fd: number, captureMs: number) {
+		this.fd = fd;
+		this.deadline = this.started + captureMs;
+	}
+
+	alive(): void {
+		if (this.over) throw new Abandoned();
+	}
+
+	/** Whether a hook wait or a report read must stop: the capture is over or its deadline passed. */
+	readonly late = (): boolean => this.over || Date.now() >= this.deadline;
+
+	write(text: string): void {
+		if (this.fd === null) return;
+		try {
+			writeSync(this.fd, text);
+		} catch (e) {
+			process.stderr.write(`as2test: stuck capture: write failed: ${errText(e)}\n`);
+			this.close();
+		}
+	}
+
+	/** A headed, timed section, its body capped at CAPTURE_CAP bytes. */
+	section(title: string, since: number, body: string): void {
+		this.alive();
+		const bytes = Buffer.from(body);
+		const text = bytes.length > CAPTURE_CAP ? `${bytes.subarray(0, CAPTURE_CAP).toString()}\n[section cut at ${CAPTURE_CAP} bytes]\n` : body;
+		this.write(`== ${title} (${Date.now() - since} ms) ==\n${text}${text.endsWith("\n") ? "" : "\n"}`);
+	}
+
+	/**
+	 * Run one tool async, detached in its own process group, stdout kept to `outCap` bytes and stderr to its last
+	 * STDERR_TAIL; resolves when its pipes close (never rejects once started). Nothing is spawned once the capture is over.
+	 */
+	tool(argv: string[], outCap = CAPTURE_CAP): Promise<ToolRun> {
+		this.alive();
+		const t0 = Date.now();
+		const { promise, resolve } = Promise.withResolvers<ToolRun>();
+		const out: Buffer[] = [];
+		let outLen = 0;
+		let err = Buffer.alloc(0);
+		let child: ChildProcess | undefined;
+		let settled = false;
+		const finish = (code: number | null, signal: NodeJS.Signals | null, error: string | null) => {
+			if (settled) return;
+			settled = true;
+			if (child?.pid !== undefined) this.live.delete(child.pid);
+			resolve({ argv, pid: child?.pid, code, signal, error, out: Buffer.concat(out).toString(), err: err.toString(), ms: Date.now() - t0 });
+		};
+		try {
+			child = spawn(argv[0]!, argv.slice(1), { cwd: "/", stdio: ["ignore", "pipe", "pipe"], detached: true });
+		} catch (e) {
+			finish(null, null, errText(e));
+			return promise;
+		}
+		if (child.pid !== undefined) this.live.set(child.pid, child);
+		child.stdout?.on("data", (c: Buffer) => {
+			const keep = Math.min(c.length, outCap - outLen);
+			if (keep > 0) {
+				out.push(c.subarray(0, keep));
+				outLen += keep;
+			}
+		});
+		child.stderr?.on("data", (c: Buffer) => {
+			err = Buffer.concat([err, c]);
+			if (err.length > STDERR_TAIL) err = err.subarray(err.length - STDERR_TAIL);
+		});
+		child.on("error", (e) => finish(null, null, errText(e)));
+		child.on("close", (code, signal) => finish(code, signal, null));
+		return promise;
+	}
+
+	/** End the capture: SIGKILL every capture group still running and abandon its pipes (never awaited); returns those groups. */
+	stop(): number[] {
+		this.over = true;
+		const killed = [...this.live.keys()];
+		for (const [pgid, child] of this.live) {
+			signalGroup(pgid, "SIGKILL");
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			child.unref();
+		}
+		this.live.clear();
+		return killed;
+	}
+
+	/** The path `sample` writes its report for `pid` to, inside the cap dir; recorded so cleanup unlinks exactly it. */
+	reportPath(pid: number): string {
+		const path = join(this.capDir!, `sample-${pid}.txt`);
+		this.reports.add(path);
+		return path;
+	}
+
+	/**
+	 * Before the kill, bounded work only: unlink each sample report this capture named (lstat first; a link is unlinked itself,
+	 * never followed; a directory is left), then one rmdir of the cap dir. When that rmdir fails (something else is in it, or a
+	 * just-killed sample is still closing) the dir is left for `afterKill` and the stuck log says so, once.
+	 */
+	clearCapDir(): void {
+		if (this.capDir === null) return;
+		for (const report of this.reports) {
+			try {
+				if (!lstatSync(report).isDirectory()) unlinkSync(report);
+			} catch {
+				// already gone, or not removable here: the rmdir below fails and afterKill removes it
+			}
+		}
+		this.reports.clear();
+		try {
+			rmdirSync(this.capDir);
+			this.capDir = null;
+		} catch (e) {
+			const code = (e as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") {
+				this.capDir = null;
+				return;
+			}
+			if (this.capDirLeft) return;
+			this.capDirLeft = true;
+			this.write(code === "ENOTEMPTY" || code === "EEXIST" ? "cap dir not empty: left for after the kill\n" : `cap dir not removed: ${errText(e)}: left for after the kill\n`);
+		}
+	}
+
+	/**
+	 * After killGroup has killed the part's group: remove a cap dir `clearCapDir` left, without following a link in it
+	 * (removeTree; a just-killed sample may still be closing, so a few tries), then close the stuck log. Never throws.
+	 */
+	async afterKill(): Promise<void> {
+		try {
+			for (let attempt = 1; this.capDir !== null; attempt++) {
+				try {
+					removeTree(this.capDir);
+					this.capDir = null;
+				} catch (e) {
+					if ((e as NodeJS.ErrnoException).code === "ENOENT") this.capDir = null;
+					else if (attempt >= 5) {
+						this.write(`cap dir ${this.capDir} not removed after the kill: ${errText(e)}\n`);
+						this.capDir = null;
+					} else await Bun.sleep(20);
+				}
+			}
+		} finally {
+			this.close();
+		}
+	}
+
+	close(): void {
+		this.over = true;
+		if (this.fd === null) return;
+		const fd = this.fd;
+		this.fd = null;
+		closeSync(fd);
+	}
+}
+
+/** A tool's block in its section: the command, its pid, how it ended and its stdout; on a failure or refusal, its stderr tail. */
+function toolBlock(r: ToolRun): string {
+	const how = r.error !== null ? `not run: ${r.error}` : r.signal !== null ? `signal ${r.signal}` : `exit ${r.code}`;
+	const failedTool = r.error !== null || r.code !== 0;
+	const out = r.out === "" || r.out.endsWith("\n") ? r.out : `${r.out}\n`;
+	const err = failedTool && r.err.trim() !== "" ? `stderr (last ${STDERR_TAIL} bytes):\n${r.err.trimEnd()}\n` : "";
+	return `$ ${r.argv.join(" ")}  [pid ${r.pid ?? "none"}, ${how}, ${r.ms} ms]\n${out}${err}`;
+}
+
+/**
+ * Read a file only when it is a regular file, without following a link or blocking: open O_RDONLY|O_NOFOLLOW|O_NONBLOCK,
+ * fstat, then one positional read of at most `max` bytes, the first (`head`) or the last (`tail`).
+ */
+function readRegular(path: string, max: number, from: "head" | "tail"): { text: string } | { refused: string } {
+	let fd: number;
+	try {
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	} catch (e) {
+		return { refused: `${path}: open failed: ${errText(e)}` };
+	}
+	try {
+		const st = fstatSync(fd);
+		if (!st.isFile()) {
+			const kind = st.isFIFO() ? "a FIFO" : st.isDirectory() ? "a directory" : st.isSocket() ? "a socket" : "a device";
+			return { refused: `${path} is ${kind}, not a regular file` };
+		}
+		const len = Math.min(st.size, max);
+		const buf = Buffer.alloc(len);
+		const n = readSync(fd, buf, 0, len, from === "tail" ? st.size - len : 0);
+		return { text: buf.subarray(0, n).toString() };
+	} finally {
+		closeSync(fd);
+	}
+}
+
+interface Proc {
+	pid: number;
+	bun: boolean;
+}
+
+/** Whether a command line runs bun: its first word's basename. */
+const runsBun = (command: string): boolean => basename(command.trim().split(/\s+/)[0] ?? "") === "bun";
+
+/**
+ * Section 1: the part's process group plus every descendant of its members (a child that moved group is still shown), from
+ * one ps snapshot. Where ps is refused (a sandbox refuses its setuid exec), its exit and stderr, then the same tree from pgrep.
+ */
+async function processTree(c: Capture, pgid: number): Promise<{ body: string; procs: Proc[] }> {
+	const ps = await c.tool(PS, PS_CAP);
+	c.alive();
+	if (ps.error === null && ps.code === 0) {
+		const rows = ps.out.split("\n").flatMap((line) => {
+			const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+(.*)$/.exec(line);
+			return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), command: m[4]!, line: line.trim() }] : [];
+		});
+		const tree = new Set([pgid, ...rows.filter((r) => r.pgid === pgid).map((r) => r.pid)]);
+		for (let grew = true; grew; ) {
+			grew = false;
+			for (const r of rows) {
+				if (tree.has(r.ppid) && !tree.has(r.pid)) {
+					tree.add(r.pid);
+					grew = true;
+				}
+			}
+		}
+		const mine = rows.filter((r) => tree.has(r.pid));
+		return {
+			body: ["PID PPID PGID STAT ELAPSED COMMAND", ...mine.map((r) => r.line), ""].join("\n"),
+			procs: mine.map((r) => ({ pid: r.pid, bun: runsBun(r.command) })),
+		};
+	}
+	const lines = [toolBlock(ps).trimEnd(), "fallback: /usr/bin/pgrep -lf (PID COMMAND; no ppid, state or elapsed)"];
+	const found = new Map<number, string>();
+	const pgrep = async (args: string[]): Promise<number[]> => {
+		const r = await c.tool(["/usr/bin/pgrep", "-lf", ...args]);
+		c.alive();
+		// pgrep exits 1 when nothing matched; anything else is a failure worth keeping.
+		if (r.error !== null || (r.code !== 0 && r.code !== 1)) lines.push(toolBlock(r).trimEnd());
+		const fresh: number[] = [];
+		for (const line of r.out.split("\n")) {
+			const m = /^(\d+) (.*)$/.exec(line);
+			if (!m || found.has(Number(m[1]))) continue;
+			found.set(Number(m[1]), m[2]!);
+			fresh.push(Number(m[1]));
+		}
+		return fresh;
+	};
+	let frontier = [pgid, ...(await pgrep(["-g", String(pgid)]))];
+	for (let depth = 0; frontier.length > 0 && depth < 32; depth++) frontier = await pgrep(["-P", frontier.join(",")]);
+	for (const [pid, command] of found) lines.push(`${pid} ${command}`);
+	return { body: `${lines.join("\n")}\n`, procs: [...found].map(([pid, command]) => ({ pid, bun: runsBun(command) })) };
+}
+
+/** Section 2, one bun process: `sample` into the cap dir, then (before the deadline only) its report read the safe way. Never rejects. */
+async function sampleOne(cfg: Config, runId: string, c: Capture, pid: number): Promise<string> {
+	try {
+		const report = c.reportPath(pid);
+		const r = await c.tool(["/usr/bin/sample", String(pid), "3", "-mayDie", "-file", report]);
+		await hook(cfg, runId, "stuck-sample-read", { stop: c.late, info: { report } });
+		if (c.late()) return `${toolBlock(r)}report not read: the capture is over\n`;
+		const read = readRegular(report, CAPTURE_CAP, "head");
+		return `${toolBlock(r)}${"text" in read ? `report (first ${CAPTURE_CAP} bytes at most):\n${read.text}` : `report refused: ${read.refused}`}\n`;
+	} catch (e) {
+		return e instanceof Abandoned ? "" : `sample ${pid}: failed: ${errText(e)}\n`;
+	}
+}
+
+/** Sections 1-4 in order; sample and lsof start together once the tree is known. */
+async function captureSections(cfg: Config, runId: string, c: Capture, pgid: number, work: string, stem: string, logPath: string): Promise<void> {
+	c.capDir = mkdtempSync(join(work, `${stem}.stuck-`));
+	let since = Date.now();
+	const { body, procs } = await processTree(c, pgid);
+	c.section(`1. process tree of group ${pgid}: ${PS.join(" ")}`, since, body);
+	since = Date.now();
+	const buns = procs.filter((p) => p.bun);
+	const samples = buns.map((p) => sampleOne(cfg, runId, c, p.pid));
+	const lsofs = procs.map((p) => c.tool(["/usr/sbin/lsof", "-nP", "-p", String(p.pid)]));
+	await hook(cfg, runId, "stuck-capture", { stop: c.late });
+	c.alive();
+	const sampled = await Promise.all(samples);
+	c.alive();
+	c.section(`2. sample per bun process (${buns.length})`, since, buns.length === 0 ? "no bun process in the tree\n" : sampled.join("\n"));
+	const listed = await Promise.all(lsofs);
+	c.alive();
+	c.section(`3. lsof per process (${procs.length})`, since, procs.length === 0 ? "no process in the tree\n" : listed.map(toolBlock).join("\n"));
+	c.clearCapDir();
+	since = Date.now();
+	const tail = readRegular(logPath, CAPTURE_CAP, "tail");
+	let text = "refused" in tail ? `refused: ${tail.refused}\n` : "";
+	if ("text" in tail) {
+		const lines = tail.text.split("\n");
+		if (lines.at(-1) === "") lines.pop();
+		text = lines.length === 0 ? "(empty)\n" : `${lines.slice(-LOG_TAIL_LINES).join("\n")}\n`;
+	}
+	c.section(`4. last ${LOG_TAIL_LINES} lines of ${logPath}`, since, text);
+}
+
+/**
+ * D5: before the cap's kill, a bounded stuck capture into `<part stem>.stuck.log` beside the part's log, opened
+ * O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one stderr line and null comes back.
+ * One deadline (cfg.captureMs) owns it: at the deadline every capture group still running is SIGKILLed, its readers are
+ * abandoned, the cap dir is cleared with bounded work only (`clearCapDir`) and the file says `capture cut at <ms> ms`.
+ * The caller kills the part's group, then calls the returned capture's `afterKill` (a leftover cap dir goes, the file
+ * closes). Never throws; nothing it does changes the part's exit.
+ */
+async function stuckCapture(cfg: Config, runId: string, work: string, pgid: number, logPath: string, cap: number): Promise<Capture | null> {
+	const stem = basename(logPath, ".log");
+	const path = join(work, `${stem}.stuck.log`);
+	let fd: number;
+	try {
+		fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+	} catch (e) {
+		process.stderr.write(`as2test: stuck capture skipped: cannot create ${path}: ${errText(e)}\n`);
+		return null;
+	}
+	const c = new Capture(fd, cfg.captureMs);
+	try {
+		c.write(`stuck capture of ${stem} (process group ${pgid}) at its cap of ${cap} ms, ${new Date(c.started).toISOString()}, deadline ${cfg.captureMs} ms\n`);
+		const deadline = Promise.withResolvers<"cut">();
+		const timer = setTimeout(() => deadline.resolve("cut"), cfg.captureMs);
+		const run = captureSections(cfg, runId, c, pgid, work, stem, logPath).then(
+			() => "done" as const,
+			(e: unknown) => {
+				if (!(e instanceof Abandoned)) c.write(`capture failed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`);
+				return "done" as const;
+			},
+		);
+		const how = await Promise.race([run, deadline.promise]);
+		clearTimeout(timer);
+		const killed = c.stop();
+		c.clearCapDir();
+		if (how === "cut") c.write(`capture cut at ${Date.now() - c.started} ms\nkilled capture groups: ${killed.join(" ") || "none"}\n`);
+		else if (killed.length > 0) c.write(`killed capture groups still running: ${killed.join(" ")}\n`);
+	} catch (e) {
+		c.write(`capture failed: ${errText(e)}\n`);
+	}
+	return c;
+}
+
 // ---- prepare ---------------------------------------------------------------------------------------
 
 function git(args: string[], env: Record<string, string>, cwd: string): void {
@@ -171,16 +564,53 @@ function openUp(path: string): void {
 	} else if (st.isFile()) chmodSync(path, st.mode & 0o100 ? 0o755 : 0o644);
 }
 
-function prepare(cfg: Config, a: Areas, runId: string, sha: string): void {
+/**
+ * Where a side runs (PLAN wl-mv8s8srodefytc rev 17.1 D8): the PR side in `runs/<run id>` itself, base in `runs/<run id>/base`,
+ * each with its own clone (`<dir>/repo`) and child layout. Both sides record their process groups in `runs/<run id>/groups`
+ * and write their reports into `runs/<run id>`, base's as `base-solo-<i>.*`.
+ */
+type Side = "pr" | "base";
+const REPORT_PREFIX: Record<Side, string> = { pr: "", base: "base-" };
+
+/** The side's directory: the run's work dir, or its `base` child, a real directory that resolves to itself. */
+function sideDir(a: Areas, runId: string, side: Side): string {
+	const work = workDir(a, runId);
+	if (side === "pr") return work;
+	const base = join(work, "base");
+	if (!inside(base, work) || realpathSync(base) !== base) return refuse(`${base} is not a directory (base-prepare first)`);
+	return base;
+}
+
+function prepare(cfg: Config, a: Areas, runId: string, sha: string, side: Side): void {
 	if (!SHA_RE.test(sha)) refuse(`${sha} is not a full sha`);
 	fence(a, runId);
 	const stageRun = join(a.stage, runId);
 	const bundle = join(stageRun, "repo.bundle");
 	if (!existsSync(bundle)) failed(`${bundle} is missing`);
 	if (!inside(bundle, stageRun) || realpathSync(bundle) === stageRun) refuse(`${bundle} resolves outside ${stageRun}`);
-	const work = join(a.runs, runId);
+	// Base clones beside the PR's clone, after it: the run's work dir and its groups file already exist.
+	const runWork = side === "pr" ? join(a.runs, runId) : workDir(a, runId);
+	const work = side === "pr" ? runWork : join(runWork, "base");
+	if (side === "pr" && existsSync(work)) {
+		// The shell must make TMPDIR before Bun starts, including a sweep/probe before prepare.
+		// Only that bootstrap layout may preexist; claim preparation exclusively before any other write.
+		workDir(a, runId);
+		const tmp = join(work, ".wrapper-tmp");
+		const entries = readdirSync(work);
+		if (entries.length !== 1 || entries[0] !== ".wrapper-tmp") refuse(`${work} already exists`);
+		const st = lstatSync(tmp);
+		if (!st.isDirectory() || realpathSync(tmp) !== tmp || st.uid !== process.getuid?.() || (st.mode & 0o777) !== 0o700) refuse(`${tmp} is not an owned private plain directory`);
+	} else {
+		try {
+			mkdirSync(work, { mode: 0o755 });
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "EEXIST") refuse(`${work} already exists`);
+			throw e;
+		}
+	}
+	// A failed/interrupted prepare is not reusable, nor can two prepare processes share a run.
 	try {
-		mkdirSync(work, { mode: 0o755 });
+		mkdirSync(join(work, ".prepare"), { mode: 0o700 });
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code === "EEXIST") refuse(`${work} already exists`);
 		throw e;
@@ -190,19 +620,22 @@ function prepare(cfg: Config, a: Areas, runId: string, sha: string): void {
 	writeFileSync(l.gitconfig, childGitconfigText(), { mode: 0o644 });
 	writeFileSync(join(l.shimDir, "git"), gitShimText(REAL_GIT), { mode: 0o755 });
 	symlinkSync(cfg.bun, join(l.shimDir, "bun"));
-	writeFileSync(groupsFile(work), "", { mode: 0o644 });
+	if (side === "pr") writeFileSync(groupsFile(work), "", { mode: 0o644 });
 	// The clone sees no system config and an empty global one.
 	const env = { ...childEnv(process.env, work), GIT_CONFIG_GLOBAL: "/dev/null" };
 	git(["clone", "--quiet", "--no-checkout", realpathSync(bundle), join(work, "repo")], env, work);
 	git(["checkout", "--quiet", "--detach", sha], env, join(work, "repo"));
 	git(["remote", "remove", "origin"], env, join(work, "repo"));
-	openUp(work);
+	chmodSync(work, 0o755);
+	// Native extraction artifacts in the wrapper's private startup TMPDIR stay private.
+	for (const name of readdirSync(work)) if (name !== ".wrapper-tmp") openUp(join(work, name));
 	process.stdout.write(`prepared ${join(work, "repo")} at ${sha}\n`);
 }
 
 // ---- full and solo ---------------------------------------------------------------------------------
 
-function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): number {
+/** `<stage>/<run id>/caps.json`, written by the runner in its trusted phase before any part. */
+function caps(a: Areas, runId: string): { path: string; v: Record<string, unknown> } {
 	const path = join(a.stage, runId, "caps.json");
 	let v: unknown;
 	try {
@@ -210,9 +643,23 @@ function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): numbe
 	} catch {
 		return refuse(`${path} is missing or not json (the runner writes the caps before a part)`);
 	}
-	const n = v && typeof v === "object" && key in v ? (v as Record<string, unknown>)[key] : undefined;
+	return { path, v: v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {} };
+}
+
+function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): number {
+	const { path, v } = caps(a, runId);
+	const n = v[key];
 	if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return refuse(`${path} has no positive ${key}`);
 	return Math.round(n * 60_000);
+}
+
+/** The PR full part's workers: caps.json `fullWorkers`, 1 (serial) when the key is absent; anything but an integer of 1 or more is refused. */
+function fullWorkers(a: Areas, runId: string): number {
+	const { path, v } = caps(a, runId);
+	const n = v.fullWorkers;
+	if (n === undefined) return 1;
+	if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 1) return refuse(`${path} has a fullWorkers that is not an integer of 1 or more`);
+	return n;
 }
 
 /** Remove a stale report so a part that writes none is read as missing, never as an earlier one. */
@@ -224,10 +671,13 @@ function unlinkIfPresent(path: string): void {
 	}
 }
 
-/** Run `bun test …` in its own process group under the cap; the group is recorded for a `groups` sweep. */
-async function part(cfg: Config, work: string, argv: string[], logPath: string, cap: number): Promise<number> {
+/**
+ * Run `bun test …` in `<dir>/repo` with `<dir>`'s child env, in its own process group under the cap; the group is recorded in the
+ * run's groups file for a `groups` sweep. At the cap, the stuck capture (D5) runs, bounded by its own deadline, before the kill.
+ */
+async function part(cfg: Config, runId: string, work: string, dir: string, argv: string[], logPath: string, cap: number): Promise<number> {
 	const log = openSync(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-	const child = spawn(cfg.bun, argv, { cwd: join(work, "repo"), env: childEnv(process.env, work), stdio: ["ignore", log, log], detached: true });
+	const child = spawn(cfg.bun, argv, { cwd: join(dir, "repo"), env: childEnv(process.env, dir), stdio: ["ignore", log, log], detached: true });
 	closeSync(log);
 	const pgid = child.pid;
 	if (pgid === undefined) return failed(`bun did not start`);
@@ -240,7 +690,10 @@ async function part(cfg: Config, work: string, argv: string[], logPath: string, 
 	const first = await Promise.race([done, capped]);
 	clearTimeout(timer);
 	if (first === "cap") {
+		const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
 		await killGroup(cfg, pgid);
+		// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
+		await capture?.afterKill();
 		await done;
 		throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
 	}
@@ -253,21 +706,24 @@ async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
 	fence(a, runId);
 	const work = workDir(a, runId);
 	const cap = capMs(a, runId, "fullCapMin");
+	const workers = fullWorkers(a, runId);
 	const xml = join(work, "full.xml");
 	const log = join(work, "full.log");
 	unlinkIfPresent(xml);
 	unlinkIfPresent(log);
-	return part(cfg, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`], log, cap);
+	unlinkIfPresent(join(work, "full.stuck.log"));
+	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap);
 }
 
-async function solo(cfg: Config, a: Areas, runId: string, file: string): Promise<number> {
+async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
 	if (!file.startsWith("./")) refuse(`${file} must be ./<relative path>`);
 	const rel = file.slice(2);
 	if (rel === "" || rel.includes("\0") || rel.split("/").some((s) => s === "" || s === "." || s === "..")) refuse(`${file} is not a plain relative path`);
 	if (!isBunTestFile(rel)) refuse(`${file} is not a Bun test file name`);
 	fence(a, runId);
 	const work = workDir(a, runId);
-	const repo = join(work, "repo");
+	const dir = sideDir(a, runId, side);
+	const repo = join(dir, "repo");
 	let realRepo: string;
 	try {
 		realRepo = realpathSync(repo);
@@ -279,21 +735,23 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string): Promise
 	if (!inside(target, realRepo) || realpathSync(target) === realRepo) refuse(`${file} resolves outside the clone`);
 	if (!lstatSync(realpathSync(target)).isFile()) refuse(`${file} is not a file`);
 	const cap = capMs(a, runId, "soloCapMin");
-	// Claim the lowest free index: solo-<i>.log is created exclusively.
+	// Claim the lowest free index: <stem>-<i>.log is created exclusively.
 	let i = 1;
 	let log = "";
+	const stem = `${REPORT_PREFIX[side]}solo`;
 	for (; ; i++) {
-		log = join(work, `solo-${i}.log`);
+		log = join(work, `${stem}-${i}.log`);
 		try {
 			lstatSync(log);
 		} catch {
 			break;
 		}
 	}
-	const xml = join(work, `solo-${i}.xml`);
+	const xml = join(work, `${stem}-${i}.xml`);
 	unlinkIfPresent(xml);
-	process.stdout.write(`part solo-${i}\n`);
-	return part(cfg, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
+	unlinkIfPresent(join(work, `${stem}-${i}.stuck.log`));
+	process.stdout.write(`part ${stem}-${i}\n`);
+	return part(cfg, runId, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
 }
 
 // ---- sweep -------------------------------------------------------------------------------------------
@@ -355,13 +813,22 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 		}
 		return [...new Set(text.split("\n").filter((s) => /^[1-9]\d*$/.test(s)).map(Number))].filter((g) => g !== process.pid);
 	};
+	// Resolve the actual account, not an argv/config UID. Refuse before signaling or touching /private/tmp
+	// unless this is really that user's process. Groups fixtures never resolve the account or sweep temp.
+	let ownerUid: number | null = null;
+	if (cfg.sweep !== "groups") {
+		const id = spawnSync("/usr/bin/id", ["-u", AS2TEST_USER], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		const uid = /^\d+\s*$/.test(id.stdout ?? "") ? Number(id.stdout.trim()) : NaN;
+		if (id.status !== 0 || !Number.isSafeInteger(uid) || uid <= 0 || process.getuid?.() !== uid) refuse(`uid sweep must run as ${AS2TEST_USER}`);
+		ownerUid = uid;
+	}
 	const signal = (sig: "TERM" | "KILL"): void => {
 		if (cfg.sweep === "groups") for (const g of groups()) signalGroup(g, `SIG${sig}`);
-		else spawnSync("/usr/bin/pkill", [`-${sig}`, "-U", AS2TEST_USER], { stdio: "ignore" });
+		else spawnSync("/usr/bin/pkill", [`-${sig}`, "-U", String(ownerUid)], { stdio: "ignore" });
 	};
 	const anyLeft = (): boolean => {
 		if (cfg.sweep === "groups") return groups().some(groupAlive);
-		return spawnSync("/usr/bin/pgrep", ["-U", AS2TEST_USER], { stdio: "ignore" }).status === 0;
+		return spawnSync("/usr/bin/pgrep", ["-U", String(ownerUid)], { stdio: "ignore" }).status === 0;
 	};
 
 	signal("TERM");
@@ -371,6 +838,13 @@ async function sweep(cfg: Config, a: Areas, runId: string): Promise<number> {
 	await hook(cfg, runId, "sweep-read2");
 	signal("KILL");
 	if (cfg.sweep === "groups" && existsSync(groupsFile(work))) writeFileSync(groupsFile(work), groups().filter(groupAlive).map((g) => `${g}\n`).join(""));
+	if (ownerUid !== null) {
+		for (const removal of sweepLegacyNativeTemps("/private/tmp", ownerUid)) {
+			const line = `native-temp: ${JSON.stringify(removal)}\n`;
+			if (removal.kind === "removed") process.stdout.write(line);
+			else process.stderr.write(line);
+		}
+	}
 	db.run("COMMIT");
 	db.close();
 	process.stdout.write(`swept ${runId} (${cfg.sweep === "groups" ? "groups" : `uid ${AS2TEST_USER}`})\n`);
@@ -451,7 +925,7 @@ function probe(a: Areas, runId: string, paths: string[]): number {
 
 // ---- main ------------------------------------------------------------------------------------------------
 
-const ARITY: Record<string, number> = { prepare: 1, full: 0, solo: 1, sweep: 0, cleanup: 1 };
+const ARITY: Record<string, number> = { prepare: 1, full: 0, solo: 1, "base-prepare": 1, "base-solo": 1, sweep: 0, cleanup: 1 };
 
 async function main(argv: string[]): Promise<number> {
 	process.umask(0o022);
@@ -466,12 +940,14 @@ async function main(argv: string[]): Promise<number> {
 	const a = areas(cfg);
 	switch (sub) {
 		case "prepare":
-			prepare(cfg, a, runId, ops[0]!);
+		case "base-prepare":
+			prepare(cfg, a, runId, ops[0]!, sub === "prepare" ? "pr" : "base");
 			return WRAPPER_EXIT.ok;
 		case "full":
 			return full(cfg, a, runId);
 		case "solo":
-			return solo(cfg, a, runId, ops[0]!);
+		case "base-solo":
+			return solo(cfg, a, runId, ops[0]!, sub === "solo" ? "pr" : "base");
 		case "sweep":
 			return sweep(cfg, a, runId);
 		case "cleanup":

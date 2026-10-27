@@ -1,7 +1,6 @@
 // Jo's short inputs at the surface (SPEC-2.0.md § A1.2, § B3 item 5, § B5, § B13.1): a stakes
 // word or a mode word flips the workload in view; an option name answers the open question that
-// offers it; `withdraw` withdraws it (then replan; then cancel on the runner's ceiling question, whose
-// default is the stop); `approve` / `deny` answers a reserved request. `approve <id>` / `deny <id>`
+// offers it; `withdraw` withdraws it (then replan); `approve` / `deny` answers a reserved request. `approve <id>` / `deny <id>`
 // naming a reserved request that exists but no longer waits (its lane stopped, decided, withdrawn,
 // superseded) is refused with its state (`closedReservedRefusal`), never passed on as prose.
 // A bare answer word with more than one possible target is refused as ambiguous ("which one?");
@@ -29,15 +28,17 @@
 // (`orchestrator_record_instruction`) after the commands land; a command line between two such
 // runs separates two instructions. A paste with no command line at all is prose and passes through
 // untouched, as a single prose line does. The wrapper of a `pending` block pasted back (its
-// heading, the fence around its answer lines, the generated sentences under it,
-// `pendingWrapperLines`) is dropped, so the block pasted whole forwards no instruction of its own;
+// heading, the fence around its answer lines, the plan path and pair offer lines hung under them,
+// the generated sentences under it, `pendingWrapperLines`) is dropped, so the block pasted whole
+// forwards no instruction of its own;
 // any other line Jo pasted, a fence of Jo's own included, is kept.
 //
-// The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5): the stakes word
-// re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and an answer to the
-// runner's ceiling question settles it (*extend* raises by one block and requests the relaunch). Each
-// raise names the Jo instruction written first, which is what `effectiveCeiling` checks. The
-// `ceiling` word is never a numbered batch.
+// The workload ceiling (DESIGN-workload-ceiling.md § 1 B and D, § 2 items 2 and 5; PLAN wl-mvfkv7llkp7nk0 § 4): the
+// stakes word re-sizes the ceiling, `ceiling <usd> [<hours>] [wl-…]` sets Jo's exact figure, and `extend <wl-…>` raises
+// it by one block of the workload's own size. Each raise names the Jo instruction written first (`ceiling: <usd>
+// <hours>` for both words), which is what `effectiveCeiling` checks, and both words relaunch a lane stopped at the
+// ceiling through `raiseCeiling`. The `ceiling` word is never a numbered batch; `extend` alone or `extend <q-…>` falls
+// through to the answer path, so the round-limit question's `extend` still answers.
 //
 // The review round limit (PLAN wl-mupu0sx2o046io D9, D10; SPEC-2.0.md § B4): `rounds <n> [wl-…]`
 // sets the workload's limit (the instruction, then the `review-rounds:` entry naming it; never a
@@ -58,10 +59,10 @@
 // the plan question's), and refuse with the reason rather than pass as prose. An `approve` answering
 // a question that is not the plan question while `plan: first` stands says so in its receipt (D4).
 //
-// The pair trigger (PLAN wl-mv67564rdkfvnk D7, surface/src/pair-suggest.ts): `pair` answers a round-limit or ceiling
-// question only when that question's raiser offered it (a `pair-offer:` with the site's stamp names it). It settles the
-// question as `stop` does, flips the workload to user-driven as Jo, writes `pair-taken:`, and asks a live lane holder to
-// stop, all in one transaction (`applyPair`); on any other question `pair` is refused naming it.
+// The pair trigger (PLAN wl-mv67564rdkfvnk D7, surface/src/pair-suggest.ts): `pair` answers a round-limit question only
+// when its raiser offered it (a `pair-offer:` with the classifier's stamp names it). It settles the question as `stop`
+// does, flips the workload to user-driven as Jo, writes `pair-taken:`, and asks a live lane holder to stop, all in one
+// transaction (`applyPair`); on any other question `pair` is refused naming it.
 //
 // Binding PRs for a test run with no push (PLAN wl-mv5qdfvv82ivwg § 2.1; migration/items/test-pr-binds-named-prs.md):
 // `test-pr <wl-…> <N> [<N> …]` (numbers separated by spaces and/or commas, deduplicated, Jo's order
@@ -70,6 +71,33 @@
 // (`boundPrs`, surface/src/launch.ts). The workload is always named, never inferred. The word is the
 // command or `refused` with the reason (not an open workload, the standing one, no number, a bad
 // number), never prose and never a numbered-batch piece, at any length.
+//
+// Waiving a merged PR for the close check (PLAN wl-mvfjen3q5mqi2o D3): `waive-pr <wl-…> <N> [<N> …]` is parsed and
+// refused exactly as `test-pr` is (`prWordCommand`), and writes Jo's instruction `waive-pr <wl> <N…>`, then the
+// surface's `waive-pr: <N…> <instruction id>` naming it, in one transaction; the close check reads them (`waivedPrs`,
+// surface/src/launch.ts) and passes a MERGED PR nothing covers. It never binds a PR for a test run (`boundPrs`).
+//
+// The merge train (PLAN wl-mv8s8srodefytc § 1, surface/src/merge-train.ts): `train <N> [<N> …]` (numbers by spaces and/or
+// commas, `#N` accepted, deduplicated, Jo's order kept, at most 50) opens a merge-train workload in one transaction
+// (`applyTrain`: the preallocated id, the brief `trainBrief`, normal and autonomous, the surface's repo, `done:` TRAIN_DONE,
+// the normal ceiling, no `plan:`, Jo's instruction `train <wl> <N…>` and the surface's `train: <N…> <instruction id>`);
+// `train <wl-…> <N> [<N> …]` adds PRs to an open train (refused on any other workload, the standing one, a closed one, or
+// for a PR already on the train), writing Jo's `launch-requested:` when no lane holds it live, so a stopped train
+// relaunches. Either form refuses a PR already on another open train of the same repo, unless Jo skipped it there (rev 17.1
+// D8, `onOtherTrain`). Exactly two forms fall through to the answer path, since a question may offer the option `train`: `train`
+// alone and `train <q-…>`; every other `train …` line is the command or `refused`, never prose. A train word inside a
+// numbered batch is refused (`trainInBatch`). Jo's `skip` on a question on a train slice of PR n cancels that PR's open
+// train slices in the answer's transaction, keeping open one whose test run is live (`trainSkipClose`).
+//
+// Ending a standing ruling at once (PLAN wl-mvfkv7llkp7nk0 § 1, gates/src/rulings.ts): `end-ruling <ruling-id>` writes Jo's
+// instruction `end-ruling <id>` on the standing workload, which `endedRulings` reads, so every later question of that
+// ruling's kind goes to Jo again. One token, never an option word; an id `STANDING_RULINGS` does not hold, or a ruling
+// already ended, is `refused` with the reason, never prose.
+//
+// Halting a plan (PLAN wl-mvfkv7llkp7nk0 § 3): `halt <wl-…>` writes Jo's instruction `halt <wl>` on that workload, the
+// surface's `plan: halted <instruction>` (so `planFirst` reads it unapproved again, change slices are refused, the plan
+// never starts on its own again, and `prStakes` holds its PRs), and a `lane-stop:` request when a lane holds it live.
+// A workload not open, the standing one, or one already halted with no approve since is `refused`, never prose.
 //
 // Withdrawing a workload with no done-because: receipt (PLAN wl-mv8s939084z1ts D1–D4): `withdraw <wl-…>`
 // (exactly one workload id; a line whose second word starts `wl-` is the command or `refused`, at
@@ -84,6 +112,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
+import { END_RULING_WORD, endedRulings, endRulingBody, isRulingId, type RulingId, STANDING_RULINGS } from "../../gates/src/rulings";
 import { reviewStopBody, stopReviewsInstructionBody } from "../../classifier/src/review-stop";
 import {
 	countRounds, effectiveRoundLimit, type FindingKind, type Findings, parseReviewLimit, REVIEW_ROUND_DEFAULTS, reviewLoopEndBody,
@@ -91,17 +120,20 @@ import {
 	severityLine, UNKNOWN,
 } from "../../classifier/src/rounds";
 import { LOW_CONFIDENCE_THRESHOLD } from "../../classifier/src/route";
-import { LANE_RUNNER_BY, type Ledger, type Mode, type QuestionRow, type RoutingKind, type SliceRow, type Stakes } from "../../ledger/src/index";
-import { type Ceiling, CEILING_OPTIONS, ceilingBody, effectiveCeiling, sizeFor } from "./ceiling";
-import { closedReservedRefusal, waitingReserved } from "./errors";
+import { CLASSIFIER_BY, type Ledger, type Mode, newId, type QuestionRow, type RoutingKind, type Stakes } from "../../ledger/src/index";
+import { type Ceiling, ceilingBody, crossed, effectiveCeiling, EXTEND_SOURCE, parseSpend, sizeFor } from "./ceiling";
+import { recordRepo, repoOf } from "./decision-log";
+import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
-	attempts, type ControlEntry, controlEntries, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst,
-	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, withdrawInstructionBody, withdrawnBody,
+	attempts, byHandLine, consumedIds, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst, planHaltedBody,
+	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody, withdrawInstructionBody, withdrawnBody,
 } from "./launch";
+import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
+import { ensureStandingWorkload } from "./identity";
 import { answerOrchestratorQuestion } from "./orchestrator-question";
-import { PAIR_OPTION, type PairSite, pairOfferStamp, pairTakenBody, parsePairOffer } from "./pair-suggest";
-import { parseHeartbeat, recordLive, runDirOf, runsRoot, testRuns } from "./test-run";
+import { PAIR_OPTION, type PairSite, pairOfferLine, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
+import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
 import { DUE_PREFIX, MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
@@ -112,9 +144,11 @@ export type Command =
 	| { kind: "stakes"; workloadId: string; stakes: Stakes }
 	| { kind: "mode"; workloadId: string; mode: Mode }
 	| { kind: "answer"; workloadId: string; questionId: string; answer: string }
-	| { kind: "withdraw"; workloadId: string; questionId: string; then: "replan" | "cancel" }
+	| { kind: "withdraw"; workloadId: string; questionId: string }
 	| { kind: "reserved"; workloadId: string; entryId: string; verdict: "approve" | "deny" }
 	| { kind: "ceiling"; workloadId: string; usd: number; wallMin: number | null }
+	/** `extend <wl-…>`: one more block of the workload's own size on its ceiling (PLAN wl-mvfkv7llkp7nk0 § 4). */
+	| { kind: "extend"; workloadId: string }
 	/** `rounds <n>`: the workload's review round limit (D9). */
 	| { kind: "rounds"; workloadId: string; rounds: number }
 	/** `stop-reviews`: `target` is the workload's id (every loop on it) or one slice's id (that loop) (D10). */
@@ -125,6 +159,16 @@ export type Command =
 	| { kind: "supersede"; workloadId: string; by: string }
 	/** `test-pr <wl-…> <N…>`: Jo binds these PR numbers to the workload for a test run with no push. */
 	| { kind: "test-pr"; workloadId: string; prs: number[] }
+	/** `waive-pr <wl-…> <N…>`: Jo waives these merged PR numbers on the workload for the close check. */
+	| { kind: "waive-pr"; workloadId: string; prs: number[] }
+	/** `train <N…>`: Jo opens a merge train on these PRs (`applyTrain`, never `apply`: the open needs the surface's repo). */
+	| { kind: "train"; prs: number[] }
+	/** `train <wl-…> <N…>`: Jo adds these PRs to the open merge train `workloadId`. */
+	| { kind: "train-append"; workloadId: string; prs: number[] }
+	/** `end-ruling <ruling-id>`: Jo ends one standing ruling at once (gates/src/rulings.ts). */
+	| { kind: "end-ruling"; ruling: RulingId }
+	/** `halt <wl-…>`: Jo stops a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3): plan-first again, its live lane stopped, its PRs held. */
+	| { kind: "halt"; workloadId: string }
 	/** `withdraw <wl-…>`: Jo withdraws the workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1). */
 	| { kind: "withdraw-workload"; workloadId: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
@@ -179,8 +223,18 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	// One token each (D1, D2), so neither is ever read as an option word: `cancel` stays the plan question's.
 	if (word === "cancel-slice") return cancelSliceCommand(ledger, words.slice(1), heartbeatOf);
 	if (word === "supersede") return supersedeCommand(ledger, words.slice(1));
+	if (word === END_RULING_WORD) return endRulingCommand(ledger, words.slice(1));
+	// `halt <wl-…>` is the command or `refused`; `halt` alone or naming no workload falls through, so an option named "halt" still answers.
+	if (word === HALT_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return haltCommand(ledger, words[1]!);
+	// `extend <wl-…>` likewise; `extend` alone or `extend <q-…>` falls through, so the round-limit question's `extend` still answers.
+	if (word === EXTEND_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return extendCommand(ledger, words[1]!);
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
-	if (word === "test-pr") return testPrCommand(ledger, words.slice(1));
+	if (word === "test-pr" || word === "waive-pr") return prWordCommand(ledger, word, words.slice(1));
+	// The command or `refused` at any length, except `train` alone and `train <q-…>`, which fall through to the answer path.
+	if (word === "train") {
+		const c = trainCommand(ledger, words.slice(1));
+		if (c) return c;
+	}
 	// PLAN wl-mv8s939084z1ts D1: `withdraw wl-…` is the command or `refused` at any length; bare `withdraw` and `withdraw q-…` go on below.
 	if (word === "withdraw" && /^wl-/i.test(words[1] ?? "")) return withdrawWorkloadCommand(ledger, words.slice(1));
 	if (words.length === 0 || words.length > 2) return null;
@@ -200,7 +254,7 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 		const wl = target();
 		return wl ? { kind: "mode", workloadId: wl, mode: (word === "user driven" ? "user-driven" : word) as Mode } : null;
 	}
-	// One token (D10), so it never answers the ceiling question's `stop` option.
+	// One token (D10), so it never answers an option named `stop`.
 	if (word === "stop-reviews") return stopReviewsCommand(ledger, arg, view);
 	if (!arg) {
 		const candidates = bareTargets(ledger, view, word);
@@ -222,9 +276,7 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === "withdraw") {
 		const q = arg ? questions.find((x) => x.id === arg) : questions[0];
 		if (!q) return null;
-		// The ceiling question has nothing to replan: withdrawing it cancels its slice, so the close is not blocked, and the lane stops at the ceiling (the default).
-		const then = isCeilingQuestion(q, ledger.slice(q.slice_id)) ? "cancel" : "replan";
-		return { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then };
+		return { kind: "withdraw", workloadId: q.workload_id, questionId: q.id };
 	}
 	const matches = questions.filter((q) => q.options.some((o) => o.toLowerCase() === word));
 	const q = arg ? matches.find((x) => x.id === arg) : matches[0];
@@ -254,6 +306,23 @@ function bareTargets(ledger: Ledger, view: string[], word: string): Target[] {
 
 /** One piece of a numbered batch: `1 approve`, `#1 approve`, `1: approve`, `q1: approve`, `1) deny`. */
 const BATCH_PIECE = /^(?:#|q)?(\d+)\s*[:.)]?\s+(\S+)$/i;
+/** A numbered piece that carries a train word with arguments (`1 train 101`). */
+const NUMBERED_TRAIN = /^(?:#|q)?\d+\s*[:.)]?\s+train\s+\S/i;
+
+/** The refusal of a train word inside a numbered batch (§ 1): it opens a workload, and a batch answers rows. */
+export const TRAIN_IN_BATCH = "a train word opens or adds to a merge train, never inside a numbered batch: send `train …` on a line of its own";
+
+/**
+ * Is `text` a numbered batch with a train word in it (PLAN wl-mv8s8srodefytc § 1): split as `parseBatch` splits, the first
+ * piece numbered and some piece a train word with arguments (`train 101`, `2 train 101`). `1 train` stays a batch piece
+ * answering a question that offers `train`; a line that starts with `train` is the train word, never this.
+ */
+export function trainInBatch(text: string): boolean {
+	const pieces = text.split(/[\n,]/).map((p) => p.trim()).filter((p) => p.length > 0);
+	const first = pieces[0];
+	if (first === undefined || !(BATCH_PIECE.test(first) || NUMBERED_TRAIN.test(first))) return false;
+	return pieces.some((p) => NUMBERED_TRAIN.test(p) || /^train\s+\S/i.test(p));
+}
 
 export interface BatchItem {
 	n: number;
@@ -263,19 +332,20 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
 
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
- * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]` and `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1)
- * any number (`interpret` refuses past `TEST_PR_MAX`, and `withdraw` past one id), everything else two.
+ * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]`,
+ * `train [<wl-…>] <N> [<N> …]` and `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1) any number (`interpret` refuses past
+ * `TEST_PR_MAX`, and `withdraw` past one id), everything else two.
  */
 export function maxWords(text: string): number {
 	if (/^withdraw\s+wl-/i.test(text)) return Number.POSITIVE_INFINITY;
-	const long = /^(ceiling|rounds|supersede|test-pr)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" ? Number.POSITIVE_INFINITY : 2;
+	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "waive-pr" || long === "train" ? Number.POSITIVE_INFINITY : 2;
 }
 
-/** Could `text` (one line, trimmed) be a command: a numbered batch, or short enough for a word command. A false means prose, with no ledger read. */
+/** Could `text` (one line, trimmed) be a command: a numbered batch (a train word inside one included, to be refused), or short enough for a word command. A false means prose, with no ledger read. */
 export function commandShaped(text: string): boolean {
 	const t = stripTail(text);
-	return t.length > 0 && (parseBatch(t) !== null || t.split(/\s+/).length <= maxWords(t));
+	return t.length > 0 && (parseBatch(t) !== null || trainInBatch(t) || t.split(/\s+/).length <= maxWords(t));
 }
 
 /** The pieces of a numbered batch (split on newlines and commas, trimmed, empties dropped), or null when any piece is not `<n> <word>`. */
@@ -295,9 +365,11 @@ export function parseBatch(text: string): { n: number; word: string }[] | null {
  * Interpret `text` as a numbered batch (`parseBatch`); null when it is not one, so prose passes
  * through. Each piece is checked against the session numbering: the number was given, its row
  * still waits, the word fits the row, the number appears once. All pass → the commands in order;
- * any fails → one line per piece, nothing to apply.
+ * any fails → one line per piece, nothing to apply. A train word inside a batch (`trainInBatch`)
+ * refuses it whole.
  */
 export function interpretBatch(ledger: Ledger, numbering: Numbering, text: string): BatchResult | null {
+	if (trainInBatch(text)) return { ok: false, lines: [TRAIN_IN_BATCH] };
 	const parsed = parseBatch(text);
 	if (!parsed) return null;
 	const checked = checkBatch(ledger, numbering, parsed);
@@ -324,13 +396,12 @@ function checkBatch(ledger: Ledger, numbering: Numbering, parsed: readonly { n: 
 		}
 		const q = questions.get(t.rowId);
 		if (!q) return stale;
-		if (w === "withdraw") {
-			// The same rule as a bare `withdraw`: the runner's ceiling question cancels, every other question replans.
-			const then = isCeilingQuestion(q, ledger.slice(q.slice_id)) ? "cancel" : "replan";
-			return { n, cmd: { kind: "withdraw", workloadId: q.workload_id, questionId: q.id, then } };
-		}
+		if (w === "withdraw") return { n, cmd: { kind: "withdraw", workloadId: q.workload_id, questionId: q.id } };
 		const answer = q.options.find((o) => o.toLowerCase() === w);
-		if (answer === undefined) return `#${n} takes: ${[...q.options, "withdraw"].join(" / ")}`;
+		if (answer === undefined) {
+			const { takes, after } = takesOf(ledger, q);
+			return `#${n} takes: ${takes}${after}`;
+		}
 		return { n, cmd: { kind: "answer", workloadId: q.workload_id, questionId: q.id, answer } };
 	});
 }
@@ -378,12 +449,12 @@ export function stripTail(line: string): string {
 /** The words that open a command: the stakes and mode words, the answer words, every option an open question offers, and the long commands. */
 function commandWords(ledger: Ledger): string[] {
 	const offered = ledger.inFlight().flatMap((w) => w.openQuestions).flatMap((q) => q.options.map((o) => o.toLowerCase()));
-	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", "rounds", "stop-reviews", ...offered];
+	return [...STAKES_WORDS, ...MODE_WORDS, "approve", "deny", "withdraw", "ceiling", EXTEND_WORD, "rounds", "stop-reviews", HALT_WORD, ...offered];
 }
 
 /**
  * The id-shaped targets a line of a paste names after a command word (`approve en-nope`, `left
- * q-nope`, `production wl-nope`, `ceiling 120 wl-nope`), or null when the line opens with no
+ * q-nope`, `production wl-nope`, `ceiling 120 wl-nope`, `extend wl-nope`), or null when the line opens with no
  * command word or names no id, so short prose (`fix it`, `approve please`) stays prose. Such a line
  * is a command attempt: it is refused, never prose, when an id does not resolve (`unresolvedId`) or
  * when `interpret` still refuses it. Only the paste reads this: the same line alone passes through
@@ -424,7 +495,7 @@ function looseWorkloadPair(text: string): boolean {
 	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!) && !ANSWER_ID.test(words[1]!);
 }
 
-/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels or the workload it supersedes or withdraws; else null. */
+/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels, the workload it supersedes, withdraws or halts, or the ruling it ends; else null. */
 function resolves(cmd: Command): string | null {
 	switch (cmd.kind) {
 		case "answer":
@@ -437,6 +508,10 @@ function resolves(cmd: Command): string | null {
 		case "supersede":
 		case "withdraw-workload":
 			return cmd.workloadId;
+		case "end-ruling":
+			return cmd.ruling;
+		case "halt":
+			return `${HALT_WORD} ${cmd.workloadId}`;
 		default:
 			return null;
 	}
@@ -454,7 +529,8 @@ function resolves(cmd: Command): string | null {
  * - plain words otherwise; consecutive plain-words lines form one instruction and a command line
  *   separates two;
  * - a line of a `pending` block pasted back that is its generated wrapper (`pendingWrapperLines`:
- *   its heading, the fence around its answer lines, the generated sentences under it): dropped,
+ *   its heading, the fence around its answer lines, the plan path and pair offer lines hung under
+ *   them, the generated sentences under it): dropped,
  *   neither a command nor part of an instruction; a fence or heading-like line of Jo's own is kept.
  * Null when no line is a command or a refused one: the paste is prose and passes through. Every
  * command line must resolve before any is applied, and a question or reserved request answered
@@ -476,6 +552,10 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		const t = stripTail(l.trim());
 		if (t.length === 0 || generated.has(i)) continue;
 		const line = i + 1;
+		if (trainInBatch(t)) {
+			read.push({ line, text: t, kind: "invalid", why: TRAIN_IN_BATCH });
+			continue;
+		}
 		const pieces = parseBatch(t);
 		if (pieces) {
 			read.push({ line, text: t, kind: "batch", pieces });
@@ -497,8 +577,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		else {
 			// Every id resolves and the line still is no command: named with what the row takes.
 			const q = ledger.inFlight().flatMap((w) => w.openQuestions).find((x) => x.id === ids[0]);
-			const takes = q ? ` (${ids[0]} takes: ${[...q.options, "withdraw"].join(" / ")})` : "";
-			read.push({ line, text: t, kind: "invalid", why: `"${t}" is not a command the surface knows${takes}` });
+			const takes = q ? takesOf(ledger, q) : null;
+			read.push({ line, text: t, kind: "invalid", why: `"${t}" is not a command the surface knows${takes ? ` (${ids[0]} takes: ${takes.takes})${takes.after}` : ""}` });
 		}
 	}
 	if (!read.some((r) => r.kind !== "prose")) return null;
@@ -515,7 +595,9 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		const id = resolves(cmd);
 		if (id === null) return null;
 		if (first[id] !== undefined) {
-			const done = cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "withdraw-workload" ? "withdrawn" : "answered";
+			const done =
+				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "withdraw-workload" ? "withdrawn"
+				: cmd.kind === "end-ruling" ? "ended" : cmd.kind === "halt" ? "halted" : "answered";
 			return `${id} is already ${done} on ${first[id]}; once per row`;
 		}
 		first[id] = where;
@@ -622,12 +704,15 @@ function stopReviewsCommand(ledger: Ledger, arg: string | undefined, view: reado
 	return slice && view.includes(slice.workload_id) ? { kind: "stop-reviews", workloadId: slice.workload_id, target: slice.id } : null;
 }
 
-/** The most PR numbers one `test-pr` word binds. */
+/** The most PR numbers one `test-pr` or `waive-pr` word binds. */
 export const TEST_PR_MAX = 50;
 
-/** Why `test-pr` cannot bind PRs to `wl`, or null: an open workload in view, not the standing one. `apply` checks it again. */
-function testPrRefusal(ledger: Ledger, wl: string): string | null {
-	if (wl === STANDING_WORKLOAD_ID) return "the standing workload takes no test-pr binding";
+/** The words `prWordCommand` reads: Jo's PR bindings that name their workload and only add numbers to it. */
+type PrWord = "test-pr" | "waive-pr";
+
+/** Why `word` cannot bind PRs to `wl`, or null: an open workload in view, not the standing one. `apply` checks it again. */
+function prWordRefusal(ledger: Ledger, word: PrWord, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID) return `the standing workload takes no ${word} binding`;
 	const w = ledger.workload(wl);
 	if (!w) return `no workload ${wl}`;
 	if (w.status !== "open" || !workloadsInView(ledger).includes(wl)) return `${wl} is ${w.status === "open" ? "not in view" : w.status}: only an open workload is bound`;
@@ -635,22 +720,75 @@ function testPrRefusal(ledger: Ledger, wl: string): string | null {
 }
 
 /**
- * `test-pr <wl-…> <N> [<N> …]` after the word: the workload (required), then PR numbers separated
- * by spaces and/or commas, each a positive whole number, deduplicated in Jo's order, at most
- * `TEST_PR_MAX`; `testPrRefusal` clear. Anything else is `refused` with the reason, never prose.
+ * `test-pr <wl-…> <N> [<N> …]` or `waive-pr <wl-…> <N> [<N> …]` after the word: the workload (required), then PR numbers
+ * separated by spaces and/or commas, each a positive whole number, deduplicated in Jo's order, at most `TEST_PR_MAX`;
+ * `prWordRefusal` clear. Anything else is `refused` with the reason, never prose.
  */
-function testPrCommand(ledger: Ledger, rest: readonly string[]): Command {
-	const usage = "test-pr <wl-…> <N> [<N> …]";
+function prWordCommand(ledger: Ledger, word: PrWord, rest: readonly string[]): Command {
+	const usage = `${word} <wl-…> <N> [<N> …]`;
 	const wl = rest[0]?.replace(/,+$/, "");
-	if (wl === undefined || !/^wl-\S+$/i.test(wl)) return { kind: "refused", why: `test-pr names the workload first: ${usage}` };
+	if (wl === undefined || !/^wl-\S+$/i.test(wl)) return { kind: "refused", why: `${word} names the workload first: ${usage}` };
 	const tokens = rest.slice(1).join(" ").split(/[\s,]+/).filter((t) => t.length > 0);
-	if (tokens.length === 0) return { kind: "refused", why: `test-pr names at least one PR number: ${usage}` };
+	if (tokens.length === 0) return { kind: "refused", why: `${word} names at least one PR number: ${usage}` };
 	const bad = tokens.find((t) => !/^[1-9]\d*$/.test(t) || !Number.isSafeInteger(Number(t)));
 	if (bad !== undefined) return { kind: "refused", why: `${bad} is not a PR number (a positive whole number): ${usage}` };
 	const prs = [...new Set(tokens.map(Number))];
-	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `test-pr binds at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
-	const why = testPrRefusal(ledger, wl);
-	return why === null ? { kind: "test-pr", workloadId: wl, prs } : { kind: "refused", why };
+	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `${word} binds at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
+	const why = prWordRefusal(ledger, word, wl);
+	return why === null ? { kind: word, workloadId: wl, prs } : { kind: "refused", why };
+}
+
+/** The train word's usage, named in every refusal of a malformed `train …` line. */
+const TRAIN_USAGE = "train <N> [<N> …] opens a merge train; train <wl-…> <N> [<N> …] adds PRs to one";
+
+/**
+ * Why `train <wl> <prs>` cannot add to `wl` (PLAN wl-mv8s8srodefytc § 1), or null: an open workload in view, not the
+ * standing one, that is a merge train (`trainPrs`: Jo's `train:` or the tick's `train-board:`, PLAN wl-mvbjiettjrfpxc D2), no
+ * PR among `prs` already on that train (each PR appears once per train, so its slice ids are used once) unless Jo's stop
+ * holds the train (`trainHold`): then the word is the resume and may re-name its PRs (D2), and none on another open train
+ * of the same repo (rev 17.1 D8, `onOtherTrain`). `apply` checks it again inside its transaction.
+ */
+function trainAppendRefusal(ledger: Ledger, wl: string, prs: readonly number[]): string | null {
+	if (wl === STANDING_WORKLOAD_ID) return "the standing workload is never a merge train";
+	const w = ledger.workload(wl);
+	if (!w) return `no workload ${wl}`;
+	if (w.status !== "open" || !workloadsInView(ledger).includes(wl)) return `${wl} is ${w.status === "open" ? "not in view" : w.status}: only an open merge train takes PRs`;
+	const entries = ledger.entries(wl);
+	const instructions = ledger.instructions(wl);
+	const on = trainPrs(entries, instructions);
+	if (on.length === 0) return `${wl} is not a merge train (no train: or train-board: entry); open one with train <N> [<N> …]`;
+	const held = trainHold({ entries, instructions, questions: ledger.questions(wl) }) !== null;
+	const dup = held ? undefined : prs.find((n) => on.includes(n));
+	if (dup !== undefined) return `#${dup} is already on train ${wl}; a skipped PR gets a new train: \`train ${dup}\``;
+	const repo = repoOf(ledger, wl);
+	return repo === null ? null : otherTrainRefusal(ledger, repo, prs, wl);
+}
+
+/** The refusal for a PR already on another open train of `repo` (rev 17.1 D8: one train, one task stream per PR), or null. */
+function otherTrainRefusal(ledger: Ledger, repo: string, prs: readonly number[], except: string | null): string | null {
+	const other = onOtherTrain(ledger, repo, prs, except);
+	return other === null ? null : `#${other.pr} is already on open merge train ${other.train}; a PR rides one train at a time: add to that one with \`train ${other.train} …\`, or wait for it to close`;
+}
+
+/**
+ * `train …` after the word (§ 1): `train <N…>` opens a train, `train <wl-…> <N…>` adds to one; PR numbers separated
+ * by spaces and/or commas, `#N` accepted, each a positive whole number, deduplicated in Jo's order, at most
+ * `TEST_PR_MAX`. Null for exactly `train` alone and `train <q-…>`, which fall through to the answer path (a question
+ * may offer the option `train`); every other line is the command or `refused` with the reason, never prose.
+ */
+function trainCommand(ledger: Ledger, rest: readonly string[]): Command | null {
+	if (rest.length === 0 || (rest.length === 1 && /^q-/i.test(rest[0]!))) return null;
+	const first = rest[0]!.replace(/,+$/, "");
+	const wl = /^wl-/i.test(first) ? first : null;
+	const tokens = (wl === null ? rest : rest.slice(1)).join(" ").split(/[\s,]+/).filter((t) => t.length > 0);
+	if (tokens.length === 0) return { kind: "refused", why: `train names at least one PR number: ${TRAIN_USAGE}` };
+	const bad = tokens.find((t) => !/^#?[1-9]\d*$/.test(t) || !Number.isSafeInteger(Number(t.replace(/^#/, ""))));
+	if (bad !== undefined) return { kind: "refused", why: `${bad} is not a PR number (a positive whole number, # allowed): ${TRAIN_USAGE}` };
+	const prs = [...new Set(tokens.map((t) => Number(t.replace(/^#/, ""))))];
+	if (prs.length > TEST_PR_MAX) return { kind: "refused", why: `train takes at most ${TEST_PR_MAX} PRs at once; ${prs.length} named` };
+	if (wl === null) return { kind: "train", prs };
+	const why = trainAppendRefusal(ledger, wl, prs);
+	return why === null ? { kind: "train-append", workloadId: wl, prs } : { kind: "refused", why };
 }
 
 /**
@@ -669,14 +807,20 @@ function sliceStateRefusal(ledger: Ledger, id: string): string | null {
 }
 
 /**
- * Why a test run on slice `id` (on `wl`) holds `cancel-slice` off (D1), or null: a run is live by
- * `runLive` (via `recordLive`: no result, and a heartbeat under 60 s old or, before its first
- * heartbeat, a request under 120 s old). `apply` checks it again inside its transaction, since a
- * `test-requested:` can land between the word's reading and its apply.
+ * The live test run on slice `id` (on `wl`), or undefined: a run is live by `runLive` (via `recordLive`: no result,
+ * and a heartbeat under 60 s old or, before its first heartbeat, a request under 120 s old).
+ */
+function liveRunOn(ledger: Ledger, wl: string, id: string, heartbeatOf: HeartbeatOf): RunRecord | undefined {
+	const nowMs = Date.parse(ledger.now());
+	return testRuns(ledger.entries(wl)).find((r) => r.request.slice === id && recordLive(r, heartbeatOf(r.request.runId), nowMs));
+}
+
+/**
+ * Why a live test run on slice `id` (on `wl`, `liveRunOn`) holds `cancel-slice` off (D1), or null. `apply` checks
+ * it again inside its transaction, since a `test-requested:` can land between the word's reading and its apply.
  */
 function liveRunRefusal(ledger: Ledger, wl: string, id: string, heartbeatOf: HeartbeatOf): string | null {
-	const nowMs = Date.parse(ledger.now());
-	const live = testRuns(ledger.entries(wl)).find((r) => r.request.slice === id && recordLive(r, heartbeatOf(r.request.runId), nowMs));
+	const live = liveRunOn(ledger, wl, id, heartbeatOf);
 	if (!live) return null;
 	const { runId, pr } = live.request;
 	return `test run ${runId} (PR #${pr}) on ${id} is live: its test-run: settles the slice; cancel it once the run has ended`;
@@ -748,12 +892,42 @@ function withdrawWorkloadCommand(ledger: Ledger, rest: readonly string[]): Comma
 	return why === null ? { kind: "withdraw-workload", workloadId: wl } : { kind: "refused", why };
 }
 
-/**
- * Is `q` the runner's ceiling question (DESIGN-workload-ceiling.md § 2 item 4): raised by the lane
- * runner on a slice of its own, `sl-ceiling-<n>`. The runner (surface/scripts/lane.ts) uses the same test.
- */
-export function isCeilingQuestion(q: Pick<QuestionRow, "slice_id" | "created_by">, slice: Pick<SliceRow, "id"> | null): boolean {
-	return slice !== null && slice.id === q.slice_id && slice.id.startsWith("sl-ceiling-") && q.created_by === LANE_RUNNER_BY;
+/** Why `end-ruling <id>` cannot apply, or null: the id names a standing ruling Jo has not ended. `apply` checks it again. */
+function endRulingRefusal(ledger: Ledger, id: string): string | null {
+	if (!isRulingId(id)) return `${id} is no standing ruling (${STANDING_RULINGS.map((r) => r.id).join(", ")})`;
+	return endedRulings(ledger.instructions(STANDING_WORKLOAD_ID)).has(id) ? `the ruling ${id} is already ended` : null;
+}
+
+/** `end-ruling <ruling-id>` after the word: one id, `endRulingRefusal` clear; anything else is `refused` with the reason, never prose. */
+function endRulingCommand(ledger: Ledger, rest: readonly string[]): Command {
+	if (rest.length !== 1) return { kind: "refused", why: `end-ruling names one ruling: end-ruling <${STANDING_RULINGS.map((r) => r.id).join(" | ")}>` };
+	const id = rest[0]!.toLowerCase();
+	const why = endRulingRefusal(ledger, id);
+	return why === null ? { kind: "end-ruling", ruling: id as RulingId } : { kind: "refused", why };
+}
+
+/** Jo's word that halts a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3). */
+export const HALT_WORD = "halt";
+
+/** Why `halt <wl>` cannot apply, or null: an open workload other than the standing one whose newest `plan:` entry is not `halted`. `apply` checks it again. */
+function haltRefusal(ledger: Ledger, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID || !workloadsInView(ledger).includes(wl)) return `${wl} is not an open workload`;
+	const plan = controlOf(ledger, wl)?.filter((c) => c.prefix === "plan").at(-1);
+	return plan !== undefined && /^halted\b/.test(plan.rest) ? `${wl} is already halted; approve its next plan question to start it again` : null;
+}
+
+/** `halt <wl-…>`: the command when `haltRefusal` is clear, else `refused` with the reason, never prose. */
+function haltCommand(ledger: Ledger, wl: string): Command {
+	const why = haltRefusal(ledger, wl);
+	return why === null ? { kind: "halt", workloadId: wl } : { kind: "refused", why };
+}
+
+/** Jo's word that raises a workload's ceiling by one block of its own size (PLAN wl-mvfkv7llkp7nk0 § 4). */
+export const EXTEND_WORD = "extend";
+
+/** `extend <wl-…>`: the command on an open workload other than the standing one, else `refused`, never prose. */
+function extendCommand(ledger: Ledger, wl: string): Command {
+	return workloadsInView(ledger).includes(wl) ? { kind: "extend", workloadId: wl } : { kind: "refused", why: `${wl} is not an open workload` };
 }
 
 /**
@@ -837,31 +1011,77 @@ function stopReviews(ledger: Ledger, cmd: Extract<Command, { kind: "stop-reviews
 }
 
 /**
+ * Cancel slice `sl` on `wl` inside the caller's transaction (cancel-slice's writer): every open question on it
+ * withdrawn as Jo with `then cancel` and `reason` (the `withdraw` word's ledger call), then the slice cancelled
+ * (`Ledger.cancelSlice`) unless the last withdrawal's cancel already did it. Returns the withdrawn questions and
+ * one receipt piece per withdrawal.
+ */
+function cancelSliceRows(ledger: Ledger, wl: string, sl: string, reason: string): { withdrawn: QuestionRow[]; lines: string[] } {
+	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
+	const withdrawn = ledger.questions(wl).filter((q) => q.slice_id === sl && q.state === "open");
+	const lines = withdrawn.map((q) => `withdrew ${q.id} (withdrawal ${ledger.withdrawQuestion(q.id, { ...stamp, reason, then: "cancel" })}, then cancel)`);
+	if (ledger.slice(sl)!.state !== "cancelled") ledger.cancelSlice(sl, { by: SURFACE_BY });
+	return { withdrawn, lines };
+}
+
+/**
+ * After a cancel that settled `questions`: when one was raised by a launched lane and no lane holds `wl` live, Jo's
+ * `launch-requested:` (`raiseCeiling`'s request), since a cancelled slice is no resolution a parked lane resumes on
+ * (`resolutions`). Returns the receipt tail.
+ */
+function relaunchAfterCancel(ledger: Ledger, wl: string, questions: readonly QuestionRow[], reason: string): string {
+	const w = ledger.workload(wl)!;
+	const launched = new Set(attempts(controlEntries(ledger.entries(wl))).map((a) => a.laneId));
+	if (!questions.some((q) => launched.has(q.created_by)) || w.mode !== "autonomous" || heldLive(w, ledger.now())) return "";
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), reason) });
+	return "; no lane holds it live, so a relaunch is requested";
+}
+
+/**
  * `cancel-slice` applied (D1), inside one transaction: `sliceStateRefusal` and `liveRunRefusal`
- * checked again (each throws, writing nothing), Jo's instruction on the slice, every open question
- * on it withdrawn with `then cancel` naming the instruction (the `withdraw` word's ledger call),
- * and the slice cancelled (`Ledger.cancelSlice`) unless the last withdrawal's cancel already did
- * it. When a withdrawn question was raised by a launched lane and no lane holds the workload live,
- * Jo's `launch-requested:` follows (`settleCeiling`'s rule), since a cancel withdrawal is no
- * resolution a parked lane resumes on (`resolutions`). Returns the receipt.
+ * checked again (each throws, writing nothing), Jo's instruction on the slice, then the slice
+ * cancelled with its open questions withdrawn naming the instruction (`cancelSliceRows`), and Jo's
+ * `launch-requested:` when a withdrawn question was a launched lane's (`relaunchAfterCancel`).
+ * Returns the receipt.
  */
 function cancelSlice(ledger: Ledger, cmd: Extract<Command, { kind: "cancel-slice" }>, heartbeatOf: HeartbeatOf): string {
-	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 	const { workloadId: wl, sliceId: sl } = cmd;
 	const why = sliceStateRefusal(ledger, sl) ?? liveRunRefusal(ledger, wl, sl, heartbeatOf);
 	if (why !== null) throw new Error(why);
-	const id = ledger.recordInstruction({ ...stamp, workloadId: wl, sliceId: sl, body: `cancel-slice ${sl}` });
-	const open = ledger.questions(wl).filter((q) => q.slice_id === sl && q.state === "open");
-	const withdrawn = open.map((q) => `withdrew ${q.id} (withdrawal ${ledger.withdrawQuestion(q.id, { ...stamp, reason: `cancel-slice (instruction ${id})`, then: "cancel" })}, then cancel)`);
-	if (ledger.slice(sl)!.state !== "cancelled") ledger.cancelSlice(sl, { by: SURFACE_BY });
-	const w = ledger.workload(wl)!;
-	const launched = new Set(attempts(controlEntries(ledger.entries(wl))).map((a) => a.laneId));
-	let relaunch = "";
-	if (open.some((q) => launched.has(q.created_by)) && w.mode === "autonomous" && !heldLive(w, ledger.now())) {
-		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), `cancel-slice ${sl}`) });
-		relaunch = "; no lane holds it live, so a relaunch is requested";
-	}
-	return [`cancelled slice ${sl} on ${wl} (instruction ${id})`, ...withdrawn].join("; ") + relaunch;
+	const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: wl, sliceId: sl, body: `cancel-slice ${sl}` });
+	const { withdrawn, lines } = cancelSliceRows(ledger, wl, sl, `cancel-slice (instruction ${id})`);
+	const relaunch = relaunchAfterCancel(ledger, wl, withdrawn, `cancel-slice ${sl}`);
+	return [`cancelled slice ${sl} on ${wl} (instruction ${id})`, ...lines].join("; ") + relaunch;
+}
+
+/**
+ * The skip close (PLAN wl-mv8s8srodefytc § 1), inside the transaction of Jo's answer `answerId` to `q`: when the
+ * answer is `skip`, `q` sits on a train slice of PR n (`trainSlicePr`) and its workload carries a valid `train:`
+ * entry, every open or paused train slice of n (`sl-train-<k>-<n>`, every `sl-train-<k>-<n>-full-<r>`) is cancelled
+ * with cancel-slice's writer, citing the answer, so a skipped red PR leaves nothing open; a lane parked on `q`
+ * relaunches as after `cancel-slice`. A slice whose test run is live (`liveRunOn`, cancel-slice's refusal, read with
+ * `heartbeatOf`) is kept open and named, since its `test-run:` settles it; the skip itself is never refused. Returns
+ * the receipt tail; "" (nothing written) on any other question.
+ */
+function trainSkipClose(ledger: Ledger, q: QuestionRow, answerId: string, heartbeatOf: HeartbeatOf): string {
+	const wl = q.workload_id;
+	const n = trainSlicePr(q.slice_id, wl);
+	if (n === null || trainPrs(ledger.entries(wl), ledger.instructions(wl)).length === 0) return "";
+	// A cancelled slice is no resolution a lane parked on a question there resumes on (`resolutions` needs it open): the withdrawn
+	// questions, and `q` itself when its own slice is cancelled, count for a relaunch. When q's slice is kept open (a live run), Jo's
+	// answer is a normal resolution and q stays out.
+	const settled: QuestionRow[] = [];
+	const open = ledger.slices(wl).filter((s) => trainSlicePr(s.id, wl) === n && (s.state === "open" || s.state === "paused"));
+	const lines = open.flatMap((s) => {
+		const live = liveRunOn(ledger, wl, s.id, heartbeatOf);
+		if (live) return [`kept ${s.id} open: test run ${live.request.runId} is live; it settles the slice`];
+		const r = cancelSliceRows(ledger, wl, s.id, `skip on the merge train (answer ${answerId})`);
+		if (s.id === q.slice_id) settled.push(q);
+		settled.push(...r.withdrawn);
+		return [`cancelled ${s.id}`, ...r.lines];
+	});
+	const relaunch = relaunchAfterCancel(ledger, wl, settled, `train skip #${n}`);
+	return `; merge train: Jo skipped #${n}${lines.length > 0 ? `: ${lines.join(", ")}` : "; no train slice of it is open"}${relaunch}`;
 }
 
 /** A settled round's remaining findings: its members' blocks merged into one severity line, plus the hands whose block was unreadable. */
@@ -908,38 +1128,45 @@ export function ceilingText(c: Ceiling): string {
 	return `$${Number(c.usd.toFixed(2))} / ${Number((c.wallMin / 60).toFixed(2))}h`;
 }
 
+/** Jo's instruction a raise names, for the `ceiling` and `extend` words alike: `ceiling: <usd> <hours>`, hours to two places. */
+function ceilingInstructionBody(c: Ceiling): string {
+	return `ceiling: ${c.usd} ${Number((c.wallMin / 60).toFixed(2))}`;
+}
+
 /**
- * Settle the ceiling question after Jo's answer `answerId` (§ 2 item 5), inside the answer's
- * transaction. *extend* writes the ceiling plus one block of the workload's own size, naming the
- * answer; every answer completes the ceiling slice; *extend* then writes Jo's `launch-requested:`
- * (the body the launch tool writes), so a lane the runner stopped at the ceiling relaunches: when no
- * lane holds the workload under a live lease, or when the holder's newest valid `lane-stop:` is
- * `accepted ceiling` (it is stopping at the ceiling and will not read the raise). A live holder that
- * is still running reads the raised ceiling at its next poll and goes on: a request written then would
- * outlive it and relaunch a finished workload. Returns the receipt tail, naming which case it was.
+ * Raise the ceiling to `next` on Jo's instruction `instructionId` (the `ceiling` and `extend` words, PLAN
+ * wl-mvfkv7llkp7nk0 § 4), inside the caller's transaction: the `ceiling:` entry naming the instruction, then the relaunch
+ * rule both words share. Jo's `launch-requested:` (the body the launch tool writes, cause `why`) is written when the
+ * workload's newest lane was stopped at the ceiling (its `lane-stop: <lane> accepted ceiling`, whether it is still
+ * stopping or gone), the workload is autonomous, the lane's last `spend:` is under `next` in both halves, and no
+ * unconsumed request already waits; so that lane relaunches once its lease is gone. Otherwise nothing is requested: a
+ * live holder not stopped at the ceiling reads the new value at its next poll and goes on, and a request written with
+ * no lane stopped at the ceiling would outlive the raise and relaunch a finished workload. The runner reads the ceiling
+ * and accepts its ceiling stop in one transaction (surface/scripts/lane.ts `meterPoll`) and this check runs in the
+ * caller's, so a raise either lands first and the lane goes on, or sees the accepted stop here. Returns the receipt tail,
+ * naming which case it was.
  */
-function settleCeiling(ledger: Ledger, q: QuestionRow, word: string, answerId: string): string {
-	const wl = q.workload_id;
-	if (word !== "extend") {
-		ledger.completeSlice(q.slice_id, { by: SURFACE_BY, artifact: `answered ${word} ${answerId}` });
-		return "";
-	}
+function raiseCeiling(ledger: Ledger, wl: string, next: Ceiling, source: string, instructionId: string, why: string): string {
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(next, source, instructionId) });
 	const w = ledger.workload(wl)!;
-	const block = sizeFor(w.stakes, judgedKindOf(ledger, wl));
-	const cur = ceilingOf(ledger, wl);
-	const next = { usd: cur.usd + block.usd, wallMin: cur.wallMin + block.wallMin };
-	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(next, "extend one block", answerId) });
-	ledger.completeSlice(q.slice_id, { by: SURFACE_BY, artifact: `answered extend ${answerId}` });
-	const raised = `; ceiling raised to ${ceilingText(next)}`;
-	let why = "no lane holds it live";
-	if (w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
-		const entries = ledger.entries(wl);
-		const stops = controlEntries(entries, holdersOf(entries, w.holder)).filter((c) => c.prefix === "lane-stop" && c.laneId === w.holder);
-		if (!/^accepted ceiling\b/.test(stops.at(-1)?.rest ?? "")) return `${raised}; ${w.holder} still holds it and goes on under it`;
-		why = `${w.holder} is stopping at the ceiling`;
+	const live = w.holder !== null && heldLive(w, ledger.now());
+	const control = controlOf(ledger, wl) ?? [];
+	const tried = attempts(control);
+	const lane = tried.at(-1)?.laneId;
+	const mine = control.filter((c) => c.laneId === lane);
+	if (lane === undefined || !mine.some((c) => c.prefix === "lane-stop" && /^accepted ceiling\b/.test(c.rest))) {
+		return live && w.holder!.startsWith("lane-") ? `; ${w.holder} still holds it and goes on under it` : "";
 	}
-	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "ceiling extend") });
-	return `${raised}; ${why}, so a relaunch is requested`;
+	const stopped = `${lane} ${live && w.holder === lane ? "is stopping" : "stopped"} at the ceiling`;
+	if (w.mode !== "autonomous") return `; ${stopped} and ${wl} is ${w.mode}, so nothing relaunches`;
+	const spent = mine.filter((c) => c.prefix === "spend").map((c) => parseSpend(c.rest)).filter((s) => s !== null).at(-1);
+	if (spent && crossed(spent, next) === 100) {
+		return `; ${stopped} and its spend ($${spent.usd.toFixed(2)} / ${Math.round(spent.wallMin)} min) still reaches ${ceilingText(next)}, so nothing relaunches`;
+	}
+	const consumed = consumedIds(tried);
+	if (control.some((c) => c.prefix === "launch-requested" && !consumed.has(c.id))) return `; ${stopped} and a relaunch is already requested`;
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), why) });
+	return `; ${stopped}, so a relaunch is requested`;
 }
 
 /** A workload's valid control entries, every holder counted (`holdersOf` with the ledger's recorded holders); null when there is no such workload. */
@@ -973,47 +1200,61 @@ export function modeFlipControl(ledger: Ledger, workloadId: string, mode: Mode):
 }
 
 /**
- * The site at which `q` validly offers `pair` (PLAN wl-mv67564rdkfvnk D9 (3)), else null: `pair` is among its options,
- * it is the classifier's round-limit question or the runner's ceiling question, and a `pair-offer:` naming it at that
- * site carries that site's stamp (the classifier at the round limit, the lane runner at the ceiling).
+ * The valid `pair` offer of `q` (PLAN wl-mv67564rdkfvnk D9 (3); PLAN wl-mvb9mw00ycfjeo D2, D3), else null: `pair` is among
+ * its options, it is the classifier's round-limit question, and a `pair-offer:` naming it at that site carries the
+ * classifier's stamp. The site, and the signals of the newest such entry (what every render's offer line names).
+ * `applyPair` refuses on null, and every render of a question shows the offer line only when this is not null.
  */
-function pairOfferSite(ledger: Ledger, q: QuestionRow): PairSite | null {
-	if (!(JSON.parse(q.options) as string[]).some((o) => o.toLowerCase() === PAIR_OPTION)) return null;
-	const site: PairSite | null = isCeilingQuestion(q, ledger.slice(q.slice_id)) ? "ceiling" : isReviewLimitQuestion(ledger, q) ? "round-limit" : null;
-	if (site === null) return null;
-	const by = pairOfferStamp(site);
-	const offered = ledger.entries(q.workload_id, "assumption").some((e) => {
-		const o = e.created_by === by ? parsePairOffer(e.body) : null;
-		return o !== null && o.questionId === q.id && o.site === site;
-	});
-	return offered ? site : null;
+export function openPairOffer(
+	ledger: Ledger,
+	q: Pick<QuestionRow, "id" | "workload_id" | "slice_id" | "created_by"> & { options: readonly string[] },
+): { site: PairSite; signals: string[] } | null {
+	if (!q.options.some((o) => o.toLowerCase() === PAIR_OPTION) || !isReviewLimitQuestion(ledger, q)) return null;
+	const offer = ledger.entries(q.workload_id, "assumption").flatMap((e) => {
+		const o = e.created_by === CLASSIFIER_BY ? parsePairOffer(e.body) : null;
+		return o !== null && o.questionId === q.id ? [o] : [];
+	}).at(-1);
+	return offer ? { site: offer.site, signals: offer.signals } : null;
+}
+
+/**
+ * What a question takes, as the typed-input refusals list it (D2): its options less `pair`, then `withdraw`; and `after`,
+ * the offer line on its own line (`\n` first) when the offer is valid, else empty, for the refusal to end with.
+ */
+function takesOf(ledger: Ledger, q: Pick<QuestionRow, "id" | "workload_id" | "slice_id" | "created_by"> & { options: readonly string[] }): { takes: string; after: string } {
+	const offer = openPairOffer(ledger, q);
+	const takes = [...shownOptions(q.options), "withdraw"].join(" / ");
+	return { takes, after: offer ? `\n${pairOfferLine(wordsOf(ledger, q.workload_id), q.id, q.workload_id, offer.signals)}` : "" };
 }
 
 /**
  * Jo's `pair` on an offered question (D7), in one transaction: the answer; the settlement `stop` writes (the round
- * limit's `review-loop-end: <sl> reason stop`, or the ceiling slice done `answered stop <answer>`, so the runner reads
- * stop); the flip to user-driven as Jo via the surface; `pair-taken:`; and the `lane-stop:` request a live lane holder
- * accepts. A question with no valid offer is refused naming it, and nothing is written.
+ * limit's `review-loop-end: <sl> reason stop`); the flip to user-driven as Jo via the surface; `pair-taken:`; and the
+ * `lane-stop:` request a live lane holder accepts. A question with no valid offer is refused naming it, and nothing is
+ * written. The receipt (PLAN
+ * wl-mvb9mw00ycfjeo D6) ends on the line `in another terminal:` (after `when the lane has stopped (a few seconds), `
+ * when a stop was requested: its lease must lapse before `as2 lane` is admitted) and then a line that is exactly the
+ * by-hand command; the surface adds the clipboard line after it (surface/extensions/surface-input.ts).
  */
 function applyPair(ledger: Ledger, q: QuestionRow, answer: string): string {
-	const site = pairOfferSite(ledger, q);
-	if (site === null) throw new Error(`${q.id} does not offer pair: no pair-offer: from its raiser names it at its site; refused, never applied`);
+	const offer = openPairOffer(ledger, { ...q, options: JSON.parse(q.options) as string[] });
+	if (offer === null) throw new Error(`${q.id} does not offer pair: no pair-offer: from its raiser names it at its site; refused, never applied`);
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
 	return ledger.write(() => {
 		const answerId = ledger.answerQuestion(q.id, { ...stamp, answer });
-		const settled = site === "round-limit" ? settleReviewLimit(ledger, q, "stop", answerId) : settleCeiling(ledger, q, "stop", answerId);
+		const settled = settleReviewLimit(ledger, q, "stop", answerId);
 		const flip = ledger.flipMode(q.workload_id, { ...stamp, mode: "user-driven" });
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: q.workload_id, kind: "assumption", body: pairTakenBody(q.id, answerId) });
 		const stop = modeFlipControl(ledger, q.workload_id, "user-driven");
-		const what = site === "round-limit" ? settled : `; the ceiling question reads stop`;
-		return `answered ${q.id} with "${answer}" (answer ${answerId})${what}; mode on ${q.workload_id} → user-driven (mode-flip ${flip}); continue it yourself: as2 lane ${q.workload_id}${stop}`;
+		const wait = stop === "" ? "" : "when the lane has stopped (a few seconds), ";
+		return `answered ${q.id} with "${answer}" (answer ${answerId})${settled}; mode on ${q.workload_id} → user-driven (mode-flip ${flip})${stop}\n${wait}in another terminal:\n${byHandLine(q.workload_id)}`;
 	});
 }
 
 /**
  * Apply a command through the ledger module as Jo via the surface. Returns the one-line receipt.
- * `heartbeatOf` is the run heartbeat reader `cancel-slice` re-checks its live-run refusal with; pass
- * the one `interpret` was given.
+ * `heartbeatOf` is the run heartbeat reader `cancel-slice` re-checks its live-run refusal with, and a
+ * train `skip` keeps a slice with a live run open by; pass the one `interpret` was given.
  */
 export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): string {
 	const stamp = { by: SURFACE_BY, author: "jo", channel: "surface" as const };
@@ -1050,8 +1291,7 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			if (word === PAIR_OPTION) return applyPair(ledger, q0, cmd.answer);
 			// D4: *approve* on any other question while `plan: first` stands unapproved approves nothing, and the receipt says so.
 			const notPlan = !plan && word === "approve" && planFirst(controlOf(ledger, q0.workload_id) ?? []) !== null;
-			const ceiling = isCeilingQuestion(q0, ledger.slice(q0.slice_id)) && (CEILING_OPTIONS as readonly string[]).includes(word);
-			const roundLimit = !ceiling && (ROUND_LIMIT_OPTIONS as readonly string[]).includes(word) && isReviewLimitQuestion(ledger, q0);
+			const roundLimit = (ROUND_LIMIT_OPTIONS as readonly string[]).includes(word) && isReviewLimitQuestion(ledger, q0);
 			if (plan && word === "cancel") {
 				const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "plan cancelled from the surface", then: "cancel" });
 				return `cancelled the plan: withdrew ${cmd.questionId} (withdrawal ${id}); slice ${q0.slice_id} is ${ledger.slice(q0.slice_id)?.state ?? "unknown"}`;
@@ -1060,8 +1300,8 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			const id = ledger.write(() => {
 				const answerId = ledger.answerQuestion(cmd.questionId, { ...stamp, answer: cmd.answer });
 				if (plan && word === "approve") ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planApprovedBody(answerId) });
-				if (ceiling) tail = settleCeiling(ledger, q0, word, answerId);
 				if (roundLimit) tail = settleReviewLimit(ledger, q0, word as RoundLimitOption, answerId);
+				if (word === "skip") tail += trainSkipClose(ledger, q0, answerId, heartbeatOf);
 				return answerId;
 			});
 			const slice = ledger.slice(q0.slice_id);
@@ -1069,16 +1309,12 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			return `answered ${cmd.questionId} with "${cmd.answer}" (answer ${id}); slice ${q0.slice_id} is ${slice?.state ?? "unknown"}${approved}${tail}`;
 		}
 		case "withdraw": {
-			// The standing slice is never cancelled (item 105): a withdrawal of the orchestrator's own ask always replans, whatever the command carries.
-			const standing = cmd.workloadId === STANDING_WORKLOAD_ID;
-			const then = standing ? "replan" : cmd.then;
-			const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "withdrawn from the surface", then });
+			// The standing slice is never cancelled (item 105), and no other question's withdrawal cancels: every one replans.
+			const id = ledger.withdrawQuestion(cmd.questionId, { ...stamp, reason: "withdrawn from the surface", then: "replan" });
 			const q = ledger.question(cmd.questionId)!;
 			const slice = ledger.slice(q.slice_id);
-			if (standing) return `withdrew the orchestrator's ${cmd.questionId} (withdrawal ${id}, then replan); the standing slice stays ${slice?.state ?? "unknown"}`;
-			const what = then === "replan" ? "replanned, not executed"
-				: isCeilingQuestion(q, slice) ? "cancelled; the lane stops at the ceiling as the default" : "cancelled";
-			return `withdrew ${cmd.questionId} (withdrawal ${id}, then ${then}); slice ${q.slice_id} is ${slice?.state ?? "unknown"}: ${what}`;
+			if (cmd.workloadId === STANDING_WORKLOAD_ID) return `withdrew the orchestrator's ${cmd.questionId} (withdrawal ${id}, then replan); the standing slice stays ${slice?.state ?? "unknown"}`;
+			return `withdrew ${cmd.questionId} (withdrawal ${id}, then replan); slice ${q.slice_id} is ${slice?.state ?? "unknown"}: replanned, not executed`;
 		}
 		case "reserved": {
 			const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${cmd.verdict} ${cmd.entryId}` });
@@ -1088,10 +1324,21 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			// Jo's exact figure (§ 1 D): the instruction, then the entry naming it; omitted hours keep the wall in force.
 			return ledger.write(() => {
 				const next = { usd: cmd.usd, wallMin: cmd.wallMin ?? ceilingOf(ledger, cmd.workloadId).wallMin };
-				const hours = Number((next.wallMin / 60).toFixed(2));
-				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `ceiling: ${next.usd} ${hours}` });
-				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: ceilingBody(next, "your word", id) });
-				return `ceiling on ${cmd.workloadId} → ${ceilingText(next)} (instruction ${id})`;
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: ceilingInstructionBody(next) });
+				const tail = raiseCeiling(ledger, cmd.workloadId, next, "your word", id, "ceiling word");
+				return `ceiling on ${cmd.workloadId} → ${ceilingText(next)} (instruction ${id})${tail}`;
+			});
+		}
+		case "extend": {
+			// One more block of the workload's own size on the value in force (PLAN wl-mvfkv7llkp7nk0 § 4), shaped like the ceiling word.
+			return ledger.write(() => {
+				const w = ledger.workload(cmd.workloadId)!;
+				const block = sizeFor(w.stakes, judgedKindOf(ledger, cmd.workloadId));
+				const cur = ceilingOf(ledger, cmd.workloadId);
+				const next = { usd: cur.usd + block.usd, wallMin: cur.wallMin + block.wallMin };
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: ceilingInstructionBody(next) });
+				const tail = raiseCeiling(ledger, cmd.workloadId, next, EXTEND_SOURCE, id, "ceiling extend");
+				return `ceiling on ${cmd.workloadId} extended by ${ceilingText(block)} → ${ceilingText(next)} (instruction ${id})${tail}`;
 			});
 		}
 		case "rounds": {
@@ -1119,12 +1366,67 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "test-pr": {
 			// Jo's instruction first, then the surface's `test-pr:` naming it, in one transaction; the runner reads both (`boundPrs`).
 			return ledger.write(() => {
-				const why = testPrRefusal(ledger, cmd.workloadId);
+				const why = prWordRefusal(ledger, "test-pr", cmd.workloadId);
 				if (why !== null) throw new Error(why);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: testPrInstructionBody(cmd.workloadId, cmd.prs) });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: testPrBody(cmd.prs, id) });
 				const prs = cmd.prs.map((n) => `#${n}`).join(", ");
 				return `${cmd.prs.length === 1 ? "PR" : "PRs"} ${prs} bound to ${cmd.workloadId} for test runs with no push (instruction ${id})`;
+			});
+		}
+		case "waive-pr": {
+			// Jo's instruction first, then the surface's `waive-pr:` naming it, in one transaction; the close check reads both (`waivedPrs`).
+			return ledger.write(() => {
+				const why = prWordRefusal(ledger, "waive-pr", cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: waivePrInstructionBody(cmd.workloadId, cmd.prs) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: waivePrBody(cmd.prs, id) });
+				const prs = cmd.prs.map((n) => `#${n}`).join(", ");
+				return `${cmd.prs.length === 1 ? "PR" : "PRs"} ${prs} waived on ${cmd.workloadId} for the close check (instruction ${id})`;
+			});
+		}
+		case "train":
+			throw new Error("train opens a workload in the surface's repo: applyTrain applies it, never apply");
+		case "train-append": {
+			// Jo's instruction first, then the surface's `train:` naming it, in one transaction; a train no lane holds live relaunches.
+			return ledger.write(() => {
+				const why = trainAppendRefusal(ledger, cmd.workloadId, cmd.prs);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: trainInstructionBody(cmd.workloadId, cmd.prs) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: trainBody(cmd.prs, id) });
+				const w = ledger.workload(cmd.workloadId)!;
+				let relaunch = "";
+				if (w.mode === "autonomous" && !heldLive(w, ledger.now())) {
+					ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: launchRequestedBody("jo", ledger.now(), "train append") });
+					relaunch = "; no lane holds it live, so a relaunch is requested";
+				}
+				return `added ${cmd.prs.map((n) => `#${n}`).join(", ")} to merge train ${cmd.workloadId} (instruction ${id}); order ${trainPrs(ledger.entries(cmd.workloadId), ledger.instructions(cmd.workloadId)).join(", ")}${relaunch}`;
+			});
+		}
+		case "end-ruling": {
+			// Jo's instruction on the standing workload is the end (`endedRulings`); nothing else is written.
+			return ledger.write(() => {
+				const why = endRulingRefusal(ledger, cmd.ruling);
+				if (why !== null) throw new Error(why);
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: endRulingBody(cmd.ruling) });
+				return `Jo's ruling ${cmd.ruling} is ended (instruction ${id}); its questions go to you again`;
+			});
+		}
+		case "halt": {
+			// Jo's instruction, the surface's `plan: halted <instruction>`, and a stop request to a lane holding it live, in one write.
+			return ledger.write(() => {
+				const why = haltRefusal(ledger, cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: `${HALT_WORD} ${cmd.workloadId}` });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: planHaltedBody(id) });
+				const w = ledger.workload(cmd.workloadId)!;
+				let stop = "";
+				if (w.holder?.startsWith("lane-") && heldLive(w, ledger.now())) {
+					ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: laneStopRequestBody(w.holder, HALT_WORD, "jo") });
+					stop = `; stop requested of ${w.holder} (it accepts at its next poll)`;
+				}
+				return `${cmd.workloadId} is halted (instruction ${id}): its plan needs your approve again, change slices are refused and the train holds its PRs${stop}`;
 			});
 		}
 		case "withdraw-workload": {
@@ -1143,4 +1445,27 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 		case "refused":
 			throw new Error(`${cmd.why}; refused, never applied`);
 	}
+}
+
+/**
+ * Jo's `train <N…>` applied (PLAN wl-mv8s8srodefytc § 1), in one transaction: the id preallocated (`newId`) so the brief
+ * names this train's slice ids, the workload opened normal and autonomous with brief `trainBrief(wl, prs)`, its repo
+ * `repo` (the surface's cwd), `done:` TRAIN_DONE and the normal ceiling, no `plan:` (the procedure is the plan); then
+ * Jo's instruction `train <wl> <N…>` and the surface's `train:` naming it. Returns the receipt and the new id, which
+ * the routes launch (never parsed back from the receipt). Throws, writing nothing, when a PR is already on another open
+ * train of `repo` (rev 17.1 D8): the repo is known only here, so the parse cannot check it.
+ */
+export function applyTrain(ledger: Ledger, cmd: Extract<Command, { kind: "train" }>, repo: string): { line: string; workloadId: string } {
+	return ledger.write(() => {
+		const why = otherTrainRefusal(ledger, repo, cmd.prs, null);
+		if (why !== null) throw new Error(`${why}; refused, never applied`);
+		const wl = newId("workload");
+		ledger.openWorkload({ by: SURFACE_BY, id: wl, brief: trainBrief(wl, cmd.prs), stakes: "normal", mode: "autonomous" });
+		recordRepo(ledger, wl, repo);
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: doneBody(TRAIN_DONE) });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: ceilingBody(sizeFor("normal", null), stakesSource("normal", null)) });
+		const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: wl, body: trainInstructionBody(wl, cmd.prs) });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: trainBody(cmd.prs, id) });
+		return { line: `opened merge train ${wl} for ${cmd.prs.map((n) => `#${n}`).join(", ")} (instruction ${id})`, workloadId: wl };
+	});
 }
