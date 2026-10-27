@@ -12,6 +12,11 @@
 //       detached. Prints `test-run <run id> runner <pid> sha <head> slice <slice> log <path>`, plus
 //       ` bound-by <instruction id>` when only Jo's binding admitted the PR, exit 0. A refusal is one
 //       stderr line `test-runner start: <reason>` and exit 2; a failure the same, exit 3; usage exit 1.
+//       The carried green (PLAN wl-mvpwkpqobyp20w D4): on a merge train, when the PR's last request across the train, its
+//       head branch's workload and its fix workloads is green at S and the head is S or past it only by decision-log commits
+//       (`ghCompare` before the transaction, the authority re-read in it), the transaction writes `test-requested:` and a green
+//       `test-run:` at the head (reason `carried from <R> at <S> (decision-log only)`, R's counts) and settles the slice; no run
+//       is spawned, `as2/full-suite` success is posted after the commit, and the line has `runner none`, `log none` and ends ` carried <R>`.
 //   run <run id>
 //       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it; queued runs take it oldest
 //       request first, by their `test-requested:` entry's time in runs.db's `queue` table, skipping dead waiters), `current` published
@@ -58,19 +63,19 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { assertNotLiveLedgerUnderTest, defaultLedgerPath, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
+import { assertNotLiveLedgerUnderTest, defaultLedgerPath, type EntryRow, Ledger, TEST_RUNNER_BY, type WorkloadStatusRow } from "../../ledger/src/index";
 import {
 	AS2TEST_LIBEXEC, AS2TEST_SUDOERS, CHECKOUT_DRIFT, type DsclRead, type InstallFacts, installDecision, type InstallVerdict, type OwnerIds, preflightDecision,
 	preflightProbes, probeCall, probeDecision, readInstall, REBUILT_FILES, REFRESH_CAP_S, REFRESH_EXIT, REFRESH_FAILED, type Verdict,
 } from "../src/as2test";
 import { repoOf } from "../src/decision-log";
 import { boundPrs, holdersOf, worktreePath } from "../src/launch";
-import { FULL_SUITE_STATUS, trainHold, trainPrs } from "../src/merge-train";
+import { FULL_SUITE_STATUS, fixBindings, fixBinds, ghCompare, trainHold, trainPrs } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
-	AS2TEST_ROOT, AS2TEST_USER, baseParts, boundBranches, buildTestRun, changedTestFiles, decideRun, fullSuiteSlice, HEARTBEAT_EVERY_MS,
-	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
-	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
+	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, carriedRun, changedTestFiles, decideRun, decisionLogFault, fullSuiteSlice, HEARTBEAT_EVERY_MS,
+	heartbeatText, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult, partResult, prAdmissible,
+	type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunFacts, runDirOf, runnerDiedRun, type RunRecord,
 	runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, type TestRequested, type TestRun, testRequestedBody, testRunBody, testRunFailedBody, testRunFailedOf, type TestVerdict,
 	type TestRunnerConfig, testRunnerConfig, testRuns, workDirOf, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
@@ -198,13 +203,14 @@ export function heartbeatOf(root: string, runId: string): number | null {
 
 /**
  * A named boundary. With AGENT_SYSTEM_TEST_HOOKS set, every pass appends a line to
- * `<dir>/<run id>.<point>.marks`; when `<dir>/<run id>.<point>.pause` exists, it writes
- * `.reached` and waits for `.go`, then removes all three (one pause per arming). Unset, it is inert.
+ * `<dir>/<id>.<point>.marks` (`id` is the run id; the starter's carry, which has no run, names its workload);
+ * when `<dir>/<id>.<point>.pause` exists, it writes `.reached` and waits for `.go`, then removes all three
+ * (one pause per arming). Unset, it is inert.
  */
-function hookMark(runId: string, point: string, info: Record<string, unknown> = {}): { base: string } | null {
+function hookMark(id: string, point: string, info: Record<string, unknown> = {}): { base: string } | null {
 	const dir = process.env.AGENT_SYSTEM_TEST_HOOKS;
 	if (!dir) return null;
-	const base = join(dir, `${runId}.${point}`);
+	const base = join(dir, `${id}.${point}`);
 	appendFileSync(`${base}.marks`, `${JSON.stringify({ at: Date.now(), pid: process.pid, ...info })}\n`);
 	return { base };
 }
@@ -212,8 +218,8 @@ function hookResume(base: string): void {
 	for (const s of [".pause", ".go", ".reached"]) rmSync(base + s, { force: true });
 }
 /** The synchronous form, for a boundary inside an open SQLite transaction. */
-function hookSync(runId: string, point: string, info: Record<string, unknown> = {}): void {
-	const h = hookMark(runId, point, info);
+function hookSync(id: string, point: string, info: Record<string, unknown> = {}): void {
+	const h = hookMark(id, point, info);
 	if (!h || !existsSync(`${h.base}.pause`)) return;
 	writeFileSync(`${h.base}.reached`, JSON.stringify({ pid: process.pid, at: Date.now(), ...info }));
 	while (!existsSync(`${h.base}.go`)) Bun.sleepSync(25);
@@ -385,20 +391,23 @@ export function writeBaseCache(root: string, sha: string, part: string, result: 
 
 // ---- start ------------------------------------------------------------------------------------------
 
-/** `gh pr view <pr> -R <owner/repo> --json <fields>`'s object; a gh failure or an answer that is no JSON fails the start. */
-function ghPrJson(ownerRepo: string, pr: number, fields: string): Record<string, unknown> {
-	const r = spawnSync(["gh", "pr", "view", String(pr), "-R", ownerRepo, "--json", fields], {
-		stdout: "pipe", stderr: "pipe", timeout: 15_000,
-	});
+/** gh's JSON for `args` (gh found on PATH with this process's env); a gh failure or an answer that is no JSON fails the start, named `what`. */
+function ghJson(args: string[], what = `gh ${args.join(" ")}`): unknown {
+	const r = spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
 	if (r.exitCode !== 0) {
 		const why = r.exitedDueToTimeout ? "timed out" : r.stderr.toString().trim().split("\n").at(-1) || `exit ${r.exitCode}`;
-		throw new Fail(`gh pr view ${pr} -R ${ownerRepo} failed: ${why}`, START_EXIT.failed);
+		throw new Fail(`${what} failed: ${why}`, START_EXIT.failed);
 	}
 	try {
-		return JSON.parse(r.stdout.toString()) as Record<string, unknown>;
+		return JSON.parse(r.stdout.toString());
 	} catch {
-		throw new Fail(`gh pr view ${pr} -R ${ownerRepo} did not return json`, START_EXIT.failed);
+		throw new Fail(`${what} did not return json`, START_EXIT.failed);
 	}
+}
+
+/** `gh pr view <pr> -R <owner/repo> --json <fields>`'s object. */
+function ghPrJson(ownerRepo: string, pr: number, fields: string): Record<string, unknown> {
+	return ghJson(["pr", "view", String(pr), "-R", ownerRepo, "--json", fields], `gh pr view ${pr} -R ${ownerRepo}`) as Record<string, unknown>;
 }
 
 function ghPrView(ownerRepo: string, pr: number): PrView & { body: string } {
@@ -437,7 +446,88 @@ function recordError(ledger: Ledger, wl: string, request: TestRequested, runDir:
 	});
 }
 
-function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): number {
+/**
+ * The `as2/full-suite` commit status (FULL_SUITE_STATUS) on exactly `sha` in the served repo `ownerRepo`, for any PR (PLAN wl-mv8s8srodefytc
+ * rev 17.1 D2: branch protection on main requires it): `gh api -X POST repos/<owner/repo>/statuses/<sha>`, gh found on PATH with this
+ * process's env, as the starter's `gh pr view` is; posted by a run on its verdict and by the starter on a carried green. A failed post is
+ * logged through `log` and never changes the verdict; it never throws, and gh is killed after 15 s.
+ */
+async function postFullSuite(ownerRepo: string, state: "success" | "failure" | "error", sha: string, description: string, log: (s: string) => void): Promise<void> {
+	const what = `status ${FULL_SUITE_STATUS} ${state} on ${sha}`;
+	if (!ownerRepo) {
+		log(`${what} not posted: the run has no served repo`);
+		return;
+	}
+	const argv = ["gh", "api", "-X", "POST", `repos/${ownerRepo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`];
+	try {
+		const p = spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
+		const timer = setTimeout(() => p.kill("SIGKILL"), 15_000);
+		const err = await new Response(p.stderr).text();
+		await p.exited;
+		clearTimeout(timer);
+		log(p.exitCode === 0 ? `${what} posted` : `${what} not posted: ${err.trim().split("\n").at(-1) || (p.signalCode ?? `exit ${p.exitCode}`)}`);
+	} catch (e) {
+		log(`${what} not posted: ${errText(e)}`);
+	}
+}
+
+// ---- the carried green (PLAN wl-mvpwkpqobyp20w D4) ------------------------------------------------------
+
+/**
+ * D4a's sources for PR `pr` on merge train `train`: the train; the workload a `wl/<W>` head branch names; and every workload, open or
+ * closed, whose `train-fix:` is for this repo and binds the PR on the train (`fixBinds`). W and each fix count only when their `repo:`
+ * checkout's origin is the served `ownerRepo`; `origins` keeps each checkout's origin once read, so a re-read in a transaction runs git
+ * only for a checkout it has not seen.
+ */
+function carrySources(ledger: Ledger, train: string, pr: number, headRefName: string, ownerRepo: string, origins: Map<string, string | null>): string[] {
+	const want = ownerRepo.toLowerCase();
+	const served = (id: string): boolean => {
+		const repo = repoOf(ledger, id);
+		if (repo === null) return false;
+		if (!origins.has(repo)) origins.set(repo, originOf(repo));
+		const origin = origins.get(repo);
+		return origin != null && ownerRepoOf(origin)?.toLowerCase() === want;
+	};
+	const out = [train];
+	const owner = headRefName.startsWith("wl/") ? headRefName.slice(3) : null;
+	if (owner !== null && owner !== train && ledger.workload(owner) !== null && served(owner)) out.push(owner);
+	for (const f of fixBindings(ledger, { closed: true })) {
+		if (!out.includes(f.workloadId) && f.repo.toLowerCase() === want && fixBinds(ledger, f, train, pr) && served(f.workloadId)) out.push(f.workloadId);
+	}
+	return out;
+}
+
+/**
+ * D4a's authority: the last `test-requested:` for PR `pr` across `sources` in ledger order, created_at then rowid (one query: the
+ * order `ledger.entries` and `authoritativeRun` read within one workload, so equal stamps across workloads resolve by insertion), and
+ * that request's own result, read from its own workload's records. Null unless that result is a green: a newer red, error, stale or
+ * superseded request, or one still pending, carries nothing, whatever older greens exist.
+ */
+function carryAuthority(ledger: Ledger, sources: readonly string[], pr: number): ResultRecord | null {
+	const rows = ledger.db.query<EntryRow, string[]>(`SELECT * FROM entries WHERE workload_id IN (${sources.map(() => "?").join(", ")}) ORDER BY created_at, rowid`).all(...sources);
+	const last = authoritativeRun(testRuns(rows), pr);
+	const on = last === null ? undefined : rows.find((e) => e.id === last.request.entryId)?.workload_id;
+	const own = on === undefined ? null : (testRuns(ledger.entries(on)).find((r) => r.request.runId === last!.request.runId)?.result ?? null);
+	return own?.verdict === "green" ? own : null;
+}
+
+/**
+ * D4b, before any transaction (no gh call holds the ledger's lock): the authority's green at S when the PR's head `head` is S
+ * (`identical`, no gh call) or passes `decisionLogFault` on GitHub's compare of the two (`ghCompare`); else null, and the request
+ * runs as any other. A compare GitHub cannot answer completely, or a gh call that fails, carries nothing.
+ */
+function carryCandidate(ledger: Ledger, sources: readonly string[], pr: number, head: string, ownerRepo: string): ResultRecord | null {
+	const from = carryAuthority(ledger, sources, pr);
+	if (from === null) return null;
+	try {
+		const c = ghCompare(ownerRepo, from.sha, head, ghJson);
+		return decisionLogFault(c.ok ? c.compare : null) === null ? from : null;
+	} catch {
+		return null;
+	}
+}
+
+async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): Promise<number> {
 	const ledger = openLedger();
 	const w = ledger.workload(wl);
 	if (!w || w.status !== "open") throw new Fail(`no open workload ${wl}`, START_EXIT.refused);
@@ -457,12 +547,19 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 	if (stacked !== null) throw new Fail(stacked, START_EXIT.refused);
 	// Admitted only through a binding: the starter's line names it (Jo's instruction, or the train's board entry), so every such run is traceable to it.
 	const boundBy = bound.includes(view.headRefName) ? null : (bindings.find((b) => b.pr === view.number)?.by ?? null);
+	// D4b: on a merge train, the green this request may carry to the head this start read (evidence for R, S and that head).
+	const origins = new Map<string, string | null>();
+	const candidate = trainPrs(entries, instructions).includes(pr)
+		? carryCandidate(ledger, carrySources(ledger, wl, pr, view.headRefName, ownerRepo, origins), pr, view.headRefOid, ownerRepo)
+		: null;
+	if (candidate !== null) hookSync(wl, "carry-evidence");
 
 	const root = runsRoot(process.env);
 	mkdirSync(root, { recursive: true, mode: 0o700 });
 	const runId = makeRunId(Date.now(), Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => (b % 36).toString(36)).join(""));
 	const runDir = runDirOf(root, runId);
-	const slice = ledger.write(() => {
+	const { slice, carried } = ledger.write(() => {
+		if (candidate !== null) hookSync(wl, "carry-open");
 		const now = Date.parse(ledger.now());
 		const res = reservation(testRuns(ledger.entries(wl)), (id) => heartbeatOf(root, id), now);
 		if (!res.ok) {
@@ -485,9 +582,26 @@ function cmdStart(wl: string, pr: number, sliceArg: string | null, by: string): 
 		for (const d of res.settleDead) {
 			ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: d.request.slice, kind: "assumption", body: testRunBody(runnerDiedRun(d.request, runDirOf(root, d.request.runId))) });
 		}
-		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody({ runId, pr, sha: view.headRefOid, slice: sl, by }) });
-		return sl;
+		// D4c: the carry commits only on the authority D4b compared (same R, same S, the head this start read), re-read from this
+		// transaction's rows before this request joins them; any other falls through to the run. No gh call here: Ledger.write may run this again.
+		const from = candidate === null ? null : carryAuthority(ledger, carrySources(ledger, wl, pr, view.headRefName, ownerRepo, origins), pr);
+		const carry = from !== null && from.runId === candidate!.runId && from.sha === candidate!.sha ? from : null;
+		const request: TestRequested = { runId, pr, sha: view.headRefOid, slice: sl, by };
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody(request) });
+		if (carry === null) return { slice: sl, carried: null };
+		const run = carriedRun(request, carry);
+		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRunBody(run) });
+		ledger.completeSlice(sl, { by: TEST_RUNNER_BY, artifact: settleArtifact(run) });
+		hookSync(wl, "carry-written");
+		return { slice: sl, carried: carry };
 	});
+
+	if (carried !== null) {
+		// D4d, after the commit: the status the run would post, outside any transaction; a failed post is logged and the green stands.
+		await postFullSuite(ownerRepo, "success", view.headRefOid, `carried from run ${carried.runId} at ${carried.sha.slice(0, 7)} (decision-log only)`, (s) => process.stderr.write(`test-runner start: ${s}\n`));
+		process.stdout.write(`test-run ${runId} runner none sha ${view.headRefOid} slice ${slice} log none${boundBy ? ` bound-by ${boundBy}` : ""} carried ${carried.runId}\n`);
+		return START_EXIT.ok;
+	}
 
 	const log = join(runDir, "runner.log");
 	try {
@@ -1094,30 +1208,6 @@ class Runner {
 		return new RegExp(`^([0-9a-f]{40})\\trefs/pull/${pr}/head$`, "m").exec(r.out)?.[1] ?? null;
 	}
 
-	/**
-	 * The `as2/full-suite` commit status (FULL_SUITE_STATUS) on exactly `sha` in the served repo, for any PR (PLAN wl-mv8s8srodefytc
-	 * rev 17.1 D2: branch protection on main requires it): `gh api -X POST repos/<owner/repo>/statuses/<sha>`, gh found on PATH
-	 * with this process's env, as the starter's `gh pr view` is. A failed post is logged here and never changes the verdict.
-	 */
-	async postStatus(state: "success" | "failure" | "error", sha: string, description: string): Promise<void> {
-		const what = `status ${FULL_SUITE_STATUS} ${state} on ${sha}`;
-		if (!this.ownerRepo) {
-			this.log(`${what} not posted: the run has no served repo`);
-			return;
-		}
-		const argv = ["gh", "api", "-X", "POST", `repos/${this.ownerRepo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`];
-		try {
-			const p = spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "pipe" });
-			const timer = setTimeout(() => p.kill("SIGKILL"), 15_000);
-			const err = await new Response(p.stderr).text();
-			await p.exited;
-			clearTimeout(timer);
-			this.log(p.exitCode === 0 ? `${what} posted` : `${what} not posted: ${err.trim().split("\n").at(-1) || (p.signalCode ?? `exit ${p.exitCode}`)}`);
-		} catch (e) {
-			this.log(`${what} not posted: ${errText(e)}`);
-		}
-	}
-
 	/** Steps in the plan's order: lock and publish → install check (and refresh) → sweep → probe → retention → trusted → prepare → parts with a sweep after each → base runs → post-sweep finalization deadline → head re-check. */
 	async body(): Promise<void> {
 		({ url: this.url, repo: this.repo, ownerRepo: this.ownerRepo } = servedOf(this.ledger, this.wl, this.config));
@@ -1266,9 +1356,9 @@ class Runner {
 				return START_EXIT.failed;
 			}
 			// Only a terminal state, and only on the sha the fetch confirmed this run tested (trusted's sha check).
-			// postStatus never throws and kills gh after 15 s.
+			// postFullSuite never throws and kills gh after 15 s.
 			const state = this.f.fetchedSha === run.sha ? FULL_SUITE_STATE[run.verdict] : undefined;
-			if (state) await this.postStatus(state, run.sha, `full suite ${run.verdict}, run ${run.runId}`);
+			if (state) await postFullSuite(this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}`, (s) => this.log(s));
 			return 0;
 		} finally {
 			clearInterval(this.timer);
