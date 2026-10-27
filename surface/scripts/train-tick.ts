@@ -82,7 +82,7 @@ import { AS2_VERIFIED_TAG } from "../src/as2test";
 import { ceilingStopped } from "../src/ceiling";
 import { loadTestRunnerConfig } from "../src/close-entry";
 import {
-	attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, landFirstOn, launchRequestedBody, launchRowsFor, mainRetries, trainBindings, verdictOf,
+	attempts, consumedIds, controlEntries, heldLive, holdersOf, LANE_SCRIPT, laneCap, landFirstOffBody, landFirstOffPending, landFirstOn, launchRequestedBody, launchRowsFor, mainRetries, sameRepo, trainBindings, verdictOf,
 } from "../src/launch";
 import { attemptBlock, type ChainCommit, ghMainChain, INCONCLUSIVE, type MainState, mainResults, mainState, mainVerdicts } from "../src/main-state";
 import {
@@ -97,7 +97,7 @@ import {
 } from "../src/merge-train";
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import { sendNotice, TRAIN_SIGNOFF_APPLIED_PREFIX, trainMergedEntryBody, trainMergedNoticeBody } from "../src/notice";
-import { type CompareResult, decisionLogFault, ownerRepoOf, type ResultRecord, type TestRunnerConfig, testRuns } from "../src/test-run";
+import { type CompareResult, decisionLogFault, fastPlans, ownerRepoOf, type ResultRecord, runsRoot, type TestRunnerConfig, testRuns, withFullSuitePublication } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID } from "../src/types";
 
 /** One gh process: its exit code and output. */
@@ -119,6 +119,8 @@ export interface LandDeps {
 	runner: (args: string[]) => GhResult;
 	/** The tick's own control root, read now (`ControlRoot`); throws when git or the file system cannot answer. */
 	root: () => ControlRoot;
+	/** Configured runner runs root; tests inject an isolated directory. No new operator configuration. */
+	runsRoot?: string;
 }
 
 /** The tick's seams: gh, the lane launcher and the notification are injected, so a test runs a pass on fakes and a temp ledger. */
@@ -194,7 +196,7 @@ export function tick(d: TickDeps): string[] {
 	let root: ControlRoot | null = null;
 	if (d.land && ledger.workload(STANDING_WORKLOAD_ID)) {
 		const entries = ledger.entries(STANDING_WORKLOAD_ID);
-		const on = landFirstRepos(entries, ledger.instructions(STANDING_WORKLOAD_ID));
+		const on = landFirstRepos(entries, ledger.instructions(STANDING_WORKLOAD_ID), true);
 		let refusal: string[];
 		try {
 			root = d.land.root();
@@ -725,7 +727,7 @@ const lastLine = (r: GhResult) => ((r.stdout.trim() || r.stderr.trim()).split("\
 const SHA40 = /^[0-9a-f]{40}$/;
 
 /** One land-first row (`landFirstNoticeBody`) on the standing workload as MERGE_TRAIN_BY, and its log line. */
-function landNote(d: TickDeps, say: (line: string) => void, repo: string, e: LandFirstEvent): void {
+function landNote(d: Pick<TickDeps, "ledger">, say: (line: string) => void, repo: string, e: LandFirstEvent): void {
 	const body = landFirstNoticeBody(repo, e);
 	d.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
 	say(`${STANDING_WORKLOAD_ID}: ${body}`);
@@ -772,6 +774,11 @@ function landPass(
 	const read = results.at(-1)?.entryId ?? null;
 	const greens = new Set([...mainVerdicts(results).values()].filter((v) => v.verdict === "green").map((v) => v.sha));
 	for (const repo of served) {
+		// Off reconciliation does not depend on main being readable, green or even requested this pass.
+		if (!reconcileLandFirstOff(d, repo, land.runsRoot ?? runsRoot(process.env), repoOf, say)) {
+			res.stopped.add(repo);
+			continue;
+		}
 		try {
 			const tip = mainTip(repo, ghJson);
 			const chain: ChainCommit[] = ghMainChain(repo, tip, ghJson, greens);
@@ -786,6 +793,99 @@ function landPass(
 		}
 	}
 	return res;
+}
+
+/**
+ * Complete only the off instruction ids read under the publisher's mutex, after every current open
+ * fast/tree success was revoked. One attempt per head per pass; failures remain durable and held.
+ * The next scheduled tick is the sole retry layer. Full-suite execution is left untouched.
+ */
+export function reconcileLandFirstOff(
+	d: Pick<TickDeps, "ledger" | "gh">, repo: string, root: string, repoOf: (wl: string) => string | null, say: (line: string) => void,
+): boolean {
+	const { ledger } = d;
+	if (landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo).length === 0) return true;
+	try {
+		return withFullSuitePublication(root, repo, () => {
+			const entries = ledger.entries(STANDING_WORKLOAD_ID);
+			const ids = landFirstOffPending(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo);
+			if (ids.length === 0) return true;
+			const ghJson = (args: string[]): unknown => {
+				const r = d.gh(args);
+				if (r.code !== 0) throw new GhError(`gh ${args.join(" ")} exited ${r.code}: ${lastLine(r)}`);
+				try {
+					return JSON.parse(r.stdout);
+				} catch (error) {
+					throw new GhError(`gh ${args.join(" ")} returned invalid JSON: ${errText(error)}`);
+				}
+			};
+			const open = openHeads(repo, ghJson, true);
+			// Include closed workloads: their unmerged PRs can still have usable required statuses.
+			const workloads = ledger.db.query<{ workload_id: string }, []>(
+				"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE 'test-requested: %'",
+			).all();
+			const classification = new Map<string, "fast" | "full" | "unknown">();
+			for (const { workload_id: wl } of workloads) {
+				const rows = ledger.entries(wl);
+				const matching = testRuns(rows).filter((r) => r.result !== null && open.get(r.request.pr) === r.request.sha);
+				if (matching.length === 0) continue;
+				const origin = repoOf(wl);
+				if (origin !== null && !sameRepo(origin, repo)) continue;
+				const plans = fastPlans(rows);
+				for (const r of matching) {
+					const key = `${r.request.pr} ${r.request.sha}`;
+					const plan = plans.get(r.request.runId);
+					const full = r.result!.scope === "full" && r.result!.host === "mac" && plan?.scope !== "tree" && plan?.scope !== "fast";
+					// A real full result at this identical head remains usable even if a later fast run exists.
+					if (origin === null) {
+						if (!classification.has(key)) classification.set(key, "unknown");
+					} else if (full && (r.result!.verdict === "green" || r.result!.verdict === "red-main")) classification.set(key, "full");
+					else if (classification.get(key) !== "full" && (plan?.scope === "tree" || plan?.scope === "fast" || r.result!.scope === "fast")) classification.set(key, "fast");
+				}
+			}
+			let failed = false;
+			for (const [pr, head] of open) {
+				try {
+					if (newestGateStatus(repo, head, ghJson, true)?.state !== "success") continue;
+					const kind = classification.get(`${pr} ${head}`);
+					if (kind === "full") continue;
+					if (kind !== "fast") throw new Error(`cannot identify whether #${pr} ${head}'s success is a full result or fast/tree plan; repair its runner provenance`);
+					const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", "description=land-first off: fast/tree success revoked; request the full suite"]);
+					if (r.code !== 0) throw new GhError(`gh status revoke #${pr} ${head} exited ${r.code}: ${lastLine(r)}`);
+					say(`land-first ${repo}: off reconciliation revoked #${pr} ${head}`);
+				} catch (error) {
+					failed = true;
+					const attempt = landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo).filter((r) => r.event === "revoke-failed" && r.pr === pr && r.head === head).length + 1;
+					try {
+						landNote(d, say, repo, { event: "revoke-failed", pr, head, attempt, error: `off reconciliation pending: ${errText(error)}; next tick retries` });
+					} catch (receiptError) {
+						throw new AggregateError([error, receiptError], `off reconciliation #${pr} ${head} failed: ${errText(error)}; failure receipt also failed: ${errText(receiptError)}`);
+					}
+				}
+			}
+			if (failed) return false;
+			// The network work is over. Only this short write holds the ledger; later off ids stay pending.
+			ledger.write(() => {
+				for (const id of ids) {
+					const instruction = ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === id)!;
+					const wordRepo = instruction.body.split(" ")[1]!;
+					ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(wordRepo, "complete", id) });
+				}
+			});
+			const pending = landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
+			say(`land-first ${repo}: off reconciliation completed for ${ids.join(", ")}${pending.length > 0 ? "; a newer off remains pending" : "; fast/tree successes revoked, full results preserved"}`);
+			return pending.length === 0;
+		});
+	} catch (error) {
+		const body = `train-error: off reconciliation pending for ${repo}: ${errText(error)}; merges held, next tick retries`;
+		say(body);
+		try {
+			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		} catch (receiptError) {
+			throw new AggregateError([error, receiptError], `${body}; failure receipt could not be persisted: ${errText(receiptError)}`);
+		}
+		return false;
+	}
 }
 
 /**
@@ -878,13 +978,16 @@ function promotePass(d: TickDeps, land: LandDeps, ops: IssueOps, say: (line: str
 }
 
 /** The open PRs of `repo` and their heads: `gh pr list --state open`. */
-function openHeads(repo: string, ghJson: (args: string[]) => unknown): Map<number, string> {
-	const list = ghJson(["pr", "list", "-R", repo, "--state", "open", "--json", "number,headRefOid", "--limit", "500"]);
-	if (!Array.isArray(list)) throw new GhError(`gh pr list -R ${repo} returned an unexpected shape`);
+function openHeads(repo: string, ghJson: (args: string[]) => unknown, all = false): Map<number, string> {
+	const response = all
+		? ghJson(["api", `repos/${repo}/pulls?state=open&per_page=100`, "--paginate", "--slurp"])
+		: ghJson(["pr", "list", "-R", repo, "--state", "open", "--json", "number,headRefOid", "--limit", "500"]);
+	if (!Array.isArray(response) || (all && response.some((page) => !Array.isArray(page)))) throw new GhError(`gh open PR listing -R ${repo} returned an unexpected shape`);
+	const list: unknown[] = all ? response.flat() : response;
 	const out = new Map<number, string>();
 	for (const p of list as unknown[]) {
 		const n = field(p, "number");
-		const head = field(p, "headRefOid");
+		const head = all ? field(field(p, "head"), "sha") : field(p, "headRefOid");
 		if (typeof n !== "number" || typeof head !== "string" || !SHA40.test(head)) throw new GhError(`gh pr list -R ${repo} returned a PR with no number or head`);
 		out.set(n, head);
 	}
@@ -892,10 +995,11 @@ function openHeads(repo: string, ghJson: (args: string[]) => unknown): Map<numbe
 }
 
 /** The newest `as2/full-suite` status on `sha` (GitHub lists a commit's statuses newest first); null when it has none. */
-function newestGateStatus(repo: string, sha: string, ghJson: (args: string[]) => unknown): { state: string; description: string } | null {
+function newestGateStatus(repo: string, sha: string, ghJson: (args: string[]) => unknown, all = false): { state: string; description: string } | null {
 	const path = `repos/${repo}/commits/${sha}/statuses`;
-	const list = ghJson(["api", path]);
-	if (!Array.isArray(list)) throw new GhError(`gh api ${path} returned an unexpected shape`);
+	const response = ghJson(["api", path, ...(all ? ["--paginate", "--slurp"] : [])]);
+	if (!Array.isArray(response) || (all && response.some((page) => !Array.isArray(page)))) throw new GhError(`gh api ${path} returned an unexpected shape`);
+	const list: unknown[] = all ? response.flat() : response;
 	const s = (list as unknown[]).find((x) => field(x, "context") === FULL_SUITE_STATUS);
 	if (s === undefined) return null;
 	const state = field(s, "state");
@@ -1323,7 +1427,7 @@ function main(argv: string[]): number {
 		// D1 boards only on the repositories the test runner serves, read as its starter reads them.
 		const cfg = loadTestRunnerConfig(process.env);
 		if (!cfg.ok) log(`testRunner config unreadable (${cfg.error}): nothing boards this pass`);
-		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
+		tick({ ledger, gh: realGh, launch: realLaunch, notify: realNotify, land: { runner: realRunner, root: realRoot, runsRoot: runsRoot(process.env) }, log, ...(cfg.ok ? { config: cfg.config } : {}) });
 		return 0;
 	} finally {
 		ledger.close();

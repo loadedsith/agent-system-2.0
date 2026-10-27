@@ -94,6 +94,7 @@ export const CONTROL_PREFIXES = [
 	"lane-metrics", "daily-report",
 	"now", "ruling-conflict",
 	"land-first", "main-retry", "train-reconciled", "runner-preflight", "fast-plan", "fast-fallback", "status-failed",
+	"land-first-off-pending", "land-first-off-complete",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
@@ -190,7 +191,9 @@ export const DAILY_REPORT_BY = "daily-report";
  * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
  * Land-first's rows (PLAN wl-mvq4edbaf13vnk § 2, D12) are on the standing workload: `land-first: <repo> on|off <instruction id>` and
  * `main-retry: <repo> <instruction id>` are the surface's alone, Jo's words written after his instruction in one transaction
- * (`landFirstOn` reads the first); `train-reconciled: …` is the train tick's alone (MERGE_TRAIN_BY, D6), which the merge hold reads;
+ * (`landFirstOn` reads the first). Off also writes the surface's `land-first-off-pending: <repo> <instruction id>` there;
+ * only the tick's `land-first-off-complete: <repo> <instruction id>` clears that request, after revocation under the publication mutex.
+ * `train-reconciled: …` is the train tick's alone (MERGE_TRAIN_BY, D6), which the merge hold reads;
  * `runner-preflight: ok|refused <reason> source <sha> root <path>` is the runner's alone (TEST_RUNNER_BY, D5), and so are its D4 rows on
  * the run's workload (surface/scripts/test-runner.ts): `fast-plan: <run id> <json>` (the admission's plan), `fast-fallback: <run id>
  * <reason>` (the one Mac fallback of the hosted fast check) and `status-failed: <run id> <state> on <sha>: <error>` (a refused final
@@ -257,6 +260,8 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	now: [ESCALATION_BY],
 	"ruling-conflict": [ESCALATION_BY],
 	"land-first": [SURFACE_BY],
+	"land-first-off-pending": [SURFACE_BY],
+	"land-first-off-complete": [MERGE_TRAIN_BY],
 	"main-retry": [SURFACE_BY],
 	"train-reconciled": [MERGE_TRAIN_BY],
 	"runner-preflight": [TEST_RUNNER_BY],
@@ -1347,6 +1352,10 @@ export function landFirstInstructionBody(repo: string, on: boolean): string {
 export function landFirstBody(repo: string, on: boolean, instructionId: string): string {
 	return `${LAND_FIRST_WORD}: ${repo} ${on ? "on" : "off"} ${instructionId}`;
 }
+/** Off has two phases: the surface requests revocation, and the tick completes it under the publication mutex. */
+export function landFirstOffBody(repo: string, state: "pending" | "complete", instructionId: string): string {
+	return `land-first-off-${state}: ${repo} ${instructionId}`;
+}
 /** Jo's instruction body for `main-retry <repo>`, which `main-retry:` names. */
 export function mainRetryInstructionBody(repo: string): string {
 	return `${MAIN_RETRY_WORD} ${repo}`;
@@ -1363,8 +1372,8 @@ export function mainRetryBody(repo: string, instructionId: string): string {
  */
 function joRepoEntries(
 	entries: readonly EntryRow[], instructions: readonly InstructionRow[], prefix: "land-first" | "main-retry",
-): { repo: string; on: boolean; createdAt: string }[] {
-	const out: { repo: string; on: boolean; createdAt: string }[] = [];
+): { repo: string; on: boolean; instructionId: string; createdAt: string }[] {
+	const out: { repo: string; on: boolean; instructionId: string; createdAt: string }[] = [];
 	for (const c of controlEntries(entries)) {
 		if (c.prefix !== prefix) continue;
 		const on = entries.find((e) => e.id === c.id)?.workload_id;
@@ -1374,18 +1383,40 @@ function joRepoEntries(
 		const body = prefix === "land-first" ? landFirstInstructionBody(m[1]!, state) : mainRetryInstructionBody(m[1]!);
 		const ins = instructions.find((x) => x.id === m[3]);
 		if (!ins || ins.workload_id !== on || ins.kind !== "instruction" || ins.author !== "jo" || ins.created_by !== SURFACE_BY || ins.body !== body) continue;
-		out.push({ repo: m[1]!, on: state, createdAt: c.createdAt });
+		out.push({ repo: m[1]!, on: state, instructionId: ins.id, createdAt: c.createdAt });
 	}
 	return out;
 }
 
 /**
- * Land-first is on for `repo` when the newest valid `land-first:` entry for it (`sameRepo`) on the standing workload says
- * `on` (§ 2 Activation). No entry is off. Pass the standing workload's entries and instructions; the runner, the tick, the
- * merge hold and the lane extension all read it here.
+ * Land-first is on for `repo` when the newest valid word says on and no off reconciliation remains.
+ * A later on does not cancel unfinished revocation. Legacy off words without pending markers stay off.
+ * Pass standing entries/instructions: the runner, tick, merge hold and lane extension all read it here.
  */
 export function landFirstOn(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): boolean {
-	return joRepoEntries(entries, instructions, "land-first").filter((e) => sameRepo(e.repo, repo)).at(-1)?.on ?? false;
+	return (joRepoEntries(entries, instructions, "land-first").filter((e) => sameRepo(e.repo, repo)).at(-1)?.on ?? false)
+		&& landFirstOffPending(entries, instructions, repo).length === 0;
+}
+
+/** Valid, unfinished off instruction ids, oldest first. Completion of one id never clears a newer off. */
+export function landFirstOffPending(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): string[] {
+	const words = joRepoEntries(entries, instructions, "land-first").filter((e) => !e.on && sameRepo(e.repo, repo));
+	const pending = new Set<string>();
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== "land-first-off-pending" && c.prefix !== "land-first-off-complete") continue;
+		if (entries.find((e) => e.id === c.id)?.workload_id !== STANDING_WORKLOAD_ID) continue;
+		const m = /^(\S+) (\S+)$/.exec(c.rest);
+		if (!m || !REPO_WORD_RE.test(m[1]!) || !sameRepo(m[1]!, repo)) continue;
+		if (!words.some((w) => w.instructionId === m[2] && w.repo === m[1])) continue;
+		if (c.prefix === "land-first-off-pending") pending.add(m[2]!);
+		else pending.delete(m[2]!);
+	}
+	return [...pending];
+}
+
+/** A normal merge is guarded while activation is on OR an off request is not yet reconciled. */
+export function landFirstHeld(entries: readonly EntryRow[], instructions: readonly InstructionRow[], repo: string): boolean {
+	return landFirstOn(entries, instructions, repo) || landFirstOffPending(entries, instructions, repo).length > 0;
 }
 
 /** The ledger times of Jo's valid `main-retry:` entries for `repo`, oldest first: what opens a main commit's next attempt block (§ 2 Attempts). */

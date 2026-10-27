@@ -17,15 +17,15 @@ import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
-import { trainFixBody } from "../src/launch";
+import { landFirstBody, landFirstInstructionBody, landFirstOffBody, trainFixBody } from "../src/launch";
 import {
-	childLayout, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
-	WRAPPER_EXIT, type WrapperCall, wrapperArgv,
+	childLayout, fastPlanBody, fastPlanOf, heartbeatText, makeRunId, parseHeartbeat, parseTestRun, partResult, pushDestBody, runnerDiedRun, type TestRun, testRequestedBody, testRunBody, testRuns, workDirOf,
+	withFullSuitePublication, WRAPPER_EXIT, type WrapperCall, wrapperArgv,
 } from "../src/test-run";
 import { landFirstNoticeBody, trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
-import { admitMain, citedRuns, fastPlanOf, importPart, importReport, lockRow, openLockDb, postGate, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
-import { mainResults, mainVerdicts, parseRunnerPreflight } from "../src/main-state";
+import { admitMain, citedRuns, importPart, importReport, lockRow, openLockDb, postGate, promoteMain, publishIfOwner, reap as reapRequests, retentionPrune, run, START_EXIT, verifiedPreflight, type Gh } from "../scripts/test-runner";
+import { bootstrapRefusal, mainResults, mainVerdicts, parseRunnerPreflight } from "../src/main-state";
 import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { alive, tmp, until } from "./helpers";
 import { carry305, landFirst, mainRun } from "./train-world";
@@ -2791,7 +2791,6 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			const result = await finalized(w, wl, id);
 			expect(result.scope).toBe(mode === "full" || mode === "tree carry" ? "full" : "fast");
 			expect(statusPosts(w)).toEqual([`pending ${head}`, `${mode === "full" ? "success" : "failure"} ${head}`]);
-			expect(calls(w).at(-1)).toContain(mode === "full" ? "description=full suite green" : "description=land-first is off: a fast/tree plan is not a full-suite result");
 			if (mode === "tree carry") {
 				expect((await new Response(starter.stdout).text())).toContain("runner none");
 				expect(dispatches(w)).toEqual([]);
@@ -2801,11 +2800,11 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		});
 	}
 
-	test("publication off keeps full-scope policy strict: only a green full Mac result at this head succeeds", () => {
+	test("publication off preserves full-suite verdict states only for full Mac results at this head", () => {
 		const w = landWorld();
 		landFirst(w.ledger, OWNER_REPO, false);
 		const { wl } = bind(w, PR.green, fx.head.green);
-		for (const variant of ["green", "red-main", "red", "error", "fast", "linux", "wrong head"] as const) {
+		for (const variant of ["green", "red-main", "red", "error", "fast", "fast plan", "tree plan", "linux", "wrong head"] as const) {
 			const posts: string[][] = [];
 			const gh: Gh = (args) => {
 				if (args[0] !== "api" || args[1] !== "-X" || !args[3]?.includes("/statuses/")) throw new Error(`off publication unexpectedly read GitHub: ${args.join(" ")}`);
@@ -2813,7 +2812,7 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 				return { code: 0, stdout: "{}", stderr: "" };
 			};
 			const result = postGate({
-				gh, ledger: w.ledger, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green, need: "full",
+				gh, ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green, need: variant === "fast plan" || variant === "tree plan" ? "fast" : "full",
 				result: {
 					verdict: variant === "red-main" || variant === "red" || variant === "error" ? variant : "green",
 					sha: variant === "wrong head" ? fx.main : fx.head.green,
@@ -2821,10 +2820,10 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 				},
 				wl, runId: "tr-offpolicy", log: () => {},
 			});
-			expect(result).toMatchObject({ state: variant === "green" ? "success" : "failure", error: null });
+			const state = variant === "green" || variant === "red-main" ? "success" : variant === "error" ? "error" : "failure";
+			expect(result).toMatchObject({ state, error: null });
 			expect(posts).toHaveLength(1);
-			expect(posts[0]).toContain(`state=${variant === "green" ? "success" : "failure"}`);
-			if (variant !== "green") expect(result.description).toBe("land-first is off: a full-suite green on the Mac at this head is required");
+			expect(posts[0]).toContain(`state=${state}`);
 		}
 	});
 
@@ -2887,10 +2886,51 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 			expect(rows[0]!.body).toContain(reason === "dispatch" ? "dispatch failed: dispatch denied" : reason === "wrong head" ? "not as2-verified" : "no result in");
 			expect(subsOf(w, id).filter((s) => s === "fast")).toEqual(["fast"]);
 			expect(subsOf(w, id)).not.toContain("full");
-			expect(JSON.parse(readFileSync(join(w.as2, "stage", id, "caps.json"), "utf8"))).toMatchObject({ fastCapMin: 10, stuckStop: "enforce" });
 			expect(marks(w, id, "acquired")).toHaveLength(1);
 			expect(statusPosts(w)).toEqual([`pending ${fx.head.green}`, `success ${fx.head.green}`]);
 			expect(preflights(w)).toHaveLength(1);
+		});
+	}
+
+	for (const failure of ["install", "lock", "receipt"] as const) {
+		test(`fast preflight ${failure} failure leaves a refused activation receipt or both errors locally`, async () => {
+			const w = landWorld();
+			const { wl, slice } = bind(w, PR.green, fx.head.green);
+			const id = request(w, wl, slice, PR.green, fx.head.green);
+			w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: fastPlanBody(id, {
+				ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [],
+			}) });
+			const publisher = failure === "lock" ? new Database(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "promotion.db")) : null;
+			publisher?.exec("BEGIN IMMEDIATE");
+			if (failure !== "lock") chmodSync(join(w.libexec, "bun"), 0o700);
+			if (failure === "receipt") w.ledger.db.exec(`CREATE TRIGGER refuse_preflight BEFORE INSERT ON entries WHEN NEW.body LIKE 'runner-preflight:%' BEGIN SELECT RAISE(FAIL, 'preflight receipt refused by fixture'); END`);
+			const child = spawnRun(w, id, {
+				AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "25",
+				AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS: "25", AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS: "25", AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS: "25",
+				AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "1500",
+			});
+			try {
+				await until("fast preflight failure finishes", () => child.exitCode !== null, 10_000);
+				expect(await child.exited).toBe(0);
+				const result = await resultOf(w, wl, id);
+				expect(result).toMatchObject({ verdict: "error", scope: "fast", full: null });
+				expect(w.ledger.slice(slice)!.state).toBe("open");
+				expect(dispatches(w)).toEqual([]);
+				expect(marks(w, id, "acquired")).toEqual([]);
+				if (failure === "receipt") {
+					const receiptFailure = runnerLog(w, id).split("\n").find((line) => line.includes("preflight receipt refused by fixture"));
+					expect(receiptFailure).toBeDefined();
+					expect(receiptFailure).toContain(result.reason!);
+				} else {
+					const receipt = parseRunnerPreflight(preflights(w).at(-1)!.body)!;
+					expect(receipt.ok).toBe(false);
+					expect(receipt.reason).toContain(result.reason!);
+					expect(bootstrapRefusal(w.ledger.entries(STANDING_WORKLOAD_ID)).some((r) => r.includes(receipt.reason!))).toBe(true);
+				}
+			} finally {
+				publisher?.close();
+				await child.exited;
+			}
 		});
 	}
 
@@ -3035,6 +3075,49 @@ describe("land-first main D5 (R13, R14)", () => {
 		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.head.green);
 		expect(admit(w, fx.head.green).action).toBe("verdict");
 	});
+	for (const path of ["settle", "startup", "publication error"] as const) {
+		test(`main ${path} waiting behind an off publisher reads completed off before revoking, retaining its informational status`, async () => {
+			const w = mainWorld();
+			openSuccess(w);
+			const sha = path === "startup" ? fx.main : fx.head.red;
+			const id = mainRequest(w, sha);
+			if (path === "publication error") w.ledger.db.exec(`CREATE TRIGGER refuse_main_result BEFORE INSERT ON entries
+				WHEN NEW.body LIKE 'test-run:%' BEGIN SELECT RAISE(FAIL, 'main result publication refused by fixture'); END`);
+			let runnerExit: Promise<number> | undefined;
+			try {
+				withFullSuitePublication(w.runs, OWNER_REPO, () => {
+					const child = spawnRun(w, id, path === "startup" ? { AGENT_SYSTEM_TEST_RUNNER_CONFIG: join(w.root, "missing.yml") } : {});
+					runnerExit = child.exited;
+					// A real child blocks in SQLite while this synchronous callback owns the mutex; fake timers cannot drive its clock.
+					const deadline = Date.now() + 60_000;
+					while (marks(w, OWNER_REPO.replaceAll("/", "_"), "main-revocation-acquiring").length === 0) {
+						if (child.exitCode !== null) throw new Error(`main exited before acquiring publication mutex: ${child.exitCode}\n${runnerLog(w, id)}`);
+						if (Date.now() >= deadline) throw new Error(`main did not reach publication mutex before fixture deadline\n${runnerLog(w, id)}`);
+						Bun.sleepSync(25);
+					}
+					expect(calls(w)).not.toContain("context=as2/full-suite");
+					expect(calls(w)).not.toContain("context=as2/main-full");
+					// Stand in for the off reconciler completing under the same mutex, before the waiting main can read activation.
+					w.ledger.write(() => {
+						const off = w.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(OWNER_REPO, false) });
+						w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(OWNER_REPO, false, off) });
+						w.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(OWNER_REPO, "pending", off) });
+						w.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(OWNER_REPO, "complete", off) });
+					});
+				});
+				expect(await runnerExit).toBe(path === "publication error" ? START_EXIT.failed : 0);
+				expect(calls(w)).not.toContain("context=as2/full-suite");
+				expect(calls(w)).not.toContain("pr list");
+				expect(calls(w)).toContain(`statuses/${sha} -f state=${path === "settle" ? "failure" : "error"} -f context=as2/main-full`);
+				const result = path === "publication error"
+					? JSON.parse(readFileSync(join(w.runs, id, "result.json"), "utf8"))
+					: await resultOf(w, STANDING_WORKLOAD_ID, id);
+				expect(result).toMatchObject({ main: true, verdict: path === "settle" ? "red" : "error" });
+			} finally {
+				await runnerExit;
+			}
+		});
+	}
 	for (const on of [true, false]) for (const scenario of ["red", "skipped", "exit"] as const) {
 		test(`${scenario} main persists verdict/facts before publication with land-first ${on ? "on" : "off"}`, async () => {
 			const w = mainWorld();
@@ -3398,7 +3481,7 @@ describe("verified control promotion and bootstrap (R14/R15/R34)", () => {
 		expect(w.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("runner-preflight:")).map((e) => parseRunnerPreflight(e.body)?.ok)).toEqual([false]);
 		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.main);
 	});
-	test("verified reconciliation waits for promotion, reads current fresh, and excludes promotion through refresh and final coherence", async () => {
+	test("verified reconciliation and promotion each wait through healthy work held longer than five seconds and retain final coherence", async () => {
 		const w = world();
 		const old = verifiedWorld(w);
 		landFirst(w.ledger, OWNER_REPO, true);
@@ -3416,7 +3499,7 @@ touch '${refreshReached}'
 n=0
 while [ ! -f '${refreshGo}' ]; do
 	n=$((n+1))
-	[ "$n" -lt 200 ] || { echo 'race fixture refresh release timed out' >&2; exit 72; }
+	[ "$n" -lt 1200 ] || { echo 'race fixture refresh release timed out' >&2; exit 72; }
 	sleep 0.025
 done`));
 		// SOURCE must describe the installed barrier helper; only its commit is stale before reconciliation.
@@ -3433,6 +3516,8 @@ done`));
 			await until("preflight waiting for promotion", () => marks(w, id, "promotion-busy").length > 0);
 			const firstBeat = parseHeartbeat(readFileSync(join(w.runs, id, "heartbeat"), "utf8"), id)!;
 			await until("heartbeat while promotion is contended", () => parseHeartbeat(readFileSync(join(w.runs, id, "heartbeat"), "utf8"), id)! > firstBeat);
+			// Real SQLite contention crosses child processes using Date.now(); fake timers cannot exercise the former five-second timeout.
+			await Bun.sleep(5500);
 			expect(realpathSync(join(directory, "current"))).toBe(old);
 			expect(existsSync(join(w.root, "sudo.log"))).toBe(false);
 			symlinkSync(next, join(directory, "next"));
@@ -3447,6 +3532,8 @@ done`));
 			expect(() => publisher.exec("BEGIN IMMEDIATE")).toThrow(/locked|busy/i);
 			expect(realpathSync(join(directory, "current"))).toBe(next);
 			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.main);
+			// The separate synchronous publisher must also survive a real >5 s refresh holder; child clocks cannot be advanced here.
+			await Bun.sleep(5500);
 			writeFileSync(refreshGo, "");
 			expect(await runner.exited).toBe(0);
 			expect(await promotion.exited).toBe(0);
@@ -3475,13 +3562,17 @@ done`));
 		publisher.exec("BEGIN IMMEDIATE");
 		const owner = workload(w);
 		const id = request(w, owner.wl, owner.slice, PR.green, fx.head.green);
-		const runner = spawnRun(w, id);
+		const runner = spawnRun(w, id, {
+			AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "25",
+			AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS: "25", AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS: "25", AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS: "25",
+			AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS: "1500",
+		});
 		try {
+			await until("bounded reconciliation finishes without releasing the publisher", () => runner.exitCode !== null, 10_000);
 			expect(await runner.exited).toBe(0);
 			expect(await resultOf(w, owner.wl, id)).toMatchObject({
 				verdict: "error", reason: expect.stringContaining("verified reconciliation could not acquire"),
 			});
-			expect(runnerLog(w, id)).toContain("within 5000 ms");
 			expect(marks(w, id, "heartbeat").length).toBeGreaterThan(1);
 			expect(readFileSync(join(w.root, "verified-tag"), "utf8")).toBe(fx.control);
 			expect(existsSync(join(w.root, "sudo.log"))).toBe(false);

@@ -1,0 +1,231 @@
+// Offline word -> durable merge hold -> status reconciliation; no real GitHub or home state.
+import { describe, expect, test } from "bun:test";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { checkReserved } from "../../gates/src/rows/r06-reserved";
+import { reconcileLandFirstOff, type GhResult } from "../scripts/train-tick";
+import { errorLines } from "../src/errors";
+import { ensureStandingWorkload } from "../src/identity";
+import { apply, interpret } from "../src/input";
+import { landFirstBody, landFirstInstructionBody, landFirstOffBody, landFirstOffPending, landFirstOn } from "../src/launch";
+import { fastPlanBody, testRequestedBody, testRunBody, withFullSuitePublication } from "../src/test-run";
+import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { tempLedger, tmp } from "./helpers";
+
+const REPO = "thewolff/product";
+const HEAD = "a".repeat(40);
+const OTHER = "b".repeat(40);
+const FULL = "c".repeat(40);
+function fixture() {
+	const { ledger, path } = tempLedger();
+	ensureStandingWorkload(ledger);
+	const root = tmp("off-publication");
+	const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "off transition fixture", stakes: "normal", mode: "autonomous" });
+	const rows = () => ledger.entries(STANDING_WORKLOAD_ID);
+	const instructions = () => ledger.instructions(STANDING_WORKLOAD_ID);
+	const pending = () => landFirstOffPending(rows(), instructions(), REPO);
+	const states = new Map([[HEAD, "success"], [OTHER, "success"], [FULL, "success"]]);
+	let fail = true;
+	const posts: string[] = [];
+	const gh = (args: string[]): GhResult => {
+		const ok = (v: unknown) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
+		if (args[1]?.includes("/pulls?")) return ok([[...states].map(([sha], i) => ({ number: i + 1, head: { sha } }))]);
+		if (args[1]?.endsWith("/statuses")) {
+			const head = args[1]!.split("/").at(-2)!;
+			return ok([[{ context: "as2/full-suite", state: states.get(head), description: "green" }]]);
+		}
+		if (args[1] === "-X") {
+			const head = args[3]!.split("/").at(-1)!;
+			posts.push(head);
+			if (fail && head === OTHER) return { code: 1, stdout: "", stderr: "HTTP 502" };
+			states.set(head, "failure");
+			return ok({});
+		}
+		throw new Error(`unexpected fake gh ${args.join(" ")}`);
+	};
+	const result = (pr: number, head: string, scope: "fast" | "tree" | "full") => {
+		const runId = `tr-off${pr}`;
+		const entry = (body: string) => ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, kind: "assumption", body });
+		entry(testRequestedBody({ runId, pr, sha: head, slice: `sl-off${pr}`, by: "lane-off" }));
+		entry(fastPlanBody(runId, scope === "tree" ? { ref: "wl/test", scope, g: HEAD, run: "tr-main" } : scope === "fast" ? { ref: "wl/test", scope, files: ["a.test.ts"], parse: [], macOnly: [] } : { ref: "wl/test", scope, reasons: ["schema"] }));
+		entry(testRunBody({ runId, pr, sha: head, verdict: "green", reason: null, headAtEnd: head, base: null, mergeBase: null, full: null, solo: [], failures: [], runDir: null, preflight: "ok", scope: scope === "fast" ? "fast" : "full", host: scope === "fast" ? "linux" : "mac", main: false, exec: null }));
+	};
+	result(1, HEAD, "fast");
+	result(2, OTHER, "tree"); // A tree carry intentionally has full scope in its result.
+	result(3, FULL, "full");
+	const logs: string[] = [];
+	const reconcile = () => reconcileLandFirstOff({ ledger, gh }, REPO, root, () => REPO, (s) => logs.push(s));
+	const held = () => checkReserved({ toolName: "bash", input: { command: `gh pr merge 1 -R ${REPO} --merge` } }, { role: "lane", cwd: root, env: { HOME: root } }, {
+		standing: () => ({ entries: rows(), instructions: instructions() }), now: () => Date.parse(ledger.now()), remoteRepos: () => [REPO],
+	});
+	return { ledger, path, root, wl, gh, pending, states, posts, logs, reconcile, held, recover: () => { fail = false; } };
+}
+
+describe("land-first off reconciliation", () => {
+	test("word atomically holds merges; a per-head failure stays pending; retry revokes tree but preserves full green", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			expect(x.pending()).toHaveLength(1);
+			expect(x.held()).not.toBeNull();
+			expect(x.reconcile()).toBe(false);
+			expect(x.states.get(HEAD)).toBe("failure");
+			expect(x.states.get(OTHER)).toBe("success");
+			expect(x.states.get(FULL)).toBe("success");
+			expect(x.pending()).toHaveLength(1);
+			expect(x.logs.join("\n")).toContain("HTTP 502");
+			x.recover();
+			expect(x.reconcile()).toBe(true);
+			expect(x.pending()).toEqual([]);
+			expect(x.states.get(OTHER)).toBe("failure");
+			expect(x.posts.filter((s) => s === HEAD)).toHaveLength(1);
+			expect(x.posts).not.toContain(FULL);
+			expect(x.held()).toBeNull();
+			expect(x.reconcile()).toBe(true);
+		} finally { x.ledger.close(); }
+	});
+
+	test("a later on cannot erase pending off; completing an older request cannot clear a repeated off", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const [old] = x.pending();
+			const on = x.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(REPO, true) });
+			x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(REPO, true, on) });
+			expect(landFirstOn(x.ledger.entries(STANDING_WORKLOAD_ID), x.ledger.instructions(STANDING_WORKLOAD_ID), REPO)).toBe(false);
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			x.ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(REPO, "complete", old!) });
+			expect(x.pending()).toHaveLength(1);
+			x.recover();
+			expect(x.reconcile()).toBe(true);
+			expect(landFirstOn(x.ledger.entries(STANDING_WORKLOAD_ID), x.ledger.instructions(STANDING_WORKLOAD_ID), REPO)).toBe(false);
+		} finally { x.ledger.close(); }
+	});
+
+	test("forged completion cannot release the pending hold", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(REPO, "complete", x.pending()[0]!) });
+			expect(x.pending()).toHaveLength(1);
+			expect(x.held()).not.toBeNull();
+		} finally { x.ledger.close(); }
+	});
+
+	test("publication mutex releases on failure and leaves the ledger writable during publication", () => {
+		const x = fixture();
+		try {
+			expect(() => withFullSuitePublication(x.root, REPO, () => {
+				apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+				throw new Error("publisher interrupted");
+			})).toThrow("publisher interrupted");
+			x.recover();
+			expect(x.reconcile()).toBe(true);
+			expect(withFullSuitePublication(x.root, REPO.toUpperCase(), () => 7)).toBe(7);
+		} finally { x.ledger.close(); }
+	});
+
+	test("an in-flight pre-off publication finishes before revocation and durable completed-off", async () => {
+		const x = fixture();
+		const on = x.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(REPO, true) });
+		x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(REPO, true, on) });
+		const events = join(x.root, "publication-events.log");
+		writeFileSync(events, "");
+		const worker = new Worker(new URL("./fixtures/full-suite-publication-worker.ts", import.meta.url).href);
+		const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+		try {
+			await new Promise<void>((resolve, reject) => {
+				worker.onerror = (event) => reject(new Error(event.message));
+				worker.onmessage = (event) => {
+					if (event.data === "locked") resolve();
+					else if (event.data?.error) reject(new Error(event.data.error));
+				};
+				worker.postMessage({ root: x.root, repo: REPO, ledgerPath: x.path, signal, events });
+			});
+			// The publisher already read on and holds the mutex. The word still commits without waiting on it.
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			expect(x.pending()).toHaveLength(1);
+			expect(x.held()).not.toBeNull();
+			x.recover();
+			Atomics.store(new Int32Array(signal), 0, 1);
+			Atomics.notify(new Int32Array(signal), 0);
+			const complete = reconcileLandFirstOff({ ledger: x.ledger, gh: (args) => {
+				if (args[1] === "-X") appendFileSync(events, "revoke\n");
+				return x.gh(args);
+			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s));
+			expect(complete).toBe(true);
+			appendFileSync(events, "completed-off\n");
+			expect(readFileSync(events, "utf8").trim().split("\n")).toEqual(["publisher-read-on", "publisher-success", "revoke", "revoke", "completed-off"]);
+			expect(x.pending()).toEqual([]);
+		} finally {
+			worker.terminate();
+			x.ledger.close();
+		}
+	}, 10_000);
+
+	test("the newest on word takes effect only after pending off revocation completes", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const id = x.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(REPO, true) });
+			x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(REPO, true, id) });
+			expect(landFirstOn(x.ledger.entries(STANDING_WORKLOAD_ID), x.ledger.instructions(STANDING_WORKLOAD_ID), REPO)).toBe(false);
+			x.recover();
+			expect(x.reconcile()).toBe(true);
+			expect(landFirstOn(x.ledger.entries(STANDING_WORKLOAD_ID), x.ledger.instructions(STANDING_WORKLOAD_ID), REPO)).toBe(true);
+			expect(x.states.get(HEAD)).toBe("failure");
+			expect(x.states.get(OTHER)).toBe("failure");
+		} finally { x.ledger.close(); }
+	});
+
+	test("pending off and its latest failed head survive a surface restart, then disappear on completion", () => {
+		const x = fixture();
+		apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+		const [instruction] = x.pending();
+		expect(x.reconcile()).toBe(false);
+		const pendingRow = x.ledger.entries(STANDING_WORKLOAD_ID).find((e) => e.body === landFirstOffBody(REPO, "pending", instruction!))!;
+		x.ledger.close();
+		const restarted = Ledger.open(x.path, { backupOnOpen: false, backup: false });
+		try {
+			const pendingLine = errorLines(restarted).find((e) => e.state?.startsWith("off-pending "));
+			expect(pendingLine).toMatchObject({ kind: "train", workloadId: STANDING_WORKLOAD_ID, rowId: pendingRow.id });
+			expect(pendingLine?.state).toContain(instruction!);
+			expect(pendingLine?.line).toContain(OTHER);
+			expect(pendingLine?.line).toContain("HTTP 502");
+			x.recover();
+			expect(reconcileLandFirstOff({ ledger: restarted, gh: x.gh }, REPO, x.root, () => REPO, (s) => x.logs.push(s))).toBe(true);
+			expect(errorLines(restarted).filter((e) => e.state?.startsWith("off-pending "))).toEqual([]);
+		} finally { restarted.close(); }
+	});
+
+	test("a listing failure stays visible without pretending off completed or touching full success", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const complete = reconcileLandFirstOff({ ledger: x.ledger, gh: () => ({ code: 1, stdout: "", stderr: "listing unavailable" }) }, REPO, x.root, () => REPO, (s) => x.logs.push(s));
+			expect(complete).toBe(false);
+			expect(x.pending()).toHaveLength(1);
+			const line = errorLines(x.ledger).find((e) => e.state?.startsWith("off-pending "));
+			expect(line?.kind).toBe("train");
+			expect(line?.line).toContain("listing unavailable");
+			expect(x.posts).toEqual([]);
+			expect(x.states.get(FULL)).toBe("success");
+		} finally { x.ledger.close(); }
+	});
+
+	test("legacy off words stay off; untrusted or instruction-mismatched pending markers create no synthetic hold", () => {
+		const x = fixture();
+		try {
+			const id = x.ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(REPO, false) });
+			x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(REPO, false, id) });
+			x.ledger.recordEntry({ by: "lane-forged", workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(REPO, "pending", id) });
+			x.ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody("thewolff/another", "pending", id) });
+			expect(x.pending()).toEqual([]);
+			expect(x.held()).toBeNull();
+			expect(x.reconcile()).toBe(true);
+			expect(x.posts).toEqual([]);
+			expect(landFirstOn(x.ledger.entries(STANDING_WORKLOAD_ID), x.ledger.instructions(STANDING_WORKLOAD_ID), REPO)).toBe(false);
+		} finally { x.ledger.close(); }
+	});
+});

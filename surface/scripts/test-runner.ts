@@ -48,7 +48,8 @@
 //       Land-first (PLAN wl-mvq4edbaf13vnk D4): on a land-first repository `start` posts `pending` first (a refused post refuses
 //       the request) and records `fast-plan:` in the admission's transaction: a tree carry (no run), the fast set, or the full
 //       suite by exception, which runs as above. A fast-set run holds no Mac slot for its hosted part: its preflight reconciles
-//       current/tag/bundle under promotion.db (one refresh at most), then the trusted clone and the parse check over the plan's parse
+//       current/tag/bundle under promotion.db (one refresh at most), with asynchronous acquisition and a shared bounded
+//       refresh-plus-finalization holder/wait budget, then the trusted clone and the parse check over the plan's parse
 //       targets (one that does not transpile makes the run red and nothing runs), then `as2-fast.yml` dispatched on `as2-verified`
 //       (`hostedFast`); fast.xml, fast.log and
 //       fast.summary are imported into the run dir and judged (`fastExec`: a planned file with no executed test makes it red).
@@ -137,6 +138,7 @@ import { type ControlRoot, controlRootRefusal, FULL_SUITE_STATUS, fixBindings, f
 import { bodyDeps, DEFAULT_BRANCH } from "../src/merge-train-stack";
 import {
 	AS2TEST_ROOT, AS2TEST_USER, authoritativeRun, baseParts, boundBranches, buildTestRun, callStuck, callTimedOut, carriedRun, changedTestFiles, decideRun, decisionLogFault, type ExecCounts, execOf, executedFiles, executorStalledReason,
+	type FastPlan, type FastSetPlan, fastPlanBody, fastPlanOf, withFullSuitePublication,
 	fullSuiteSlice, HEARTBEAT_EVERY_MS, HEARTBEAT_STALE_MS, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseTestRequested, type PartInput, type PartResult,
 	partResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, recordLive, reportCapBytes, reservation, type ResultRecord, resultJson, RUN_ID_RE, type RunDecision, type RunFacts, runDirOf,
 	runnerDiedRun, type RunRecord, runsDbOf, runsRoot, securityRedBody, securityRedOf, servedRepo, settleArtifact, stageDirOf, StuckWatch, stuckReason, type TestHost, type TestRequested, type TestRun, testRequestedBody,
@@ -259,8 +261,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 }
 
 /** `git -C <repo> config --get remote.origin.url`, or null. */
-function originOf(repo: string): string | null {
-	const r = spawnSync(["git", "-C", repo, "config", "--get", "remote.origin.url"], { stdout: "pipe", stderr: "pipe" });
+function originOf(repo: string, deadline = Infinity): string | null {
+	const r = spawnSync(["git", "-C", repo, "config", "--get", "remote.origin.url"], { stdout: "pipe", stderr: "pipe", timeout: deadline === Infinity ? undefined : verifierTimeout(deadline, 120_000, `reading origin of ${repo}`) });
 	const out = r.stdout.toString().trim();
 	return r.exitCode === 0 && out ? out : null;
 }
@@ -542,7 +544,7 @@ export function diedRun(request: TestRequested, runDir: string | null, reason = 
 }
 
 /** After a reservation, a run that cannot proceed (no runner spawned, no profile to run under) gets its `error` result, while it still owns its request. */
-function recordError(ledger: Ledger, wl: string, request: TestRequested, runDir: string, reason: string): void {
+function recordError(ledger: Ledger, root: string, wl: string, request: TestRequested, runDir: string, reason: string): void {
 	const written = ledger.write(() => {
 		if (!ownsRequest(testRuns(ledger.entries(wl)), request.runId)) return false;
 		const prior = testRuns(ledger.entries(wl)).find((r) => r.request.runId === request.runId)?.results[0];
@@ -560,7 +562,7 @@ function recordError(ledger: Ledger, wl: string, request: TestRequested, runDir:
 				process.stdout.write(`publication.log in ${runDir} not written: ${errText(e)}; retain this process log and repair the run directory\n`);
 			}
 		});
-		revokeIfActive(ledger, realGh, request.main.repo, `main ${request.sha.slice(0, 7)} error: ${reason}`, log);
+		revokeIfActive(ledger, root, realGh, request.main.repo, `main ${request.sha.slice(0, 7)} error: ${reason}`, log);
 		postStatus(realGh, request.main.repo, "error", request.sha, `main full error, run ${request.runId}`, log, MAIN_FULL_STATUS);
 	}
 }
@@ -626,52 +628,6 @@ export function postStatus(
 
 // ---- land-first (PLAN wl-mvq4edbaf13vnk D4, D5) -------------------------------------------------------
 
-/**
- * What a land-first admission decided for head X (D4), recorded as `fast-plan: <run id> <json>` in the admission's transaction:
- * the fast set (`files` on hosted Linux, `parse` targets, `macOnly` files left for main runs), the full suite with every
- * exception that requires it, or a tree carry (X's tree is G's, so G's green main run `run` is X's result, no run). `ref` is
- * the PR's head branch, which names a train revert (`train/revert-<T 7>`) to the gate.
- */
-export type FastPlan = { ref: string } & (
-	| { scope: "fast"; files: string[]; parse: string[]; macOnly: string[] }
-	| { scope: "full"; reasons: string[] }
-	| { scope: "tree"; g: string; run: string }
-);
-/** A plan that runs the fast set (D4): hosted Linux `files`, `parse` targets, `macOnly` files left for main runs. */
-export type FastSetPlan = Extract<FastPlan, { scope: "fast" }>;
-export const FAST_PLAN_PREFIX = "fast-plan:";
-export function fastPlanBody(runId: string, plan: FastPlan): string {
-	if (!RUN_ID_RE.test(runId)) throw new Error(`fast-plan: ${runId} is not a run id`);
-	return `${FAST_PLAN_PREFIX} ${runId} ${JSON.stringify(plan)}`;
-}
-const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
-export function parseFastPlan(body: string): { runId: string; plan: FastPlan } | null {
-	const m = /^fast-plan: (tr-[a-z0-9]+) (\{.*\})$/.exec(body.trim());
-	if (!m) return null;
-	let v: unknown;
-	try {
-		v = JSON.parse(m[2]!);
-	} catch {
-		return null;
-	}
-	const p = v as Record<string, unknown>;
-	if (v === null || typeof v !== "object" || typeof p.ref !== "string") return null;
-	const ref = p.ref;
-	if (p.scope === "fast" && strings(p.files) && strings(p.parse) && strings(p.macOnly)) return { runId: m[1]!, plan: { ref, scope: "fast", files: p.files, parse: p.parse, macOnly: p.macOnly } };
-	if (p.scope === "full" && strings(p.reasons)) return { runId: m[1]!, plan: { ref, scope: "full", reasons: p.reasons } };
-	if (p.scope === "tree" && typeof p.g === "string" && SHA40.test(p.g) && typeof p.run === "string" && RUN_ID_RE.test(p.run)) return { runId: m[1]!, plan: { ref, scope: "tree", g: p.g, run: p.run } };
-	return null;
-}
-/** The runner's own `fast-plan:` for `runId` among a workload's entries (`controlEntries` drops another writer's copy), or null. */
-export function fastPlanOf(entries: readonly EntryRow[], runId: string): FastPlan | null {
-	for (const c of controlEntries(entries)) {
-		if (c.prefix !== "fast-plan") continue;
-		const p = parseFastPlan(c.body);
-		if (p !== null && p.runId === runId) return p.plan;
-	}
-	return null;
-}
-
 /** Land-first is on for `ownerRepo`, read now from the standing workload (`landFirstOn`, D12). */
 function landFirstNow(ledger: Ledger, ownerRepo: string): boolean {
 	return landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), ownerRepo);
@@ -693,17 +649,25 @@ function mainPublicationLog(ledger: Ledger, wl: string, runId: string, local: (s
 	};
 }
 
-/** Shadow main runs keep their informational status, but must never touch required PR statuses until activation is established live. */
-function revokeIfActive(ledger: Ledger, gh: Gh, repo: string, reason: string, log: (s: string) => void): void {
-	let on: boolean;
+/** Shadow main runs keep their informational status. Activation and every revocation share the off/publication mutex. */
+function revokeIfActive(ledger: Ledger, root: string, gh: Gh, repo: string, reason: string, log: (s: string) => void): void {
 	try {
-		on = landFirstNow(ledger, repo);
+		hookMark(repo.replaceAll("/", "_"), "main-revocation-acquiring");
+		withFullSuitePublication(root, repo, () => {
+			let on: boolean;
+			try {
+				on = landFirstNow(ledger, repo);
+			} catch (e) {
+				log(`revocation on ${repo} not attempted: activation could not be read: ${errText(e)}; the tick must reconcile when the ledger is readable`);
+				return;
+			}
+			if (on) revokeOpen(gh, repo, reason, log);
+			else log(`shadow main on ${repo}: required PR statuses unchanged (land-first is off)`);
+		});
 	} catch (e) {
-		log(`revocation on ${repo} not attempted: activation could not be read: ${errText(e)}; the tick must reconcile when the ledger is readable`);
-		return;
+		// A missing/busy mutex or cleanup failure cannot cancel the independent informational main status.
+		log(`revocation on ${repo} could not complete under the publication mutex: ${errText(e)}; the tick must reconcile; original main outcome: ${reason}`);
 	}
-	if (on) revokeOpen(gh, repo, reason, log);
-	else log(`shadow main on ${repo}: required PR statuses unchanged (land-first is off)`);
 }
 
 /** A git command for the runner's own trusted reads (`trustedEnv`, no hooks), synchronous; a failure throws naming it. */
@@ -870,35 +834,38 @@ export function gateDecision(i: GateInput): GateDecision {
 
 /**
  * Post the gate's state on the head (D4, through #320's mechanism), re-reading activation at publication: off refuses fast/tree
- * plans and requires a full Mac green at the head; on uses mergeGate's live main policy. An unreadable gate posts failure (F7).
+ * plans and applies FULL_SUITE_STATE only to a full Mac result at the head; on uses mergeGate's live main policy. An unreadable gate posts failure (F7).
  * A post GitHub refuses records `status-failed: <run id> <state> on <sha>: <error>` (F6), leaving the head pending.
  */
-export function postGate(i: GateInput & { wl: string; runId: string; log: (s: string) => void }): { state: "success" | "failure"; description: string; error: string | null } {
-	let decided: { state: "success" | "failure"; description: string };
-	try {
-		if (!landFirstNow(i.ledger, i.repo)) {
-			if (i.need === "fast") decided = { state: "failure", description: "land-first is off: a fast/tree plan is not a full-suite result; request the full suite" };
-			else if (i.result?.sha === i.head && i.result.verdict === "green" && i.result.scope === "full" && i.result.host === "mac") decided = { state: "success", description: "full suite green" };
-			else decided = { state: "failure", description: "land-first is off: a full-suite green on the Mac at this head is required" };
-		} else {
-			const d = gateDecision(i);
-			decided = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
-		}
-	} catch (e) {
-		decided = { state: "failure", description: `the gate could not read activation, main or the head: ${errText(e)}` };
-	}
-	i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
-	const error = postStatus(i.gh, i.repo, decided.state, i.head, decided.description, i.log);
-	if (error !== null) {
+export function postGate(i: GateInput & { root: string; wl: string; runId: string; log: (s: string) => void }): { state: "success" | "failure" | "error"; description: string; error: string | null } {
+	return withFullSuitePublication(i.root, i.repo, () => {
+		let decided: { state: "success" | "failure" | "error"; description: string };
 		try {
-			i.ledger.write(() => i.ledger.recordEntry({
-				by: TEST_RUNNER_BY, workloadId: i.wl, kind: "assumption", body: `status-failed: ${i.runId} ${decided.state} on ${i.head}: ${error.replace(/\s+/g, " ")}`,
-			}));
+			if (!landFirstNow(i.ledger, i.repo)) {
+				if (i.need === "fast") decided = { state: "failure", description: "land-first is off: a fast/tree plan is not a full-suite result; request the full suite" };
+				else if (i.result?.sha === i.head && i.result.scope === "full" && i.result.host === "mac") {
+					decided = { state: FULL_SUITE_STATE[i.result.verdict] ?? "failure", description: `full suite ${i.result.verdict}` };
+				} else decided = { state: "failure", description: "land-first is off: a full-suite Mac result at this head is required" };
+			} else {
+				const d = gateDecision(i);
+				decided = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
+			}
 		} catch (e) {
-			i.log(`status-failed: not recorded: ${errText(e)}`);
+			decided = { state: "failure", description: `the gate could not read activation, main or the head: ${errText(e)}` };
 		}
-	}
-	return { ...decided, error };
+		i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
+		const error = postStatus(i.gh, i.repo, decided.state, i.head, decided.description, i.log);
+		if (error !== null) {
+			try {
+				i.ledger.write(() => i.ledger.recordEntry({
+					by: TEST_RUNNER_BY, workloadId: i.wl, kind: "assumption", body: `status-failed: ${i.runId} ${decided.state} on ${i.head}: ${error.replace(/\s+/g, " ")}`,
+				}));
+			} catch (e) {
+				i.log(`status-failed: not recorded: ${errText(e)}`);
+			}
+		}
+		return { ...decided, error };
+	});
 }
 
 /**
@@ -1126,25 +1093,25 @@ export function verifiedDirectory(): string {
 function controlCheckout(): string { return process.env.AGENT_SYSTEM_TEST_RUNNER_CONTROL_ROOT || REPO_ROOT; }
 
 /** Trusted git, bounded, with no caller gitconfig, hooks or templates. */
-function verifierGit(cwd: string, args: string[]): string {
+function verifierGit(cwd: string, args: string[], deadline = Infinity): string {
 	const r = spawnSync(["git", "-C", cwd, ...NETWORK, ...args], {
-		env: trustedEnv("/dev/null"), stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 120_000,
+		env: trustedEnv("/dev/null"), stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: verifierTimeout(deadline, 120_000, `git ${args.join(" ")} in ${cwd}`),
 	});
-	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} in ${cwd}: ${r.exitedDueToTimeout ? "timed out after 120 s" : r.stderr.toString().trim() || `exit ${r.exitCode}`}`);
+	if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} in ${cwd}: ${r.exitedDueToTimeout ? "timed out within the verifier operation/holder budget" : r.stderr.toString().trim() || `exit ${r.exitCode}`}`);
 	return r.stdout.toString().trim();
 }
 function resolvedCurrent(dir: string): string | null {
 	try { return realpathSync(join(dir, "current")); }
 	catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
 }
-export function runnerControlRoot(root = controlCheckout(), dir = verifiedDirectory()): ControlRoot {
+export function runnerControlRoot(root = controlCheckout(), dir = verifiedDirectory(), deadline = Infinity): ControlRoot {
 	const own = realpathSync(root);
 	const current = resolvedCurrent(dir);
 	return {
-		root: own, head: verifierGit(own, ["rev-parse", "HEAD"]),
-		modified: verifierGit(own, ["status", "--porcelain", "--untracked-files=no"]).split("\n").filter(Boolean),
-		current, currentHead: current === null ? null : verifierGit(current, ["rev-parse", "HEAD"]),
-		repo: ownerRepoOf(originOf(own) ?? "")?.toLowerCase() ?? null,
+		root: own, head: verifierGit(own, ["rev-parse", "HEAD"], deadline),
+		modified: verifierGit(own, ["status", "--porcelain", "--untracked-files=no"], deadline).split("\n").filter(Boolean),
+		current, currentHead: current === null ? null : verifierGit(current, ["rev-parse", "HEAD"], deadline),
+		repo: ownerRepoOf(originOf(own, deadline) ?? "")?.toLowerCase() ?? null,
 	};
 }
 /** Publish only a lightweight commit tag, after the root. A read-after-write makes partial failures safely retryable. */
@@ -1164,13 +1131,13 @@ export function pointVerifiedTag(gh: Gh, repo: string, sha: string): void {
 /** The activation receipt is earned from actual filesystem/tag/helper facts, even in shadow mode. */
 export function verifiedPreflight(
 	ledger: Ledger, repo: string, source: string | null, helper: string, gh: Gh = realGh,
-	root = controlCheckout(), directory = verifiedDirectory(),
+	root = controlCheckout(), directory = verifiedDirectory(), deadline = Infinity,
 ): string[] {
 	try {
-		const facts = runnerControlRoot(root, directory);
+		const facts = runnerControlRoot(root, directory, deadline);
 		const refusal = controlRootRefusal(facts, ledger.entries(STANDING_WORKLOAD_ID));
 		if (refusal.length > 0) return refusal;
-		const tag = verifiedTagOf(gh, repo);
+		const tag = verifiedTagOf(verifierGh(deadline, gh), repo);
 		if (tag !== facts.currentHead) refusal.push(`${AS2_VERIFIED_TAG} ${tag ?? "missing"} does not name current ${facts.currentHead}`);
 		if (source !== facts.currentHead) refusal.push(`bundle SOURCE ${source ?? "unreadable"} does not equal current/tag commit ${facts.currentHead}`);
 		if (!readFileSync(helper, "utf8").includes(`refs/tags/${AS2_VERIFIED_TAG}:refs/tags/${AS2_VERIFIED_TAG}`)) refusal.push(`refresh helper ${helper} does not fetch refs/tags/${AS2_VERIFIED_TAG}; rerun install/as2test-setup.sh`);
@@ -1192,7 +1159,26 @@ export function promoteVerified(sha: string, manual = false): number {
 }
 export type Promotion = { ok: true; sha: string; schema: string | null } | { ok: false; reason: string };
 export interface PromotionOptions { directory?: string; origin?: string; gh?: Gh; manual?: boolean }
-const PROMOTION_LOCK_MS = 5_000;
+/**
+ * One protected holder may need a complete refresh (including signal/reap waits) plus the existing finalization budget
+ * for verifier git/GitHub work. Waiters allow that same bounded work, not the old five-second SQLite default.
+ * The existing refresh/finalization test overrides shorten both budgets; there is no independent retry or config knob.
+ */
+function promotionBudgetMs(): number {
+	return msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS", REFRESH_TIMEOUT_MS)
+		+ msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS", REFRESH_KILL_GRACE_MS)
+		+ msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS", REFRESH_REAP_MS)
+		+ msEnv("AGENT_SYSTEM_TEST_RUNNER_FINALIZE_MS", FINALIZE_MS);
+}
+function verifierTimeout(deadline: number, cap: number, operation: string): number {
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) throw new Stop(`verified reconciliation/promotion holder deadline exceeded before ${operation}; retry after inspecting the verifier`);
+	return Math.min(cap, remaining);
+}
+/** Bound every GitHub call to the holder's single deadline, retaining the normal per-operation cap. */
+function verifierGh(deadline: number, gh: Gh = realGh): Gh {
+	return (args, timeoutMs = 30_000) => gh(args, verifierTimeout(deadline, timeoutMs, `gh ${args.join(" ")}`));
+}
 
 /** One serialization store for promotion and preflight's current/tag/bundle reconciliation. Caller closes even a failed BEGIN. */
 function openPromotionDb(directory: string): Database {
@@ -1215,24 +1201,26 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 		const dir = resolve(o.directory ?? verifiedDirectory());
 		db = openPromotionDb(dir);
 		hookMark(sha, "promotion-acquiring");
-		db.exec(`PRAGMA busy_timeout = ${PROMOTION_LOCK_MS}; BEGIN IMMEDIATE`);
+		db.exec(`PRAGMA busy_timeout = ${Math.trunc(promotionBudgetMs())}; BEGIN IMMEDIATE`);
+		const deadline = Date.now() + promotionBudgetMs();
+		const git = (cwd: string, args: string[]) => verifierGit(cwd, args, deadline);
 		const clone = join(dir, "repo");
 		const origin = o.origin ?? process.env.AGENT_SYSTEM_TEST_RUNNER_ORIGIN ?? `https://github.com/${repo}.git`;
-		if (!existsSync(clone)) verifierGit(dir, ["clone", "--no-checkout", "--no-local", "--template=", origin, clone]);
-		if (realpathSync(clone) !== clone || verifierGit(clone, ["rev-parse", "--show-toplevel"]) !== clone) throw new Error(`dedicated verified clone ${clone} is not its own root`);
-		const configuredOrigin = verifierGit(clone, ["config", "--get", "remote.origin.url"]);
+		if (!existsSync(clone)) git(dir, ["clone", "--no-checkout", "--no-local", "--template=", origin, clone]);
+		if (realpathSync(clone) !== clone || git(clone, ["rev-parse", "--show-toplevel"]) !== clone) throw new Error(`dedicated verified clone ${clone} is not its own root`);
+		const configuredOrigin = git(clone, ["config", "--get", "remote.origin.url"]);
 		if (configuredOrigin !== origin && ownerRepoOf(configuredOrigin)?.toLowerCase() !== repo.toLowerCase()) throw new Error(`verified clone ${clone} has a different origin than ${origin}`);
-		verifierGit(clone, ["fetch", "--no-tags", origin, sha]);
-		if (verifierGit(clone, ["rev-parse", `${sha}^{commit}`]) !== sha) throw new Error(`fetched promotion target is not ${sha}`);
+		git(clone, ["fetch", "--no-tags", origin, sha]);
+		if (git(clone, ["rev-parse", `${sha}^{commit}`]) !== sha) throw new Error(`fetched promotion target is not ${sha}`);
 		const current = resolvedCurrent(dir);
-		const before = current === null ? null : verifierGit(current, ["rev-parse", "HEAD"]);
+		const before = current === null ? null : git(current, ["rev-parse", "HEAD"]);
 		if (!o.manual && before !== null && before !== sha) {
-			const chain = verifierGit(clone, ["rev-list", "--first-parent", "--reverse", sha]).split("\n");
+			const chain = git(clone, ["rev-list", "--first-parent", "--reverse", sha]).split("\n");
 			const at = chain.indexOf(before);
 			if (at < 0) throw new Error(`current ${before} is not on ${sha}'s first-parent chain; manual repair required`);
 			for (const next of chain.slice(at + 1)) {
-				const diff = verifierGit(clone, ["diff", `${next}^1`, next, "--", "ledger/schema.sql"]);
-				const version = verifierGit(clone, ["diff", "--unified=0", `${next}^1`, next, "--", "ledger/src/index.ts"]);
+				const diff = git(clone, ["diff", `${next}^1`, next, "--", "ledger/schema.sql"]);
+				const version = git(clone, ["diff", "--unified=0", `${next}^1`, next, "--", "ledger/src/index.ts"]);
 				if (diff || version.split("\n").some((l) => /^[+-](?![+-])/.test(l) && /\bSCHEMA_VERSION\b/.test(l))) {
 					log(`verifier-stalled: schema change at ${next}; Jo must migrate the ledger and run promote-verified.ts with a verified sha`);
 					ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `verifier-stalled: ${repo.toLowerCase()} ${sha} schema ${next}` });
@@ -1241,10 +1229,10 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 			}
 		}
 		const release = join(dir, sha.slice(0, 12));
-		if (!existsSync(release)) verifierGit(clone, ["worktree", "add", "--detach", release, sha]);
-		if (realpathSync(release) !== release || verifierGit(release, ["rev-parse", "HEAD"]) !== sha
-			|| verifierGit(release, ["rev-parse", "--git-common-dir"]) !== join(clone, ".git")
-			|| verifierGit(release, ["status", "--porcelain", "--untracked-files=no"]) !== "") throw new Error(`verified release ${release} is foreign, dirty or names another commit; repair it before retrying`);
+		if (!existsSync(release)) git(clone, ["worktree", "add", "--detach", release, sha]);
+		if (realpathSync(release) !== release || git(release, ["rev-parse", "HEAD"]) !== sha
+			|| git(release, ["rev-parse", "--git-common-dir"]) !== join(clone, ".git")
+			|| git(release, ["status", "--porcelain", "--untracked-files=no"]) !== "") throw new Error(`verified release ${release} is foreign, dirty or names another commit; repair it before retrying`);
 		const link = join(dir, `.current-${process.pid}`);
 		// A crashed publisher may leave only this symlink. Never replace a directory or an unrelated file.
 		if (existsSync(link) || (() => { try { return lstatSync(link).isSymbolicLink(); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; throw e; } })()) {
@@ -1253,9 +1241,9 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 		}
 		symlinkSync(release, link);
 		renameSync(link, join(dir, "current"));
-		pointVerifiedTag(o.gh ?? realGh, repo, sha);
+		pointVerifiedTag(verifierGh(deadline, o.gh), repo, sha);
 		// Only registered, owned detached worktrees directly below this root may be removed.
-		const releases = verifierGit(clone, ["worktree", "list", "--porcelain"]).split("\n\n").flatMap((block) => {
+		const releases = git(clone, ["worktree", "list", "--porcelain"]).split("\n\n").flatMap((block) => {
 			const path = /^worktree (.+)$/m.exec(block)?.[1];
 			return path && dirname(path) === dir && /^[0-9a-f]{12}$/.test(path.slice(dir.length + 1)) && /^detached$/m.test(block) ? [path] : [];
 		}).sort((a, b) => lstatSync(b).mtimeMs - lstatSync(a).mtimeMs);
@@ -1263,8 +1251,8 @@ export function promoteMain(ledger: Ledger, repo: string, sha: string, log: (s: 
 		keep.add(release); // A manual rollback may make current older than the newest three; never delete it.
 		for (const path of releases) {
 			if (keep.has(path) || resolvedCurrent(dir) === path) continue;
-			if (realpathSync(path) !== path || verifierGit(path, ["rev-parse", "--git-common-dir"]) !== join(clone, ".git")) throw new Error(`refusing retention of foreign worktree ${path}`);
-			verifierGit(clone, ["worktree", "remove", path]);
+			if (realpathSync(path) !== path || git(path, ["rev-parse", "--git-common-dir"]) !== join(clone, ".git")) throw new Error(`refusing retention of foreign worktree ${path}`);
+			git(clone, ["worktree", "remove", path]);
 		}
 		log(`promoted ${sha}`);
 		return { ok: true, sha, schema: null };
@@ -1602,7 +1590,7 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 		// On a land-first repository the gate decides it (D4); a refused post records `status-failed:` and leaves the head pending.
 		if (land !== null || landFirstNow(ledger, ownerRepo)) {
 			postGate({
-				gh: realGh, ledger, repo: ownerRepo, head: view.headRefOid, ref: view.headRefName, pr, need: land?.plan.scope === "fast" || land?.plan.scope === "tree" ? "fast" : "full",
+				gh: realGh, ledger, root, repo: ownerRepo, head: view.headRefOid, ref: view.headRefName, pr, need: land?.plan.scope === "fast" || land?.plan.scope === "tree" ? "fast" : "full",
 				result: { verdict: carried.run.verdict, sha: carried.run.sha, scope: carried.run.scope, host: carried.run.host }, wl, runId, log: say,
 			});
 		} else postStatus(realGh, ownerRepo, "success", view.headRefOid, `carried from run ${carried.from.runId} at ${carried.from.sha.slice(0, 7)} (decision-log only)`, say);
@@ -1617,7 +1605,7 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 	} catch (e) {
 		const reason = `the runner did not start: ${errText(e)}`;
 		try {
-			recordError(ledger, wl, { runId, pr, sha: view.headRefOid, slice, by }, runDir, reason);
+			recordError(ledger, root, wl, { runId, pr, sha: view.headRefOid, slice, by }, runDir, reason);
 		} catch (e2) {
 			say(`the failure could not be recorded: ${errText(e2)}`);
 		}
@@ -2208,8 +2196,8 @@ class Runner {
 		if (this.preflightRecorded) return;
 		this.preflightRecorded = true;
 		const src = this.source;
-		const reasons = [...(refusal === null ? [] : [refusal]), ...(this.verifiedReasons ?? verifiedPreflight(this.ledger, this.ownerRepo, src.ok ? src.sha : null, join(this.install.libexec, "refresh")))];
 		try {
+			const reasons = [...(refusal === null ? [] : [refusal]), ...(this.verifiedReasons ?? verifiedPreflight(this.ledger, this.ownerRepo, src.ok ? src.sha : null, join(this.install.libexec, "refresh")))];
 			const body = runnerPreflightBody({ ok: reasons.length === 0, reason: reasons.length === 0 ? null : reasons.join("; "), source: src.ok ? src.sha : "0".repeat(40), root: realpathSync(controlCheckout()) });
 			this.ledger.write(() => {
 				ensureStandingWorkload(this.ledger);
@@ -2217,7 +2205,7 @@ class Runner {
 			});
 			this.log(body);
 		} catch (e) {
-			this.log(`runner-preflight: not recorded: ${errText(e)}`);
+			this.log(`runner-preflight: not recorded: ${errText(e)}; original preflight outcome: ${refusal ?? "install checks passed"}; inspect this run's runner.log before retrying activation`);
 		}
 	}
 
@@ -2233,11 +2221,11 @@ class Runner {
 	 * REFRESH_REAP_MS more for sudo to exit, and `exited: false` when it has not. Its stdout and stderr go to run-dir files,
 	 * never pipes a root grandchild could hold open past the cap, and are then copied into runner.log.
 	 */
-	async refresh(): Promise<{ code: number | null; signal: string | null; timedOut: boolean; exited: boolean; cap: string; reap: string; out: string; err: string }> {
+	async refresh(deadline = Infinity): Promise<{ code: number | null; signal: string | null; timedOut: boolean; exited: boolean; cap: string; reap: string; out: string; err: string }> {
 		const argv = ["sudo", "-n", join(this.install.libexec, "refresh")];
-		const capMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS", REFRESH_TIMEOUT_MS);
 		const graceMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_GRACE_MS", REFRESH_KILL_GRACE_MS);
 		const reapMs = msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_REAP_MS", REFRESH_REAP_MS);
+		const capMs = verifierTimeout(deadline - graceMs - reapMs, msEnv("AGENT_SYSTEM_TEST_RUNNER_REFRESH_CAP_MS", REFRESH_TIMEOUT_MS), "refreshing the verifier bundle");
 		const outFile = join(this.runDir, "refresh.out");
 		const errFile = join(this.runDir, "refresh.err");
 		const outFd = openSync(outFile, "w", 0o600);
@@ -2316,7 +2304,8 @@ class Runner {
 			// Do not block the event loop/heartbeat while a released predecessor is still promoting. This is the sole retry
 			// layer: nonblocking BEGINs, bounded backoff and one deadline, followed by exactly one reconciliation.
 			db.exec("PRAGMA busy_timeout = 0");
-			const deadline = Date.now() + PROMOTION_LOCK_MS;
+			const budget = promotionBudgetMs();
+			const deadline = Date.now() + budget;
 			let waitMs = 25;
 			for (;;) {
 				try {
@@ -2324,14 +2313,14 @@ class Runner {
 					break;
 				} catch (e) {
 					if (!isBusy(e)) throw e;
-					if (Date.now() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within ${PROMOTION_LOCK_MS} ms: ${errText(e)}; retry after the publisher finishes`);
+					if (Date.now() >= deadline) throw new Stop(`verified reconciliation could not acquire ${join(directory, "promotion.db")} within its holder budget: ${errText(e)}; retry after the publisher finishes`);
 					if (waitMs === 25) this.log(`verified reconciliation waiting for ${join(directory, "promotion.db")}`);
 					hookMark(this.id, "promotion-busy");
 					await Bun.sleep(Math.min(waitMs, Math.max(0, deadline - Date.now())));
 					waitMs = Math.min(waitMs * 2, 250);
 				}
 			}
-			return await this.reconcileInstall(true);
+			return await this.reconcileInstall(true, Date.now() + budget);
 		} catch (e) {
 			failure = e;
 			throw e;
@@ -2344,7 +2333,7 @@ class Runner {
 	}
 
 	/** Current/tag, input hashes, the one refresh and the final coherence check all share the publisher's transaction. */
-	private async reconcileInstall(on: boolean): Promise<Verdict> {
+	private async reconcileInstall(on: boolean, deadline = Infinity): Promise<Verdict> {
 		const stop: (reason: string) => never = (reason) => {
 			this.f.preflight = `preflight: ${reason}`;
 			throw new Stop(this.f.preflight);
@@ -2353,20 +2342,20 @@ class Runner {
 		let refreshed: string | null = null;
 		let verifierMismatch = false;
 		if (on) {
-			const own = runnerControlRoot();
+			const own = runnerControlRoot(undefined, undefined, deadline);
 			const rootRefusal = controlRootRefusal(own, this.ledger.entries(STANDING_WORKLOAD_ID));
 			if (rootRefusal.length > 0) return stop(rootRefusal.join("; "));
-			const reasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"));
+			const reasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"), realGh, undefined, undefined, deadline);
 			if (reasons.length > 0) {
 				if (!readFileSync(join(this.install.libexec, "refresh"), "utf8").includes(`refs/tags/${AS2_VERIFIED_TAG}:refs/tags/${AS2_VERIFIED_TAG}`)) return stop(reasons.join("; "));
 				this.log(`verified preflight: ${reasons.join("; ")}; re-pointing the tag and refreshing once`);
-				pointVerifiedTag(realGh, this.ownerRepo, own.currentHead!);
+				pointVerifiedTag(verifierGh(deadline), this.ownerRepo, own.currentHead!);
 				verifierMismatch = true;
 			}
 		}
 		if (verifierMismatch || (!v.ok && v.kind !== "install")) {
 			this.log(`preflight: ${!v.ok ? v.reason : "bundle/tag mismatch"}; running the refresh helper`);
-			const r = await this.refresh();
+			const r = await this.refresh(deadline);
 			if (r.code !== REFRESH_EXIT.ok) {
 				// The REFRESH_EXIT name of the code (`fetch` for 70); `failed` for a code the helper does not define, such as sudo's own refusal.
 				const name = Object.entries(REFRESH_EXIT).find(([, c]) => c === r.code)?.[0] ?? "failed";
@@ -2384,7 +2373,7 @@ class Runner {
 			if (!v.ok && v.kind === "input-drift" && facts.source.ok) {
 				const src = facts.source.source;
 				const rel = Object.keys(src.inputs).find((k) => facts.inputHashes[k] !== src.inputs[k]);
-				const head = await run(["git", ...NO_HOOKS, "rev-parse", "--verify", "HEAD"], { cwd: REPO_ROOT, env: trustedEnv("/dev/null"), timeoutMs: 30_000 });
+				const head = await run(["git", ...NO_HOOKS, "rev-parse", "--verify", "HEAD"], { cwd: REPO_ROOT, env: trustedEnv("/dev/null"), timeoutMs: verifierTimeout(deadline, 30_000, "reading the drifted checkout") });
 				const sha = /^[0-9a-f]{40}$/.test(head.out.trim()) ? head.out.trim().slice(0, 12) : "unknown";
 				stop(`${CHECKOUT_DRIFT}: ${rel} in the runner's checkout ${REPO_ROOT} (HEAD ${sha}) differs from the bundle, which is built from origin/main ${src.sourceSha.slice(0, 12)}; bring the checkout to origin/main`);
 			}
@@ -2396,7 +2385,7 @@ class Runner {
 		}
 		if (!v.ok) return stop(v.reason);
 		if (on) {
-			this.verifiedReasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"));
+			this.verifiedReasons = verifiedPreflight(this.ledger, this.ownerRepo, this.source.ok ? this.source.sha : null, join(this.install.libexec, "refresh"), realGh, undefined, undefined, deadline);
 			if (this.verifiedReasons.length > 0) return stop(`verified preflight refused after one refresh: ${this.verifiedReasons.join("; ")}`);
 		}
 		return refreshed ? { ok: true, summary: `${v.summary}; ${refreshed}` } : v;
@@ -2720,10 +2709,16 @@ class Runner {
 		this.fast = { plan, host: "linux", parse: [], missing: [], exec: null };
 		this.slotless = true;
 		// Hosted work still executes control code locally: on-mode install facts must be read inside the reconciliation lock.
-		const v = landFirstNow(this.ledger, this.ownerRepo) ? await this.installCheck() : this.decideInstall().v;
-		this.f.preflight = v.ok ? v.summary : `preflight: ${v.reason}`;
-		if (!v.ok) this.log(`preflight: ${v.reason}; the hosted fast check runs none of the Mac install, so it goes on (a Mac fallback refreshes or stops on it)`);
-		this.recordPreflight(v.ok ? null : v.reason);
+		try {
+			const v = landFirstNow(this.ledger, this.ownerRepo) ? await this.installCheck() : this.decideInstall().v;
+			this.f.preflight = v.ok ? v.summary : `preflight: ${v.reason}`;
+			if (!v.ok) this.log(`preflight: ${v.reason}; the hosted fast check runs none of the Mac install, so it goes on (a Mac fallback refreshes or stops on it)`);
+			this.recordPreflight(v.ok ? null : v.reason);
+		} catch (e) {
+			// Even a superseded fast preflight leaves an explicit refusal, never the preceding process's activation receipt.
+			this.recordPreflight(e instanceof Stop || e instanceof Fail || e instanceof Superseded ? e.message : `the runner failed: ${errText(e)}`);
+			throw e;
+		}
 		const changed = await this.trusted();
 		if (changed === null) return;
 		const tree = treeAt(join(this.stage, "repo", ".git"), this.request.sha, trustedEnv(join(this.runDir, "trusted.gitconfig")), false);
@@ -2960,7 +2955,7 @@ class Runner {
 					// The ledger is unavailable: result.json and runner.log retain the error, and the tick reaps the request.
 					// Revocation must not depend on a working ledger or on another logging write succeeding.
 					const log = (s: string) => this.log(s);
-					revokeIfActive(this.ledger, realGh, this.request.main.repo, `main ${run.sha.slice(0, 7)} publication error, run ${run.runId}: ${reason}`, log);
+					revokeIfActive(this.ledger, this.root, realGh, this.request.main.repo, `main ${run.sha.slice(0, 7)} publication error, run ${run.runId}: ${reason}`, log);
 					postStatus(realGh, this.request.main.repo, "error", run.sha, `main full publication error, run ${run.runId}`, log, MAIN_FULL_STATUS);
 				}
 				return START_EXIT.failed;
@@ -2976,7 +2971,7 @@ class Runner {
 					const controlRepo = ownerRepoOf(originOf(controlCheckout()) ?? "")?.toLowerCase() ?? null;
 					if (controlRepo === this.ownerRepo.toLowerCase()) promoteMain(this.ledger, this.ownerRepo, run.sha, log);
 					else log(`verified promotion skipped for served repository ${this.ownerRepo}: this runner's control repository is ${controlRepo ?? "unreadable (repair its origin before promotion)"}`);
-				} else revokeIfActive(this.ledger, realGh, this.ownerRepo, `main ${run.sha.slice(0, 7)} ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log);
+				} else revokeIfActive(this.ledger, this.root, realGh, this.ownerRepo, `main ${run.sha.slice(0, 7)} ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log);
 				const state = verdict?.verdict === "green" ? "success" : verdict !== undefined ? "failure" : "error";
 				postStatus(realGh, this.ownerRepo, state, run.sha, `main full ${verdict?.verdict ?? run.verdict}, run ${run.runId}`, log, MAIN_FULL_STATUS);
 				return released ? 0 : START_EXIT.failed;
@@ -2990,7 +2985,7 @@ class Runner {
 					if (plan !== null || landFirstNow(this.ledger, this.ownerRepo)) {
 						const ref = plan?.ref ?? ghPrView(this.ownerRepo, run.pr).headRefName;
 						postGate({
-							gh: realGh, ledger: this.ledger, repo: this.ownerRepo, head: run.sha, ref, pr: run.pr, need: plan?.scope === "fast" || plan?.scope === "tree" ? "fast" : "full",
+							gh: realGh, ledger: this.ledger, root: this.root, repo: this.ownerRepo, head: run.sha, ref, pr: run.pr, need: plan?.scope === "fast" || plan?.scope === "tree" ? "fast" : "full",
 							result: { verdict: run.verdict, sha: run.sha, scope: run.scope, host: run.host }, wl: this.wl, runId: this.id, log: (s) => this.log(s),
 						});
 					} else {
@@ -3026,7 +3021,7 @@ class Runner {
 			} catch (e) {
 				const reason = `the pending main runner did not start: ${errText(e)}`;
 				try {
-					recordError(this.ledger, this.wl, findRequest(this.ledger, a.runId)!.request, runDirOf(this.root, a.runId), reason);
+					recordError(this.ledger, this.root, this.wl, findRequest(this.ledger, a.runId)!.request, runDirOf(this.root, a.runId), reason);
 				} catch (audit) {
 					this.log(`${reason}; its error result was not recorded: ${errText(audit)}; the tick must reap it`);
 				}
@@ -3111,7 +3106,7 @@ async function cmdRun(runId: string): Promise<number> {
 	} catch (e) {
 		// No caps to run under: the request still gets its error result.
 		process.stdout.write(`${new Date().toISOString()} ${errText(e)}\n`);
-		recordError(ledger, found.workloadId, found.request, runDirOf(runsRoot(process.env), runId), errText(e));
+		recordError(ledger, runsRoot(process.env), found.workloadId, found.request, runDirOf(runsRoot(process.env), runId), errText(e));
 		return 0;
 	}
 	return new Runner(ledger, found.workloadId, found.request, config).main();
@@ -3146,7 +3141,7 @@ function cmdMain(repo: string, sha: string): number {
 				spawnRunner(runDirOf(root, a.runId), a.runId);
 			} catch (e) {
 				const reason = `the runner did not start: ${errText(e)}`;
-				recordError(ledger, STANDING_WORKLOAD_ID, findRequest(ledger, a.runId)!.request, runDirOf(root, a.runId), reason);
+				recordError(ledger, root, STANDING_WORKLOAD_ID, findRequest(ledger, a.runId)!.request, runDirOf(root, a.runId), reason);
 				throw new Fail(reason, START_EXIT.failed);
 			}
 		}

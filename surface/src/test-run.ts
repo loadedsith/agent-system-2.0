@@ -1,9 +1,6 @@
-// The outside-the-fence test runner's pure half (MIGRATION.md item 24; the approved plan of
-// workload wl-muraerdsgw7gn4, revision 12, § 2 to § 4). Nothing here touches the filesystem, a
-// process or the ledger: the starter and the detached run (surface/scripts/test-runner.ts), the lane
-// tool (surface/extensions/lane-tools.ts), the close check (surface/extensions/workload.ts), the
-// `_as2test` wrapper (surface/src/as2test.ts, surface/scripts/test-exec.ts) and row 8's push record
-// read what they need and hand it in, so every decision below is tested over plain values.
+// The outside-the-fence test runner's shared half (MIGRATION.md item 24).
+// Decisions below consume plain values. The publication mutex alone opens a separate SQLite file,
+// never the ledger: runner status publication and off reconciliation share its critical section.
 //
 // What lives here:
 // - the bodies of `test-requested:`, `test-run:`, `push-dest:` (control entries, launch.ts WRITERS)
@@ -14,8 +11,11 @@
 // - the verdict and settle decision, ownership, liveness, the starter's reservation, retention;
 // - the bound-branch rule for a PR, and the close-freshness decision over compare results;
 // - the untrusted child's environment, its git shim and gitconfig, and the wrapper's argv contract.
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type EntryRow, type SliceState, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { assertNotLiveLedgerUnderTest, type EntryRow, type SliceState, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { defaultLedgerPath } from "../../ledger/src/locality";
 import { branchName, controlEntries } from "./launch";
 import { PUSH_DEST_PREFIX, TEST_REQUESTED_PREFIX, TEST_RUN_FAILED_PREFIX, TEST_RUN_PREFIX } from "./types";
@@ -225,6 +225,91 @@ export function runDirOf(root: string, runId: string): string {
 }
 /** The lock database under the runs root (§ 2.3 step 1). */
 export const runsDbOf = (root: string): string => join(root, "runs.db");
+
+/**
+ * Serialize the activation read and required-status publication with off revocation/completion.
+ * A separate SQLite file per repository avoids holding the ledger or runs.db across network I/O.
+ * Acquisition waits at most 60 s; closing the connection (including process death) releases it.
+ * Bodies are synchronous, like the runner's bounded gh calls; never return a Promise.
+ */
+export function withFullSuitePublication<T>(root: string, repo: string, body: () => T): T {
+	const ownerRepo = ownerRepoOf(repo);
+	if (ownerRepo === null) throw new Error(`publication mutex: ${repo} is not owner/repo`);
+	const key = createHash("sha256").update(ownerRepo.toLowerCase()).digest("hex");
+	const path = `${runsDbOf(root)}.publication-${key}.db`;
+	assertNotLiveLedgerUnderTest(root);
+	assertNotLiveLedgerUnderTest(path);
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	const db = new Database(path, { create: true, strict: true });
+	let failed = false;
+	let failure: unknown;
+	let value!: T;
+	try {
+		db.exec("PRAGMA busy_timeout = 60000");
+		db.exec("BEGIN IMMEDIATE");
+		value = body();
+		if (value !== null && (typeof value === "object" || typeof value === "function") && "then" in value) {
+			throw new Error(`publication mutex ${path}: body returned an asynchronous value; use synchronous publication`);
+		}
+	} catch (error) {
+		failed = true;
+		failure = new Error(`publication mutex ${path} for ${ownerRepo}: ${error instanceof Error ? error.message : String(error)}; retry publication or off reconciliation`, { cause: error });
+	} finally {
+		try {
+			db.close();
+		} catch (error) {
+			const cleanup = new Error(`publication mutex ${path}: close failed; inspect the publisher before retrying`, { cause: error });
+			failure = failed ? new AggregateError([failure, cleanup], `publication and mutex close failed for ${ownerRepo}`) : cleanup;
+			failed = true;
+		}
+	}
+	if (failed) throw failure;
+	return value;
+}
+
+/** The runner's admission plan; tree carries are not full-suite execution even when their result has full scope. */
+export type FastPlan = { ref: string } & (
+	| { scope: "fast"; files: string[]; parse: string[]; macOnly: string[] }
+	| { scope: "full"; reasons: string[] }
+	| { scope: "tree"; g: string; run: string }
+);
+export type FastSetPlan = Extract<FastPlan, { scope: "fast" }>;
+export const FAST_PLAN_PREFIX = "fast-plan:";
+export function fastPlanBody(runId: string, plan: FastPlan): string {
+	if (!RUN_ID_RE.test(runId)) throw new Error(`fast-plan: ${runId} is not a run id`);
+	return `${FAST_PLAN_PREFIX} ${runId} ${JSON.stringify(plan)}`;
+}
+const planStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
+export function parseFastPlan(body: string): { runId: string; plan: FastPlan } | null {
+	const m = /^fast-plan: (tr-[a-z0-9]+) (\{.*\})$/.exec(body.trim());
+	if (!m) return null;
+	let v: unknown;
+	try {
+		v = JSON.parse(m[2]!);
+	} catch {
+		return null;
+	}
+	const p = v as Record<string, unknown>;
+	if (v === null || typeof v !== "object" || typeof p.ref !== "string") return null;
+	const ref = p.ref;
+	if (p.scope === "fast" && planStrings(p.files) && planStrings(p.parse) && planStrings(p.macOnly)) return { runId: m[1]!, plan: { ref, scope: "fast", files: p.files, parse: p.parse, macOnly: p.macOnly } };
+	if (p.scope === "full" && planStrings(p.reasons)) return { runId: m[1]!, plan: { ref, scope: "full", reasons: p.reasons } };
+	if (p.scope === "tree" && isSha(p.g) && isRunId(p.run)) return { runId: m[1]!, plan: { ref, scope: "tree", g: p.g, run: p.run } };
+	return null;
+}
+/** Only plans written by the runner count; first plan per run is the admission's decision. */
+export function fastPlans(entries: readonly EntryRow[]): Map<string, FastPlan> {
+	const out = new Map<string, FastPlan>();
+	for (const c of controlEntries(entries)) {
+		if (c.prefix !== "fast-plan") continue;
+		const p = parseFastPlan(c.body);
+		if (p !== null && !out.has(p.runId)) out.set(p.runId, p.plan);
+	}
+	return out;
+}
+export function fastPlanOf(entries: readonly EntryRow[], runId: string): FastPlan | null {
+	return fastPlans(entries).get(runId) ?? null;
+}
 
 // ---- bodies: test-requested: ---------------------------------------------------------------------
 

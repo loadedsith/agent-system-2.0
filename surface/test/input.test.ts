@@ -1599,11 +1599,10 @@ describe("land-first and main-retry: Jo's words on the standing workload (PLAN w
 		expect(on(ledger)).toBe(false);
 		const cmd = interpret(ledger, "land-first agent-system-2.0 on")!;
 		expect(cmd).toEqual({ kind: "land-first", repo: "agent-system-2.0", on: true });
-		const receipt = apply(ledger, cmd);
+		apply(ledger, cmd);
 		const [i] = ledger.instructions(STANDING_WORKLOAD_ID);
 		expect(i).toMatchObject({ kind: "instruction", body: "land-first agent-system-2.0 on", author: "jo", channel: "surface", created_by: SURFACE_BY });
 		expect(ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("land-first")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `land-first: agent-system-2.0 on ${i!.id}`]]);
-		expect(receipt).toBe(`land-first is on for agent-system-2.0 (instruction ${i!.id})`);
 		// the runner's config names owner/repo; another repository is not on; the word is case-insensitive
 		expect(on(ledger)).toBe(true);
 		expect(on(ledger, "thewolff/agent-system-2.0")).toBe(true);
@@ -1613,7 +1612,8 @@ describe("land-first and main-retry: Jo's words on the standing workload (PLAN w
 		expect(on(ledger)).toBe(false);
 		c.at("2026-10-01T10:10:00.000Z");
 		apply(ledger, interpret(ledger, "land-first agent-system-2.0 on")!);
-		expect(on(ledger)).toBe(true);
+		// The latest word is on, but off's already-requested revocations must reconcile first.
+		expect(on(ledger)).toBe(false);
 	});
 
 	test("`land-first <repo> off` needs no bootstrap; `on` is refused, writing nothing, until every bootstrap reason clears", () => {

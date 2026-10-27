@@ -111,9 +111,9 @@
 // <q-…>` keep their question meaning.
 //
 // Land-first activation and main retries (PLAN wl-mvq4edbaf13vnk § 2 Activation, Attempts; D12): `land-first <repo> on|off`
-// writes Jo's instruction `land-first <repo> on|off` on the standing workload, then the surface's `land-first: <repo> on|off
-// <instruction id>` naming it, in one transaction; `landFirstOn` (surface/src/launch.ts) reads them. `on` is refused until
-// § 2's bootstrap holds (`bootstrapRefusal`, surface/src/main-state.ts, read from the standing workload's entries), checked
+// writes Jo's instruction `land-first <repo> on|off` and the surface's `land-first:` binding in one transaction.
+// Off also writes `land-first-off-pending:` there: merges stay held until tick revocation completes under the publication mutex.
+// On is refused until § 2's bootstrap holds (`bootstrapRefusal`, surface/src/main-state.ts, read from the standing workload's entries), checked
 // again inside `apply`. `main-retry <repo>` writes Jo's `main-retry <repo>` and the surface's `main-retry: <repo> <instruction
 // id>` the same way; it opens the next attempt block of an exhausted main commit (`mainRetries`). Both words are the command
 // or `refused` with the reason, at any length, never prose.
@@ -135,7 +135,7 @@ import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
 	attempts, byHandLine, consumedIds, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst, planHaltedBody,
 	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody, withdrawInstructionBody, withdrawnBody,
-	LAND_FIRST_WORD, landFirstBody, landFirstInstructionBody, MAIN_RETRY_WORD, mainRetryBody, mainRetryInstructionBody, REPO_WORD_RE,
+	LAND_FIRST_WORD, landFirstBody, landFirstInstructionBody, landFirstOffBody, landFirstOffPending, MAIN_RETRY_WORD, mainRetryBody, mainRetryInstructionBody, REPO_WORD_RE,
 } from "./launch";
 import { bootstrapRefusal } from "./main-state";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
@@ -1455,14 +1455,17 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 			});
 		}
 		case "land-first": {
-			// Jo's instruction, then the surface's `land-first:` naming it, on the standing workload in one transaction (`landFirstOn`).
+			// Raw word and pending off marker commit together; acknowledgement is not revocation completion.
 			return ledger.write(() => {
 				const why = landFirstRefusal(ledger, cmd.repo, cmd.on);
 				if (why !== null) throw new Error(why);
 				ensureStandingWorkload(ledger);
 				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(cmd.repo, cmd.on) });
 				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(cmd.repo, cmd.on, id) });
-				return `land-first is ${cmd.on ? "on" : "off"} for ${cmd.repo} (instruction ${id})`;
+				if (!cmd.on) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(cmd.repo, "pending", id) });
+				const pending = landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), cmd.repo);
+				if (pending.length > 0) return `land-first ${cmd.on ? "on" : "off"} requested for ${cmd.repo} (instruction ${id}); off reconciliation pending: merges held until the tick revokes fast/tree successes`;
+				return `land-first is on for ${cmd.repo} (instruction ${id})`;
 			});
 		}
 		case "main-retry": {

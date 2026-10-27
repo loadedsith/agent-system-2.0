@@ -30,7 +30,7 @@ import { SCRATCH_ENV, insideRoot, ownScratchRoot, scratchSpelling } from "../scr
 import { markConfined } from "../session";
 import { Ledger, type EntryRow, type InstructionRow } from "../../../ledger/src/index";
 import { defaultLedgerPath } from "../../../ledger/src/locality";
-import { controlEntries, landFirstOn } from "../../../surface/src/launch";
+import { controlEntries, landFirstHeld, landFirstOffPending } from "../../../surface/src/launch";
 import { INCONCLUSIVE, mainResults, mainVerdicts, SUSPECT_MAX_MS } from "../../../surface/src/main-state";
 import { latestTrainReconciled } from "../../../surface/src/merge-train";
 import { STANDING_WORKLOAD_ID } from "../../../surface/src/types";
@@ -525,7 +525,7 @@ function mergeHoldRefusal(cmd: string, cwd: string, ctx: CallContext, toolEnv: u
 		return held(`the ledger could not be read to tell whether land-first is on (${err instanceof Error ? err.message : String(err)}); fix the ledger, then retry`);
 	}
 	const { entries, instructions } = standing;
-	const onRepos = [...new Set(controlEntries(entries).filter((c) => c.prefix === "land-first").map((c) => c.rest.split(" ")[0]!))].filter((r) => landFirstOn(entries, instructions, r));
+	const onRepos = [...new Set(controlEntries(entries).filter((c) => c.prefix === "land-first").map((c) => c.rest.split(" ")[0]!))].filter((r) => landFirstHeld(entries, instructions, r));
 	if (onRepos.length === 0) return null;
 	const unknown = (why: string) => held(`land-first is on for ${onRepos.join(", ")} and the gate cannot tell which repository this merge lands in: ${why}`);
 	// The repositories the merge lands in: those a `gh pr merge -R`, a REST endpoint or a PR URL names; a `gh pr merge`
@@ -558,13 +558,15 @@ function mergeHoldRefusal(cmd: string, cwd: string, ctx: CallContext, toolEnv: u
 		for (const r of remotes) targets.add(r);
 	}
 	if (targets.size === 0) for (const r of onRepos) targets.add(r);
-	const landFirst = [...targets].filter((r) => landFirstOn(entries, instructions, r));
+	const landFirst = [...targets].filter((r) => landFirstHeld(entries, instructions, r));
 	if (landFirst.length === 0) return null;
 	const lone = notLoneMerge(cmd, cwd, ctx.env, x);
 	if (lone !== null) return held(`${landFirst.join(", ")} is land-first and this is not one lone foreground merge command, which only Jo approves: ${lone}`);
 	const head = pinnedHead(x);
 	const nowMs = hold.now();
 	for (const repo of landFirst) {
+		const pending = landFirstOffPending(entries, instructions, repo);
+		if (pending.length > 0) return held(`${repo}: off reconciliation pending (${pending.join(", ")}); the tick must revoke fast/tree successes before normal merges resume`);
 		const why = stateRefusal(repo, head, entries, nowMs);
 		if (why !== null) return held(`${repo} is land-first and the ledger does not admit a merge now: ${why}`);
 	}

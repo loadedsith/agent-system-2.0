@@ -24,7 +24,7 @@ import { basename, dirname } from "node:path";
 import { parseHandSpawn } from "../../classifier/src/lab";
 import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import {
-	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, landFirstOn, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard,
+	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, landFirstHeld, landFirstOn, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard,
 	parseTrainFix, planFirst, planSlice, prBindingInstructionBody, prBindings, sameRepo, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
 import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type SliceRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
@@ -2709,10 +2709,10 @@ export function stopSummary(repo: string, s: { kind: string; tip: string; g: str
 }
 
 /**
- * Every repository land-first is on for now (`landFirstOn`), lowercase: the full `owner/repo` the tick's rows name (its
- * `train-reconciled:` and land-first notices), else the word Jo's `land-first:` names when no tick row names it yet (`sameRepo`).
+ * Every repository land-first is on for now, lowercase; `includePendingOff` also includes repositories
+ * whose off revocations are unfinished. Prefer the full owner/repo from tick rows over Jo's short name.
  */
-export function landFirstRepos(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): string[] {
+export function landFirstRepos(entries: readonly EntryRow[], instructions: readonly InstructionRow[], includePendingOff = false): string[] {
 	const full = new Set<string>();
 	for (const c of controlEntries(entries)) {
 		const r = c.prefix === "train-reconciled" ? parseTrainReconciled(c.body)?.repo : c.prefix === "train-notice" ? parseLandFirst(c.rest)?.repo : undefined;
@@ -2721,7 +2721,7 @@ export function landFirstRepos(entries: readonly EntryRow[], instructions: reado
 	const named = controlEntries(entries).filter((c) => c.prefix === "land-first").map((c) => c.rest.split(" ")[0]!.toLowerCase());
 	const out = new Set(full);
 	for (const n of named) if (![...full].some((f) => sameRepo(f, n))) out.add(n);
-	return [...out].filter((r) => landFirstOn(entries, instructions, r)).sort();
+	return [...out].filter((r) => includePendingOff ? landFirstHeld(entries, instructions, r) : landFirstOn(entries, instructions, r)).sort();
 }
 
 /** A control process's own root as git and the file system read it now (§ 2 Protect the verifier, Self-checks). */

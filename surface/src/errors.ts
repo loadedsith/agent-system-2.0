@@ -96,7 +96,7 @@ import { SCRATCH_ENTRY } from "../../gates/src/scratch";
 import { type NowCategory, nowMarks } from "../../gates/src/rulings";
 import { nowReserved } from "../../gates/src/rows/r06-reserved";
 import { openPairOffer } from "./input";
-import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, laneExit, mainRetries, queuedOf } from "./launch";
+import { byHandLine, type ControlEntry, type ControlPrefix, controlEntries, doneLine, holdersOf, isIntendedOutcome, isPlanQuestionIn, landFirstOffPending, laneExit, mainRetries, queuedOf, sameRepo } from "./launch";
 import {
 	landFirstRepos, landFirstRows, type LandFirstRow, latestTrainReconciled, mainRedNotices, protectionEpisodes, RECONCILED_STALE_MS, stopEpisode, type TaskWindow, TRAIN_ALERT_LADDER,
 	trainAlertLevel, trainMembers, trainTaskWindows,
@@ -466,7 +466,25 @@ function landFirstLines(ledger: Ledger, now: string): ErrorLine[] {
 	const push = (rowId: string, line: string, state?: string) => out.push({ kind: "train", workloadId: wl, rowId, line, ...(state === undefined ? {} : { state }) });
 	const sha7 = (s: string) => s.slice(0, 7);
 	const prsOf = (suspects: readonly number[]) => (suspects.length === 0 ? "none named" : suspects.map((n) => `#${n}`).join(", "));
-	for (const repo of landFirstRepos(entries, instructions)) {
+	for (const repo of landFirstRepos(entries, instructions, true)) {
+		const pending = landFirstOffPending(entries, instructions, repo);
+		if (pending.length > 0) {
+			const marker = controlEntries(entries).find((c) => c.prefix === "land-first-off-pending" && pending.includes(c.rest.split(" ")[1]!) && sameRepo(c.rest.split(" ")[0]!, repo))!;
+			const order = new Map(entries.map((e, i) => [e.id, i]));
+			const since = order.get(marker.id)!;
+			const headFailure = rows.findLast((r) => r.event === "revoke-failed" && sameRepo(r.repo, repo) && r.error.startsWith("off reconciliation pending:") && order.get(r.entryId)! > since);
+			const passFailure = entries.findLast((e) => {
+				const named = /^train-error: off reconciliation pending for (\S+):/.exec(e.body);
+				return e.created_by === MERGE_TRAIN_BY && e.kind === "assumption" && named !== null
+					&& sameRepo(named[1]!, repo) && order.get(e.id)! > since;
+			});
+			const latest = passFailure !== undefined && (headFailure === undefined || order.get(passFailure.id)! > order.get(headFailure.entryId)!)
+				? { id: passFailure.id, detail: passFailure.body }
+				: headFailure?.event === "revoke-failed" ? { id: headFailure.entryId, detail: `#${headFailure.pr} head ${headFailure.head}: ${headFailure.error}` } : null;
+			push(marker.id, `land-first off requested for ${repo} (instructions ${pending.join(", ")}): reconciliation pending; normal merges held${latest ? `; latest failure ${latest.id}: ${latest.detail}` : ""} — next: the tick retries remaining fast/tree revocations; check com.agent-system-2.train-tick and its log if no progress`,
+				`off-pending ${pending.join(" ")} failure ${latest?.id ?? "none"}`);
+			continue;
+		}
 		const mine = rows.filter((r) => r.repo === repo);
 		const reconciled = latestTrainReconciled(entries, repo);
 		const ep = stopEpisode(mine);
