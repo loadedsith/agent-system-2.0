@@ -8,7 +8,7 @@
 //                                        system prompt, spawn `run` detached; prints `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
-//                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
+//                                        lane-metrics:/lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
 //                                        notice, the 100 % stop and its notice) polled every STOP_POLL_MS. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
@@ -48,7 +48,7 @@
 // `ctx-index`, which writes as the one its `--by` names. `drain` writes nothing itself: its starters write as `lane-starter`.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
-import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { headroom } from "../../classifier/src/headroom";
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
@@ -73,7 +73,7 @@ import {
 	branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
@@ -81,6 +81,7 @@ import {
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
+import { laneMetrics, laneMetricsBody, psSampler, RSS_SAMPLE_MS, rssMeter } from "../src/metrics";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { sendNotice } from "../src/notice";
 import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
@@ -104,6 +105,8 @@ const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
+/** The least time between two RSS samples of the omp tree (PLAN wl-mvbcjageg7o2yo § 2.2); the fake-omp tests shorten it. */
+const RSS_SAMPLE_INTERVAL_MS = msEnv("AGENT_SYSTEM_LANE_RSS_SAMPLE_MS", RSS_SAMPLE_MS);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
@@ -321,11 +324,102 @@ function byHandPromptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prep
  * profile default) and the session `resumeOrigin` picks (decisions 6, 7, 14), resumed only when its origin lane ran on that
  * same model (`resumePlan`, MIGRATION.md item 85); `skipped` says why a recorded session was not resumed.
  */
-function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: string | null; resume: string | null; skipped: string | null } {
+function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: string | null; resume: string | null; skipped: string | null; recovered: string | null } {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
 	const model = laneModel(control);
-	return { model, ...resumePlan(control, laneId, resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)), model) };
+	const resolved = resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id));
+	const origin = resumeOrigin(control, laneId, resolved);
+	if (origin === null || regularRealpath(origin.session) !== null) {
+		return { model, ...resumePlan(control, laneId, resolved, model), recovered: null };
+	}
+	const dir = join(laneDir(w.id, homeDir()), "sessions");
+	let newest: { path: string; canonical: string; mtime: number } | null = null;
+	for (const name of topLevelSessions(dir)) {
+		const path = join(dir, name);
+		try {
+			const stat = statSync(path);
+			if (!stat.isFile()) continue;
+			const canonical = realpathSync(path);
+			if (newest === null || stat.mtimeMs > newest.mtime || (stat.mtimeMs === newest.mtime && path > newest.path)) {
+				newest = { path, canonical, mtime: stat.mtimeMs };
+			}
+		} catch {
+			// A candidate removed during discovery is not usable.
+		}
+	}
+	const missing = `recorded session ${origin.session} is missing`;
+	if (newest === null) return { model, resume: null, skipped: `${missing}; no usable top-level workload session`, recovered: null };
+	let candidateLane: string | null = null;
+	for (let i = control.length - 1; i >= 0; i--) {
+		const candidate = sessionOrigin([control[i]!]);
+		if (candidate !== null && regularRealpath(candidate.session) === newest.canonical) {
+			candidateLane = candidate.laneId;
+			break;
+		}
+	}
+	const started = candidateLane === null ? null : laneStarted(control, candidateLane);
+	const ran = started === null ? undefined : started.model;
+	if (ran !== model) {
+		return { model, resume: null, skipped: `${missing}; newest ${newest.path} ran on ${ran === undefined ? "unknown" : ran ?? "default"}`, recovered: null };
+	}
+	return { model, resume: newest.path, skipped: null, recovered: `${missing}; recovering newest workload session ${newest.path}` };
+}
+
+/** Existing regular files only: aliases may prove provenance, nonexistent paths never do. */
+function regularRealpath(path: string): string | null {
+	try {
+		return statSync(path).isFile() ? realpathSync(path) : null;
+	} catch {
+		return null;
+	}
+}
+
+interface StderrCapture {
+	settle: () => Promise<void>;
+	context: () => string;
+}
+
+/** Drain immediately after spawn; retain only the final 8 KiB, independent of frames or newlines. */
+function captureStderr(stream: ReadableStream<Uint8Array>): StderrCapture {
+	const reader = stream.getReader();
+	const tail = new Uint8Array(8192);
+	let used = 0;
+	let truncated = false;
+	const drained = (async () => {
+		try {
+			for (;;) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				const keep = Math.min(value.length, tail.length);
+				const retained = Math.min(used, tail.length - keep);
+				truncated ||= used + value.length > tail.length;
+				tail.copyWithin(0, used - retained, used);
+				tail.set(value.subarray(value.length - keep), retained);
+				used = retained + keep;
+				process.stderr.write(value);
+			}
+		} catch (err) {
+			process.stderr.write(`runner: omp stderr drain failed: ${oneLine(err)}\n`);
+		}
+	})();
+	let settling: Promise<void> | null = null;
+	return {
+		settle: () => settling ??= (async () => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([drained, new Promise<void>((done) => { timer = setTimeout(done, 250); })]);
+			} finally {
+				clearTimeout(timer);
+				// Cancellation may itself wait on an inherited pipe: never await it.
+				void reader.cancel().catch(() => undefined);
+			}
+		})(),
+		context: () => {
+			const text = new TextDecoder().decode(tail.subarray(0, used)).replace(/\s+/g, " ").trim();
+			return text ? `stderr: ${truncated || text.length > 1000 ? "…" : ""}${text.slice(-1000)}` : "no stderr";
+		},
+	};
 }
 
 /**
@@ -1106,7 +1200,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let deadlineAt = Number.MAX_SAFE_INTEGER;
 	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
 
-	let child: Subprocess<"pipe", "pipe", "inherit"> | null = null;
+	let child: Subprocess<"pipe", "pipe", "pipe"> | null = null;
+	let stderrCapture: StderrCapture | null = null;
+	let childExited = false;
 	let outcome: LaneOutcome | null = null;
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
@@ -1227,6 +1323,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
+	/** This run's spend baseline, measured once right after the spawn record: lane-metrics: reports the final measure minus it. */
+	let baseline: Spend | null = null;
+	/** The omp tree's peak RSS, sampled on the stop poll (PLAN wl-mvbcjageg7o2yo § 2.2). */
+	const rss = rssMeter(psSampler, RSS_SAMPLE_INTERVAL_MS);
 	/**
 	 * One meter poll (`meterPoll`): the 80 % notice once per ceiling value; at 100 % the stop notice once per ceiling value
 	 * and the stop through the stop path (acceptance `ceiling`, outcome stop, no lane-died:), the ceiling read and the
@@ -1292,6 +1392,18 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			} catch (err) {
 				process.stderr.write(`runner: the final spend scan failed: ${String(err)}\n`);
 			}
+			// This run's metrics (PLAN wl-mvbcjageg7o2yo § 2.2) in a write of their own before the finalization's, so a failure
+			// here never rolls back the release, spend: or lane-exit: below.
+			if (runStart !== null) {
+				try {
+					const metrics = laneMetrics({
+						runStartMs: runStart, runEndMs: Date.now(), final: spend, baseline, model, ranModel, prompts, continues, outcome: final, peakRssMb: rss.peakMb, rssSamples: rss.samples,
+					});
+					writeAsOwner(ledger, lock, () => record(laneMetricsBody(laneId, metrics)));
+				} catch (err) {
+					process.stderr.write(`runner: the lane-metrics: entry could not be written: ${String(err)}\n`);
+				}
+			}
 			let drained = false;
 			const owned = writeAsOwner(ledger, lock, () => {
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
@@ -1301,7 +1413,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						: final === "deadline" ? laneDiedDeadlineBody(laneId, maxTime, inFlight) : laneDiedExitBody(laneId, final, code, signal);
 					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
 				}
-				if (final === "never-ready") record(launchFailedBody(laneId, readinessStage, `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
+				if (final === "never-ready") record(launchFailedBody(laneId, readinessStage, readinessStage === "startup"
+					? readinessFailure!
+					: `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
 				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
@@ -1470,6 +1584,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
 			});
+			if (start.recovered !== null) process.stderr.write(`runner: ${laneId} ${start.recovered}; argv ${JSON.stringify(argv)}\n`);
 			maxTime = argv[argv.indexOf("--max-time") + 1]!;
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
@@ -1493,7 +1608,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const omp = startAsOwner(ledger, lock, () => {
 			child = spawnIfReserved(ledger, wl, laneId, child, () => {
 				runStart = Date.now();
-				return spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+				const omp = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+				stderrCapture = captureStderr(omp.stderr);
+				return omp;
 			});
 			record(startRecord());
 			return child;
@@ -1509,10 +1626,25 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			lostLock = true;
 			throw new Fail("run", `${laneId} not started: lost the run lock ${lock.path} before the spawn (${now}); no omp spawned, nothing recorded or released`, STARTER_EXIT.held!);
 		}
+		try {
+			baseline = measure(controlNow().control);
+		} catch (err) {
+			process.stderr.write(`runner: the baseline spend scan failed: ${String(err)}\n`);
+		}
 		// Preparation can block on git and profile reads. The child's readiness window and
 		// max-time start at its actual spawn, just like the ceiling meter's live wall time.
 		const spawnedAt = runStart!;
 		deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+		const exited = omp.exited.then(async (code) => {
+			childExited = true;
+			await stderrCapture?.settle();
+			if (!ready && outcome === null && fatal === null) {
+				readinessStage = "startup";
+				readinessFailure = `omp exit code ${code} signal ${omp.signalCode ?? "-"} before ready; ${stderrCapture?.context() ?? "no stderr"}`;
+				outcome = "never-ready";
+			}
+			return code;
+		});
 		send({ id: STATE_ID, type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
@@ -1520,7 +1652,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		// unnamed lane still out after budget comparison is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
 		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
-			if (ready || finished || outcome !== null || fatal !== null) return;
+			if (ready || finished || childExited || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
@@ -1605,6 +1737,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 
 		const stopPoll = setInterval(() => {
 			if (finished) return;
+			if (omp.exitCode === null && omp.signalCode === null) void rss.tick(omp.pid, Date.now());
 			try {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
@@ -1751,7 +1884,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				}
 			}
 		}
-		const code = await omp.exited;
+		const code = await exited;
 		if (fatal !== null) throw fatal;
 		finish(code, omp.signalCode ?? null);
 	} catch (err) {
@@ -1766,10 +1899,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock, f.stage === HEADROOM_STAGE ? LANE_RUNNER_BY : LANE_STARTER_BY);
 			return f.code;
 		}
+		// Decide before killing: the child-exit handler must not turn this runner failure into startup SIGKILL.
+		if (!ready && outcome === null) {
+			readinessStage = f.stage;
+			readinessFailure = `${f.stage} failed: ${f.message}`;
+		}
+		outcome ??= ready ? "died" : "never-ready";
 		child.kill("SIGKILL");
 		const code = await child.exited;
-		if (!ready) readinessFailure = `${f.stage} failed: ${f.message}`;
-		outcome ??= ready ? "died" : "never-ready";
+		await stderrCapture?.settle();
 		finish(code, child.signalCode ?? null);
 		return f.code;
 	}
@@ -1799,7 +1937,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 	try {
 		const p = prepare(ledger, wl, true);
 		// Jo's named model, and a session recorded on another model is not resumed, as in the runner (item 85).
-		const { model, resume, skipped } = resumeOf(ledger, w, laneId);
+		const { model, resume, skipped, recovered } = resumeOf(ledger, w, laneId);
 		ledger.write(() => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
@@ -1815,6 +1953,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt supplied from ${firstPromptPath}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
+		if (recovered !== null) line(recovered);
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.

@@ -11,8 +11,9 @@
 // every other question is `other` and always asks.
 //
 // Callers pass the facts a scope needs (`RulingFacts`): the classifier its R1–R5 verdict for a park
-// (classifier/extension.ts), a lane the workload's builders, stakes and train flag
-// (surface/extensions/lane-tools.ts), the orchestrator the workload its ask is about
+// (classifier/extension.ts), a lane the workload's builders, stakes and train flag, and on a train's merge question the
+// `trainSignoff` fact the tool computes from the ledger and live gh reads (surface/extensions/lane-tools.ts,
+// surface/src/merge-train.ts `trainSignoff`; PLAN wl-mvg8itbt0rz3ls D1, D2), the orchestrator the workload its ask is about
 // (surface/src/orchestrator-question.ts). surface/scripts/invariants.ts `ruling-miss` replays the
 // same check over question rows to catch a raise path that bypassed it.
 //
@@ -34,7 +35,7 @@ import { controlEntries } from "../../surface/src/launch";
 import { installedConfigPath } from "../../surface/src/pair-suggest";
 import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 
-export type RulingId = "kimi-out" | "flow-repair" | "merges" | "models" | "gates-stakes";
+export type RulingId = "kimi-out" | "flow-repair" | "merges" | "models" | "gates-stakes" | "train-signoff";
 
 /** What a question asks, from its option set (count-questions.py's mapping); a `model` question's kind is its declared subject. */
 export type QuestionKind = "review-park" | "open-workload" | "merge" | "stakes" | "lane-model" | "review-model" | "other";
@@ -52,6 +53,13 @@ export interface RulingQuestion {
 	subject?: ModelSubject | null;
 }
 
+/**
+ * PLAN wl-mvg8itbt0rz3ls D2: a train PR's merge sign-off as the lane tool computed it (surface/src/merge-train.ts
+ * `trainSignoff`): ok with the PR, its disposition slice, the train's `owner/repo`, the head gh read and the green run at it;
+ * or the first rule that failed. Defined here so this module needs no import of merge-train.ts.
+ */
+export type TrainSignoffFact = { ok: true; pr: number; slice: string; repo: string; head: string; run: string } | { ok: false; reason: string };
+
 /** The facts a ruling's scope reads, passed by the asker; a fact the asker does not know is left out and no ruling relies on it. */
 export interface RulingFacts {
 	asker: Asker;
@@ -63,6 +71,8 @@ export interface RulingFacts {
 	stakes?: string | null;
 	/** A lane's workload is a merge train. */
 	train?: boolean;
+	/** A train lane's merge question: Jo's train word, the PR's workload, its review, green and main's protection (PLAN wl-mvg8itbt0rz3ls D2). */
+	trainSignoff?: TrainSignoffFact;
 	/** The open workload the orchestrator's question is about, or null for none. */
 	about?: string | null;
 	/** The classifier review row's OpenAI model, read only when a review-model question needs it. */
@@ -136,7 +146,22 @@ export function subjectProblem(options: readonly string[], subject: string | nul
 
 const option = (q: RulingQuestion, word: string) => q.options.find((o) => o.toLowerCase() === word.toLowerCase());
 
-/** The five rulings of DRAFT.md § 4, with scope and end as their sources and REVIEW.md A4 give them. */
+/**
+ * PLAN wl-mvg8itbt0rz3ls D1: what a train lane does when `train-signoff` decides its production PR's merge question, step 7 c. to
+ * e. as for a normal PR, self-contained so a train opened on an older brief acts on it too.
+ */
+export function trainSignoffAction(f: Extract<TrainSignoffFact, { ok: true }>): string {
+	const { pr, repo, head, slice, run } = f;
+	return (
+		`merge #${pr} now as step 7 c. to e. for a normal PR: \`gh pr merge ${pr} -R ${repo} --merge --match-head-commit ${head}\` ` +
+		"(a merge commit, never --admin, --squash, --rebase or --auto); " +
+		`verify \`gh pr view ${pr} -R ${repo} --json state,mergeCommit\` shows MERGED (a refused merge: back to step 7 a. once, then ` +
+		`lane_record_entry \`train-error: pr ${pr} merge-refused <gh's messages>\` and pass the PR over); ` +
+		`complete ${slice} with artifact \`merged by train <merge commit sha> (run ${run})\`; the train tick tells Jo`
+	);
+}
+
+/** The six rulings: DRAFT.md § 4's five, with scope and end as their sources and REVIEW.md A4 give them, and train-signoff (PLAN wl-mvg8itbt0rz3ls D1). */
 export const STANDING_RULINGS: readonly Ruling[] = [
 	{
 		id: "kimi-out",
@@ -202,6 +227,19 @@ export const STANDING_RULINGS: readonly Ruling[] = [
 		action: () => "open it at production stakes: a workload whose PR touches gates/ is production at open (Jo's standing rule until item 82 is built)",
 		exceptions: "A stakes question about an open workload is a conversion Jo decides: asked.",
 		ends: { at: null, event: "item 82 is built" },
+	},
+	{
+		// PLAN wl-mvg8itbt0rz3ls D1: Jo's train word on a production-stakes PR is his merge sign-off (jo-issues #155). Only a train
+		// lane's tool computes `trainSignoff`, so no other asker (orchestrator, classifier, the tick, `ruling-miss`) is covered.
+		id: "train-signoff",
+		sources: ["in-mvg8clpoo9xn28", "in-mvg8ibntzpnzeo", "in-mvg9zz54ejepz4"],
+		kinds: ["merge"],
+		scope: (_q, _k, f) => f.asker === "lane" && f.train === true && f.trainSignoff?.ok === true,
+		answer: () => "merge",
+		action: (_q, _k, f) => trainSignoffAction(f.trainSignoff as Extract<TrainSignoffFact, { ok: true }>),
+		exceptions:
+			"A PR whose merge question is already open on any of its train slices (Jo's answer stands), a merge question asked on a full-suite slice rather than the PR's disposition slice, a train Jo stopped and has not resumed with his train word, a PR no Jo `train` word named, a PR with no ledger workload (non-`wl/` branch, fork), a workload not at production stakes, held by Jo's halt (or the auto-start's hold), whose plan is not yet approved, or whose newest review has not passed or is still running, a head no green run tested, main's protection not verified ok live, or gh failing: asked.",
+		ends: { at: null, event: "Jo's end-ruling train-signoff (jo-issues #155: Jo's train word is the production sign-off)" },
 	},
 ];
 

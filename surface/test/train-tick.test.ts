@@ -11,13 +11,18 @@ import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "..
 import { type GhResult, tick } from "../scripts/train-tick";
 import { type Ceiling, ceilingBody, type Spend, spendBody } from "../src/ceiling";
 import { errorLines } from "../src/errors";
-import { controlEntries, decideLaunch, laneExitBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody } from "../src/launch";
+import { ensureStandingWorkload } from "../src/identity";
+import { applyTrain, interpret } from "../src/input";
 import {
-	actionable, fixBindings, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs,
-	trainRetries, trainSliceId, type TrainTask, trainWakeBody,
+	controlEntries, decideLaunch, laneExitBody, launchFailedBody, launchRequestedBody, planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
+} from "../src/launch";
+import {
+	actionable, fixBindings, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs, trainAlertBody, trainAlertMarker,
+	trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody,
 } from "../src/merge-train";
+import { trainMergedNoticeBody } from "../src/notice";
 import { makeRunId, testRequestedBody } from "../src/test-run";
-import { ESCALATION_BY, MERGE_TRAIN_BY, SURFACE_BY } from "../src/types";
+import { ESCALATION_BY, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { releasedOpenBody } from "../src/turn-end";
 import {
 	boardWorld, COMMIT_FILES_CAP, COMMIT_FILES_PER_PAGE, DECISION_LOG_FILE, type FakeDiffEntry, type FakeIssue, H0, H1, H2, JO, OWNER_LANE, protectedRules, REPO, TRAIN_LANE, world,
@@ -888,6 +893,88 @@ describe("main's protection, verified again (PLAN wl-mvbjiettjrfpxc D6)", () => 
 		expect(w.g.issues[0]!.state).toBe("CLOSED");
 		expect(errorLines(w.ledger).filter((l) => l.kind === "train")).toEqual([]);
 		expect(w.boards()).toHaveLength(1);
+	});
+});
+
+describe("one merge notice per PR the train merged (PLAN wl-mvg8itbt0rz3ls D4)", () => {
+	const MERGED = (pr: number) => `merged by train ${"d".repeat(40)} (run tr-${pr})`;
+	/** A train world with the standing workload, the train lane's PR slices completed with `artifacts` (by PR). */
+	const merged = (artifacts: Record<number, string>, o: { signoff?: { pr: number; by: string } } = {}) => {
+		const w = world();
+		ensureStandingWorkload(w.ledger);
+		for (const [pr, artifact] of Object.entries(artifacts)) {
+			const sl = w.ledger.addSlice({ by: TRAIN_LANE, workloadId: w.train, id: trainSliceId(w.train, Number(pr)), task: `PR #${pr}`, doneCondition: "terminal", inputs: `#${pr}` });
+			if (o.signoff?.pr === Number(pr)) {
+				w.ledger.recordEntry({ by: o.signoff.by, workloadId: w.train, sliceId: sl, kind: "assumption", body: `ruling-applied: train-signoff kind merge slice ${sl} answer merge` });
+			}
+			w.ledger.completeSlice(sl, { by: TRAIN_LANE, artifact });
+		}
+		return w;
+	};
+	/** The tick's merge control entries on the standing workload. */
+	const entries = (w: { ledger: Ledger }) =>
+		w.ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith("train-notice: merged")).map((e) => e.body);
+	/** Every notice on the standing workload, as sent. */
+	const sent = (w: { ledger: Ledger }) =>
+		w.ledger.db.query<{ body: string; created_by: string }, [string]>("SELECT body, created_by FROM messages WHERE workload_id = ? ORDER BY created_at, rowid").all(STANDING_WORKLOAD_ID);
+	const close = (w: { ledger: Ledger; train: string }) => {
+		w.ledger.releaseWorkload(w.train, { by: TRAIN_LANE, holder: TRAIN_LANE });
+		w.ledger.closeWorkload(w.train, { by: SURFACE_BY });
+	};
+
+	test("R7: a PR the train merged gets one notice and one control entry across two ticks; Jo's own merge gets none", () => {
+		const w = merged({ 101: MERGED(101), 106: `merged by Jo ${"e".repeat(40)}` });
+		w.run();
+		expect(entries(w)).toEqual([`train-notice: merged ${REPO} #101 ${w.train}`]);
+		expect(sent(w)).toEqual([{ body: `notice: merge train merged #101 (${REPO}, normal stakes): ${MERGED(101)}`, created_by: MERGE_TRAIN_BY }]);
+		expect(errorLines(w.ledger).filter((l) => l.kind === "notice").map((l) => l.line)).toEqual([expect.stringContaining(`merge train merged #101 (${REPO}, normal stakes)`)]);
+		w.c.plusHours(0.1);
+		w.run();
+		expect(entries(w)).toHaveLength(1);
+		expect(sent(w)).toHaveLength(1);
+	});
+
+	test("R7: a skipped PR gets no notice", () => {
+		const w = merged({ 101: "skipped: CLOSED", 106: `merged by Jo ${"e".repeat(40)}` });
+		w.run();
+		expect(entries(w)).toEqual([]);
+		expect(sent(w)).toEqual([]);
+	});
+
+	test("R7: the train's ruling-applied: train-signoff on the slice names Jo's train word; written by anyone but a holder it does not", () => {
+		const prod = merged({ 101: MERGED(101) }, { signoff: { pr: 101, by: TRAIN_LANE } });
+		prod.run();
+		expect(sent(prod).map((m) => m.body)).toEqual([`notice: merge train merged #101 (${REPO}, production, Jo's train word (ruling train-signoff)): ${MERGED(101)}`]);
+		const other = merged({ 101: MERGED(101) }, { signoff: { pr: 101, by: OWNER_LANE } });
+		other.run();
+		expect(sent(other).map((m) => m.body)).toEqual([`notice: merge train merged #101 (${REPO}, normal stakes): ${MERGED(101)}`]);
+	});
+
+	test("R7: a train closed 2 h earlier still notifies, one closed 25 h earlier does not", () => {
+		const recent = merged({ 101: MERGED(101) });
+		close(recent);
+		recent.c.plusHours(2);
+		recent.run();
+		expect(entries(recent)).toEqual([`train-notice: merged ${REPO} #101 ${recent.train}`]);
+		expect(sent(recent)).toHaveLength(1);
+		const old = merged({ 101: MERGED(101) });
+		close(old);
+		old.c.plusHours(25);
+		old.run();
+		expect(entries(old)).toEqual([]);
+		expect(sent(old)).toEqual([]);
+	});
+
+	test("the control entry disturbs neither the protection nor the red-main reader; the artifact is collapsed and clipped to 160", () => {
+		const w = merged({ 101: MERGED(101), 106: MERGED(106) }); // no PR left pending: main's protection is not read
+		w.run();
+		expect(entries(w)).toHaveLength(2);
+		expect(protectionEpisodes(w.ledger).size).toBe(0);
+		expect(mainRedNotices(w.ledger).size).toBe(0);
+		const body = trainMergedNoticeBody(REPO, 7, false, `merged by train\n  ${"x".repeat(300)}`);
+		const artifact = body.slice(`merge train merged #7 (${REPO}, normal stakes): `.length);
+		expect(artifact).toHaveLength(160);
+		expect(artifact).toBe(`merged by train ${"x".repeat(143)}…`);
 	});
 });
 
