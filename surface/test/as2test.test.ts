@@ -1101,7 +1101,7 @@ const callFields = ${callFields.toString()};
 const r3GetterCall = ${r3GetterCall.toString()};
 const byteGetterCall = ${byteGetterCall.toString()};
 const log = (o) => appendFileSync("../qual.jsonl", JSON.stringify(o) + "\\n");
-const idle = (ms = 1_000) => Bun.sleep(ms);
+const idle = (ms = 2_000) => Bun.sleep(ms);
 // A real hot computation on the real clock: the detector samples this process's CPU over real 250 ms ticks, so no fake time.
 const spin = (ms) => {
 	const end = Date.now() + ms;
@@ -1202,7 +1202,7 @@ test("qualifies", async () => {
 		alive = false;
 	}
 	log({ name: "inherit", command: null, start, end, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
-}, 120_000);
+}, 240_000);
 `;
 
 describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)", () => {
@@ -1213,7 +1213,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 			"setup.ts": "(globalThis as Record<string, unknown>).__fixturePreload = 1;\n",
 			"qual.test.ts": QUAL_TEST,
 			"a.test.ts": OK_TEST,
-		}, { fullCapMin: 2, soloCapMin: 2, fullWorkers: 2, stuckStop: "enforce" });
+		}, { fullCapMin: 5, soloCapMin: 5, fullWorkers: 2, stuckStop: "enforce" });
 		const r = call(b, { sub: "full", runId: "tr-sq1" });
 		const work = workOf(b, "tr-sq1");
 		expect(r.stderr).toBe("");
@@ -1232,7 +1232,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const ticks = (from: number, to: number) => trace.filter((t) => t.at > from && t.at < to);
 		const phases = rows.filter((x) => typeof x.start === "number");
 		for (const [i, p] of phases.entries()) {
-			const next = phases[i + 1]?.start ?? p.end + 1_000;
+			const next = phases[i + 1]?.start ?? p.end + 2_000;
 			const during = ticks(p.start + 300, p.end - 300);
 			if (p.command !== null) {
 				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
@@ -1244,7 +1244,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 					expect(mine(t)[0]!.since).toBeLessThanOrEqual(p.end);
 				}
 			}
-			const after = ticks(p.end + 300, Math.min(p.end + 1_000, next) - 50);
+			// Each phase idles 2 s after its call, so a loaded machine's late 250 ms ticks still land in this window.
+			const after = ticks(p.end + 300, Math.min(p.end + 2_000, next) - 50);
 			expect(after.length).toBeGreaterThanOrEqual(1);
 			for (const t of after) expect({ phase: p.name, at: t.at, markers: mine(t) }).toEqual({ phase: p.name, at: t.at, markers: [] });
 		}
@@ -1302,10 +1303,13 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		// The part's marker dir and preload are gone; the trace and nothing else of the detector's is left.
 		expect(existsSync(join(work, "stuck-markers-full"))).toBe(false);
 		expect(existsSync(join(work, "stuck-preload-full.js"))).toBe(false);
-	}, 180_000);
+	}, 360_000);
 
 	test("enforce: the spin fixture gets a signature line, stuck-stop, a signature capture, a teardown of every owned group (a group created during the capture included) and exit 125 within persist + capture + teardown + slack; capture tools, marker dir and preload are gone", async () => {
-		const b = box("stuck-enforce", DETECT);
+		// A capture budget past the default, so the held hook and a loaded machine's slow sample still leave all five sections
+		// (the cut at the budget is the stuck-cut test's).
+		const knobs = { ...DETECT, signatureCaptureMs: 10_000 };
+		const b = box("stuck-enforce", knobs);
 		prepared(b, "tr-se1", { "spin.test.ts": spinTest(true), "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
 		const work = workOf(b, "tr-se1");
 		const hook = join(b.hooks, "tr-se1.signature-capture");
@@ -1344,7 +1348,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(Date.parse(stop.iso) - Date.parse(sig.iso)).toBeGreaterThanOrEqual(DETECT.detectPersistMs - 50);
 		// The budget runs from the matching signature's first tick (PLAN § Budget).
 		const signatureToExit = exitedAt - Date.parse(sig.iso);
-		expect(signatureToExit).toBeLessThan(DETECT.detectPersistMs + STUCK_DEFAULTS.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
+		expect(signatureToExit).toBeLessThan(DETECT.detectPersistMs + knobs.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 3_000);
 		report({ fixture: "enforce", signatureToExitMs: signatureToExit, firstSignatureToExitMs: exitedAt - Date.parse(first.iso), stopToExitMs: exitedAt - Date.parse(stop.iso) });
 		// Every owned process and group is gone, with no sweep.
 		for (const pid of [leader, worker, helper, late]) expect({ pid, alive: alive(pid) }).toEqual({ pid, alive: false });
@@ -1581,16 +1585,35 @@ test("c", async () => {
 		};
 		type Done = { b: Box; work: string; exit: number | null; stdout: string; stderr: string };
 		let all: Promise<Record<string, Done>> | null = null;
-		/** Every control at once (each in its own box), started by the first test that needs them. */
+		/**
+		 * Three controls at a time (each in its own box), started by the first test that needs them: most of them spin a worker
+		 * hot for 6 s, and all at once they starved the rest of the full suite of CPU.
+		 */
+		const CONTROLS_AT_ONCE = 3;
+		/** Every test here may be the first to wait for all the controls. */
+		const CONTROL_TEST_MS = 240_000;
+		const runControl = async ([name, files]: [string, Record<string, string>], i: number): Promise<[string, Done]> => {
+			const b = box(`stuck-neg-${name}`, DETECT);
+			const runId = `tr-sn${i}`;
+			prepared(b, runId, { "a.test.ts": OK_TEST, ...files }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
+			const p = spawnCall(b, { sub: "full", runId });
+			const exit = await p.exited;
+			return [name, { b, work: workOf(b, runId), exit, stdout: await new Response(p.stdout).text(), stderr: await new Response(p.stderr).text() }];
+		};
 		const results = (): Promise<Record<string, Done>> =>
-			(all ??= Promise.all(Object.entries(fixtures).map(async ([name, files], i): Promise<[string, Done]> => {
-				const b = box(`stuck-neg-${name}`, DETECT);
-				const runId = `tr-sn${i}`;
-				prepared(b, runId, { "a.test.ts": OK_TEST, ...files }, { fullCapMin: 1, soloCapMin: 1, fullWorkers: 2, stuckStop: "enforce" });
-				const p = spawnCall(b, { sub: "full", runId });
-				const exit = await p.exited;
-				return [name, { b, work: workOf(b, runId), exit, stdout: await new Response(p.stdout).text(), stderr: await new Response(p.stderr).text() }];
-			})).then(Object.fromEntries));
+			(all ??= (async () => {
+				const entries = Object.entries(fixtures);
+				const done: [string, Done][] = [];
+				let next = 0;
+				const worker = async (): Promise<void> => {
+					while (next < entries.length) {
+						const i = next++;
+						done.push(await runControl(entries[i]!, i));
+					}
+				};
+				await Promise.all(Array.from({ length: CONTROLS_AT_ONCE }, worker));
+				return Object.fromEntries(done);
+			})());
 		/** The control ended normally, with no detector line at all; returns its trace and worker pid. */
 		async function settled(name: string): Promise<{ trace: TraceRow[]; w: number; work: string }> {
 			const d = (await results())[name]!;
@@ -1617,24 +1640,24 @@ test("c", async () => {
 			const { trace, w } = await settled("zombie-no-marker");
 			expect(zombieOf(trace, w)).toBe(true);
 			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("a real Bun.spawnSync(['/usr/bin/true']) that returns, then an async /usr/bin/true born at once and a 6 s sync loop: the marker is inactive", async () => {
 			const { trace, w } = await settled("returned-call-then-zombie");
 			expect(zombieOf(trace, w)).toBe(true);
 			expect(trace.filter((t) => t.zombies.length > 0).every((t) => activeAt(t).length === 0)).toBe(true);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("the same with the marker file made immutable before the first call: no marker ever becomes active", async () => {
 			const { trace, w } = await settled("immutable-marker");
 			expect(zombieOf(trace, w)).toBe(true);
 			expect(trace.every((t) => activeAt(t).length === 0)).toBe(true);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("Bun.spawnSync(['/usr/bin/true', <getter>]) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished, so the hot worker's zombie never meets a marker", async () => {
 			const { trace, w } = await settled("argv-getter");
 			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		for (const shape of ["proto-cwd", "env-array"] as const) {
 			const what = shape === "proto-cwd" ? "Bun.spawnSync(['/usr/bin/true'], {}) beside an Object.prototype cwd getter" : "Bun.spawnSync(['/usr/bin/true'], { env: <array with an enumerable named getter> })";
@@ -1647,7 +1670,7 @@ test("c", async () => {
 				// bun 1.3.14 runs the env array's getter; it stops its option lookups before Object.prototype, so the inherited
 				// getter runs only if a later bun reads it, and then it must meet no marker either.
 				expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(out.hits > 0 ? MEANINGFUL_SPAN_MS : 0);
-			}, 90_000);
+			}, CONTROL_TEST_MS);
 		}
 
 		test("Bun.spawnSync(['/usr/bin/true'], { stdin: <Buffer with an own Symbol.asyncIterator getter> }) whose getter starts an async /usr/bin/true and computes past the persistence: the call runs unpublished and does what it does unwrapped, so the hot worker's zombie never meets a marker", async () => {
@@ -1660,30 +1683,30 @@ test("c", async () => {
 			const zombieTicks = trace.filter((t) => t.zombies.some((z) => z.ppid === w && z.comm === "true"));
 			expect(unmarkedZombieSpanMs(trace, w)).toBeGreaterThanOrEqual(MEANINGFUL_SPAN_MS);
 			expect(zombieTicks.filter((t) => activeAt(t).some((m) => m.pid === w))).toEqual([]);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("a long async test", async () => {
 			const { trace, w } = await settled("long-async");
 			expect(trace.some((t) => t.tree.some((p) => p.pid === w))).toBe(true);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("a real Bun.spawnSync(['/bin/sleep', '3']): the marker is active with a live child, and the worker is not hot", async () => {
 			const { trace, w } = await settled("sync-sleep");
 			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "sleep") && t.tree.some((p) => p.ppid === w && p.comm === "sleep"))).toBe(true);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("another worker printing continuously beside an idle one", async () => {
 			const { trace, w, work } = await settled("printer-beside-idle");
 			const idle = fixturePid(work, "idle.pid");
 			expect(idle).not.toBe(w);
 			expect(trace.some((t) => t.tree.some((p) => p.pid === w) && t.tree.some((p) => p.pid === idle))).toBe(true);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 
 		test("a zombie whose parent is a sleeping fixture process, beside a hot worker holding a marker", async () => {
 			const { trace, w } = await settled("zombie-of-a-sleeper");
 			expect(trace.some((t) => activeAt(t).some((m) => m.pid === w && m.command === "true") && t.zombies.some((z) => z.comm === "true" && z.ppid !== w))).toBe(true);
 			expect(zombieOf(trace, w)).toBe(false);
-		}, 90_000);
+		}, CONTROL_TEST_MS);
 	});
 });
 
