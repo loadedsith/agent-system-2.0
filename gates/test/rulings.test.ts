@@ -4,7 +4,9 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Ledger } from "../../ledger/src/index";
-import { askJo, checkRulings, endedRulings, questionKind, type Ruling, type RulingFacts, type RulingId, STANDING_RULINGS, subjectProblem } from "../src/rulings";
+import {
+	askJo, checkRulings, endedRulings, questionKind, type Ruling, type RulingFacts, type RulingId, STANDING_RULINGS, subjectProblem, type TrainSignoffFact, trainSignoffAction,
+} from "../src/rulings";
 import { raiseOrchestratorQuestion } from "../../surface/src/orchestrator-question";
 import { ESCALATION_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../../surface/src/types";
 import { tmp } from "./helpers";
@@ -180,6 +182,51 @@ describe("endedRulings: only Jo's word through the surface, for a ruling held he
 		expect([...endedRulings(l.instructions(STANDING_WORKLOAD_ID))]).toEqual([]);
 		endRuling(l, "merges");
 		expect([...endedRulings(l.instructions(STANDING_WORKLOAD_ID))]).toEqual(["merges"]);
+	});
+});
+
+describe("train-signoff (PLAN wl-mvg8itbt0rz3ls D1; R3, R4): Jo's train word on a production PR is his merge sign-off", () => {
+	const MERGE = ["merged", "skip", "stop"];
+	const HEAD = "c".repeat(40);
+	const OK: TrainSignoffFact = { ok: true, pr: 267, slice: "sl-train-mvg46wxgwnsw00-267", repo: "thewolff/agent-system-2.0", head: HEAD, run: "tr-0abc1234" };
+	const trainLane = (over: Partial<RulingFacts> = {}) => lane({ train: true, trainSignoff: OK, ...over });
+
+	test("decides only a lane's merge question on a train whose fact is ok", () => {
+		expect(check(MERGE, trainLane())).toMatchObject({ ruling: "train-signoff", answer: "merge" });
+		expect(check(MERGE, trainLane({ trainSignoff: { ok: false, reason: "no green at its head" } }))).toBeNull();
+		expect(check(MERGE, trainLane({ trainSignoff: undefined }))).toBeNull();
+		// no train: never train-signoff (a normal-stakes lane's merge question is the merges ruling's)
+		expect(check(MERGE, trainLane({ train: false }))?.ruling).toBe("merges");
+		expect(check(MERGE, trainLane({ train: false, stakes: "production" }))).toBeNull();
+		expect(check(MERGE, trainLane({ train: undefined, stakes: "production" }))).toBeNull();
+		for (const asker of ["orchestrator", "classifier", "train"] as const) expect(check(MERGE, { asker, train: true, trainSignoff: OK })).toBeNull();
+		// a train's other questions are never merge questions
+		expect(check(["retry", "skip", "stop"], trainLane())).toBeNull();
+		expect(check(MERGE, trainLane(), { ended: ["train-signoff"] })).toBeNull();
+	});
+
+	test("the action is step 7 c. to e.: a merge commit at the verified head, verify, record; the command carries none of --admin, --squash, --rebase or --auto", () => {
+		const action = check(MERGE, trainLane())!.action;
+		expect(action).toBe(trainSignoffAction(OK));
+		const merge = /`(gh pr merge [^`]*)`/.exec(action)?.[1];
+		expect(merge).toBe(`gh pr merge 267 -R thewolff/agent-system-2.0 --merge --match-head-commit ${HEAD}`);
+		for (const flag of ["--admin", "--squash", "--rebase", "--auto"]) expect(merge).not.toContain(flag);
+		expect(action).toContain("gh pr view 267 -R thewolff/agent-system-2.0 --json state,mergeCommit");
+		expect(action).toContain("train-error: pr 267 merge-refused");
+		expect(action).toContain("complete sl-train-mvg46wxgwnsw00-267 with artifact `merged by train <merge commit sha> (run tr-0abc1234)`");
+	});
+
+	test("askJo records ruling-applied: train-signoff with no question row; after Jo's end-ruling train-signoff the same question is raised", () => {
+		const { l, wl, sl } = ledger();
+		const ask = () => askJo(l, { by: "lane-a", workloadId: wl, sliceId: sl, body: "Merge #267?", options: MERGE }, { ...trainLane(), now: IN_WINDOW });
+		expect(ask()).toMatchObject({ decided: { ruling: "train-signoff", answer: "merge" } });
+		expect(l.questions(wl)).toEqual([]);
+		expect(l.entries(wl).map((e) => e.body)).toEqual([`ruling-applied: train-signoff kind merge slice ${sl} answer merge`]);
+		endRuling(l, "train-signoff");
+		expect([...endedRulings(l.instructions(STANDING_WORKLOAD_ID))]).toEqual(["train-signoff"]);
+		const r = ask();
+		expect("raised" in r).toBe(true);
+		expect(l.questions(wl).map((q) => q.state)).toEqual(["open"]);
 	});
 });
 
