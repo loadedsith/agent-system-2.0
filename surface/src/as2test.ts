@@ -44,6 +44,8 @@ export const UID_SWEEP = `/usr/bin/pkill -U ${AS2TEST_USER}`;
 /** The sweep's SIGTERM → SIGKILL grace and its wait for `locks/sweep.db` (§ 2.3 steps 1 and 3). */
 export const KILL_GRACE_MS = 10_000;
 export const SWEEP_LOCK_WAIT_MS = 60_000;
+/** The stuck capture's one deadline at a part's cap, before its group is killed (PLAN wl-mvq4edh02r5z40 D5). */
+export const CAPTURE_MS = 20_000;
 
 export type SweepScope = "uid" | "groups";
 
@@ -62,6 +64,8 @@ export interface ExecWrapperOptions {
 	killGraceMs?: number;
 	/** Test-only, `groups` renders only: the most a sweep waits for `locks/sweep.db` (default 60 s). */
 	sweepLockWaitMs?: number;
+	/** Test-only, `groups` renders only: the stuck capture's deadline at a part's cap (default 20 s). */
+	captureMs?: number;
 }
 
 /** What the wrapper hands test-exec in `AS2TEST_EXEC_CONFIG`; test-exec validates it again. */
@@ -73,6 +77,7 @@ export interface ExecConfig {
 	hooks: string | null;
 	killGraceMs: number;
 	sweepLockWaitMs: number;
+	captureMs: number;
 }
 
 export class WrapperRenderError extends Error {}
@@ -86,8 +91,8 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 		if (typeof v !== "string" || !plainAbs(v)) throw new WrapperRenderError(`${k} must be a normalized absolute path: ${String(v)}`);
 	}
 	if (o.sweepScope !== "uid" && o.sweepScope !== "groups") throw new WrapperRenderError(`sweepScope must be uid or groups: ${String(o.sweepScope)}`);
-	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined;
-	if (testOnly && o.sweepScope !== "groups") throw new WrapperRenderError("hooks, killGraceMs and sweepLockWaitMs are test-only: a uid render carries none");
+	const testOnly = o.hooks !== undefined || o.killGraceMs !== undefined || o.sweepLockWaitMs !== undefined || o.captureMs !== undefined;
+	if (testOnly && o.sweepScope !== "groups") throw new WrapperRenderError("hooks, killGraceMs, sweepLockWaitMs and captureMs are test-only: a uid render carries none");
 	if (o.hooks !== undefined && !plainAbs(o.hooks)) throw new WrapperRenderError(`hooks must be a normalized absolute path: ${o.hooks}`);
 	const ms = (v: number | undefined, d: number, k: string): number => {
 		if (v === undefined) return d;
@@ -97,14 +102,16 @@ export function execConfigOf(o: ExecWrapperOptions): ExecConfig {
 	return {
 		root: o.root, bun: o.bun, sweep: o.sweepScope === "uid" ? UID_SWEEP : "groups", hooks: o.hooks ?? null,
 		killGraceMs: ms(o.killGraceMs, KILL_GRACE_MS, "killGraceMs"), sweepLockWaitMs: ms(o.sweepLockWaitMs, SWEEP_LOCK_WAIT_MS, "sweepLockWaitMs"),
+		captureMs: ms(o.captureMs, CAPTURE_MS, "captureMs"),
 	};
 }
 
 /**
  * The `exec` wrapper's sh text (§ 2.3 step 3). It checks the run id against `^tr-[a-z0-9]+$`, the
  * subcommand and its exact arity, then replaces itself with test-exec under `env -i` and a fixed
- * env: PATH, LANG, TERM, SHELL, USER and LOGNAME (from `id -un`, not the caller), and the config.
- * test-exec checks everything again, fences on `<root>/stage/current`, and resolves every path.
+ * env: PATH, LANG, TERM, SHELL, USER and LOGNAME (from `id -un`, not the caller), the config, and
+ * an existing private `runs/<id>/.wrapper-tmp` TMPDIR before Bun starts. Bootstrap validates argv,
+ * fences on `<root>/stage/current`, and rejects symlinked areas/run/temp paths before creating anything.
  */
 export function renderExecWrapper(o: ExecWrapperOptions): string {
 	const config = execConfigOf(o);
@@ -122,13 +129,59 @@ export function renderExecWrapper(o: ExecWrapperOptions): string {
 		'[ "$#" -ge 2 ] || refuse "usage: exec <subcommand> <run id> [operand...]"',
 		`case "$2" in tr-|tr-*[!${alnum}]*) refuse "run id must match ^tr-[a-z0-9]+\\$" ;; tr-*) ;; *) refuse "run id must match ^tr-[a-z0-9]+\\$" ;; esac`,
 		'case "$1" in',
-		'\tfull|base-full|sweep) [ "$#" -eq 2 ] || refuse "$1 takes exactly <run id>" ;;',
+		'\tfull|sweep) [ "$#" -eq 2 ] || refuse "$1 takes exactly <run id>" ;;',
 		'\tprepare|solo|base-prepare|base-solo|cleanup) [ "$#" -eq 3 ] || refuse "$1 takes exactly <run id> and one operand" ;;',
 		'\tprobe) [ "$#" -ge 3 ] || refuse "probe takes <run id> and one or more paths" ;;',
 		'\t*) refuse "unknown subcommand" ;;',
 		"esac",
+		// Reject malformed operands before bootstrap has any filesystem side effect.
+		'case "$1" in',
+		'\tprepare|base-prepare) [ "${#3}" -eq 40 ] || refuse "not a full sha"; case "$3" in *[!0123456789abcdef]*) refuse "not a full sha" ;; esac ;;',
+		`\tcleanup) case "$3" in tr-|tr-*[!${alnum}]*) refuse "old run id is malformed" ;; tr-*) ;; *) refuse "old run id is malformed" ;; esac; [ "$3" != "$2" ] || refuse "cleanup never deletes its own run" ;;`,
+		'\tsolo|base-solo) case "$3" in ./*) ;; *) refuse "test must be ./<relative path>" ;; esac',
+		'\t\trel=${3#./}; case "/$rel/" in *//*|*"/../"*|*"/./"*) refuse "test is not a plain relative path" ;; esac',
+		'\t\tcase "${rel##*/}" in *[._]test.ts|*[._]test.tsx|*[._]test.js|*[._]test.jsx|*[._]test.mjs|*[._]test.cjs|*[._]test.mts|*[._]test.cts|*[._]spec.ts|*[._]spec.tsx|*[._]spec.js|*[._]spec.jsx|*[._]spec.mjs|*[._]spec.cjs|*[._]spec.mts|*[._]spec.cts) ;; *) refuse "not a Bun test file name" ;; esac ;;',
+		'\tprobe) n=0; for p do n=$((n + 1)); [ "$n" -gt 2 ] || continue; case "$p" in /*) ;; *) refuse "probe takes absolute paths" ;; esac; done ;;',
+		"esac",
+		// Resolve only the fixed root. Everything below it must be a plain, physical directory.
+		`root=$(CDPATH= cd -P ${shq(config.root)} && pwd -P) || refuse "root is missing"`,
+		'plain_dir() { [ -d "$1" ] && [ ! -L "$1" ] && [ "$(CDPATH= cd -P "$1" && pwd -P)" = "$1" ]; }',
+		'for area in stage runs locks; do plain_dir "$root/$area" || refuse "$root/$area is not a plain directory"; done',
+		'current=$(/bin/cat "$root/stage/current" 2>/dev/null) || current=',
+		// Match test-exec's trim(), including current files published with trailing newlines.
+		'current=${current#"${current%%[![:space:]]*}"}; current=${current%"${current##*[![:space:]]}"}',
+		`[ "$current" = "$2" ] || { printf 'as2test: fenced: current does not name %s\\n' "$2" >&2; exit ${WRAPPER_EXIT.fenced}; }`,
+		'case "$1" in prepare|base-prepare)',
+		'\tstage_run="$root/stage/$2"; bundle="$stage_run/repo.bundle"',
+		`\t[ -e "$bundle" ] || { printf 'as2test: failed: bundle is missing\\n' >&2; exit ${WRAPPER_EXIT.failed}; }`,
+		'\tplain_dir "$stage_run" && [ -f "$bundle" ] && [ ! -L "$bundle" ] || refuse "bundle is not a plain staged file" ;;',
+		'esac',
+		'work="$root/runs/$2"',
+		'tmp="$work/.wrapper-tmp"',
+		'if [ "$1" = cleanup ]; then',
+		'\told="$root/runs/$3"',
+		'\tif [ -e "$old" ] || [ -L "$old" ]; then plain_dir "$old" || refuse "$old is not a real directory"; fi',
+		'fi',
+		'if [ -e "$work" ] || [ -L "$work" ]; then',
+		'\tplain_dir "$work" && [ -O "$work" ] || refuse "$work is not an owned plain directory"',
+		'\tif [ "$1" = prepare ]; then',
+		'\t\tplain_dir "$tmp" || refuse "$work already exists"',
+		'\t\tfor p in "$work"/* "$work"/.[!.]* "$work"/..?*; do',
+		'\t\t\t[ -e "$p" ] || [ -L "$p" ] || continue',
+		'\t\t\t[ "$p" = "$tmp" ] || refuse "$work already exists"',
+		'\t\tdone',
+		'\tfi',
+		'else',
+		'\tcase "$1" in full|solo|base-prepare|base-solo) refuse "$work does not exist (prepare first)" ;; esac',
+		'\t(umask 077; /bin/mkdir "$work") || refuse "cannot create $work"',
+		'fi',
+		'if [ -e "$tmp" ] || [ -L "$tmp" ]; then',
+		'\tplain_dir "$tmp" && [ -O "$tmp" ] && [ "$(/usr/bin/find "$tmp" -prune -type d -perm 0700)" = "$tmp" ] || refuse "$tmp is not an owned private plain directory"',
+		'else',
+		'\t(umask 077; /bin/mkdir "$tmp") || refuse "cannot create $tmp"',
+		'fi',
 		"me=$(/usr/bin/id -un) || refuse \"no user name\"",
-		`exec /usr/bin/env -i PATH=${WRAPPER_PATH} LANG=en_US.UTF-8 TERM=dumb SHELL=/bin/sh USER="$me" LOGNAME="$me" \\`,
+		`exec /usr/bin/env -i PATH=${WRAPPER_PATH} LANG=en_US.UTF-8 TERM=dumb SHELL=/bin/sh USER="$me" LOGNAME="$me" TMPDIR="$tmp" \\`,
 		`\tAS2TEST_EXEC_CONFIG=${shq(JSON.stringify(config))} \\`,
 		`\t${shq(o.bun)} ${shq(o.script)} "$@"`,
 		"",

@@ -67,6 +67,8 @@ Your workload's ledger is written only through these tools, never a CLI: `ledger
 
 Jo's standing rulings are checked before any question you raise (SPEC-2.0.md § B3, *Amended 2026-10-19*). When one already answers it, `lane_raise_question` writes no question and returns `decided by Jo's ruling <id>: <action>`; do what the action says, and publish no QUESTION block. A notice is something Jo is told and does not answer (a ceiling at 80 %, a ceiling stop, a plan that started on its own); only the machinery sends one. Your first prompt names the workload's ceiling: at 80 % Jo gets a notice, and at 100 % an autonomous lane is stopped and Jo is told, with no question to you or to Jo. A lane Jo runs by hand is never stopped at the ceiling; it gets its spend figure at every turn start.
 
+Pass `now` to `lane_raise_question` (`integrity`, `security`, `incident`, `guard`, `boundary`, `irreversible` or `money`) only when Jo must hear it at once: a credible data-integrity or security risk or an urgent incident, a change that weakens a guard or crosses a boundary Jo stated, or an irreversible effect or money commitment the plan does not authorize (SPEC-2.0.md § B3, *Amended 2026-10-20*). It skips the rulings and auto-start and reaches Jo on fire. Asking an open question again returns its id and raises nothing. Ask Jo before you change a failing test under `gates/test/`: those are the security tests.
+
 Any order of workloads, PRs or next steps you give Jo or act on comes from `as2_rank`, never your own judgment; Jo's "X first", unpins and goals are the orchestrator's to record.
 
 ## Git shape and completion (decision 11)
@@ -77,3 +79,15 @@ The full `bun test` runs outside your fence on the test runner (MIGRATION.md ite
 
 A migration item, when a brief or plan calls for one, is a new file `migration/items/<slug>.md` whose front matter is `title`, `status`, `workload` and `pr`, in that order, with no `number:`. Never add or renumber a line in MIGRATION.md for a new item: the number arrives after the pull request merges. Cite the item by its path, never by a number you cannot know yet, and make later `status:` or `pr:` changes in the item file.
 
+
+## Fault tolerance
+
+Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md`) apply to your code, your runs and the slices you dispatch.
+
+- **Fail loudly.** No swallowed error: no empty `catch`, no silent default. A hand's failure reaches the ledger, and a fallback announces itself.
+- **Fail obviously.** Every error you write or report names what broke, where (file or command), the evidence, and the next step, or says none is known.
+- **Recover by restart.** Re-dispatching a slice is safe to repeat; durable state is the ledger, and the rest is rebuilt from it.
+- **Bound every retry.** Retry in one layer only, with a limit, then escalate to the next layer up or a `question` row; no retry inside a retry.
+- **Silence is a failure.** Long work has a deadline that tracks progress; a hung hand, a job that never started, or a dead watcher is an error you report.
+- **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
+- **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.

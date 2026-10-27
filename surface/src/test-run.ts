@@ -7,7 +7,7 @@
 //
 // What lives here:
 // - the bodies of `test-requested:`, `test-run:`, `push-dest:` (control entries, launch.ts WRITERS)
-//   and `test-run-failed:` (a pushed signal to the orchestrator), each formatted and parsed exactly;
+//   and `test-run-failed:` and `security-red:` (pushed signals to the orchestrator), each formatted and parsed exactly;
 // - the profile's `testRunner:` block and the origin → `owner/repo` mapping every `gh -R` names;
 // - the junit report (Bun's `--reporter=junit`) and the console log beside it, read into a part result;
 // - the changed-test-file filter on Bun's discovery names;
@@ -42,8 +42,10 @@ export const DECISION_LOG_DIR = ".ai/decision-log/";
 export const RUNS_ROOT_ENV = "AGENT_SYSTEM_TEST_RUNS";
 
 /**
- * `red-main` (PLAN wl-mv8s8srodefytc rev 17.1 D8): every failing test of every part also fails in base's run of the same
- * part (origin/main at the sha the trusted phase fetched), so the PR adds no failure; it settles like `green`.
+ * `red-main` (PLAN wl-mv8s8srodefytc rev 17.1 D8; PLAN wl-mvq4edh02r5z40 D3): every PR part reported cleanly, no failure is in a
+ * security test, every failure of the full part fails again in that file's solo part, and every failure of every failing solo part
+ * also fails in base's solo run of the same file (origin/main at the sha the trusted phase fetched), so the PR adds no failure; it
+ * settles like `green`.
  */
 export type TestVerdict = "green" | "red-main" | "red" | "stale" | "error" | "superseded";
 export const TEST_VERDICTS: readonly TestVerdict[] = ["green", "red-main", "red", "stale", "error", "superseded"];
@@ -84,11 +86,11 @@ export interface TestRunnerConfig {
 	soloCapMin: number;
 	reportCapMb: number;
 	queueMaxMin: number;
-	/** Workers for the PR's full part (`bun test --parallel=<n>` when over 1, written into caps.json); base reruns stay serial. */
+	/** Workers for the PR's full part (`bun test --parallel=<n>` when over 1, written into caps.json); base runs are single files. */
 	fullWorkers: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 1 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -228,8 +230,9 @@ export interface Failure {
 	firstError: string;
 }
 /**
- * One part compared with base's run of the same part (D8): the part (`full` or the solo `./<path>`), the names failing on the
- * PR, the names failing on base (null when base's part errored, as a solo file base lacks does), and base's error.
+ * One file compared with base's run of the same file alone (D8): the part (the solo `./<path>`; a record written before
+ * PLAN wl-mvq4edh02r5z40 may name `full`), the names failing on the PR, the names failing on base (null when base's part
+ * errored, as a solo file base lacks does), and base's error.
  */
 export interface BasePart {
 	part: string;
@@ -410,6 +413,76 @@ export function testRunFailedOf(workloadId: string, slice: string, run: TestRun)
 	return { workloadId, slice, verdict: run.verdict, sha: run.sha, failing: Math.max(counted, run.failures.length), first: run.failures[0]?.name ?? null };
 }
 
+// ---- bodies: security-red: (a pushed signal, PLAN wl-mvg1vs0rhnu3gg § 3.3) ---------------------------
+
+/** The security tests: as2 has no auth, so its security tests are the gate tests (P-11 rows, fence, reserved actions). */
+export const SECURITY_TEST_PATHS: readonly string[] = ["gates/test/"];
+/** Body prefix of the runner's message to the orchestrator for a run with a failing security test. */
+export const SECURITY_RED_PREFIX = "security-red:";
+
+export interface SecurityRed {
+	workloadId: string;
+	slice: string;
+	runId: string;
+	sha: string;
+	/** The run's failures under a security path, a test failing in two parts counted in each. */
+	failing: number;
+	/** The first such failure's name, folded to one line. */
+	first: string;
+}
+
+/** A path repo-relative: a leading `./` (a solo part's argument) dropped, so it compares with Bun's junit `file` attribute. */
+const repoRel = (path: string): string => path.replace(/^\.\//, "");
+/** The file part of a failure's `file > describe > name` (Bun 1.3.14's junit `file` attribute: repo-relative, no `./`). */
+const fileOfName = (name: string): string => name.split(" > ")[0]!;
+
+/** A security test's path (PLAN wl-mvq4edh02r5z40 D0): the path, repo-relative with any `./` dropped, starts with an entry of SECURITY_TEST_PATHS. */
+export function isSecurityPath(path: string): boolean {
+	const rel = repoRel(path);
+	return SECURITY_TEST_PATHS.some((p) => rel.startsWith(p));
+}
+
+/** A failure is in a security test when its part (a solo `./<path>`) or the file part of its name is a security path (`isSecurityPath`). */
+const isSecurityFailure = (f: { part: string; name: string }): boolean => isSecurityPath(f.part) || isSecurityPath(fileOfName(f.name));
+
+/**
+ * The run's failures in a security test (`isSecurityPath` over the part or the name's file part), in run order. Every verdict
+ * but `superseded` counts, `red-main` included: main failing the same test does not make a broken gate safe.
+ */
+export function securityFailuresOf(run: TestRun): Failure[] {
+	if (run.verdict === "superseded") return [];
+	return run.failures.filter(isSecurityFailure);
+}
+
+/** `security-red: <wl> <slice> <run id> <sha> <n> <first name>`; the name is folded to one line. */
+export function securityRedBody(s: SecurityRed): string {
+	need(/^wl-\S+$/.test(s.workloadId), `${s.workloadId} is not a workload id`);
+	need(/^sl-\S+$/.test(s.slice), `${s.slice} is not a slice id`);
+	need(isRunId(s.runId), `${s.runId} is not a run id`);
+	need(isSha(s.sha), `${s.sha} is not a full sha`);
+	need(nat(s.failing) && s.failing > 0, `${s.failing} is not a positive count`);
+	const first = s.first.replace(/\s+/g, " ").trim();
+	need(first !== "", "the first failure has no name");
+	return `${SECURITY_RED_PREFIX} ${s.workloadId} ${s.slice} ${s.runId} ${s.sha} ${s.failing} ${first}`;
+}
+
+const SECURITY_RED_RE = /^security-red: (wl-\S+) (sl-\S+) (tr-[a-z0-9]+) ([0-9a-f]{40}) ([1-9]\d*) (\S.*)$/;
+
+export function parseSecurityRed(body: string): SecurityRed | null {
+	const m = SECURITY_RED_RE.exec(body.trim());
+	if (!m) return null;
+	const failing = Number(m[5]);
+	if (!nat(failing)) return null;
+	return { workloadId: m[1]!, slice: m[2]!, runId: m[3]!, sha: m[4]!, failing, first: m[6]! };
+}
+
+/** The signal for a finished run with a failing security test (`securityFailuresOf`), or null when it has none. */
+export function securityRedOf(workloadId: string, slice: string, run: TestRun): SecurityRed | null {
+	const failures = securityFailuresOf(run);
+	if (failures.length === 0) return null;
+	return { workloadId, slice, runId: run.runId, sha: run.sha, failing: failures.length, first: failures[0]!.name };
+}
+
 // ---- bodies: push-dest: --------------------------------------------------------------------------
 
 export interface PushDest {
@@ -545,8 +618,14 @@ export function reservation(
 	return { ok: true, settleDead };
 }
 
-/** A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1). */
-export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">): boolean {
+/**
+ * A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1); a merge train's run
+ * (`train`: its workload has train membership, `trainPrs` non-empty) never does (jo-issues #213). The cap is not what keeps
+ * the queue moving past dead runs: a dead lock holder is replaced through `lockHolderStale` and a dead waiter ahead is pruned
+ * through `queueWaiterLive`, so a train's run only ever waits behind live work, and expiring it would send it to the back.
+ */
+export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">, train: boolean): boolean {
+	if (train) return false;
 	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
 }
 
@@ -850,6 +929,22 @@ const countAttr = (n: XmlNode, a: string, required: boolean): number | null => {
 };
 
 /**
+ * Each `<testcase>` under the report root, in report order, with its file (the case's own `file` attribute, else the outer
+ * `<testsuite>`'s `file` or `name`) and its describes (each nested `<testsuite>`'s name, outermost first).
+ */
+function eachCase(root: XmlNode, visit: (testcase: XmlNode, file: string, describes: string[]) => void): void {
+	const walk = (node: XmlNode, file: string | null, describes: string[]): void => {
+		for (const c of node.children) {
+			if (c.name === "testsuite") {
+				if (file === null) walk(c, c.attrs.file ?? c.attrs.name ?? "?", []);
+				else walk(c, file, [...describes, c.attrs.name ?? "?"]);
+			} else if (c.name === "testcase") visit(c, c.attrs.file ?? file ?? "?", describes);
+		}
+	};
+	walk(root, null, []);
+}
+
+/**
  * Bun's junit report (`bun test --reporter=junit --reporter-outfile=<file>`, measured on 1.3.14)
  * read into counts and failing tests. The counts are the `<testsuites>` attributes: tests, failures
  * (plus errors when present) and skipped (todo included); pass is what is left. A failing test is a
@@ -874,31 +969,43 @@ export function parseJunit(xml: string, opts: { maxBytes?: number } = {}): Junit
 	if (tests === null || failures === null || errors === null || skipped === null) return { ok: false, error: "junit <testsuites> counts are missing or not whole numbers" };
 	const out: JunitFailure[] = [];
 	let cases = 0;
-	const walk = (node: XmlNode, file: string | null, describes: string[]): void => {
-		for (const c of node.children) {
-			if (c.name === "testsuite") {
-				if (file === null) walk(c, c.attrs.file ?? c.attrs.name ?? "?", []);
-				else walk(c, file, [...describes, c.attrs.name ?? "?"]);
-			} else if (c.name === "testcase") {
-				cases++;
-				const f = c.children.find((x) => x.name === "failure" || x.name === "error");
-				if (!f) continue;
-				const caseFile = c.attrs.file ?? file ?? "?";
-				const name = c.attrs.name ?? "?";
-				out.push({
-					file: caseFile, describes, name, fullName: [caseFile, ...describes, name].join(" > "),
-					message: firstLine(f.attrs.message) ?? firstLine(f.text), type: f.attrs.type ?? null,
-				});
-			}
-		}
-	};
-	walk(root, null, []);
+	eachCase(root, (c, file, describes) => {
+		cases++;
+		const f = c.children.find((x) => x.name === "failure" || x.name === "error");
+		if (!f) return;
+		const name = c.attrs.name ?? "?";
+		out.push({
+			file, describes, name, fullName: [file, ...describes, name].join(" > "),
+			message: firstLine(f.attrs.message) ?? firstLine(f.text), type: f.attrs.type ?? null,
+		});
+	});
 	const fail = failures + errors;
 	const pass = tests - fail - skipped;
 	if (pass < 0) return { ok: false, error: `junit counts do not add up: ${tests} tests, ${fail} failing, ${skipped} skipped` };
 	if (cases !== tests) return { ok: false, error: `junit lists ${cases} test cases but counts ${tests}` };
 	if (out.length !== fail) return { ok: false, error: `junit lists ${out.length} failing cases but counts ${fail}` };
 	return { ok: true, tests, pass, fail, skip: skipped, failures: out };
+}
+
+/**
+ * The files a junit report ran at least one test of (PLAN wl-mvq4edh02r5z40 D1, the required coverage): each file, repo-relative
+ * with any `./` dropped, one of whose `<testcase>` elements has no `<skipped>` child (Bun 1.3.14 writes `<skipped />` for a skip
+ * and `<skipped message="TODO" />` for a todo), in report order without repeats. Read with parseJunit's walk; a report that does
+ * not parse ran nothing.
+ */
+export function executedFiles(xml: string): string[] {
+	let root: XmlNode;
+	try {
+		root = parseXml(xml);
+	} catch {
+		return [];
+	}
+	if (root.name !== "testsuites") return [];
+	const out = new Set<string>();
+	eachCase(root, (c, file) => {
+		if (!c.children.some((x) => x.name === "skipped")) out.add(repoRel(file));
+	});
+	return [...out];
 }
 
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
@@ -956,9 +1063,9 @@ export interface PartInput {
 	log: string | null;
 	exit: number | null;
 	ms: number;
-	/** The cap fired (`error timeout`). */
+	/** The cap fired: the wrapper exited 124, or the runner's outlive sweep fired on the call (`callTimedOut`). */
 	timedOut?: boolean;
-	/** The import refused the file (a symlink, not a regular file, unreadable, over the cap). */
+	/** The import refused a file (a symlink, not a regular file, unreadable, over the cap); a refused junit is also null here. */
 	importError?: string | null;
 	/** The report cap in bytes (reportCapBytes). */
 	maxBytes?: number;
@@ -968,17 +1075,19 @@ export interface PartResult extends PartCounts {
 }
 
 /**
- * One part's result (§ 2.3 step 6). A refused import, a timeout, a missing or unparsable junit, or a
- * non-zero exit with no failing test makes the part `error`; failing tests keep their names and the
- * first error line (the report's own message, else the log's line, else the failure type).
+ * One part's result (§ 2.3 step 6). A timeout, a refused import, a missing or unparsable junit, or a non-zero exit with no failing
+ * test makes the part `error`. A timeout comes first (PLAN wl-mvq4edh02r5z40 D0): its error is `timeout`, or `timeout; <the import
+ * refusal or the report's error>`. A junit that was imported and parses keeps its counts and failing tests whatever else went wrong
+ * (the log refused, a timeout); each failing test keeps its name and the first error line (the report's own message, else the
+ * log's line, else the failure type).
  */
 export function partResult(p: PartInput): PartResult {
 	const base = { exit: p.exit, ms: Math.max(0, Math.round(p.ms)) };
+	const errors = [...(p.timedOut ? ["timeout"] : []), ...(p.importError ? [`report import refused: ${p.importError}`] : [])];
 	const errored = (error: string, counts = { pass: 0, fail: 0, skip: 0 }, failures: PartResult["failures"] = []): PartResult => ({ ...counts, ...base, error, failures });
-	if (p.importError) return errored(`report import refused: ${p.importError}`);
-	if (p.junit === null) return errored(p.timedOut ? "timeout" : "junit report missing");
+	if (p.junit === null) return errored(errors.length > 0 ? errors.join("; ") : "junit report missing");
 	const report = parseJunit(p.junit, { maxBytes: p.maxBytes });
-	if (!report.ok) return errored(p.timedOut ? `timeout; ${report.error}` : report.error);
+	if (!report.ok) return errored([...errors, report.error].join("; "));
 	const fromLog = p.log === null ? new Map<string, (string | null)[]>() : logFirstErrors(p.log, [...new Set(report.failures.map((f) => f.file))]);
 	const failures = report.failures.map((f) => {
 		const queue = fromLog.get(f.fullName);
@@ -986,10 +1095,15 @@ export function partResult(p: PartInput): PartResult {
 		return { name: f.fullName, firstError: f.message ?? logged ?? `${f.type ?? "failure"} (no message in the report or the log)` };
 	});
 	const counts = { pass: report.pass, fail: report.fail, skip: report.skip };
-	if (p.timedOut) return errored("timeout", counts, failures);
+	if (errors.length > 0) return errored(errors.join("; "), counts, failures);
 	if (p.exit === null) return errored("killed before it exited", counts, failures);
 	if (p.exit !== 0 && report.fail === 0) return errored(`exit ${p.exit} with no failing test`, counts, failures);
 	return { ...counts, ...base, error: null, failures };
+}
+
+/** A wrapper call timed out (PLAN wl-mvq4edh02r5z40 D0): it exited 124, or the runner's outlive sweep fired on it, whatever its later exit. */
+export function callTimedOut(r: { code: number | null; outlived: boolean }): boolean {
+	return r.code === WRAPPER_EXIT.timeout || r.outlived;
 }
 
 // ---- verdict and settle ----------------------------------------------------------------------------
@@ -1002,6 +1116,11 @@ export interface RunFacts {
 	/** A run-level failure: clone, lock, queue, preflight, sweep; null when none. */
 	error: string | null;
 	full: PartResult | null;
+	/**
+	 * The full part's wrapper call timed out (PLAN wl-mvq4edh02r5z40 D0, `callTimedOut`): it exited 124 or the outlive sweep
+	 * fired on it, whatever its later exit, its early return or its report import. Read by soloPlan and decideRun, never an error string.
+	 */
+	fullTimedOut: boolean;
 	solo: (PartResult & { file: string })[];
 	/** The sha checked out and tested. */
 	headAtStart: string;
@@ -1012,8 +1131,8 @@ export interface RunFacts {
 	/** The slice's state read in the write transaction; null when it is gone. */
 	sliceState: SliceState | null;
 	/**
-	 * Base's runs of the failing parts (D8), keyed by part (`full` or the solo `./<path>`), at `sha` (origin/main as the trusted
-	 * phase fetched it); null when no part was rerun on base (`baseParts` named none, or the run stopped first).
+	 * Base's solo runs of the failing files (D8, PLAN wl-mvq4edh02r5z40 D3), keyed by the solo `./<path>`, at `sha` (origin/main as
+	 * the trusted phase fetched it); null when no file was rerun on base (`baseParts` named none, or the run stopped first).
 	 */
 	baseRuns: { sha: string; parts: Readonly<Record<string, PartResult>> } | null;
 }
@@ -1027,56 +1146,107 @@ export interface RunDecision {
 	settle: boolean;
 }
 
-/**
- * The parts the runner reruns on base (D8), in part order: each part with a failing test, when every part reported cleanly (no
- * part `error`, and every part without a failing test exited 0); else none, since such a run is `red` or `error` whatever base says.
- */
-export function baseParts(f: Pick<RunFacts, "full" | "solo">): string[] {
-	if (f.full === null) return [];
-	const parts: { label: string; p: PartResult }[] = [{ label: "full", p: f.full }, ...f.solo.map((s) => ({ label: s.file, p: s }))];
-	if (parts.some(({ p }) => p.error !== null || (p.fail === 0 && p.exit !== 0))) return [];
-	return parts.filter(({ p }) => p.fail > 0).map(({ label }) => label);
+/** The files of the full part's failing tests (the file part of each name), in report order without repeats. */
+function fullFailingFiles(full: PartResult): string[] {
+	return [...new Set(full.failures.map((x) => fileOfName(x.name)))];
 }
 
-/** Each failing part beside base's run of it (D8), or null when the run has no base runs. A part base never ran counts as base's error. */
+/** A failing file's solo argument `./<path>`, or null when it cannot run alone: `?`, not a Bun test file name, or not a plain relative path. */
+function soloArgOf(file: string): string | null {
+	const rel = repoRel(file);
+	if (rel.startsWith("/") || rel.split("/").some((s) => s === "" || s === "." || s === "..") || !isBunTestFile(rel)) return null;
+	return `./${rel}`;
+}
+
+/** What follows the full part (PLAN wl-mvq4edh02r5z40 D1): nothing (`stop`), or these files alone, each as its `./<path>` argument, in order. */
+export type SoloPlan = { stop: true } | { stop: false; files: string[] };
+
+/**
+ * The solo policy (PLAN wl-mvq4edh02r5z40 D1), from the full part, whether its call timed out (`RunFacts.fullTimedOut`), the
+ * changed test files (`./<path>`, changedTestFiles) and the files its junit ran a test of (executedFiles):
+ * - a timed-out full part stops the run: no solo and no base part;
+ * - an all-pass full part (no error, exit 0, no failing test) runs alone only the changed files it ran no test of;
+ * - a full part that reported failing tests cleanly (no error) runs alone each failing file that can run alone and is not a
+ *   security path, in report order (a rerun is diagnostic only and never touches a security failure);
+ * - any other full part (an error that is not a timeout) runs every changed file alone, but never a security-path file that
+ *   failed in the full part.
+ */
+export function soloPlan(p: { full: PartResult; timedOut: boolean; changed: readonly string[]; executed: readonly string[] }): SoloPlan {
+	if (p.timedOut) return { stop: true };
+	const { full } = p;
+	if (full.error === null && full.exit === 0 && full.fail === 0) {
+		const ran = new Set(p.executed.map(repoRel));
+		return { stop: false, files: p.changed.filter((c) => !ran.has(repoRel(c))) };
+	}
+	if (full.error === null && full.fail > 0) {
+		const files = fullFailingFiles(full).filter((f) => !isSecurityPath(f)).map(soloArgOf);
+		return { stop: false, files: files.filter((a): a is string => a !== null) };
+	}
+	const failingSecurity = fullFailingFiles(full).filter(isSecurityPath).map(repoRel);
+	return { stop: false, files: p.changed.filter((c) => !failingSecurity.includes(repoRel(c))) };
+}
+
+/** Every PR part reported cleanly (D3's guard): the full part ran, and every part has no error and exited 0 unless a test failed in it. */
+function cleanParts(f: Pick<RunFacts, "full" | "solo">): boolean {
+	if (f.full === null) return false;
+	return [f.full, ...f.solo].every((p) => p.error === null && (p.fail > 0 || p.exit === 0));
+}
+
+/**
+ * The files the runner reruns on base (D8, PLAN wl-mvq4edh02r5z40 D3), each its solo `./<path>`, in part order: every failing solo
+ * part that is not a security path, when every PR part reported cleanly (`cleanParts`); else none, since such a run is `red` or
+ * `error` whatever base says. The full part is never rerun on base.
+ */
+export function baseParts(f: Pick<RunFacts, "full" | "solo">): string[] {
+	if (!cleanParts(f)) return [];
+	return f.solo.filter((s) => s.fail > 0 && !isSecurityPath(s.file)).map((s) => s.file);
+}
+
+/**
+ * Each failing solo part that is not a security path beside base's solo run of the same file (D8), or null when the run has no base
+ * runs. A file base never ran counts as base's error.
+ */
 export function baseCompareFor(f: Pick<RunFacts, "full" | "solo" | "baseRuns">): BaseCompare | null {
 	if (f.baseRuns === null) return null;
 	const runs = f.baseRuns.parts;
-	const failing: { label: string; p: PartResult }[] = [...(f.full ? [{ label: "full", p: f.full }] : []), ...f.solo.map((s) => ({ label: s.file, p: s }))];
-	const parts = failing.filter(({ p }) => p.fail > 0).map(({ label, p }): BasePart => {
-		const base = Object.hasOwn(runs, label) ? runs[label]! : null;
+	const parts = f.solo.filter((s) => s.fail > 0 && !isSecurityPath(s.file)).map((s): BasePart => {
+		const base = Object.hasOwn(runs, s.file) ? runs[s.file]! : null;
 		const baseError = base === null ? "not run on base" : base.error;
-		return { part: label, failing: p.failures.map((x) => x.name), baseFailing: baseError === null ? base!.failures.map((x) => x.name) : null, baseError };
+		return { part: s.file, failing: s.failures.map((x) => x.name), baseFailing: baseError === null ? base!.failures.map((x) => x.name) : null, baseError };
 	});
 	return { sha: f.baseRuns.sha, parts };
 }
 
 /**
- * Main red (D8): every failing test of every compared part also fails in base's run of that part; a base error is never main red.
- * Failures compare as a multiset: a failure identity (`file > describe > name`, not unique when two cases share a name) that
- * fails more often on the head than on base is a failure base lacks, so the part is `red`.
+ * Every name of `failing` is in `against` as often (a multiset cover): a failure identity (`file > describe > name`, not unique when
+ * two cases share a name) that fails more often in `failing` is one `against` lacks.
  */
+function multisetCovered(failing: readonly string[], against: readonly string[]): boolean {
+	const left = new Map<string, number>();
+	for (const n of against) left.set(n, (left.get(n) ?? 0) + 1);
+	for (const n of failing) {
+		const k = left.get(n) ?? 0;
+		if (k === 0) return false;
+		left.set(n, k - 1);
+	}
+	return true;
+}
+
+/** Main red (D8): every failing test of every compared file also fails in base's run of that file (`multisetCovered`); a base error is never main red. */
 export function mainRed(c: BaseCompare): boolean {
-	const covered = (failing: readonly string[], base: readonly string[]): boolean => {
-		const left = new Map<string, number>();
-		for (const n of base) left.set(n, (left.get(n) ?? 0) + 1);
-		for (const n of failing) {
-			const k = left.get(n) ?? 0;
-			if (k === 0) return false;
-			left.set(n, k - 1);
-		}
-		return true;
-	};
-	return c.parts.length > 0 && c.parts.every((p) => p.baseFailing !== null && covered(p.failing, p.baseFailing));
+	return c.parts.length > 0 && c.parts.every((p) => p.baseFailing !== null && multisetCovered(p.failing, p.baseFailing));
 }
 
 /**
  * The verdict (§ 2.3 step 6, § 2.4) and whether to settle (§ 2.2 step 5, § 2.3 step 7), in this order:
  * a fetched head that is not the requested sha is `stale` before any test; a run-level failure is
- * `error`; a head that moved by the end is `stale` whatever the counts; any failing test in any
- * part is `red` (a solo failure with the suite green included), or `red-main` when base's runs of the failing parts
- * (`baseRuns`) fail every one of them too (`mainRed`, D8); a part that errored is `error`;
- * otherwise `green`. A run that does not own its request records `superseded` and settles nothing.
+ * `error`; a head that moved by the end is `stale` whatever the counts; a timed-out full part (`fullTimedOut`) is `error`
+ * naming the timeout, whatever failures its partial junit kept (PLAN wl-mvq4edh02r5z40 D2); any failing test in any part is
+ * `red`, or `red-main` (D3) when every PR part reported cleanly, no failure is in a security test, each full-part failure of a
+ * file fails again in that file's solo part (a multiset cover) and base's solo runs fail every failure of every failing solo
+ * part too (`mainRed`); a part that errored is `error`; otherwise `green`. A failing file that passed alone never moves the
+ * verdict: a `red` names it in its reason (`failing in the full part; passed alone: <files>`). A run that does not own its
+ * request records `superseded` and settles nothing.
  */
 export function decideRun(f: RunFacts): RunDecision {
 	const outcome = ((): { outcome: RunDecision["outcome"]; reason: string | null } => {
@@ -1090,13 +1260,25 @@ export function decideRun(f: RunFacts): RunDecision {
 		if (f.headAtStart !== f.requestedSha || f.headAtEnd !== f.headAtStart) {
 			return { outcome: "stale", reason: `the PR head moved to ${sha7(f.headAtEnd)} during the run of ${sha7(f.requestedSha)}` };
 		}
-		const parts = [f.full, ...f.solo];
-		if (parts.some((p) => p.fail > 0)) {
-			const compare = baseParts(f).length > 0 ? baseCompareFor(f) : null;
-			if (compare !== null && mainRed(compare)) return { outcome: "red-main", reason: `every failing test also fails on base ${sha7(compare.sha)}` };
-			return { outcome: "red", reason: null };
+		const full = f.full;
+		if (f.fullTimedOut) {
+			const e = full.error;
+			return { outcome: "error", reason: `full: ${e !== null && e.startsWith("timeout") ? e : ["timeout", ...(e === null ? [] : [e])].join("; ")}` };
 		}
-		const broken = [{ p: f.full, label: "full" }, ...f.solo.map((s) => ({ p: s, label: s.file }))].find(({ p }) => p.error !== null || p.exit !== 0);
+		const soloOf = (file: string) => f.solo.find((s) => repoRel(s.file) === repoRel(file));
+		if ([full, ...f.solo].some((p) => p.fail > 0)) {
+			const compare = baseParts(f).length > 0 ? baseCompareFor(f) : null;
+			const reproduced = fullFailingFiles(full).every((file) => {
+				const alone = soloOf(file);
+				return alone !== undefined && multisetCovered(full.failures.filter((x) => fileOfName(x.name) === file).map((x) => x.name), alone.failures.map((x) => x.name));
+			});
+			if (compare !== null && mainRed(compare) && reproduced && !failuresOf(full, f.solo).some(isSecurityFailure)) {
+				return { outcome: "red-main", reason: `every failing test also fails on base ${sha7(compare.sha)}` };
+			}
+			const passed = fullFailingFiles(full).map(soloOf).filter((s) => s !== undefined && s.error === null && s.exit === 0 && s.fail === 0);
+			return { outcome: "red", reason: passed.length > 0 ? `failing in the full part; passed alone: ${passed.map((s) => s!.file).join(", ")}` : null };
+		}
+		const broken = [{ p: full, label: "full" }, ...f.solo.map((s) => ({ p: s, label: s.file }))].find(({ p }) => p.error !== null || p.exit !== 0);
 		if (broken) return { outcome: "error", reason: `${broken.label}: ${broken.p.error ?? `exit ${broken.p.exit}`}` };
 		return { outcome: "green", reason: null };
 	})();
@@ -1135,14 +1317,31 @@ export function notifiesOrchestrator(verdict: TestVerdict, heldLive: boolean): b
 	return !SETTLING_VERDICTS.includes(verdict) && verdict !== "superseded" && !heldLive;
 }
 
-/** The artifact a settled slice carries (§ 2.3 step 7); a red-main names base's sha and every compared part (D8). */
+/**
+ * The artifact a settled slice carries (§ 2.3 step 7); a red-main names base's sha and every compared part (D8); a green's reason, which
+ * only a carried green has (`carriedRun`), is appended, so the slice keeps where its green came from.
+ */
 export function settleArtifact(run: TestRun): string {
 	need(SETTLING_VERDICTS.includes(run.verdict) && run.full !== null, `test-run ${run.runId} is not a green or red-main with a full part`);
 	const alone = run.solo.length === 0 ? "none" : run.solo.map((s) => `${s.file} ${s.pass}/${s.fail}`).join(", ");
 	const main = run.verdict === "red-main" && run.baseCompare
 		? `; every failure also fails on base ${run.baseCompare.sha} (${run.baseCompare.parts.map((p) => `${p.part} ${p.failing.length}`).join(", ")})`
 		: "";
-	return `test-run ${run.runId}: ${run.verdict} at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}${main}; ${run.runDir ?? "no run dir"}`;
+	const why = run.verdict === "green" && run.reason !== null ? `; ${run.reason}` : "";
+	return `test-run ${run.runId}: ${run.verdict} at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}${main}; ${run.runDir ?? "no run dir"}${why}`;
+}
+
+/**
+ * A merge train's carried green (PLAN wl-mvpwkpqobyp20w D4c): `request`, at a head H that descends from `from`'s sha S only by
+ * decision-log commits (or is S), is green with no run, reason `carried from <R> at <S> (decision-log only)`, and `from`'s counts and
+ * run dir, the reports the verdict rests on. Nothing re-read the head, so headAtEnd is null.
+ */
+export function carriedRun(request: TestRequested, from: TestRun): TestRun {
+	need(from.verdict === "green" && from.pr === request.pr, `test-run ${from.runId} is no green on PR #${request.pr} to carry`);
+	return {
+		runId: request.runId, verdict: "green", sha: request.sha, pr: request.pr, reason: `carried from ${from.runId} at ${from.sha} (decision-log only)`, headAtEnd: null,
+		base: from.base, mergeBase: from.mergeBase, full: from.full, solo: from.solo, failures: [], runDir: from.runDir, preflight: null,
+	};
 }
 
 // ---- retention -------------------------------------------------------------------------------------
@@ -1492,13 +1691,13 @@ export function stageDirOf(runId: string, root: string = AS2TEST_ROOT): string {
 }
 
 /**
- * One wrapper call. `base-prepare`, `base-full` and `base-solo` (PLAN wl-mv8s8srodefytc rev 17.1 D8) are `prepare`, `full` and
- * `solo` on base: a second clone of the same bundle under `runs/<run id>/base`, detached at base's sha (the bundle's
- * `as2-trusted-main`), run with the same argv and env, its reports `base-full.*` and `base-solo-<i>.*` beside the PR's.
+ * One wrapper call. `base-prepare` and `base-solo` (PLAN wl-mv8s8srodefytc rev 17.1 D8) are `prepare` and `solo` on base: a
+ * second clone of the same bundle under `runs/<run id>/base`, detached at base's sha (the bundle's `as2-trusted-main`), run with
+ * the same argv and env, its reports `base-solo-<i>.*` beside the PR's. Base never runs the full suite (PLAN wl-mvq4edh02r5z40 D3).
  */
 export type WrapperCall =
 	| { sub: "prepare" | "base-prepare"; runId: string; sha: string }
-	| { sub: "full" | "base-full"; runId: string }
+	| { sub: "full"; runId: string }
 	| { sub: "solo" | "base-solo"; runId: string; file: string }
 	| { sub: "sweep"; runId: string }
 	| { sub: "cleanup"; runId: string; oldRunId: string }
@@ -1514,7 +1713,6 @@ export function wrapperArgv(call: WrapperCall, exec: string = AS2TEST_EXEC): str
 			need(isSha(call.sha), `${call.sha} is not a full sha`);
 			return [...head, call.sha];
 		case "full":
-		case "base-full":
 		case "sweep":
 			return head;
 		case "solo":
@@ -1528,4 +1726,6 @@ export function wrapperArgv(call: WrapperCall, exec: string = AS2TEST_EXEC): str
 			need(call.paths.length > 0 && call.paths.every((p) => p.startsWith("/")), "probe takes one or more absolute paths");
 			return [...head, ...call.paths];
 	}
+	// A subcommand outside WrapperCall (`base-full`, gone with PLAN wl-mvq4edh02r5z40 D3, among them) is a caller bug the wrapper refuses too.
+	throw new TestRunShapeError(`${head[5]} is not a wrapper subcommand`);
 }

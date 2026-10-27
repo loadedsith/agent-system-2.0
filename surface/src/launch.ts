@@ -11,7 +11,7 @@
 // forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
 import { basename, dirname, isAbsolute, join } from "node:path";
 import {
-	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
+	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
@@ -19,6 +19,7 @@ import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
+import { consumedByReady, openTrains } from "./merge-train";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -86,18 +87,24 @@ export const CONTROL_PREFIXES = [
 	"reserved-withdrawn", "ctx-index", "released-open", "plan-question",
 	"test-requested", "test-run", "push-dest", "lane-model", "lane-headroom", "superseded", "pair-taken", "test-pr", "waive-pr", "train",
 	"train-task", "train-task-settled", "train-fix", "train-alert", "train-board", "train-board-skip", "train-notice", "train-autoboard",
+	"withdrawn",
 	"scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed",
 	"priority-signal", "priority-signal-failed", "rank-shown", "rank-goals", "rank-override", "rank-unpin", "rank-audit",
+	"queued",
+	"lane-metrics", "daily-report",
+	"now", "ruling-conflict",
 ] as const;
 export type ControlPrefix = (typeof CONTROL_PREFIXES)[number];
 
 /** Prefixes whose first token after the colon is the lane id the entry is about. */
 const LANE_SCOPED: Record<string, true> = {
 	launch: true, "launch-failed": true, "lane-started": true, "lane-ready": true, "lane-exit": true, "lane-parked": true, "lane-stop": true,
-	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "lane-headroom": true,
+	"lane-decided": true, spend: true, "ctx-index": true, "released-open": true, "lane-headroom": true, "lane-metrics": true,
 };
 /** The daily scratch sweep's `created_by` (surface/scripts/scratch-sweep.ts). */
 export const SCRATCH_SWEEP_BY = "scratch-sweep";
+/** The daily self-heal report's `created_by` (surface/scripts/daily-report.ts), on the standing workload. */
+export const DAILY_REPORT_BY = "daily-report";
 /**
  * Fixed writers per prefix (§ 5). `lane-stop`, `plan` and `done-because` are refined in `validWriter`. The
  * starter writes `lane-started:` / `lane-exit:` for the interactive lane it runs in Jo's terminal
@@ -125,10 +132,12 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `lane-decided: <laneId> <outcome>` is the runner's alone: it records an intended decision (`isIntendedOutcome`)
  * before it closes OMP's stdin, so the lane row's shutdown handler reads the end as intended through `exitClass`
  * (MIGRATION.md item 40, decision 14); a death outcome never writes one, its record is its `lane-died:` line (D5).
- * `plan-question: <question id>` is written only by `lane_raise_question`, as the lane holding the
+ * `plan-question: <question id>[ plan-sha256 <hex> verdict-sha256 <hex>]` is written only by `lane_raise_question`, as the lane holding the
  * workload, in the question's own transaction, when the question offers `approve` on the plan slice
  * while `plan: first` stands (PLAN wl-muq22rnjcfrrpc D9 part two); like `reserved-withdrawn:` its
- * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role.
+ * writer is a holder (`validWriter`), and `isPlanQuestionIn` reads it as the plan question's role. The two hashes
+ * (`planQuestionBinding`) are the plan file and the verdict file as the raise checked them: a repeat of the open question
+ * skips the plan checks only while both files still hash the same (PLAN wl-mvg1vs0rhnu3gg fix round 1, F1).
  * `test-requested:` and `test-run:` are the test runner's alone (MIGRATION.md item 24; surface/src/test-run.ts):
  * a lane asks through `lane_full_test`, never by writing either. `push-dest: <remote> <branch> <sha>` is
  * row 8's record of a push it let through, written as the lane holding the workload, so like
@@ -163,6 +172,9 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * `train-board: pr <n> workload <W> head <sha> run <tr-…|none> review <en-…|none>` on a train makes PR n a member as Jo's
  * `train:` does (`trainBindings`; `boundPrs` admits it); `train-board-skip:`, `train-notice:` and `train-autoboard: on <iso>`
  * (the cutover) are its records on the standing workload. A lane-written copy of any of them is dropped here.
+ * `withdrawn: <instruction id>` is the surface's alone: Jo's `withdraw <wl-…>` (surface/src/input.ts, PLAN wl-mv8s939084z1ts D3),
+ * on that workload, naming Jo's instruction written first in the same transaction; `withdrawnBy` reads it, the close takes it in
+ * place of a receipt (D4), and the predicate refuses every launch on it (`withdrawn`, D6).
  * The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5, gates/src/scratch.ts SCRATCH_ENTRY) are machinery's alone, so a lane cannot
  * hide its own over-cap line with a forged `scratch-under-cap:`: `scratch-over-cap:` / `scratch-under-cap:` are the lane row's
  * turn-end measure, written as the lane holding the workload (a holder, `validWriter`); `scratch-disk:` / `scratch-disk-ok:` the
@@ -170,6 +182,11 @@ export const SCRATCH_SWEEP_BY = "scratch-sweep";
  * Jev ranking's rows (PLAN wl-mv8k039gvogt8g D3, surface/src/rank.ts): `priority-signal:` / `priority-signal-failed:` (on the
  * ranked workload) and `rank-shown:` (on the standing workload) are the ranking machinery's (RANK_BY), whichever session ranked;
  * `rank-goals:`, `rank-override:`, `rank-unpin:` (Jo's words, bound to an input) and `rank-audit:` (the wake tick) are the surface's.
+ * `queued: <reason>` is the surface's alone (PLAN wl-mvbcjadqgblr7k D1): the open tool writes it in the open's transaction on an ask
+ * it puts in the intake queue; `queuedOf` reads it, and the first `launch:` attempt after it, of any cause, ends the queued state.
+ * The escalation lines (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 1.9; gates/src/rulings.ts `askJo`) are ESCALATION_BY's alone, written on the
+ * question's workload and slice in the raise's transaction: `now: <q-…> <category>` marks a question Jo hears at once (or upgrades a
+ * reused open one), and `ruling-conflict: <q-…> <ruling id> <ruling id>…` records the active rulings that disagreed on it, so it was raised.
  */
 const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	launch: [LANE_STARTER_BY],
@@ -212,6 +229,7 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"train-board-skip": [MERGE_TRAIN_BY],
 	"train-notice": [MERGE_TRAIN_BY],
 	"train-autoboard": [MERGE_TRAIN_BY],
+	withdrawn: [SURFACE_BY],
 	"scratch-over-cap": [],
 	"scratch-under-cap": [],
 	"scratch-disk": [SCRATCH_SWEEP_BY],
@@ -225,6 +243,11 @@ const WRITERS: Record<ControlPrefix, readonly string[]> = {
 	"rank-override": [SURFACE_BY],
 	"rank-unpin": [SURFACE_BY],
 	"rank-audit": [SURFACE_BY],
+	queued: [SURFACE_BY],
+	"lane-metrics": [LANE_RUNNER_BY],
+	"daily-report": [DAILY_REPORT_BY],
+	now: [ESCALATION_BY],
+	"ruling-conflict": [ESCALATION_BY],
 };
 
 export interface ControlEntry {
@@ -316,6 +339,7 @@ export type Cause =
 	| { kind: "first" }
 	| { kind: "request"; id: string }
 	| { kind: "resume"; ids: string[] }
+	| { kind: "priority"; exitId: string }
 	| { kind: "interactive" };
 
 export interface Attempt {
@@ -333,6 +357,7 @@ export function causeText(cause: Cause): string {
 		case "interactive": return "interactive";
 		case "request": return `request ${cause.id}`;
 		case "resume": return `resume ${cause.ids.join(" ")}`;
+		case "priority": return `priority ${cause.exitId}`;
 	}
 }
 
@@ -342,6 +367,7 @@ function parseCause(tokens: string[]): Cause | null {
 	if (kind === "interactive" && ids.length === 0) return { kind: "interactive" };
 	if (kind === "request" && ids.length === 1) return { kind: "request", id: ids[0]! };
 	if (kind === "resume" && ids.length >= 1) return { kind: "resume", ids };
+	if (kind === "priority" && ids.length === 1) return { kind: "priority", exitId: ids[0]! };
 	return null;
 }
 
@@ -440,10 +466,12 @@ export function instructionLine(i: InstructionRow): string {
 
 /**
  * Jev ranking's gate refusals (PLAN wl-mv8k039gvogt8g D7, surface/src/rank-launch.ts): `ranked: below <wl>` when a
- * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds. `launchable` never returns them.
+ * higher-ranked workload is launchable now, `parallel: <reason>` when the parallel rule holds, and the intake queue's
+ * `queued: position <n>` (PLAN wl-mvbcjadqgblr7k D5) when a queued workload ranked above it is launchable now.
+ * `launchable` never returns them.
  */
-export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}`;
-export type LaunchReason = "closed" | "standing" | "due" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
+export type RankRefusal = `ranked: below ${string}` | `parallel: ${string}` | `queued: position ${number}`;
+export type LaunchReason = "closed" | "standing" | "due" | "withdrawn" | "user-driven" | "held" | "awaiting-close" | "cap" | "died-not-relaunched" | RankRefusal;
 export type LaunchVerdict = { launch: true; cause: Cause } | { launch: false; reason: LaunchReason };
 
 /** A holder under a lease that is null or not yet lapsed at `now`. */
@@ -456,33 +484,58 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
  * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
  * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
- * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close).
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). `withdrawn`
+ * is Jo's standing `withdraw <wl>` (`withdrawnBy`, PLAN wl-mv8s939084z1ts D6): checked right after
+ * the closed/standing/due checks, before the user-driven return, the live holder and any
+ * `launch-requested:`, so nothing launches on a withdrawn workload and the tick sees it in either mode.
+ * `capExempt` (an open merge train, PLAN wl-mvpsrr4tr0p1xc D1) skips only the `cap` refusal, and its
+ * resolutions are consumed by D2's rule (`consumedByReady`: a ready lane's first prompt carried them),
+ * not by a `launch:` attempt naming them.
+ * A workload priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause
+ * `priority <exit id>`, after first, request and resume; any later launch attempt ends that state, so it
+ * is consumed once.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	capExempt = false, withdrawn = false,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
+	if (withdrawn) return { launch: false, reason: "withdrawn" };
 	if (w.mode !== "autonomous") return { launch: false, reason: "user-driven" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	const tried = attempts(control);
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
 	if (receipt !== null && !req) return { launch: false, reason: "awaiting-close" };
-	if (liveLanes >= cap) return { launch: false, reason: "cap" };
+	if (!capExempt && liveLanes >= cap) return { launch: false, reason: "cap" };
 	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
-	const res = resolved.filter((r) => !consumed.has(r.instructionId));
+	const res = resolved.filter((r) => (capExempt ? !consumedByReady(control, r.createdAt) : !consumed.has(r.instructionId)));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
+	const paused = priorityPausedOf(control);
+	if (paused !== null) return { launch: true, cause: { kind: "priority", exitId: paused.exitId } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
-/** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
+/** The predicate over the rows a launch decision reads (`launchRowsFor`): the surface's run and `reserveLane`'s. */
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return launchable(
+		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		rows.capExempt, withdrawnBy(rows.entries, rows.instructions) !== null,
+	);
+}
+
+/**
+ * The one way the surface reads a launch decision's rows (PLAN wl-mvpsrr4tr0p1xc D1): `Ledger.launchRows` with the open merge
+ * trains (`openTrains`) as the cap-exempt set, so a train's lane is never counted in `liveLanes` and a train's own rows say
+ * `capExempt`. The starter's reservation passes the same set to `reserveLane`, evaluated inside its transaction.
+ */
+export function launchRowsFor(ledger: Ledger, workloadId: string, cap: number): ReserveRows | null {
+	return ledger.launchRows(workloadId, cap, { capExempt: new Set(openTrains(ledger)) });
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */
@@ -491,22 +544,25 @@ export function decideLaunch(rows: ReserveRows): ReserveVerdict {
 	return v.launch ? { launch: true, cause: causeText(v.cause) } : v;
 }
 
-export type InteractiveReason = "closed" | "standing" | "due" | "autonomous" | "held";
+export type InteractiveReason = "closed" | "standing" | "due" | "withdrawn" | "autonomous" | "held";
 
 /**
  * The interactive policy (decision 8): Jo's `as2 lane <wl>` is the authority, so the cap and the
  * cause rules do not apply; refused on an autonomous workload and while any holder's lease is live.
+ * A workload Jo withdrew (`withdrawn`, PLAN wl-mv8s939084z1ts D6) is refused after the closed/standing/due
+ * checks, so no lease is taken on it by hand either.
  */
-export function interactiveVerdict(w: WorkloadRow, now: string): { launch: true } | { launch: false; reason: InteractiveReason } {
+export function interactiveVerdict(w: WorkloadRow, now: string, withdrawn = false): { launch: true } | { launch: false; reason: InteractiveReason } {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
 	if (w.brief.startsWith(DUE_PREFIX)) return { launch: false, reason: "due" };
+	if (withdrawn) return { launch: false, reason: "withdrawn" };
 	if (w.mode !== "user-driven") return { launch: false, reason: "autonomous" };
 	if (heldLive(w, now)) return { launch: false, reason: "held" };
 	return { launch: true };
 }
 export function decideInteractive(rows: ReserveRows): ReserveVerdict {
-	const v = interactiveVerdict(rows.workload, rows.now);
+	const v = interactiveVerdict(rows.workload, rows.now, withdrawnBy(rows.entries, rows.instructions) !== null);
 	return v.launch ? { launch: true, cause: "interactive" } : v;
 }
 
@@ -525,7 +581,7 @@ export function decideInteractive(rows: ReserveRows): ReserveVerdict {
 export function exitClass(control: readonly ControlEntry[], laneId: string): "intended" | "unintended" {
 	for (let i = control.length - 1; i >= 0; i--) {
 		const c = control[i]!;
-		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend" || c.prefix === "ctx-index") continue;
+		if (c.laneId !== laneId || c.prefix === "lane-started" || c.prefix === "lane-ready" || c.prefix === "spend" || c.prefix === "ctx-index" || c.prefix === "lane-metrics") continue;
 		if (c.prefix === "lane-stop" && !/^accepted\b/.test(c.rest)) continue;
 		if (c.prefix === "lane-decided") return isIntendedOutcome(c.rest) ? "intended" : "unintended";
 		if (c.prefix === "lane-parked" || c.prefix === "lane-stop") return "intended";
@@ -608,10 +664,11 @@ export function sessionOrigin(control: readonly ControlEntry[], laneId?: string)
 /**
  * The session the attempt `laneId` resumes (decisions 6, 7, 14) and the lane that recorded it: for a
  * `resume` cause, the newest session of the lane that raised the questions the consumed resolutions
- * answer; for a request, a first launch after a death, or the interactive `as2 lane <wl>`, the newest
- * session on the workload. `resumePlan` decides whether it is resumed.
+ * answer; for a request, a priority relaunch (the paused lane's own session, the newest), a first launch
+ * after a death, or the interactive `as2 lane <wl>`, the newest session on the workload. `resumePlan`
+ * decides whether it is resumed.
  */
-function resumeOrigin(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): { session: string; laneId: string } | null {
+export function resumeOrigin(control: readonly ControlEntry[], laneId: string, resolved: readonly Resolution[]): { session: string; laneId: string } | null {
 	const cause = attempts(control).find((a) => a.laneId === laneId)?.cause ?? null;
 	if (cause?.kind === "resume") {
 		const raised = new Set(resolved.filter((r) => cause.ids.includes(r.instructionId)).map((r) => r.laneId));
@@ -744,6 +801,91 @@ export function laneExit(control: readonly ControlEntry[], laneId: string): { co
 		if (c.prefix !== "lane-exit" || c.laneId !== laneId) continue;
 		const m = /^code\s+(\S+)\s+signal\s+(\S+)\s+outcome\s+(\S+)(?:\s+reason\s+(\S+))?/.exec(c.rest);
 		if (m) return { code: m[1]!, signal: m[2]!, outcome: m[3]!, reason: m[4] ?? null };
+	}
+	return null;
+}
+
+// ---- priority pause (PLAN wl-mv8wzytml878b4 D3) ---------------------------------------------------
+
+/** The stop reason of a priority pause: `priority-for-<wl>`, one token so `pendingStop` parses it. */
+export const PRIORITY_REASON_PREFIX = "priority-for-";
+
+/** The workload a `priority-for-<wl>` reason names, or null for any other reason. */
+function priorityFor(reason: string | null): string | null {
+	if (reason === null || !reason.startsWith(PRIORITY_REASON_PREFIX)) return null;
+	const wl = reason.slice(PRIORITY_REASON_PREFIX.length);
+	return wl === "" ? null : wl;
+}
+
+/** A `lane-stop:` request's rest: `requested <reason> by <who>`. */
+const STOP_REQUESTED = /^requested\s+(\S+)\s+by\s+\S+/;
+
+/** Whether some valid `launch:` attempt sits after control index `at`. */
+function attemptAfter(control: readonly ControlEntry[], at: number): boolean {
+	const ids = new Set(attempts(control).map((a) => a.entryId));
+	for (let i = at + 1; i < control.length; i++) if (ids.has(control[i]!.id)) return true;
+	return false;
+}
+
+/**
+ * The workload is priority-paused (D3): its newest `lane-exit:` has outcome `stop` and reason `priority-for-<X>`, the
+ * `lane-stop: <lane> accepted <ref>` for that lane names a valid `requested priority-for-<X>` entry, and no `launch:`
+ * attempt is newer than that exit. A death, a ceiling stop, Jo's `as2 lane stop` (`by-hand`) and a death recorded
+ * before a late acceptance (outcome not `stop`) are not; any later launch attempt, whatever its cause, ends the state.
+ */
+export function priorityPausedOf(control: readonly ControlEntry[]): { laneId: string; forWl: string; exitId: string } | null {
+	let at = -1;
+	for (let i = control.length - 1; i >= 0 && at < 0; i--) if (control[i]!.prefix === "lane-exit" && control[i]!.laneId !== null) at = i;
+	if (at < 0) return null;
+	const exit = control[at]!;
+	const laneId = exit.laneId!;
+	const m = /^code\s+\S+\s+signal\s+\S+\s+outcome\s+(\S+)(?:\s+reason\s+(\S+))?/.exec(exit.rest);
+	if (!m || m[1] !== "stop") return null;
+	const forWl = priorityFor(m[2] ?? null);
+	if (forWl === null || attemptAfter(control, at)) return null;
+	const requests = new Map<string, string>();
+	for (const c of control) {
+		if (c.prefix !== "lane-stop" || c.laneId !== laneId) continue;
+		const reason = STOP_REQUESTED.exec(c.rest)?.[1];
+		if (reason !== undefined) requests.set(c.id, reason);
+	}
+	const accepted = control.some((c) => {
+		if (c.prefix !== "lane-stop" || c.laneId !== laneId) return false;
+		const a = /^accepted\s+(\S+)/.exec(c.rest);
+		return a !== null && requests.get(a[1]!) === `${PRIORITY_REASON_PREFIX}${forWl}`;
+	});
+	return accepted ? { laneId, forWl, exitId: exit.id } : null;
+}
+
+/**
+ * The priority stop on its way (D3): the newest valid `lane-stop: <lane> requested priority-for-<X> by …` whose lane has
+ * no `lane-exit:` yet and no `launch:` attempt after it (accepted or not: the slot is still taken), or null.
+ */
+export function priorityPausingOf(control: readonly ControlEntry[]): { laneId: string; forWl: string; requestId: string } | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "lane-stop" || c.laneId === null) continue;
+		const forWl = priorityFor(STOP_REQUESTED.exec(c.rest)?.[1] ?? null);
+		if (forWl === null || laneExit(control, c.laneId) !== null || attemptAfter(control, i)) continue;
+		return { laneId: c.laneId, forWl, requestId: c.id };
+	}
+	return null;
+}
+
+/** `queued: <reason>`: the open tool's record that the ask went into the intake queue (PLAN wl-mvbcjadqgblr7k D1). */
+export function queuedBody(reason: string): string {
+	return `queued: ${oneLine(reason)}`;
+}
+
+/**
+ * The workload is in the intake queue (PLAN wl-mvbcjadqgblr7k D1): its newest valid `queued:` entry (the surface's alone,
+ * `controlEntries`) with no valid `launch:` attempt of any cause after it, or null. The first attempt ends the state.
+ */
+export function queuedOf(control: readonly ControlEntry[]): { entryId: string; reason: string; createdAt: string } | null {
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "queued") continue;
+		return attemptAfter(control, i) ? null : { entryId: c.id, reason: c.rest, createdAt: c.createdAt };
 	}
 	return null;
 }
@@ -1071,6 +1213,38 @@ export function supersededBy(entries: readonly EntryRow[], instructions: readonl
 	return null;
 }
 
+/** Jo's words for `withdraw <wl-…>` (PLAN wl-mv8s939084z1ts D3): the instruction body on the workload that `withdrawn:` names. */
+export function withdrawInstructionBody(workloadId: string): string {
+	return `withdraw ${workloadId}`;
+}
+/** `withdrawn: <instruction id>`: the surface's record on the workload, written after Jo's instruction in one transaction. */
+export function withdrawnBody(instructionId: string): string {
+	return `withdrawn: ${instructionId}`;
+}
+
+/**
+ * Jo's standing word that this workload is withdrawn (D3), or null: the newest `withdrawn: <instruction id>`
+ * the surface wrote (`controlEntries` drops every other writer) whose instruction is among `instructions`,
+ * on the entry's workload, kind `instruction`, authored by jo and written by the surface, with the body
+ * `withdraw <wl>`. Pass the workload's entries and its instructions. As with `supersededBy`, a lane cannot
+ * write either row as the surface; an entry naming any other instruction counts for nothing.
+ */
+export function withdrawnBy(entries: readonly EntryRow[], instructions: readonly InstructionRow[]): { instructionId: string } | null {
+	const control = controlEntries(entries);
+	for (let i = control.length - 1; i >= 0; i--) {
+		const c = control[i]!;
+		if (c.prefix !== "withdrawn") continue;
+		const m = /^(\S+)$/.exec(c.rest);
+		const on = entries.find((e) => e.id === c.id)?.workload_id;
+		if (!m || on === undefined) continue;
+		const ins = instructions.find((x) => x.id === m[1]);
+		if (ins && ins.workload_id === on && ins.kind === "instruction" && ins.author === "jo" && ins.created_by === SURFACE_BY && ins.body === withdrawInstructionBody(on)) {
+			return { instructionId: ins.id };
+		}
+	}
+	return null;
+}
+
 /**
  * The words Jo types to bind PRs to a workload: `test-pr` (a test run with no push), `train` (a merge train,
  * surface/src/merge-train.ts) and `waive-pr` (a merged PR the close check passes with no covering green, PLAN wl-mvfjen3q5mqi2o D3).
@@ -1306,8 +1480,33 @@ export const PLAN_AUTO_STARTED = "plan started without your approve";
 export function planAutoStartNoticeBody(wl: string, planBody: string): string {
 	return `${PLAN_AUTO_STARTED} on ${wl} (normal stakes, cross-lab review passed); it will not merge until ${HOLD_HOURS} h after your next message here; \`halt ${wl}\` stops it\n${planBody}`;
 }
-export function planQuestionBody(questionId: string): string {
-	return `plan-question: ${questionId}`;
+/**
+ * The plan file and the review verdict file a plan question was checked on, each as its sha256 in hex (PLAN wl-mvg1vs0rhnu3gg
+ * fix round 1, F1): the plan file's hash is of the bytes `planQuestionProblem` judged, the verdict file's of its bytes then.
+ */
+export interface PlanBinding {
+	plan: string;
+	verdict: string;
+}
+/** `plan-question: <id>`, with the binding's two hashes when the raise has them. */
+export function planQuestionBody(questionId: string, binding?: PlanBinding): string {
+	return binding ? `plan-question: ${questionId} plan-sha256 ${binding.plan} verdict-sha256 ${binding.verdict}` : `plan-question: ${questionId}`;
+}
+const PLAN_BINDING_RE = /^(\S+) plan-sha256 ([0-9a-f]{64}) verdict-sha256 ([0-9a-f]{64})$/;
+/** The binding a `plan-question:` entry's rest carries for `questionId`; null when it names another question or carries none. */
+export function planQuestionBinding(rest: string, questionId: string): PlanBinding | null {
+	const m = PLAN_BINDING_RE.exec(rest);
+	return m !== null && m[1] === questionId ? { plan: m[2]!, verdict: m[3]! } : null;
+}
+/**
+ * The plan file and the verdict file a plan question's body names, read as `planQuestionProblem` reads them: line 1, trimmed,
+ * and the last comma-separated field of the `review:` line, trimmed. Null when the body has no review line.
+ */
+export function planQuestionFiles(body: string): { plan: string; verdict: string } | null {
+	const lines = body.split("\n");
+	const review = lines.find((l, i) => i > 0 && /^review:/.test(l));
+	if (review === undefined) return null;
+	return { plan: lines[0]!.trim(), verdict: review.slice("review:".length).split(",").map((p) => p.trim()).at(-1) ?? "" };
 }
 export function doneBody(sentence: string): string {
 	return `done: ${oneLine(sentence)}`;

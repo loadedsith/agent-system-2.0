@@ -12,9 +12,10 @@ import { LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index"
 import { type Ceiling, ceilingBody, pairedCeilingPromptLine, pairedSpendStep, type Spend } from "../src/ceiling";
 import orchestratorSurface from "../index";
 import { errorLines } from "../src/errors";
-import { laneDir, laneStartedBody } from "../src/launch";
+import { laneDir, laneStartedBody, withdrawInstructionBody, withdrawnBody } from "../src/launch";
 import { openPromptWaits, artifactCommandBody, artifactCommands, artifactTrees } from "../src/signals";
 import { heartbeatText, settleArtifact, testRequestedBody, type TestRun, testRunBody } from "../src/test-run";
+
 import { ARTIFACT_TOOL, INSTRUCTION_POLL_MS, LANE_RELEASE_TOOL, LEASE_MS, SURFACE_BY } from "../src/types";
 import { workingTree } from "../src/wtree";
 import { ctxOf, fakePi, git, notices, tempRepo, timers, tmp } from "./helpers";
@@ -89,6 +90,33 @@ describe("lane row: claim and lease (§ B3 item 4 writer)", () => {
 		expect(ledger.workload(wl)!.holder).toBe("lane-b");
 		expect(notices.some((n) => n.includes("held by lane-b under a live lease"))).toBe(true);
 		expect(messages(ledger, wl)).toHaveLength(1);
+	});
+
+	test("a lane whose lease lapsed before Jo's `withdraw <wl>` does not renew it: start, timer and turn end leave the lapsed lease, so the close is not held off (PLAN wl-mv8s939084z1ts D6)", async () => {
+		timers.length = 0;
+		const { ledger, wl, env } = laneEnv();
+		const f = fakePi();
+		orchestratorSurface(f.pi, env);
+		const ctx = ctxOf();
+		await f.emit("session_start", { type: "session_start" }, ctx);
+		expect(ledger.workload(wl)!.holder).toBe("lane-a");
+		// The lane stalls past its lease; Jo withdraws the workload (the rows the surface's word writes).
+		const lapsed = "2026-09-01T11:00:00.000Z";
+		ledger.db.query("UPDATE workloads SET holder_lease_until = ?, rev = rev + 1 WHERE id = ?").run(lapsed, wl);
+		const ins = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: wl, body: withdrawInstructionBody(wl) });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: withdrawnBody(ins) });
+		notices.length = 0;
+		timers[0]!.fn();
+		await f.emit("agent_end", { willContinue: false }, ctx);
+		expect(ledger.workload(wl)!.holder_lease_until).toBe(lapsed);
+		expect(notices.filter((n) => n.includes(`workload ${wl} was withdrawn by Jo (instruction ${ins})`))).toHaveLength(2);
+		// A lane-written `withdrawn:` is no withdrawal: a fresh lane on another workload still claims as before.
+		const other = laneEnv({ AGENT_SYSTEM_LANE_ID: "lane-z" });
+		other.ledger.recordEntry({ by: "lane-z", workloadId: other.wl, kind: "assumption", body: withdrawnBody("in-forged") });
+		const g = fakePi();
+		orchestratorSurface(g.pi, other.env);
+		await g.emit("session_start", { type: "session_start" }, ctxOf());
+		expect(other.ledger.workload(other.wl)!.holder).toBe("lane-z");
 	});
 
 	test("session_shutdown with open work writes the lane-died row and releases the workload; with nothing open it only releases", async () => {
@@ -536,7 +564,7 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		const c = a.message.content;
 		expect(c).toStartWith(`Test run tr-0abc1234aaaa on ${l.wl}: red at ${SHA} (PR #17, slice ${l.sl}, ledger entry ${red}).`);
 		expect(c).toContain("Full suite: 40 passed, 11 failed, 2 skipped.");
-		expect(c).toContain("Changed test files alone: ./src/solo.test.ts 3 passed, 1 failed, 0 skipped.");
+		expect(c).toContain("Test files alone: ./src/solo.test.ts 3 passed, 1 failed, 0 skipped.");
 		expect(c).toContain(`Failing (10 of 12; the rest are in ${join(l.runs, "tr-0abc1234aaaa", "result.json")}):`);
 		expect(c).toContain("- [full] src/x.test.ts > header > case 1: error: expect(received).toBe(expected) #1\n");
 		expect(c).toContain("- [full] src/x.test.ts > header > case 10: error: expect(received).toBe(expected) #10");
@@ -557,7 +585,7 @@ describe("lane row: the test runner's results reach the lane as asides (PLAN wl-
 		expect(l.asides()).toHaveLength(2);
 		const g = l.asides()[1]!.message.content;
 		expect(g).toStartWith(`Test run tr-0abc1234bbbb on ${l.wl}: green at ${SHA}`);
-		expect(g).toContain("Changed test files alone: none.");
+		expect(g).toContain("Test files alone: none.");
 		expect(g).not.toContain("Failing");
 		expect(g).toContain("Result: ledger entry en-");
 		// nothing completed the slice: green, but not settled, and why

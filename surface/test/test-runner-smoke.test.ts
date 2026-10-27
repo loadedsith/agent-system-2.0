@@ -264,7 +264,8 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		expect(run.full).toMatchObject({ pass: 2, fail: 0, exit: 0 });
 		await until("the settle", () => l.w.ledger.slice(slice!)?.state === "done", 30_000);
 		expect(l.w.ledger.slice(slice!)).toMatchObject({ state: "done", changed_by: TEST_RUNNER_BY });
-		expect(l.w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: ./a.test.ts 1/0; ${join(l.w.runs, runId!)}`);
+		// PLAN wl-mvq4edh02r5z40 D1: the full part ran the changed a.test.ts, so nothing runs alone.
+		expect(l.w.ledger.slice(slice!)!.artifact).toBe(`test-run ${runId}: green at ${fx.head.green} on PR #${PR.green}; full 2/0/0; alone: none; ${join(l.w.runs, runId!)}`);
 
 		// (4) the lane row delivers exactly one aside, on the timer and on a tool result, never again
 		expect(l.asides()).toEqual([]);
@@ -276,7 +277,7 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		expect(a.options).toEqual({ deliverAs: "aside", triggerTurn: true });
 		expect(a.message.content).toStartWith(`Test run ${runId} on ${l.wl}: green at ${fx.head.green} (PR #${PR.green}, slice ${slice}, ledger entry ${run.entryId}).`);
 		expect(a.message.content).toContain("Full suite: 2 passed, 0 failed, 0 skipped.");
-		expect(a.message.content).toContain("Changed test files alone: ./a.test.ts 1 passed, 0 failed, 0 skipped.");
+		expect(a.message.content).toContain("Test files alone: none.");
 		expect(a.message.content).toContain(`The runner completed ${slice} on this green`);
 	});
 
@@ -309,7 +310,7 @@ describe("S5b: lane_full_test to the lane's aside, through the real starter and 
 		const c = l.asides()[0]!.message.content;
 		expect(c).toStartWith(`Test run ${runId} on ${l.wl}: red at ${fx.head.red} (PR #${PR.red}, slice ${slice}, ledger entry ${run.entryId}).`);
 		expect(c).toContain("Full suite: 2 passed, 1 failed, 0 skipped.");
-		expect(c).toContain("Changed test files alone: ./red.test.ts 1 passed, 1 failed, 0 skipped.");
+		expect(c).toContain("Test files alone: ./red.test.ts 1 passed, 1 failed, 0 skipped.");
 		expect(c).toContain(`Failing (2 of 2):\n- [full] ${failure.name}: ${failure.firstError}\n- [./red.test.ts] ${run.failures[1]!.name}: ${run.failures[1]!.firstError}`);
 		expect(c).toContain("kaboom: the broken thing broke");
 		expect(c).toContain(`${slice} stays open: fix, push, then call lane_full_test with pr ${PR.red} and slice ${slice} again.`);

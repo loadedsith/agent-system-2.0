@@ -185,6 +185,10 @@ skills:
 
 modelRoles:
   judge: typesafe/jev-1.13.0
+  # Jo 2026-10-26 (in-mvplvhx6h1c35s): an unnamed lane and Ilex start on Opus by setting, not by OMP's
+  # provider-default order; a lane Jo pinned with `lane-model:` passes --model and is unaffected
+  # (surface/src/launch.ts laneArgv).
+  default: anthropic/claude-opus-5-5
 retry:
   fallbackChains:
     judge: []
@@ -209,6 +213,10 @@ retry:
 # (openai-codex, moonshot) are the same tier on the other providers, approved as written by Jo
 # 2026-09-28. Standard's row 1 is anthropic/claude-sonnet-5-5 (Jo, 2026-09-29). Row 3 moved from
 # kimi-code to moonshot (Jo, in-muq3zh77r02g3k).
+# The moonshot row-3 entries are removed until Kimi is paid again (Jo, 2026-10-26,
+# in-mvplvhx6h1c35s; the Moonshot account is suspended for insufficient balance). While
+# classifier/src/lab.ts KIMI_OUT_RULE is active (ends 2026-11-01T00:00-07:00), its rowOmission treats
+# a row with no kimi entry as Kimi out. migration/items/kimi-off-tier-rows-until-paid.md restores them.
 # Every provider in a row must be in the provider → lab map in classifier/src/lab.ts: a build is
 # restricted to its lane's lab by that map, and a review is routed to labs other than the
 # builder's (SPEC-2.0.md § B4, "Amended 2026-10-01 — cross-lab review"); a review whose row names a
@@ -216,17 +224,14 @@ retry:
 task:
   agentModelOverrides:
     fast:
-      - anthropic/claude-haiku-4-5
+      - anthropic/claude-haiku-5-5
       - openai-codex/gpt-5.6-luna
-      - moonshot/kimi-k2.7-code-highspeed
     standard:
       - anthropic/claude-sonnet-5-5
       - openai-codex/gpt-6-luna
-      - moonshot/kimi-k2.5
     strong:
       - anthropic/claude-opus-5-5
       - openai-codex/gpt-6.1-sol
-      - moonshot/kimi-k2.7-code
     # deep's OpenAI entry is not used for reviews: classifier/src/lab.ts REVIEW_ROW_FROM sends a
     # deep review's OpenAI reviewer to the strong row via reviewRow (Jo, 2026-10-12,
     # in-mv5qfm8910ycjk), until the review-cost framework workload lands or Jo says otherwise. The
@@ -238,7 +243,6 @@ task:
     deep:
       - anthropic/claude-fable-5-1
       - openai-codex/gpt-6-astra
-      - moonshot/kimi-k3
   # M4: any task.* keys for the tool policy go inside this `task:` mapping (YAML allows one
   # `task:` key per file).
 
@@ -287,7 +291,7 @@ testRunner:
   fullCapMin: 20
   soloCapMin: 10
   reportCapMb: 50
-  queueMaxMin: 60
+  queueMaxMin: 1440
   # Workers for the PR's full part (workload wl-mvg2kzuvwngdmo): over 1, test-exec runs it as
   # `bun test --parallel=<n>` (an integer of 1 or more; absent means 1). Base reruns (`base-full`)
   # stay serial whatever this says. surface/scripts/test-run-waits.ts reads each run's `full workers`
@@ -327,16 +331,19 @@ observability:
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
 pairSuggest: all
 
-# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7; surface/src/rank-launch.ts readRankConfig) ──
-# `mode: show` (the default) changes no launch: the drain only logs a `rank-shadow` line beside its pick.
-# `order` starts the top-ranked launchable workload first (Jo's pins first); `parallel` adds the parallel
+# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7, wl-mv8wzytml878b4 D2; surface/src/rank-launch.ts readRankConfig) ──
+# `mode: order` (the default) starts the top-ranked launchable workload first (Jo's ruled list first, then Jev),
+# and pauses the lowest-ranked running lane for a Jo-ruled workload waiting at cap; the paused workload
+# relaunches by itself when a slot comes back to it. `show` changes no launch (the drain only logs a
+# `rank-shadow` line beside its oldest-first pick) and turns priority pause off; `parallel` adds the parallel
 # rule (different repositories only, the remaining ceilings within parallelBudgetUsd, a clear merge
-# order). Jo's launch word and `as2 lane` are never gated. Read fresh at every launch decision; a missing
-# or malformed block reads as show, which is the reversal. Set it with `as2 rank-mode show|order|parallel
-# [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget is unknown: no parallel start.
+# order) and also turns priority pause off. Jo's launch word and `as2 lane` are never gated. Read fresh at
+# every launch decision; a missing or malformed block reads as order; `show` is the reversal. Set it with
+# `as2 rank-mode show|order|parallel [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget
+# is unknown: no parallel start.
 # OMP has no registration for the key and keeps it in the raw layer.
 jevRank:
-  mode: show
+  mode: order
   parallelBudgetUsd: 0
 
 # ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
