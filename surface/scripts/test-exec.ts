@@ -9,13 +9,16 @@
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
 //   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
 //   exec base-solo <run id> ./<file>   `solo` in the base clone, to base-solo-<i>.xml/.log
+//   exec fast    <run id> ./<file>...  the given test files in one bun test call in the PR clone, junit to fast.xml, console
+//                                      to fast.log, under caps.json `fastCapMin`, with full's workers (PLAN wl-mvq4edbaf13vnk
+//                                      D4: the Mac fallback of the hosted fast check)
 //   exec sweep   <run id>              SIGTERM, then SIGKILL, to the run's processes, holding locks/sweep.db
 //   exec cleanup <run id> <old run id> delete runs/<old run id>
 //   exec probe   <run id> <path>...    whether this user can open or write each path (the preflight)
 //
 // The wrapper fixes the root, bun, the env and the sweep's reach in AS2TEST_EXEC_CONFIG; argv picks
 // only the subcommand and its operands. Every subcommand is fenced: it refuses unless
-// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and `base-solo`
+// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo`, `base-solo` and `fast`
 // otherwise pass bun's own exit through (128 + the signal number when bun died by a signal).
 //
 // At a part's cap, before its group is killed, a bounded stuck capture (process tree, `sample` per bun process, `lsof` per
@@ -646,7 +649,7 @@ function caps(a: Areas, runId: string): { path: string; v: Record<string, unknow
 	return { path, v: v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {} };
 }
 
-function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): number {
+function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin" | "fastCapMin"): number {
 	const { path, v } = caps(a, runId);
 	const n = v[key];
 	if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return refuse(`${path} has no positive ${key}`);
@@ -715,14 +718,17 @@ async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
 	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap);
 }
 
-async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
+/** A test operand's repo-relative path: `./<plain relative path>` naming a Bun test file, checked before anything is touched. */
+function testRel(file: string): string {
 	if (!file.startsWith("./")) refuse(`${file} must be ./<relative path>`);
 	const rel = file.slice(2);
 	if (rel === "" || rel.includes("\0") || rel.split("/").some((s) => s === "" || s === "." || s === "..")) refuse(`${file} is not a plain relative path`);
 	if (!isBunTestFile(rel)) refuse(`${file} is not a Bun test file name`);
-	fence(a, runId);
-	const work = workDir(a, runId);
-	const dir = sideDir(a, runId, side);
+	return rel;
+}
+
+/** `<dir>/repo`, the side's clone: its realpath, which must be the path itself (prepare first). */
+function cloneOf(dir: string): string {
 	const repo = join(dir, "repo");
 	let realRepo: string;
 	try {
@@ -731,9 +737,22 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 		return refuse(`${repo} is missing (prepare first)`);
 	}
 	if (realRepo !== repo) refuse(`${repo} is not a plain directory`);
+	return realRepo;
+}
+
+/** `file` (`./<rel>`) resolves, symlinks followed, to a regular file inside the clone `repo`. */
+function inClone(repo: string, file: string, rel: string): void {
 	const target = join(repo, rel);
-	if (!inside(target, realRepo) || realpathSync(target) === realRepo) refuse(`${file} resolves outside the clone`);
+	if (!inside(target, repo) || realpathSync(target) === repo) refuse(`${file} resolves outside the clone`);
 	if (!lstatSync(realpathSync(target)).isFile()) refuse(`${file} is not a file`);
+}
+
+async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
+	const rel = testRel(file);
+	fence(a, runId);
+	const work = workDir(a, runId);
+	const dir = sideDir(a, runId, side);
+	inClone(cloneOf(dir), file, rel);
 	const cap = capMs(a, runId, "soloCapMin");
 	// Claim the lowest free index: <stem>-<i>.log is created exclusively.
 	let i = 1;
@@ -752,6 +771,32 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 	unlinkIfPresent(join(work, `${stem}-${i}.stuck.log`));
 	process.stdout.write(`part ${stem}-${i}\n`);
 	return part(cfg, runId, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap);
+}
+
+/**
+ * PLAN wl-mvq4edbaf13vnk D4, the Mac fallback of the hosted fast check: the fast set's files, each `./<path>` to a regular file
+ * inside the PR clone and named once, in ONE `bun test` call to `fast.xml`/`fast.log` under caps.json `fastCapMin`. It runs as
+ * `full` does (the child env, its own process group, `fullWorkers`, the stuck capture at the cap); every operand is checked
+ * before the fence, and every file before bun starts, so a refusal runs nothing.
+ */
+async function fast(cfg: Config, a: Areas, runId: string, files: string[]): Promise<number> {
+	if (files.length === 0) refuse("fast takes one or more ./<test file>");
+	const rels = files.map(testRel);
+	const twice = rels.find((r, i) => rels.indexOf(r) !== i);
+	if (twice !== undefined) refuse(`./${twice} is named more than once`);
+	fence(a, runId);
+	const work = workDir(a, runId);
+	const repo = cloneOf(work);
+	rels.forEach((rel, i) => inClone(repo, files[i]!, rel));
+	const cap = capMs(a, runId, "fastCapMin");
+	const workers = fullWorkers(a, runId);
+	const xml = join(work, "fast.xml");
+	const log = join(work, "fast.log");
+	unlinkIfPresent(xml);
+	unlinkIfPresent(log);
+	unlinkIfPresent(join(work, "fast.stuck.log"));
+	const argv = ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : []), ...rels.map((r) => `./${r}`)];
+	return part(cfg, runId, work, work, argv, log, cap);
 }
 
 // ---- sweep -------------------------------------------------------------------------------------------
@@ -935,6 +980,8 @@ async function main(argv: string[]): Promise<number> {
 	if (!RUN_ID_RE.test(runId)) return refuse("run id must match ^tr-[a-z0-9]+$");
 	if (sub === "probe") {
 		if (ops.length < 1) return refuse("probe takes <run id> and one or more paths");
+	} else if (sub === "fast") {
+		if (ops.length < 1) return refuse("fast takes <run id> and one or more ./<test file>");
 	} else if (!Object.hasOwn(ARITY, sub)) return refuse(`unknown subcommand ${sub}`);
 	else if (ops.length !== ARITY[sub]) return refuse(`${sub} takes exactly ${ARITY[sub]} operand(s) after the run id`);
 	const a = areas(cfg);
@@ -948,6 +995,8 @@ async function main(argv: string[]): Promise<number> {
 		case "solo":
 		case "base-solo":
 			return solo(cfg, a, runId, ops[0]!, sub === "solo" ? "pr" : "base");
+		case "fast":
+			return fast(cfg, a, runId, ops);
 		case "sweep":
 			return sweep(cfg, a, runId);
 		case "cleanup":
