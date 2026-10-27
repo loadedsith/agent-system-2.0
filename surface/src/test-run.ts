@@ -90,7 +90,7 @@ export interface TestRunnerConfig {
 	fullWorkers: number;
 }
 /** The plan's defaults (§ 2.2 step 4, § 2.3 steps 1 and 3), used for a key the block leaves out. */
-export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 60, fullWorkers: 1 };
+export const TEST_RUNNER_DEFAULTS: Omit<TestRunnerConfig, "repos"> = { fullCapMin: 20, soloCapMin: 10, reportCapMb: 50, queueMaxMin: 1440, fullWorkers: 1 };
 
 /**
  * The `testRunner:` block of a parsed profile config (`Bun.YAML.parse` of profile/config.yml). No
@@ -618,8 +618,14 @@ export function reservation(
 	return { ok: true, settleDead };
 }
 
-/** A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1). */
-export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">): boolean {
+/**
+ * A run that has waited for the lock past `queueMaxMin` ends `error queued too long` (§ 2.3 step 1); a merge train's run
+ * (`train`: its workload has train membership, `trainPrs` non-empty) never does (jo-issues #213). The cap is not what keeps
+ * the queue moving past dead runs: a dead lock holder is replaced through `lockHolderStale` and a dead waiter ahead is pruned
+ * through `queueWaiterLive`, so a train's run only ever waits behind live work, and expiring it would send it to the back.
+ */
+export function queuedTooLong(waitStartMs: number, nowMs: number, config: Pick<TestRunnerConfig, "queueMaxMin">, train: boolean): boolean {
+	if (train) return false;
 	return nowMs - waitStartMs > config.queueMaxMin * 60_000;
 }
 
@@ -1311,14 +1317,31 @@ export function notifiesOrchestrator(verdict: TestVerdict, heldLive: boolean): b
 	return !SETTLING_VERDICTS.includes(verdict) && verdict !== "superseded" && !heldLive;
 }
 
-/** The artifact a settled slice carries (§ 2.3 step 7); a red-main names base's sha and every compared part (D8). */
+/**
+ * The artifact a settled slice carries (§ 2.3 step 7); a red-main names base's sha and every compared part (D8); a green's reason, which
+ * only a carried green has (`carriedRun`), is appended, so the slice keeps where its green came from.
+ */
 export function settleArtifact(run: TestRun): string {
 	need(SETTLING_VERDICTS.includes(run.verdict) && run.full !== null, `test-run ${run.runId} is not a green or red-main with a full part`);
 	const alone = run.solo.length === 0 ? "none" : run.solo.map((s) => `${s.file} ${s.pass}/${s.fail}`).join(", ");
 	const main = run.verdict === "red-main" && run.baseCompare
 		? `; every failure also fails on base ${run.baseCompare.sha} (${run.baseCompare.parts.map((p) => `${p.part} ${p.failing.length}`).join(", ")})`
 		: "";
-	return `test-run ${run.runId}: ${run.verdict} at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}${main}; ${run.runDir ?? "no run dir"}`;
+	const why = run.verdict === "green" && run.reason !== null ? `; ${run.reason}` : "";
+	return `test-run ${run.runId}: ${run.verdict} at ${run.sha} on PR #${run.pr}; full ${run.full!.pass}/${run.full!.fail}/${run.full!.skip}; alone: ${alone}${main}; ${run.runDir ?? "no run dir"}${why}`;
+}
+
+/**
+ * A merge train's carried green (PLAN wl-mvpwkpqobyp20w D4c): `request`, at a head H that descends from `from`'s sha S only by
+ * decision-log commits (or is S), is green with no run, reason `carried from <R> at <S> (decision-log only)`, and `from`'s counts and
+ * run dir, the reports the verdict rests on. Nothing re-read the head, so headAtEnd is null.
+ */
+export function carriedRun(request: TestRequested, from: TestRun): TestRun {
+	need(from.verdict === "green" && from.pr === request.pr, `test-run ${from.runId} is no green on PR #${request.pr} to carry`);
+	return {
+		runId: request.runId, verdict: "green", sha: request.sha, pr: request.pr, reason: `carried from ${from.runId} at ${from.sha} (decision-log only)`, headAtEnd: null,
+		base: from.base, mergeBase: from.mergeBase, full: from.full, solo: from.solo, failures: [], runDir: from.runDir, preflight: null,
+	};
 }
 
 // ---- retention -------------------------------------------------------------------------------------

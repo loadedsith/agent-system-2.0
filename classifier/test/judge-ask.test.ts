@@ -293,7 +293,7 @@ describe("askJudgment: choice, bool and score in one call (wl-mv8k039gvogt8g D2)
 const TABLE = tierTableFromConfig({
 	task: {
 		agentModelOverrides: {
-			fast: ["anthropic/claude-haiku-4-5"],
+			fast: ["anthropic/claude-haiku-5-5"],
 			standard: ["anthropic/claude-sonnet-5-5"],
 			strong: ["anthropic/claude-opus-5-5"],
 			deep: ["anthropic/claude-fable-5-1"],

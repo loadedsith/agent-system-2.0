@@ -232,7 +232,7 @@ test("a production review replays on the deep row with its OpenAI entry from the
 			const table = tierTableFromConfig({
 				task: {
 					agentModelOverrides: {
-						fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna:low", "moonshot/kimi-k2.7-code-highspeed"],
+						fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna:low", "moonshot/kimi-k2.7-code-highspeed"],
 						standard: ["openai-codex/gpt-6-luna", "anthropic/claude-sonnet-5-5", "moonshot/kimi-k2.5"],
 						strong: ["anthropic/claude-opus-5-5:high", "openai-codex/gpt-6-sol:high", "moonshot/kimi-k2.7-code"],
 						deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra:xhigh", "moonshot/kimi-k3"],

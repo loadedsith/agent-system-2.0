@@ -2,6 +2,7 @@
 // train, `settleTasks` gives each task one outcome bound to a fresh runner result, attempts count failed settles since Jo's
 // `retry`, `openTrainFix` opens one fix workload per (repo, PR), the owner hears of its task in its first prompt and as one aside
 // (`pushTrainTasks`), the train word keeps a PR on one open train, and `trainRouted` keeps a task's generic failures off needs-you.
+// A green carries to a head past it only by decision-log commits (`ghCompare`, `carryPairs`, PLAN wl-mvpwkpqobyp20w D1-D2).
 // Temp ledgers, temp git checkouts with a fake GitHub origin, and the fake pi only.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -13,13 +14,14 @@ import { errorLines, trainRouted } from "../src/errors";
 import { applyTrain, interpret } from "../src/input";
 import { controlEntries, firstPrompt, laneExitBody, trainFixBody } from "../src/launch";
 import {
-	fixBindings, forkOf, forkTaskAlert, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView, TRAIN_TASK_KINDS, type TrainPush, type TrainTask,
-	trainPushesOf,
+	carryPairs, COMMIT_FILES_CAP, fixBindings, forkOf, forkTaskAlert, ghCompare, nextAttempt, openTrainFix, ownerDeliveries, ownerTasks, recordTrainTask, settleTasks, type TaskView,
+	TRAIN_TASK_KINDS, type TrainPush, type TrainTask, trainPushesOf,
 	trainSliceId, trainTaskWindows, twiceFailed, unsettledTasks,
 } from "../src/merge-train";
-import { makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody } from "../src/test-run";
+import { type CompareResult, makeRunId, pushDestBody, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRuns } from "../src/test-run";
 import { INSTRUCTION_POLL_MS, LANE_TOOLS, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX } from "../src/types";
 import { clock, ctxOf, fakePi, tempLedger, timers, tmp } from "./helpers";
+import { carry305 } from "./train-world";
 
 const REPO = "thewolff/product";
 const URL = `https://github.com/${REPO}.git`;
@@ -68,12 +70,13 @@ function world(opts: { now?: () => string; ownerMode?: WorkloadRow["mode"] } = {
 	};
 	/**
 	 * The tick's settle pass at the PRs' `heads`, with GitHub's pushes to each head branch: `pushes[n]` when given, else none for
-	 * every PR in `heads` (its listing read and empty). A PR missing from both has no push evidence this pass.
+	 * every PR in `heads` (its listing read and empty). A PR missing from both has no push evidence this pass. `compares` is the
+	 * tick's `ghCompare` results by `<S> <head>` (none by default).
 	 */
-	const settle = (heads: Record<number, string>, now = ledger.now(), pushes: Record<number, TrainPush[]> = {}) => {
+	const settle = (heads: Record<number, string>, now = ledger.now(), pushes: Record<number, TrainPush[]> = {}, compares: ReadonlyMap<string, CompareResult | null> = new Map()) => {
 		const evidence = new Map<number, TrainPush[]>(Object.keys(heads).map((k) => [Number(k), []]));
 		for (const [k, v] of Object.entries(pushes)) evidence.set(Number(k), v);
-		const lines = settleTasks(ledger, { train, heads: new Map(Object.entries(heads).map(([k, v]) => [Number(k), v])), pushes: evidence }, now);
+		const lines = settleTasks(ledger, { train, heads: new Map(Object.entries(heads).map(([k, v]) => [Number(k), v])), pushes: evidence, compares }, now);
 		for (const body of lines) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: train, kind: "assumption", body });
 		return lines;
 	};
@@ -306,6 +309,145 @@ describe("settling (D8): one terminal outcome per task, bound to a fresh result"
 		const second: TrainPush = { sha: H2, at: c2.now() };
 		v.run(v.owner, sl2, 101, H2, "green");
 		expect(v.settle({ 101: H2 }, c2.now(), { 101: [first, second] })).toEqual([expect.stringMatching(new RegExp(`^train-task-settled: ${u.id} failed .*${first.at}`))]);
+	});
+});
+
+/**
+ * gh's JSON as `ghCompare` reads it: `answers` by `gh api` path; every call is recorded, and a path with no answer throws as a
+ * failed gh call does.
+ */
+function ghAnswers(answers: Record<string, unknown>) {
+	const calls: string[][] = [];
+	const read = (args: string[]): unknown => {
+		calls.push(args);
+		if (!Object.hasOwn(answers, args[1]!)) throw new Error(`gh api ${args[1]} exited 1: Not Found (HTTP 404)`);
+		return answers[args[1]!];
+	};
+	return { read, calls };
+}
+/** GitHub's compare answering `ahead` by `commits`, each with its parent count (1 unless given). */
+const aheadAnswer = (...commits: { sha: string; parents?: number }[]) => ({
+	status: "ahead", total_commits: commits.length, commits: commits.map((k) => ({ sha: k.sha, parents: Array.from({ length: k.parents ?? 1 }, () => ({ sha: H0 })) })),
+});
+/** GitHub's get-a-commit with `--paginate --slurp`: one page holding `files` (a path is a modified file). */
+const commitAnswer = (sha: string, files: (string | { filename: string; status: string; previous_filename?: string })[]) => [
+	{ sha, files: files.map((f) => (typeof f === "string" ? { filename: f, status: "modified" } : f)) },
+];
+const LOG = ".ai/decision-log/2026-10-26--1530--ilex--note.md";
+/** The #305 shape (PLAN wl-mvpwkpqobyp20w § 1): green at aebe37a4, one decision-log commit cde03460, GitHub's answers as saved. */
+const { green: S305, head: H305, answers: answers305 } = carry305(REPO);
+/** `ghCompare(REPO, from, to)` over `answers`, as the tick keys it for `settleTasks`; a compare GitHub cannot answer completely is absent. */
+function comparesOf(from: string, to: string, answers: Record<string, unknown>): Map<string, CompareResult | null> {
+	const c = ghCompare(REPO, from, to, ghAnswers(answers).read);
+	return new Map<string, CompareResult | null>(c.ok ? [[`${from} ${to}`, c.compare]] : []);
+}
+
+describe("a green carries over decision-log commits (PLAN wl-mvpwkpqobyp20w D1, D2)", () => {
+	/** A task at H0 on #101, then the owner's green at `s` and a moment later. */
+	const greenThenMoved = (s: string) => {
+		const c = clock();
+		const w = world({ now: c.now });
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101", doneCondition: "green", inputs: "#101" });
+		const t = w.task(101, H0);
+		c.plusHours(0.1);
+		const runId = w.run(w.owner, sl, 101, s, "green");
+		c.plusHours(0.05);
+		return { c, w, t, runId };
+	};
+
+	test("R1: a green at S and one decision-log-only commit to H settles the task fixed with no new run", () => {
+		const { w, t, runId } = greenThenMoved(H1);
+		expect(carryPairs(w.ledger, { train: w.train, heads: new Map([[101, H2]]) })).toEqual([{ pr: 101, from: H1, to: H2 }]);
+		const compares = comparesOf(H1, H2, { [`repos/${REPO}/compare/${H1}...${H2}`]: aheadAnswer({ sha: H2 }), [`repos/${REPO}/commits/${H2}`]: commitAnswer(H2, [LOG]) });
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, compares)).toEqual([`train-task-settled: ${t.id} fixed run ${runId} green at ${H1}, head ${H2} decision-log only`]);
+		expect(testRuns(w.ledger.entries(w.owner)).map((r) => r.request.sha)).toEqual([H1]);
+	});
+
+	test("R4: a commit touching another path, or a merge commit touching only .ai/decision-log/, does not settle", () => {
+		const { w } = greenThenMoved(H1);
+		const code = comparesOf(H1, H2, { [`repos/${REPO}/compare/${H1}...${H2}`]: aheadAnswer({ sha: H2 }), [`repos/${REPO}/commits/${H2}`]: commitAnswer(H2, [LOG, "surface/src/x.ts"]) });
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, code)).toEqual([]);
+		const merge = comparesOf(H1, H2, { [`repos/${REPO}/compare/${H1}...${H2}`]: aheadAnswer({ sha: H2, parents: 2 }), [`repos/${REPO}/commits/${H2}`]: commitAnswer(H2, [LOG]) });
+		expect(merge.get(`${H1} ${H2}`)?.commits).toEqual([{ sha: H2, parents: 2, files: [] }]);
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, merge)).toEqual([]);
+		expect(unsettledTasks(w.ledger, w.train)).toHaveLength(1);
+	});
+
+	test("R6: the #305 fixture (green aebe37a4, decision-log commit cde03460) carries in settle", () => {
+		const { w, t, runId } = greenThenMoved(S305);
+		expect(w.settle({ 101: H305 }, w.ledger.now(), {}, comparesOf(S305, H305, answers305))).toEqual([
+			`train-task-settled: ${t.id} fixed run ${runId} green at ${S305}, head ${H305} decision-log only`,
+		]);
+	});
+
+	test("a pair missing from compares, a green at H0, or a head still at H0 never carries", () => {
+		const { c, w, t } = greenThenMoved(H1);
+		// the tick's fetch failed or GitHub could not answer completely: no compare, no carry
+		expect(w.settle({ 101: H2 })).toEqual([]);
+		// the head back at H0 is no fix, whatever the compare says
+		expect(carryPairs(w.ledger, { train: w.train, heads: new Map([[101, H0]]) })).toEqual([]);
+		expect(w.settle({ 101: H0 }, w.ledger.now(), {}, new Map([[`${H1} ${H0}`, { status: "identical", commits: [] }]]))).toEqual([]);
+		// a green at H0 itself is the head the train returned
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101 again", doneCondition: "green", inputs: "#101" });
+		c.plusHours(0.05);
+		w.run(w.owner, sl, 101, H0, "green");
+		// the green at H0 is now the newest request, and an older green never carries past a newer request
+		expect(carryPairs(w.ledger, { train: w.train, heads: new Map([[101, H2]]) })).toEqual([]);
+		expect(unsettledTasks(w.ledger, w.train).map((u) => u.id)).toEqual([t.id]);
+	});
+
+	test("an older green at S never carries past a newer request: a red at H settles failed, a pending one settles nothing", () => {
+		const { c, w, t } = greenThenMoved(H1);
+		const sl = w.ledger.addSlice({ by: OWNER_LANE, workloadId: w.owner, task: "suite #101 at the head", doneCondition: "green", inputs: "#101" });
+		const compares = comparesOf(H1, H2, { [`repos/${REPO}/compare/${H1}...${H2}`]: aheadAnswer({ sha: H2 }), [`repos/${REPO}/commits/${H2}`]: commitAnswer(H2, [LOG]) });
+		const heads = { train: w.train, heads: new Map([[101, H2]]) };
+		// still pending at H: no settle, no pair
+		c.plusHours(0.05);
+		const pending = w.run(w.owner, sl, 101, H2, null);
+		expect(carryPairs(w.ledger, heads)).toEqual([]);
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, compares)).toEqual([]);
+		// red at H, both recorded before the first settle: failed on the red, never fixed
+		c.plusHours(0.05);
+		w.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: w.owner, sliceId: sl, kind: "assumption",
+			body: testRunBody({
+				runId: pending, verdict: "red", sha: H2, pr: 101, reason: null, headAtEnd: H2, base: null, mergeBase: null,
+				full: { pass: 0, fail: 1, skip: 0, exit: 1, ms: 10, error: null }, solo: [], failures: [], runDir: null, preflight: null,
+			}),
+		});
+		expect(carryPairs(w.ledger, heads)).toEqual([]);
+		expect(w.settle({ 101: H2 }, w.ledger.now(), {}, compares)).toEqual([`train-task-settled: ${t.id} failed run ${pending} red at ${H2}`]);
+	});
+
+	test("ghCompare: from === to is identical with no gh call; what GitHub cannot answer completely is ok:false; a failed or misshapen answer throws", () => {
+		const none = ghAnswers({});
+		expect(ghCompare(REPO, H1, H1, none.read)).toEqual({ ok: true, compare: { status: "identical", commits: [] } });
+		expect(none.calls).toEqual([]);
+		const path = `repos/${REPO}/compare/${H1}...${H2}`;
+		const commit = `repos/${REPO}/commits/${H2}`;
+		// more commits than the compare lists
+		expect(ghCompare(REPO, H1, H2, ghAnswers({ [path]: { ...aheadAnswer({ sha: H2 }), total_commits: 251 } }).read)).toEqual({
+			ok: false, reason: `${H2} is 251 commits ahead of ${H1}, more than the compare lists (1)`,
+		});
+		// a commit listing as many files as GitHub lists may have more
+		const many = Array.from({ length: COMMIT_FILES_CAP }, (_, i) => `.ai/decision-log/n-${i}.md`);
+		expect(ghCompare(REPO, H1, H2, ghAnswers({ [path]: aheadAnswer({ sha: H2 }), [commit]: commitAnswer(H2, many) }).read)).toEqual({
+			ok: false, reason: `commit ${H2} lists ${COMMIT_FILES_CAP} files, the most GitHub lists; its other files cannot be read`,
+		});
+		// a rename naming no previous path
+		expect(ghCompare(REPO, H1, H2, ghAnswers({ [path]: aheadAnswer({ sha: H2 }), [commit]: commitAnswer(H2, [{ filename: LOG, status: "renamed" }]) }).read)).toEqual({
+			ok: false, reason: `commit ${H2} renames ${LOG} from no listed path`,
+		});
+		// a rename contributes the path it left; files come from every page
+		const renamed = ghAnswers({ [path]: aheadAnswer({ sha: H2 }), [commit]: [...commitAnswer(H2, [LOG]), ...commitAnswer(H2, [{ filename: LOG, status: "renamed", previous_filename: "src/notes.md" }])] });
+		expect(ghCompare(REPO, H1, H2, renamed.read)).toEqual({ ok: true, compare: { status: "ahead", commits: [{ sha: H2, parents: 1, files: [LOG, LOG, "src/notes.md"] }] } });
+		expect(renamed.calls).toEqual([["api", path], ["api", commit, "--paginate", "--slurp"]]);
+		// behind or diverged: no commit read
+		expect(ghCompare(REPO, H1, H2, ghAnswers({ [path]: { status: "behind", total_commits: 0, commits: [] } }).read)).toEqual({ ok: true, compare: { status: "behind", commits: [] } });
+		expect(() => ghCompare(REPO, H1, H2, none.read)).toThrow("exited 1");
+		expect(() => ghCompare(REPO, H1, H2, ghAnswers({ [path]: { status: "sideways", total_commits: 0, commits: [] } }).read)).toThrow("unexpected shape");
+		expect(() => ghCompare(REPO, H1, H2, ghAnswers({ [path]: { status: "ahead", total_commits: 1, commits: [{ sha: H2 }] } }).read)).toThrow("no sha or parents");
+		expect(() => ghCompare(REPO, H1, H2, ghAnswers({ [path]: aheadAnswer({ sha: H2 }), [commit]: { sha: H2 } }).read)).toThrow("unexpected shape");
 	});
 });
 

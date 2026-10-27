@@ -1274,6 +1274,9 @@ surface/test/rank.test.ts	test	-
 surface/test/rank-tool.test.ts	test	-
 surface/test/rank-audit.test.ts	test	-
 surface/test/rank-launch.test.ts	test	-
+surface/test/priority-pause.test.ts	test	-
+# Intake queue (migration/items/intake-queue.md): queued asks wait in rank order and launch when a slot frees.
+surface/test/intake-queue.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
 # on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
 install/com.agent-system-2.phoenix.plist	install	-
@@ -1415,3 +1418,7 @@ plugins/test/paired-coding.test.ts	test	-
 # 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
 gates/src/pair-call.ts	module	-
 gates/test/paired-coding.test.ts	test	-
+# GitHub's saved compare and commit answers for PR #305 (aebe37a4...cde03460), the decision-log carry fixture
+# (wl-mvpwkpqobyp20w PLAN D5, 2026-10-26).
+surface/test/fixtures/train-carry-305/compare.json	test	-
+surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-

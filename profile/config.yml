@@ -224,7 +224,7 @@ retry:
 task:
   agentModelOverrides:
     fast:
-      - anthropic/claude-haiku-4-5
+      - anthropic/claude-haiku-5-5
       - openai-codex/gpt-5.6-luna
     standard:
       - anthropic/claude-sonnet-5-5
@@ -291,7 +291,7 @@ testRunner:
   fullCapMin: 20
   soloCapMin: 10
   reportCapMb: 50
-  queueMaxMin: 60
+  queueMaxMin: 1440
   # Workers for the PR's full part (workload wl-mvg2kzuvwngdmo): over 1, test-exec runs it as
   # `bun test --parallel=<n>` (an integer of 1 or more; absent means 1). Base reruns (`base-full`)
   # stay serial whatever this says. surface/scripts/test-run-waits.ts reads each run's `full workers`
@@ -331,16 +331,19 @@ observability:
 # reversal. OMP has no registration for the key and keeps it in the raw layer.
 pairSuggest: all
 
-# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7; surface/src/rank-launch.ts readRankConfig) ──
-# `mode: show` (the default) changes no launch: the drain only logs a `rank-shadow` line beside its pick.
-# `order` starts the top-ranked launchable workload first (Jo's pins first); `parallel` adds the parallel
+# ── Jev ranking's launch gate (PLAN wl-mv8k039gvogt8g D7, wl-mv8wzytml878b4 D2; surface/src/rank-launch.ts readRankConfig) ──
+# `mode: order` (the default) starts the top-ranked launchable workload first (Jo's ruled list first, then Jev),
+# and pauses the lowest-ranked running lane for a Jo-ruled workload waiting at cap; the paused workload
+# relaunches by itself when a slot comes back to it. `show` changes no launch (the drain only logs a
+# `rank-shadow` line beside its oldest-first pick) and turns priority pause off; `parallel` adds the parallel
 # rule (different repositories only, the remaining ceilings within parallelBudgetUsd, a clear merge
-# order). Jo's launch word and `as2 lane` are never gated. Read fresh at every launch decision; a missing
-# or malformed block reads as show, which is the reversal. Set it with `as2 rank-mode show|order|parallel
-# [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget is unknown: no parallel start.
+# order) and also turns priority pause off. Jo's launch word and `as2 lane` are never gated. Read fresh at
+# every launch decision; a missing or malformed block reads as order; `show` is the reversal. Set it with
+# `as2 rank-mode show|order|parallel [--budget <usd>]`. parallelBudgetUsd 0 (or missing) means the budget
+# is unknown: no parallel start.
 # OMP has no registration for the key and keeps it in the raw layer.
 jevRank:
-  mode: show
+  mode: order
   parallelBudgetUsd: 0
 
 # ── The agent channel to Ilex (PLAN wl-mv8vx7wdj5nx1c D1; surface/src/channel.ts readChannelConfig) ──
