@@ -126,7 +126,7 @@ export interface LandDeps {
 /** The tick's seams: gh, the lane launcher and the notification are injected, so a test runs a pass on fakes and a temp ledger. */
 export interface TickDeps {
 	ledger: Ledger;
-	gh: (args: string[]) => GhResult;
+	gh: (args: string[], timeoutMs?: number) => GhResult;
 	/** `lane.ts launch <wl> --requested-by merge-train`: its exit code and last line. */
 	launch: (wl: string) => { code: number; line: string };
 	/** A macOS notification with sound; false when it could not be shown. */
@@ -796,93 +796,134 @@ function landPass(
 }
 
 /**
- * Complete only the off instruction ids read under the publisher's mutex, after every current open
- * fast/tree success was revoked. One attempt per head per pass; failures remain durable and held.
- * The next scheduled tick is the sole retry layer. Full-suite execution is left untouched.
+ * List and classify outside the publication mutex. Each fast/tree revocation serializes only a
+ * fresh activation read and one deadline-clipped POST; completion serializes only the known ids.
+ * Scheduled ticks are the only retry layer: three attempts per newest off instruction, then held
+ * until repair and an explicit new `land-first <repo> off` word. Off receipts never count as
+ * landingPass revocation failures.
  */
 export function reconcileLandFirstOff(
 	d: Pick<TickDeps, "ledger" | "gh">, repo: string, root: string, repoOf: (wl: string) => string | null, say: (line: string) => void,
 ): boolean {
 	const { ledger } = d;
-	if (landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo).length === 0) return true;
+	const pending = () => landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
+	const ids = pending();
+	if (ids.length === 0) return true;
+	const block = ids.at(-1)!;
+	const attemptPrefix = `off-reconcile-attempt: ${repo} ${block} `;
+	const repair = `merges held; repair the named failure, then issue land-first ${repo} off again to begin a fresh retry block`;
+	// Exact repeated failure receipts are deduplicated within a block, even across other errors.
+	const receipt = (detail: string) => {
+		const body = `train-error: off reconciliation pending for ${repo}: block ${block}: ${detail.replace(/\s+/g, " ").trim()}`;
+		ledger.write(() => {
+			if (!ledger.entries(STANDING_WORKLOAD_ID, "assumption").some((e) => e.created_by === MERGE_TRAIN_BY && e.body === body)) {
+				ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+			}
+		});
+		say(body);
+	};
+	const attempts = ledger.write(() => {
+		const tried = ledger.entries(STANDING_WORKLOAD_ID, "assumption").filter((e) => e.created_by === MERGE_TRAIN_BY && e.body.startsWith(attemptPrefix)).length;
+		if (tried < REVOKE_ATTEMPTS) ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: `${attemptPrefix}${tried + 1}` });
+		return tried;
+	});
+	if (attempts >= REVOKE_ATTEMPTS) {
+		receipt(`OffReconciliationExhausted: ${REVOKE_ATTEMPTS} attempts exhausted; ${repair}`);
+		return false;
+	}
 	try {
-		return withFullSuitePublication(root, repo, () => {
-			const entries = ledger.entries(STANDING_WORKLOAD_ID);
-			const ids = landFirstOffPending(entries, ledger.instructions(STANDING_WORKLOAD_ID), repo);
-			if (ids.length === 0) return true;
-			const ghJson = (args: string[]): unknown => {
-				const r = d.gh(args);
-				if (r.code !== 0) throw new GhError(`gh ${args.join(" ")} exited ${r.code}: ${lastLine(r)}`);
-				try {
-					return JSON.parse(r.stdout);
-				} catch (error) {
-					throw new GhError(`gh ${args.join(" ")} returned invalid JSON: ${errText(error)}`);
-				}
-			};
-			const open = openHeads(repo, ghJson, true);
-			// Include closed workloads: their unmerged PRs can still have usable required statuses.
-			const workloads = ledger.db.query<{ workload_id: string }, []>(
-				"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE 'test-requested: %'",
-			).all();
-			const classification = new Map<string, "fast" | "full" | "unknown">();
-			for (const { workload_id: wl } of workloads) {
-				const rows = ledger.entries(wl);
-				const matching = testRuns(rows).filter((r) => r.result !== null && open.get(r.request.pr) === r.request.sha);
-				if (matching.length === 0) continue;
-				const origin = repoOf(wl);
-				if (origin !== null && !sameRepo(origin, repo)) continue;
-				const plans = fastPlans(rows);
-				for (const r of matching) {
-					const key = `${r.request.pr} ${r.request.sha}`;
-					const plan = plans.get(r.request.runId);
-					const full = r.result!.scope === "full" && r.result!.host === "mac" && plan?.scope !== "tree" && plan?.scope !== "fast";
-					// A real full result at this identical head remains usable even if a later fast run exists.
-					if (origin === null) {
-						if (!classification.has(key)) classification.set(key, "unknown");
-					} else if (full && (r.result!.verdict === "green" || r.result!.verdict === "red-main")) classification.set(key, "full");
-					else if (classification.get(key) !== "full" && (plan?.scope === "tree" || plan?.scope === "fast" || r.result!.scope === "fast")) classification.set(key, "fast");
-				}
+		// Drain any publisher that read on before the off word. Otherwise the scan could observe
+		// pending, skip that head, then complete off after the old publisher finally posts success.
+		const scan = withFullSuitePublication(root, repo, (remainingMs) => {
+			remainingMs();
+			return pending().some((id) => ids.includes(id));
+		});
+		if (!scan) return pending().length === 0;
+		const ghJson = (args: string[]): unknown => {
+			const r = d.gh(args);
+			if (r.code !== 0) throw new GhError(`gh ${args.join(" ")} exited ${r.code}: ${lastLine(r)}`);
+			try {
+				return JSON.parse(r.stdout);
+			} catch (error) {
+				throw new GhError(`gh ${args.join(" ")} returned invalid JSON: ${errText(error)}`);
 			}
-			let failed = false;
-			for (const [pr, head] of open) {
-				try {
-					if (newestGateStatus(repo, head, ghJson, true)?.state !== "success") continue;
-					const kind = classification.get(`${pr} ${head}`);
-					if (kind === "full") continue;
-					if (kind !== "fast") throw new Error(`cannot identify whether #${pr} ${head}'s success is a full result or fast/tree plan; repair its runner provenance`);
-					const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", "description=land-first off: fast/tree success revoked; request the full suite"]);
+		};
+		const open = openHeads(repo, ghJson, true);
+		// Include closed workloads: their unmerged PRs can still have usable required statuses.
+		const workloads = ledger.db.query<{ workload_id: string }, []>(
+			"SELECT DISTINCT workload_id FROM entries WHERE kind = 'assumption' AND created_by = 'test-runner' AND body LIKE 'test-requested: %'",
+		).all();
+		const classification = new Map<string, "fast" | "full" | "unknown">();
+		for (const { workload_id: wl } of workloads) {
+			const rows = ledger.entries(wl);
+			const matching = testRuns(rows).filter((r) => r.result !== null && open.get(r.request.pr) === r.request.sha);
+			if (matching.length === 0) continue;
+			const origin = repoOf(wl);
+			if (origin !== null && !sameRepo(origin, repo)) continue;
+			const plans = fastPlans(rows);
+			for (const r of matching) {
+				const key = `${r.request.pr} ${r.request.sha}`;
+				const plan = plans.get(r.request.runId);
+				const full = r.result!.scope === "full" && r.result!.host === "mac" && plan?.scope !== "tree" && plan?.scope !== "fast";
+				// A real full result at this identical head remains usable even if a later fast run exists.
+				if (origin === null) {
+					if (!classification.has(key)) classification.set(key, "unknown");
+				} else if (full && (r.result!.verdict === "green" || r.result!.verdict === "red-main")) classification.set(key, "full");
+				else if (classification.get(key) !== "full" && (plan?.scope === "tree" || plan?.scope === "fast" || r.result!.scope === "fast")) classification.set(key, "fast");
+			}
+		}
+		let failed = false;
+		for (const [pr, head] of open) {
+			try {
+				if (newestGateStatus(repo, head, ghJson, true)?.state !== "success") continue;
+				const kind = classification.get(`${pr} ${head}`);
+				if (kind === "full") continue;
+				if (kind !== "fast") throw new Error(`cannot identify whether #${pr} ${head}'s success is a full result or fast/tree plan; repair its runner provenance`);
+				const revoked = withFullSuitePublication(root, repo, (remainingMs) => {
+					const entries = ledger.entries(STANDING_WORKLOAD_ID);
+					const instructions = ledger.instructions(STANDING_WORKLOAD_ID);
+					const current = landFirstOffPending(entries, instructions, repo);
+					if (!ids.some((id) => current.includes(id)) || landFirstOn(entries, instructions, repo)) return false;
+					const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", "description=land-first off: fast/tree success revoked; request the full suite"], remainingMs());
 					if (r.code !== 0) throw new GhError(`gh status revoke #${pr} ${head} exited ${r.code}: ${lastLine(r)}`);
-					say(`land-first ${repo}: off reconciliation revoked #${pr} ${head}`);
-				} catch (error) {
-					failed = true;
-					const attempt = landFirstRows(ledger.entries(STANDING_WORKLOAD_ID), repo).filter((r) => r.event === "revoke-failed" && r.pr === pr && r.head === head).length + 1;
-					try {
-						landNote(d, say, repo, { event: "revoke-failed", pr, head, attempt, error: `off reconciliation pending: ${errText(error)}; next tick retries` });
-					} catch (receiptError) {
-						throw new AggregateError([error, receiptError], `off reconciliation #${pr} ${head} failed: ${errText(error)}; failure receipt also failed: ${errText(receiptError)}`);
-					}
+					return true;
+				});
+				if (revoked) say(`land-first ${repo}: off reconciliation revoked #${pr} ${head}`);
+			} catch (error) {
+				failed = true;
+				try {
+					receipt(`#${pr} ${head}: ${errText(error)}; merges held; next scheduled tick retries within this instruction's attempt limit`);
+				} catch (receiptError) {
+					throw new AggregateError([error, receiptError], `off reconciliation #${pr} ${head} failed: ${errText(error)}; failure receipt also failed: ${errText(receiptError)}`);
 				}
 			}
-			if (failed) return false;
-			// The network work is over. Only this short write holds the ledger; later off ids stay pending.
+		}
+		if (failed) {
+			if (attempts + 1 >= REVOKE_ATTEMPTS) receipt(`OffReconciliationExhausted: ${REVOKE_ATTEMPTS} attempts exhausted; ${repair}`);
+			return false;
+		}
+		// Every publisher re-reads activation under this mutex; pending off forbids new fast/tree
+		// successes. Thus listing may be outside it, and this bounded completion cannot clear new ids.
+		const complete = withFullSuitePublication(root, repo, (remainingMs) => {
+			remainingMs();
 			ledger.write(() => {
-				for (const id of ids) {
+				const current = pending();
+				for (const id of ids.filter((id) => current.includes(id))) {
 					const instruction = ledger.instructions(STANDING_WORKLOAD_ID).find((i) => i.id === id)!;
 					const wordRepo = instruction.body.split(" ")[1]!;
 					ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(wordRepo, "complete", id) });
 				}
 			});
-			const pending = landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
-			say(`land-first ${repo}: off reconciliation completed for ${ids.join(", ")}${pending.length > 0 ? "; a newer off remains pending" : "; fast/tree successes revoked, full results preserved"}`);
-			return pending.length === 0;
+			return pending().length === 0;
 		});
+		say(`land-first ${repo}: off reconciliation completed for ${ids.join(", ")}${complete ? "; fast/tree successes revoked, full results preserved" : "; a newer off remains pending"}`);
+		return complete;
 	} catch (error) {
-		const body = `train-error: off reconciliation pending for ${repo}: ${errText(error)}; merges held, next tick retries`;
-		say(body);
 		try {
-			ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+			receipt(`${errText(error)}; merges held; next scheduled tick retries within this instruction's attempt limit`);
+			if (attempts + 1 >= REVOKE_ATTEMPTS) receipt(`OffReconciliationExhausted: ${REVOKE_ATTEMPTS} attempts exhausted; ${repair}`);
 		} catch (receiptError) {
-			throw new AggregateError([error, receiptError], `${body}; failure receipt could not be persisted: ${errText(receiptError)}`);
+			throw new AggregateError([error, receiptError], `off reconciliation for ${repo} failed: ${errText(error)}; failure receipt could not be persisted: ${errText(receiptError)}`);
 		}
 		return false;
 	}
@@ -1088,7 +1129,8 @@ function landingPass(
 			else say(`land-first ${repo}: #${n} at ${sha7(head)} is a second repair success; only ${sha7(repair)} is named`);
 			continue;
 		}
-		const tried = rows().filter((r) => r.event === "revoke-failed" && r.pr === n && r.head === head).length;
+		// Older off reconcilers used this event too; their failures are not landing-stop attempts.
+		const tried = rows().filter((r) => r.event === "revoke-failed" && r.pr === n && r.head === head && !r.error.startsWith("off reconciliation pending:")).length;
 		if (tried >= REVOKE_ATTEMPTS) continue;
 		const r = d.gh(["api", "-X", "POST", `repos/${repo}/statuses/${head}`, "-f", "state=failure", "-f", `context=${FULL_SUITE_STATUS}`, "-f", `description=${description}`]);
 		if (r.code === 0) {
@@ -1358,9 +1400,9 @@ function alert(d: TickDeps, facts: TrainFacts, a: AlertAction, ghJson: (args: st
 	say(`${facts.wl}: alert ${q.id} (#${pr}) level ${level}: re-sent louder on issue #${n}`);
 }
 
-/** gh on PATH, 60 s at most. */
-function realGh(args: string[]): GhResult {
-	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: 60_000 });
+/** gh on PATH, 60 s at most, or the caller's shorter remaining publication budget. */
+function realGh(args: string[], timeoutMs = 60_000): GhResult {
+	const r = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe", timeout: Math.max(1, Math.min(60_000, timeoutMs)) });
 	return { code: r.exitCode ?? 1, stdout: r.stdout.toString(), stderr: r.exitedDueToTimeout ? "timed out" : r.stderr.toString() };
 }
 

@@ -229,10 +229,11 @@ export const runsDbOf = (root: string): string => join(root, "runs.db");
 /**
  * Serialize the activation read and required-status publication with off revocation/completion.
  * A separate SQLite file per repository avoids holding the ledger or runs.db across network I/O.
- * Acquisition waits at most 60 s; closing the connection (including process death) releases it.
- * Bodies are synchronous, like the runner's bounded gh calls; never return a Promise.
+ * Acquisition allows four bounded 30 s holders ahead; closing the connection (including process death) releases it.
+ * The holder gets one aggregate 30 s deadline after acquisition. Clip every network call to remainingMs().
+ * Bodies are synchronous; never return a Promise.
  */
-export function withFullSuitePublication<T>(root: string, repo: string, body: () => T): T {
+export function withFullSuitePublication<T>(root: string, repo: string, body: (remainingMs: () => number) => T): T {
 	const ownerRepo = ownerRepoOf(repo);
 	if (ownerRepo === null) throw new Error(`publication mutex: ${repo} is not owner/repo`);
 	const key = createHash("sha256").update(ownerRepo.toLowerCase()).digest("hex");
@@ -245,9 +246,25 @@ export function withFullSuitePublication<T>(root: string, repo: string, body: ()
 	let failure: unknown;
 	let value!: T;
 	try {
-		db.exec("PRAGMA busy_timeout = 60000");
-		db.exec("BEGIN IMMEDIATE");
-		value = body();
+		const acquireBy = Date.now() + 120_000;
+		for (let attempt = 0; ; attempt++) {
+			db.exec(`PRAGMA busy_timeout = ${Math.max(1, Math.min(30_000, acquireBy - Date.now()))}`);
+			try {
+				db.exec("BEGIN IMMEDIATE");
+				break;
+			} catch (error) {
+				if (!(error instanceof Error) || !("code" in error) || typeof error.code !== "string"
+					|| !error.code.startsWith("SQLITE_BUSY") || attempt >= 3 || Date.now() >= acquireBy) throw error;
+			}
+		}
+		const holderBy = Date.now() + 30_000;
+		const remainingMs = (): number => {
+			const remaining = holderBy - Date.now();
+			if (remaining <= 0) throw new Error(`publication holder deadline exhausted at ${path}; retry the bounded final publication`);
+			return remaining;
+		};
+		value = body(remainingMs);
+		remainingMs();
 		if (value !== null && (typeof value === "object" || typeof value === "function") && "then" in value) {
 			throw new Error(`publication mutex ${path}: body returned an asynchronous value; use synchronous publication`);
 		}

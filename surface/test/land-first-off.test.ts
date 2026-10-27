@@ -1,6 +1,7 @@
 // Offline word -> durable merge hold -> status reconciliation; no real GitHub or home state.
 import { describe, expect, test } from "bun:test";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { appendFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { checkReserved } from "../../gates/src/rows/r06-reserved";
@@ -9,6 +10,7 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { apply, interpret } from "../src/input";
 import { landFirstBody, landFirstInstructionBody, landFirstOffBody, landFirstOffPending, landFirstOn } from "../src/launch";
+import { landFirstRows, REVOKE_ATTEMPTS } from "../src/merge-train";
 import { fastPlanBody, testRequestedBody, testRunBody, withFullSuitePublication } from "../src/test-run";
 import { MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { tempLedger, tmp } from "./helpers";
@@ -151,12 +153,19 @@ describe("land-first off reconciliation", () => {
 			Atomics.store(new Int32Array(signal), 0, 1);
 			Atomics.notify(new Int32Array(signal), 0);
 			const complete = reconcileLandFirstOff({ ledger: x.ledger, gh: (args) => {
+				if (args[1]?.includes("/pulls?")) appendFileSync(events, "list\n");
+				// Before the pre-off publisher finishes this status is still pending. A scan before
+				// the initial short activation barrier would miss the success it is about to publish.
+				if (args[1]?.endsWith(`/${HEAD}/statuses`) && !readFileSync(events, "utf8").includes("publisher-success")) {
+					return { code: 0, stdout: JSON.stringify([[{ context: "as2/full-suite", state: "pending", description: "running" }]]), stderr: "" };
+				}
 				if (args[1] === "-X") appendFileSync(events, "revoke\n");
 				return x.gh(args);
 			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s));
 			expect(complete).toBe(true);
 			appendFileSync(events, "completed-off\n");
-			expect(readFileSync(events, "utf8").trim().split("\n")).toEqual(["publisher-read-on", "publisher-success", "revoke", "revoke", "completed-off"]);
+			expect(readFileSync(events, "utf8").trim().split("\n")).toEqual(["publisher-read-on", "publisher-success", "list", "revoke", "revoke", "completed-off"]);
+			expect(x.states.get(HEAD)).toBe("failure");
 			expect(x.pending()).toEqual([]);
 		} finally {
 			worker.terminate();
@@ -211,6 +220,135 @@ describe("land-first off reconciliation", () => {
 			expect(line?.line).toContain("listing unavailable");
 			expect(x.posts).toEqual([]);
 			expect(x.states.get(FULL)).toBe("success");
+		} finally { x.ledger.close(); }
+	});
+
+	test("listing, status reads and provenance classification do not hold the publication mutex; each POST does and receives its remaining budget", () => {
+		const x = fixture();
+		try {
+			x.recover();
+			withFullSuitePublication(x.root, REPO, () => {});
+			const path = join(x.root, readdirSync(x.root).find((name) => name.includes(".publication-"))!);
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			let reads = 0;
+			let classifications = 0;
+			let posts = 0;
+			const probe = (held: boolean) => {
+				const db = new Database(path);
+				try {
+					db.exec("PRAGMA busy_timeout = 1");
+					if (held) expect(() => db.exec("BEGIN IMMEDIATE")).toThrow();
+					else db.exec("BEGIN IMMEDIATE");
+				} finally { db.close(); }
+			};
+			const complete = reconcileLandFirstOff({ ledger: x.ledger, gh: (args, remainingMs) => {
+				const post = args[1] === "-X";
+				probe(post);
+				if (post) {
+					posts++;
+					expect(remainingMs).toBeGreaterThan(0);
+					expect(remainingMs).toBeLessThanOrEqual(30_000);
+				} else {
+					reads++;
+					expect(remainingMs).toBeUndefined();
+				}
+				return x.gh(args);
+			} }, REPO, x.root, () => {
+				probe(false);
+				classifications++;
+				return REPO;
+			}, (s) => x.logs.push(s));
+			expect(complete).toBe(true);
+			expect(reads).toBe(4);
+			expect(classifications).toBeGreaterThan(0);
+			expect(posts).toBe(2);
+			expect(x.pending()).toEqual([]);
+		} finally { x.ledger.close(); }
+	});
+
+	test("unknown provenance stays held with its named repair, never becomes a landing revocation failure", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			expect(reconcileLandFirstOff({ ledger: x.ledger, gh: x.gh }, REPO, x.root, () => null, (s) => x.logs.push(s))).toBe(false);
+			expect(x.posts).toEqual([]);
+			expect(x.pending()).toHaveLength(1);
+			expect(x.held()).not.toBeNull();
+			expect(errorLines(x.ledger).find((e) => e.state?.startsWith("off-pending "))?.line).toContain("repair its runner provenance");
+			expect(landFirstRows(x.ledger.entries(STANDING_WORKLOAD_ID), REPO).filter((r) => r.event === "revoke-failed")).toEqual([]);
+		} finally { x.ledger.close(); }
+	});
+
+	test("a repeated off arriving during the bulk read cannot be completed by the older pass", () => {
+		const x = fixture();
+		try {
+			x.recover();
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			const [old] = x.pending();
+			let added = false;
+			expect(reconcileLandFirstOff({ ledger: x.ledger, gh: (args) => {
+				if (!added && args[1]?.includes("/pulls?")) {
+					added = true;
+					apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+				}
+				return x.gh(args);
+			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s))).toBe(false);
+			expect(x.pending()).toHaveLength(1);
+			expect(x.pending()).not.toContain(old);
+			expect(x.held()).not.toBeNull();
+			expect(x.reconcile()).toBe(true);
+			expect(x.held()).toBeNull();
+		} finally { x.ledger.close(); }
+	});
+
+	test("off retries exhaust once per instruction, dedupe repeated failures, survive restart, and require repair plus a new off word", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			for (let n = 0; n < REVOKE_ATTEMPTS; n++) expect(x.reconcile()).toBe(false);
+			const receipts = () => x.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.created_by === MERGE_TRAIN_BY);
+			expect(receipts().filter((e) => e.body.startsWith("off-reconcile-attempt:"))).toHaveLength(REVOKE_ATTEMPTS);
+			expect(receipts().filter((e) => e.body.includes("HTTP 502"))).toHaveLength(1);
+			expect(receipts().filter((e) => e.body.includes("OffReconciliationExhausted"))).toHaveLength(1);
+			expect(x.posts.filter((head) => head === OTHER)).toHaveLength(REVOKE_ATTEMPTS);
+			x.recover();
+			const before = receipts().length;
+			const restarted = Ledger.open(x.path, { backupOnOpen: false, backup: false });
+			try {
+				let calls = 0;
+				expect(reconcileLandFirstOff({ ledger: restarted, gh: (args) => { calls++; return x.gh(args); } }, REPO, x.root, () => REPO, (s) => x.logs.push(s))).toBe(false);
+				expect(calls).toBe(0);
+			} finally { restarted.close(); }
+			expect(x.reconcile()).toBe(false);
+			expect(receipts()).toHaveLength(before);
+			expect(x.held()).not.toBeNull();
+			const line = errorLines(x.ledger).find((e) => e.state?.startsWith("off-pending "))?.line;
+			expect(line).toContain("OffReconciliationExhausted");
+			expect(line).toContain(`land-first ${REPO} off again`);
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			expect(x.pending()).toHaveLength(2);
+			expect(x.reconcile()).toBe(true);
+			expect(x.pending()).toEqual([]);
+			expect(x.held()).toBeNull();
+			expect(x.posts.filter((head) => head === OTHER)).toHaveLength(REVOKE_ATTEMPTS + 1);
+		} finally { x.ledger.close(); }
+	});
+
+	test("bulk listing failures share the same bounded block and exact repeated receipts are not appended", () => {
+		const x = fixture();
+		try {
+			apply(x.ledger, interpret(x.ledger, `land-first ${REPO} off`)!);
+			let calls = 0;
+			const reconcile = () => reconcileLandFirstOff({ ledger: x.ledger, gh: () => {
+				calls++;
+				return { code: 1, stdout: "", stderr: "listing unavailable" };
+			} }, REPO, x.root, () => REPO, (s) => x.logs.push(s));
+			for (let n = 0; n < REVOKE_ATTEMPTS + 2; n++) expect(reconcile()).toBe(false);
+			expect(calls).toBe(REVOKE_ATTEMPTS);
+			expect(x.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.includes("listing unavailable"))).toHaveLength(1);
+			expect(x.ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.includes("OffReconciliationExhausted"))).toHaveLength(1);
+			expect(x.pending()).toHaveLength(1);
+			expect(x.held()).not.toBeNull();
 		} finally { x.ledger.close(); }
 	});
 

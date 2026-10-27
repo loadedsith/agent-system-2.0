@@ -16,7 +16,8 @@
 //       head branch's workload and its fix workloads is green at S and the head is S or past it only by decision-log commits
 //       (`ghCompare` before the transaction, the authority re-read in it), the transaction writes `test-requested:` and a green
 //       `test-run:` at the head (reason `carried from <R> at <S> (decision-log only)`, R's counts) and settles the slice; no run
-//       is spawned, `as2/full-suite` success is posted after the commit, and the line has `runner none`, `log none` and ends ` carried <R>`.
+//       is spawned; activation-aware status publication follows the commit, and the line has `runner none`, `log none` and ends ` carried <R>`.
+//       Off mode carries only full Mac execution authority (never fast/tree plans, even through another decision-log carry).
 //   run <run id>
 //       the detached run: heartbeat at once, the runs.db lock (queued while another run holds it; queued runs take it oldest
 //       request first, by their `test-requested:` entry's time in runs.db's `queue` table, skipping dead waiters), `current` published
@@ -653,17 +654,19 @@ function mainPublicationLog(ledger: Ledger, wl: string, runId: string, local: (s
 function revokeIfActive(ledger: Ledger, root: string, gh: Gh, repo: string, reason: string, log: (s: string) => void): void {
 	try {
 		hookMark(repo.replaceAll("/", "_"), "main-revocation-acquiring");
-		withFullSuitePublication(root, repo, () => {
-			let on: boolean;
-			try {
-				on = landFirstNow(ledger, repo);
-			} catch (e) {
-				log(`revocation on ${repo} not attempted: activation could not be read: ${errText(e)}; the tick must reconcile when the ledger is readable`);
-				return;
+		const on = withFullSuitePublication(root, repo, () => landFirstNow(ledger, repo));
+		if (!on) {
+			log(`shadow main on ${repo}: required PR statuses unchanged (land-first is off)`);
+			return;
+		}
+		revokeOpen(gh, repo, reason, log, (head) => withFullSuitePublication(root, repo, (remainingMs) => {
+			if (!landFirstNow(ledger, repo)) {
+				log(`shadow main on ${repo}: required PR status at ${head} unchanged (land-first is off)`);
+				return false;
 			}
-			if (on) revokeOpen(gh, repo, reason, log);
-			else log(`shadow main on ${repo}: required PR statuses unchanged (land-first is off)`);
-		});
+			const boundedGh: Gh = (args, timeoutMs = 30_000) => gh(args, Math.min(timeoutMs, remainingMs()));
+			return postStatus(boundedGh, repo, "failure", head, `landing stopped: ${reason}`, log);
+		}));
 	} catch (e) {
 		// A missing/busy mutex or cleanup failure cannot cancel the independent informational main status.
 		log(`revocation on ${repo} could not complete under the publication mutex: ${errText(e)}; the tick must reconcile; original main outcome: ${reason}`);
@@ -836,36 +839,56 @@ export function gateDecision(i: GateInput): GateDecision {
  * Post the gate's state on the head (D4, through #320's mechanism), re-reading activation at publication: off refuses fast/tree
  * plans and applies FULL_SUITE_STATE only to a full Mac result at the head; on uses mergeGate's live main policy. An unreadable gate posts failure (F7).
  * A post GitHub refuses records `status-failed: <run id> <state> on <sha>: <error>` (F6), leaving the head pending.
+ * Lock acquisition/deadline failures instead record status-failed without posting a false test failure. The optional ref resolver
+ * runs only for on-mode gate computation, outside the lock; offDescription retains a full result's original publication wording.
  */
-export function postGate(i: GateInput & { root: string; wl: string; runId: string; log: (s: string) => void }): { state: "success" | "failure" | "error"; description: string; error: string | null } {
-	return withFullSuitePublication(i.root, i.repo, () => {
-		let decided: { state: "success" | "failure" | "error"; description: string };
-		try {
-			if (!landFirstNow(i.ledger, i.repo)) {
-				if (i.need === "fast") decided = { state: "failure", description: "land-first is off: a fast/tree plan is not a full-suite result; request the full suite" };
-				else if (i.result?.sha === i.head && i.result.scope === "full" && i.result.host === "mac") {
-					decided = { state: FULL_SUITE_STATE[i.result.verdict] ?? "failure", description: `full suite ${i.result.verdict}` };
-				} else decided = { state: "failure", description: "land-first is off: a full-suite Mac result at this head is required" };
-			} else {
-				const d = gateDecision(i);
-				decided = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
-			}
-		} catch (e) {
-			decided = { state: "failure", description: `the gate could not read activation, main or the head: ${errText(e)}` };
+export function postGate(i: Omit<GateInput, "ref"> & { ref: string | (() => string); root: string; wl: string; runId: string; log: (s: string) => void; offDescription?: string }): { state: "success" | "failure" | "error"; description: string; error: string | null } {
+	// Main-chain/compare/repair reads scale independently of a single status post; never hold the publication mutex for them.
+	let onDecision: { state: "success" | "failure"; description: string } | null = null;
+	try {
+		if (landFirstNow(i.ledger, i.repo)) {
+			const d = gateDecision({ ...i, ref: typeof i.ref === "function" ? i.ref() : i.ref });
+			onDecision = d.state === "success" ? { state: "success", description: d.description } : { state: "failure", description: d.reasons.join("; ") };
 		}
-		i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
-		const error = postStatus(i.gh, i.repo, decided.state, i.head, decided.description, i.log);
-		if (error !== null) {
+	} catch (e) {
+		onDecision = { state: "failure", description: `the gate could not read activation, main or the head: ${errText(e)}` };
+	}
+	let outcome: { state: "success" | "failure" | "error"; description: string; error: string | null };
+	try {
+		outcome = withFullSuitePublication(i.root, i.repo, (remainingMs) => {
+			let decided: { state: "success" | "failure" | "error"; description: string };
 			try {
-				i.ledger.write(() => i.ledger.recordEntry({
-					by: TEST_RUNNER_BY, workloadId: i.wl, kind: "assumption", body: `status-failed: ${i.runId} ${decided.state} on ${i.head}: ${error.replace(/\s+/g, " ")}`,
-				}));
+				if (!landFirstNow(i.ledger, i.repo)) {
+					if (i.need === "fast") decided = { state: "failure", description: "land-first is off: a fast/tree plan is not a full-suite result; request the full suite" };
+					else if (i.result?.sha === i.head && i.result.scope === "full" && i.result.host === "mac") {
+						decided = { state: FULL_SUITE_STATE[i.result.verdict] ?? "failure", description: i.offDescription ?? `full suite ${i.result.verdict}` };
+					} else decided = { state: "failure", description: "land-first is off: a full-suite Mac result at this head is required" };
+				} else decided = onDecision ?? { state: "failure", description: "land-first activated during publication: request a fresh gate decision" };
 			} catch (e) {
-				i.log(`status-failed: not recorded: ${errText(e)}`);
+				decided = { state: "failure", description: `the gate could not read activation: ${errText(e)}` };
 			}
-		}
-		return { ...decided, error };
-	});
+			i.log(`gate on ${i.head}: ${decided.state}: ${decided.description}`);
+			const boundedGh: Gh = (args, timeoutMs = 30_000) => i.gh(args, Math.min(timeoutMs, remainingMs()));
+			return { ...decided, error: postStatus(boundedGh, i.repo, decided.state, i.head, decided.description, i.log) };
+		});
+	} catch (e) {
+		const error = errText(e);
+		i.log(`gate publication on ${i.head} not posted: ${error}; status unchanged; retry publication`);
+		outcome = { state: "error", description: "publication unavailable; status unchanged", error };
+	}
+	// Audit outside the short holder section. Mutex acquisition is publication failure, never a failed test or unreadable gate.
+	if (outcome.error !== null) recordStatusFailure(i, outcome.state, outcome.error);
+	return outcome;
+}
+
+function recordStatusFailure(i: { ledger: Ledger; wl: string; runId: string; head: string; log: (s: string) => void }, state: string, error: string): void {
+	try {
+		i.ledger.write(() => i.ledger.recordEntry({
+			by: TEST_RUNNER_BY, workloadId: i.wl, kind: "assumption", body: `status-failed: ${i.runId} ${state} on ${i.head}: ${error.replace(/\s+/g, " ")}`,
+		}));
+	} catch (receiptError) {
+		throw new AggregateError([new Error(error), receiptError], `publication failed: ${error}; status-failed receipt on ${i.wl} not recorded: ${errText(receiptError)}; repair ledger writes and retry publication`);
+	}
 }
 
 /**
@@ -873,7 +896,7 @@ export function postGate(i: GateInput & { root: string; wl: string; runId: strin
  * gate's repair (`repair: …`) gets failure `landing stopped: <reason>`. One attempt per head; a failure is logged, and the tick's pass
  * revokes what is still owed (D6). Never throws: a list GitHub cannot answer is logged and revokes nothing.
  */
-export function revokeOpen(gh: Gh, repo: string, reason: string, log: (s: string) => void): { revoked: number[]; failed: number[] } {
+export function revokeOpen(gh: Gh, repo: string, reason: string, log: (s: string) => void, publish?: (head: string) => string | null | false): { revoked: number[]; failed: number[] } {
 	const out = { revoked: [] as number[], failed: [] as number[] };
 	let list: unknown;
 	try {
@@ -902,8 +925,15 @@ export function revokeOpen(gh: Gh, repo: string, reason: string, log: (s: string
 		}
 		const description = field(newest, "description");
 		if (field(newest, "state") !== "success" || (typeof description === "string" && description.startsWith("repair:"))) continue;
-		if (postStatus(gh, repo, "failure", head, `landing stopped: ${reason}`, log) === null) out.revoked.push(n);
-		else out.failed.push(n);
+		if (publish) hookSync(repo.replaceAll("/", "_"), "main-revocation-head", { head, pr: n });
+		try {
+			const error = publish ? publish(head) : postStatus(gh, repo, "failure", head, `landing stopped: ${reason}`, log);
+			if (error === null) out.revoked.push(n);
+			else if (error !== false) out.failed.push(n);
+		} catch (e) {
+			log(`revocation of #${n} at ${head.slice(0, 7)} not posted under publication mutex: ${errText(e)}; the tick must reconcile`);
+			out.failed.push(n);
+		}
 	}
 	return out;
 }
@@ -1391,12 +1421,31 @@ function carrySources(ledger: Ledger, train: string, pr: number, headRefName: st
  * that request's own result, read from its own workload's records. Null unless that result is a green: a newer red, error, stale or
  * superseded request, or one still pending, carries nothing, whatever older greens exist.
  */
-function carryAuthority(ledger: Ledger, sources: readonly string[], pr: number): ResultRecord | null {
+function carryAuthority(ledger: Ledger, sources: readonly string[], pr: number, fullOnly = false): ResultRecord | null {
 	const rows = ledger.db.query<EntryRow, string[]>(`SELECT * FROM entries WHERE workload_id IN (${sources.map(() => "?").join(", ")}) ORDER BY created_at, rowid`).all(...sources);
-	const last = authoritativeRun(testRuns(rows), pr);
+	const records = testRuns(rows);
+	const last = authoritativeRun(records, pr);
 	const on = last === null ? undefined : rows.find((e) => e.id === last.request.entryId)?.workload_id;
 	const own = on === undefined ? null : (testRuns(ledger.entries(on)).find((r) => r.request.runId === last!.request.runId)?.result ?? null);
-	return own?.verdict === "green" ? own : null;
+	if (own?.verdict !== "green") return null;
+	if (fullOnly) {
+		// A tree plan copies full/Mac counts without executing them. Follow decision-log carries back to their execution authority.
+		const seen = new Set<string>();
+		let source = own;
+		for (;;) {
+			if (seen.has(source.runId) || source.scope !== "full" || source.host !== "mac" || source.verdict !== "green") return null;
+			seen.add(source.runId);
+			const plan = fastPlanOf(rows, source.runId);
+			if (plan !== null && plan.scope !== "full") return null;
+			if (source.reason?.startsWith("carried from main run ")) return null;
+			const carried = /^carried from (tr-[a-z0-9]+) at [0-9a-f]{40} \(decision-log only\)$/.exec(source.reason ?? "");
+			if (carried === null) break;
+			const previous = records.find((r) => r.request.runId === carried[1])?.result;
+			if (!previous) return null;
+			source = previous;
+		}
+	}
+	return own;
 }
 
 /**
@@ -1405,7 +1454,7 @@ function carryAuthority(ledger: Ledger, sources: readonly string[], pr: number):
  * runs as any other. A compare GitHub cannot answer completely, or a gh call that fails, carries nothing.
  */
 function carryCandidate(ledger: Ledger, sources: readonly string[], pr: number, head: string, ownerRepo: string): ResultRecord | null {
-	const from = carryAuthority(ledger, sources, pr);
+	const from = carryAuthority(ledger, sources, pr, !landFirstNow(ledger, ownerRepo));
 	if (from === null) return null;
 	try {
 		const c = ghCompare(ownerRepo, from.sha, head, ghJson);
@@ -1568,9 +1617,8 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 		}
 		// D4c: the carry commits only on the authority D4b compared (same R, same S, the head this start read), re-read from this
 		// transaction's rows before this request joins them; any other falls through to the run. No gh call here: Ledger.write may run this again.
-		const from = candidate === null ? null : carryAuthority(ledger, carrySources(ledger, wl, pr, view.headRefName, ownerRepo, origins), pr);
-		const carry = from !== null && from.runId === candidate!.runId && from.sha === candidate!.sha
-			&& (land?.plan.scope !== "full" || (from.scope === "full" && from.host === "mac")) ? from : null;
+		const from = candidate === null ? null : carryAuthority(ledger, carrySources(ledger, wl, pr, view.headRefName, ownerRepo, origins), pr, land === null || land.plan.scope === "full");
+		const carry = from !== null && from.runId === candidate!.runId && from.sha === candidate!.sha ? from : null;
 		const request: TestRequested = { runId, pr, sha: view.headRefOid, slice: sl, by };
 		ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: sl, kind: "assumption", body: testRequestedBody(request) });
 		// D4: the land-first plan rides in the admission's transaction with the request it decides.
@@ -1587,13 +1635,12 @@ async function cmdStart(wl: string, pr: number, sliceArg: string | null, by: str
 	if (carried !== null) {
 		// D4d, after the commit: the status the run would post, outside any transaction; a failed post is logged and the green stands.
 		await hook(wl, "gate-publication", {}, Date.now() + FINALIZE_MS);
-		// On a land-first repository the gate decides it (D4); a refused post records `status-failed:` and leaves the head pending.
-		if (land !== null || landFirstNow(ledger, ownerRepo)) {
-			postGate({
-				gh: realGh, ledger, root, repo: ownerRepo, head: view.headRefOid, ref: view.headRefName, pr, need: land?.plan.scope === "fast" || land?.plan.scope === "tree" ? "fast" : "full",
-				result: { verdict: carried.run.verdict, sha: carried.run.sha, scope: carried.run.scope, host: carried.run.host }, wl, runId, log: say,
-			});
-		} else postStatus(realGh, ownerRepo, "success", view.headRefOid, `carried from run ${carried.from.runId} at ${carried.from.sha.slice(0, 7)} (decision-log only)`, say);
+		// Every carry, including one admitted off, shares activation-aware publication with off completion.
+		postGate({
+			gh: realGh, ledger, root, repo: ownerRepo, head: view.headRefOid, ref: view.headRefName, pr, need: land?.plan.scope === "fast" || land?.plan.scope === "tree" ? "fast" : "full",
+			result: { verdict: carried.run.verdict, sha: carried.run.sha, scope: carried.run.scope, host: carried.run.host }, wl, runId, log: say,
+			offDescription: `carried from run ${carried.from.runId} at ${carried.from.sha.slice(0, 7)} (decision-log only)`,
+		});
 		process.stdout.write(`test-run ${runId} runner none sha ${view.headRefOid} slice ${slice} log none${boundBy ? ` bound-by ${boundBy}` : ""} carried ${carried.from.runId}\n`);
 		return START_EXIT.ok;
 	}
@@ -1914,7 +1961,13 @@ class Runner {
 	async checkpoint(phase: string): Promise<void> {
 		await hook(this.id, `phase-${phase}`);
 		if (this.superseded) throw new Superseded(this.superseded);
-		if (this.slotless) return;
+		if (this.slotless) {
+			if (!ownsRequest(testRuns(this.ledger.entries(this.wl)), this.id)) {
+				this.lose("lost ownership of the request before the slotless phase");
+				throw new Superseded(this.superseded!);
+			}
+			return;
+		}
 		if (!publishIfOwner(this.lockDb, this.stageRoot, this.id)) {
 			this.lose(`the lock row holds ${lockRow(this.lockDb)?.runId ?? "no run"}`);
 			throw new Superseded(this.superseded!);
@@ -2715,8 +2768,7 @@ class Runner {
 			if (!v.ok) this.log(`preflight: ${v.reason}; the hosted fast check runs none of the Mac install, so it goes on (a Mac fallback refreshes or stops on it)`);
 			this.recordPreflight(v.ok ? null : v.reason);
 		} catch (e) {
-			// Even a superseded fast preflight leaves an explicit refusal, never the preceding process's activation receipt.
-			this.recordPreflight(e instanceof Stop || e instanceof Fail || e instanceof Superseded ? e.message : `the runner failed: ${errText(e)}`);
+			this.preflightThrew(e);
 			throw e;
 		}
 		const changed = await this.trusted();
@@ -2982,20 +3034,18 @@ class Runner {
 				try {
 					await hook(this.wl, "gate-publication", {}, this.postSweepDeadline);
 					const plan = fastPlanOf(this.ledger.entries(this.wl), this.id);
-					if (plan !== null || landFirstNow(this.ledger, this.ownerRepo)) {
-						const ref = plan?.ref ?? ghPrView(this.ownerRepo, run.pr).headRefName;
-						postGate({
-							gh: realGh, ledger: this.ledger, root: this.root, repo: this.ownerRepo, head: run.sha, ref, pr: run.pr, need: plan?.scope === "fast" || plan?.scope === "tree" ? "fast" : "full",
-							result: { verdict: run.verdict, sha: run.sha, scope: run.scope, host: run.host }, wl: this.wl, runId: this.id, log: (s) => this.log(s),
-						});
-					} else {
-						const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
-						postStatus(realGh, this.ownerRepo, state, run.sha, `full suite ${run.verdict}, run ${run.runId}${contained}`, (s) => this.log(s));
-					}
+					const ref = plan?.ref ?? (() => ghPrView(this.ownerRepo, run.pr).headRefName);
+					const contained = /; containment failed: /.test(`${this.f.stuck ?? ""}${this.f.executorStalled ?? ""}`) ? ", containment failed" : "";
+					postGate({
+						gh: realGh, ledger: this.ledger, root: this.root, repo: this.ownerRepo, head: run.sha, ref, pr: run.pr, need: plan?.scope === "fast" || plan?.scope === "tree" ? "fast" : "full",
+						result: { verdict: run.verdict, sha: run.sha, scope: run.scope, host: run.host }, wl: this.wl, runId: this.id, log: (s) => this.log(s),
+						offDescription: `full suite ${run.verdict}, run ${run.runId}${contained}`,
+					});
 				} catch (e) {
-					const reason = `the publication gate could not read activation or the PR: ${errText(e)}`;
-					this.log(reason);
-					postStatus(realGh, this.ownerRepo, "failure", run.sha, reason, (s) => this.log(s));
+					const reason = `the publication could not complete: ${errText(e)}`;
+					this.log(`${reason}; required status unchanged; retry publication`);
+					try { recordStatusFailure({ ledger: this.ledger, wl: this.wl, runId: this.id, head: run.sha, log: (s) => this.log(s) }, state, reason); }
+					catch (receiptError) { this.log(errText(receiptError)); }
 				}
 			}
 			return released ? 0 : START_EXIT.failed;

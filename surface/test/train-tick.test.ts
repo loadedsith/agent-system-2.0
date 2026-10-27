@@ -19,7 +19,7 @@ import {
 	planApprovedBody, planAutoApprovedBody, planHaltedBody, trainBoardBody,
 } from "../src/launch";
 import {
-	actionable, type ControlRoot, fixBindings, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
+	actionable, type ControlRoot, fixBindings, landFirstNoticeBody, landFirstRows, latestTrainReconciled, mainRedNotices, protectionEpisodes, recordTrainTask, TRAIN_ALERT_LABEL, TRAIN_ALERT_REPO, trainActivityArgs,
 	trainAlertBody, trainAlertMarker, trainHeadWokenBody, trainHoldBody, trainPrs, trainRetries, trainSliceId, type TrainTask, trainWakeBody, type WakeDeferral,
 } from "../src/merge-train";
 import { trainMergedNoticeBody } from "../src/notice";
@@ -1369,6 +1369,28 @@ describe("land-first in the tick (PLAN wl-mvq4edbaf13vnk D6, D13, § 2 Protect t
 		x.pass();
 		expect(mainCalls(x)).toHaveLength(3);
 		expect(errorLines(x.ledger).map((l) => l.line).filter((l) => l.startsWith("main runs exhausted"))).toEqual([]);
+	});
+
+	test("legacy off failures never consume a later landing-stop revocation block at the same head", () => {
+		const x = lf();
+		x.mainRun(T, "red");
+		x.gh.open.set(202, HX);
+		x.gh.status.set(HX, { state: "success", description: "fast green after re-on" });
+		x.gh.postFails = true;
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			x.ledger.recordEntry({
+				by: MERGE_TRAIN_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+				body: landFirstNoticeBody(REPO, { event: "revoke-failed", pr: 202, head: HX, attempt, error: "off reconciliation pending: HTTP 502; next tick retries" }),
+			});
+		}
+		for (const minute of [1, 6, 11, 16]) {
+			x.at(minute);
+			x.pass();
+		}
+		expect(x.gh.posts).toHaveLength(3);
+		expect(x.rows().flatMap((r) => r.event === "revoke-failed" && !r.error.startsWith("off reconciliation pending:") ? [r.attempt] : [])).toEqual([1, 2, 3]);
+		expect(x.rows().filter((r) => r.event === "revoke-gave-up")).toHaveLength(1);
+		expect(errorLines(x.ledger).some((line) => line.line.startsWith("revocation failed on #202 "))).toBe(true);
 	});
 
 	test("R17: a red tip opens one stop episode with one issue, revokes an open green 3 times then gives up once, records the repair and fails it at 30 min", () => {

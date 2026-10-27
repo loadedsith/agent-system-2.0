@@ -860,12 +860,13 @@ describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
 		if (verdict !== "pending") finish(w, wl, runId, sha, verdict, Math.max(agoMs - 1000, 0));
 		return runId;
 	}
-	function finish(w: World, wl: string, runId: string, sha: string, verdict: Exclude<Seeded, "pending">, agoMs = 0): void {
+	function finish(w: World, wl: string, runId: string, sha: string, verdict: Exclude<Seeded, "pending">, agoMs = 0, execution: Pick<TestRun, "scope" | "host"> = {}): void {
 		const red = verdict === "red";
 		const run: TestRun = {
 			runId, verdict, sha, pr: P, reason: verdict === "green" || red ? null : `seeded ${verdict}`, headAtEnd: sha, base: fx.main, mergeBase: fx.main,
 			full: verdict === "error" ? null : { pass: red ? 6 : 7, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 5, error: null }, solo: [],
 			failures: red ? [{ part: "full", name: "t > x", firstError: "error: x" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			...execution,
 		};
 		const slice = testRuns(w.ledger.entries(wl)).find((r) => r.request.runId === runId)!.request.slice;
 		w.ago(agoMs, () => w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: testRunBody(run) }));
@@ -926,6 +927,49 @@ describe("start: the carried green (PLAN wl-mvpwkpqobyp20w D4)", () => {
 		const after = readFileSync(join(w.root, "gh.log"), "utf8").trim().split("\n").slice(calls);
 		expect(after.filter((l) => l.includes("/compare/"))).toEqual([]);
 		expect(statusPosts(w)).toEqual([`success ${H}`, `success ${H}`]);
+	});
+
+	for (const source of ["full", "fast", "fast copied", "tree", "tree decision-log"] as const) {
+		test(`off-mode decision-log carry accepts only genuine full Mac authority, not ${source} copied counts`, async () => {
+			const { w, train } = trainWorld(fx.main);
+			const id = seed(w, train, S, "pending", 5000);
+			finish(w, train, id, S, "green", 4000, { scope: source === "fast" ? "fast" : "full", host: "mac" });
+			const rec = testRuns(w.ledger.entries(train)).find((r) => r.request.runId === id)!;
+			w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: train, kind: "assumption", body: fastPlanBody(id,
+				source.startsWith("tree") ? { ref: `wl/${train}`, scope: "tree", g: S, run: "tr-mainseed" }
+					: source.startsWith("fast") ? { ref: `wl/${train}`, scope: "fast", files: [], parse: [], macOnly: [] }
+						: { ref: `wl/${train}`, scope: "full", reasons: ["production"] }) });
+			if (source === "tree decision-log") {
+				const next = request(w, train, rec.request.slice, P, S, 1000);
+				w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: train, sliceId: rec.request.slice, kind: "assumption", body: testRunBody({
+					...rec.result!, runId: next, scope: "full", host: "mac", reason: `carried from ${id} at ${S} (decision-log only)`,
+				}) });
+			}
+			compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+			if (source === "full") {
+				carried(w, train, id, S, fx.main);
+				expect(statusPosts(w)).toEqual([`success ${fx.main}`]);
+				expect(readFileSync(join(w.root, "gh.log"), "utf8")).toContain(`description=carried from run ${id}`);
+			} else {
+				await ran(w, train);
+				expect(statusPosts(w)).toEqual([]);
+			}
+		});
+	}
+
+	test("an off-admitted decision-log carry rechecks activation under publication after an off/on transition", async () => {
+		const { w, train } = trainWorld(fx.main);
+		seed(w, train, S, "green", 5000);
+		compare(w, S, fx.main, [{ sha: "6".repeat(40), files: [LOG] }]);
+		arm(w, train, "gate-publication");
+		const child = Bun.spawn([process.execPath, RUNNER, "start", train, String(P), "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		try {
+			await reached(w, train, "gate-publication");
+			landFirst(w.ledger, OWNER_REPO, true);
+			// Main cannot be read in this world: on-mode publication must fail closed, never post the off-mode carry success.
+		} finally { go(w, train, "gate-publication"); }
+		expect(await child.exited).toBe(START_EXIT.ok);
+		expect(statusPosts(w)).toEqual([`failure ${fx.main}`]);
 	});
 
 	test("a commit touching another path, and a merge commit touching only .ai/decision-log/, each fall through to a run", async () => {
@@ -2934,6 +2978,146 @@ describe("land-first runner D4 (R11, R12, R15, R16, R37)", () => {
 		});
 	}
 
+	test("a fast preflight superseded at install decides no activation receipt and dispatches nothing", async () => {
+		const w = landWorld();
+		const { wl, slice } = bind(w, PR.green, fx.head.green);
+		const id = request(w, wl, slice, PR.green, fx.head.green);
+		w.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: wl, sliceId: slice, kind: "assumption", body: fastPlanBody(id, {
+			ref: `wl/${wl}`, scope: "fast", files: ["a.test.ts"], parse: ["a.test.ts"], macOnly: [],
+		}) });
+		writeFileSync(join(w.root, "gh.log"), "");
+		arm(w, id, "phase-install");
+		const child = spawnRun(w, id);
+		try {
+			await reached(w, id, "phase-install");
+			request(w, wl, slice, PR.green, fx.head.green);
+		} finally { go(w, id, "phase-install"); }
+		expect(await child.exited).toBe(0);
+		expect(await resultOf(w, wl, id)).toMatchObject({ verdict: "superseded", full: null });
+		expect(preflights(w)).toEqual([]);
+		expect(dispatches(w)).toEqual([]);
+		expect(w.ledger.slice(slice)!.state).toBe("open");
+	});
+
+	for (const publisher of ["hosted", "tree carry"] as const) test(`${publisher}: publication mutex acquisition failure keeps a genuine green pending with a durable status failure`, async () => {
+		const w = landWorld();
+		const head = publisher === "tree carry"
+			? g(w.origin, "commit-tree", g(w.origin, "rev-parse", `${fx.main}^{tree}`), "-p", fx.main, "-m", "publication unavailable")
+			: fx.head.green;
+		if (publisher === "tree carry") g(w.origin, "update-ref", `refs/pull/${PR.green}/head`, head);
+		const { wl, slice } = bind(w, PR.green, head);
+		if (publisher === "hosted") artifact(w, head, "green");
+		arm(w, wl, "gate-publication");
+		const starter = Bun.spawn([process.execPath, RUNNER, "start", wl, String(PR.green), "--slice", slice, "--requested-by", LANE], { env: w.env, stdout: "pipe", stderr: "pipe" });
+		let id = "";
+		try {
+			await reached(w, wl, "gate-publication");
+			id = testRuns(w.ledger.entries(wl)).at(-1)!.request.runId;
+			withFullSuitePublication(w.runs, OWNER_REPO, () => {});
+			const mutex = readdirSync(w.runs).find((f) => f.startsWith("runs.db.publication-") && f.endsWith(".db"))!;
+			writeFileSync(join(w.runs, mutex), "not a sqlite database");
+		} finally { go(w, wl, "gate-publication"); }
+		expect(await starter.exited).toBe(START_EXIT.ok);
+		await until("failed publication persisted", () => w.ledger.entries(wl).some((e) => e.body.startsWith(`status-failed: ${id} `)));
+		expect(await resultOf(w, wl, id)).toMatchObject({ verdict: "green" });
+		expect(statusPosts(w)).toEqual([`pending ${head}`]);
+		expect(w.ledger.entries(wl).find((e) => e.body.startsWith(`status-failed: ${id} `))!.body).toContain("publication mutex");
+	});
+
+	test("publication contention past the former 60-second waiter cap preserves a green and starts a fresh holder budget", async () => {
+		const w = landWorld();
+		landFirst(w.ledger, OWNER_REPO, false);
+		const { wl } = bind(w, PR.green, fx.head.green);
+		const events = join(w.root, "publisher.events");
+		const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+		const worker = new Worker(new URL("./fixtures/full-suite-publication-worker.ts", import.meta.url).href);
+		const holderError = new Promise<string>((resolve, reject) => {
+			worker.onmessage = (event) => {
+				if (typeof event.data === "object" && event.data.error) resolve(event.data.error);
+			};
+			worker.onerror = reject;
+		});
+		try {
+			// An intentionally broken old publisher outlives the old waiter cap. The new holder must reject its own overrun,
+			// while the queued publisher gets a fresh 30 s section after waiting through multiple bounded busy windows.
+			worker.postMessage({ root: w.runs, repo: OWNER_REPO, signal, events, holdMs: 61_000 });
+			await until("the overlong publisher holds the mutex", () => existsSync(events), 10_000);
+			const posts: string[][] = [];
+			const result = postGate({
+				gh: (args, timeoutMs) => { posts.push(args); expect(timeoutMs).toBe(15_000); return { code: 0, stdout: "{}", stderr: "" }; },
+				ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green,
+				need: "full", result: { verdict: "green", sha: fx.head.green, scope: "full", host: "mac" }, wl, runId: "tr-contention", log: () => {},
+			});
+			expect(result).toMatchObject({ state: "success", error: null });
+			expect(posts).toHaveLength(1);
+			expect(posts[0]).toContain("state=success");
+			expect(await holderError).toContain("holder deadline");
+			expect(w.ledger.entries(wl).filter((e) => e.body.startsWith("status-failed:"))).toEqual([]);
+		} finally { Atomics.notify(new Int32Array(signal), 0); worker.terminate(); }
+	});
+
+	test("gate computation does not spend the short publication holder budget and its final post is clipped", () => {
+		const w = landWorld();
+		const { wl } = bind(w, PR.green, fx.head.green);
+		const originalNow = Date.now;
+		let now = originalNow();
+		const timeouts: number[] = [];
+		const gh: Gh = (args, timeoutMs) => {
+			if (args[1] === "-X") {
+				timeouts.push(timeoutMs!);
+				return { code: 0, stdout: "{}", stderr: "" };
+			}
+			now += 31_000;
+			const path = args[1]!;
+			const fixture = join(w.root, "api", path.replaceAll("/", "_"));
+			return { code: 0, stdout: readFileSync(fixture, "utf8"), stderr: "" };
+		};
+		try {
+			Date.now = () => now;
+			expect(postGate({
+				gh, ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green,
+				need: "full", result: { verdict: "green", sha: fx.head.green, scope: "full", host: "mac" }, wl, runId: "tr-budget", log: () => {},
+			})).toMatchObject({ state: "success", error: null });
+			expect(timeouts).toEqual([15_000]);
+			expect(() => withFullSuitePublication(w.runs, OWNER_REPO, (remainingMs) => {
+				expect(remainingMs()).toBe(30_000);
+				now += 29_500;
+				expect(remainingMs()).toBe(500);
+				now += 500;
+				expect(() => remainingMs()).toThrow("holder deadline");
+			})).toThrow("holder deadline");
+		} finally { Date.now = originalNow; }
+	});
+
+	test("a final post uses the aggregate holder remainder and preserves both publication and audit failures", () => {
+		const w = landWorld();
+		landFirst(w.ledger, OWNER_REPO, false);
+		const { wl } = bind(w, PR.green, fx.head.green);
+		const originalNow = Date.now;
+		const originalEntries = w.ledger.entries;
+		let now = originalNow();
+		let activationReads = 0;
+		try {
+			Date.now = () => now;
+			w.ledger.entries = (...args) => {
+				// The second read is live activation inside the holder; precomputation is outside it.
+				if (++activationReads === 2) now += 29_500;
+				return originalEntries.apply(w.ledger, args);
+			};
+			w.ledger.db.exec(`CREATE TRIGGER refuse_status_failure BEFORE INSERT ON entries WHEN NEW.body LIKE 'status-failed:%' BEGIN SELECT RAISE(FAIL, 'publication audit denied'); END`);
+			let failure: unknown;
+			try {
+				postGate({
+					gh: (_args, timeoutMs) => { expect(timeoutMs).toBe(500); return { code: 1, stdout: "", stderr: "final post denied" }; },
+					ledger: w.ledger, root: w.runs, repo: OWNER_REPO, head: fx.head.green, ref: `wl/${wl}`, pr: PR.green,
+					need: "full", result: { verdict: "green", sha: fx.head.green, scope: "full", host: "mac" }, wl, runId: "tr-audit", log: () => {},
+				});
+			} catch (e) { failure = e; }
+			expect(failure).toBeInstanceOf(AggregateError);
+			expect((failure as AggregateError).errors.map((e: Error) => e.message)).toEqual(["final post denied", expect.stringContaining("publication audit denied")]);
+		} finally { Date.now = originalNow; w.ledger.entries = originalEntries; }
+	});
+
 	test("tree carry settles from G without a runner and a refused final gate post leaves pending with a durable failure row", async () => {
 		const w = landWorld();
 		// A distinct commit with exactly G's tree, not an identical-S carry.
@@ -3075,6 +3259,25 @@ describe("land-first main D5 (R13, R14)", () => {
 		expect(g(realpathSync(join(w.env.AGENT_SYSTEM_TEST_RUNNER_VERIFIED!, "current")), "rev-parse", "HEAD")).toBe(fx.head.green);
 		expect(admit(w, fx.head.green).action).toBe("verdict");
 	});
+	test("main bulk revocation leaves the mutex free and rechecks off separately for each final head post", async () => {
+		const w = mainWorld();
+		openSuccess(w);
+		const id = mainRequest(w, fx.head.red);
+		const key = OWNER_REPO.replaceAll("/", "_");
+		arm(w, key, "main-revocation-head");
+		const child = spawnRun(w, id);
+		try {
+			await reached(w, key, "main-revocation-head");
+			expect(calls(w)).toContain("pr list");
+			// Bulk discovery has finished but owns no publication mutex. Off can complete before this per-head post.
+			withFullSuitePublication(w.runs, OWNER_REPO, () => landFirst(w.ledger, OWNER_REPO, false));
+		} finally { go(w, key, "main-revocation-head"); }
+		expect(await child.exited).toBe(0);
+		expect(calls(w)).not.toContain("context=as2/full-suite");
+		expect(calls(w)).toContain(`statuses/${fx.head.red} -f state=failure -f context=as2/main-full`);
+		expect(await resultOf(w, STANDING_WORKLOAD_ID, id)).toMatchObject({ main: true, verdict: "red" });
+	});
+
 	for (const path of ["settle", "startup", "publication error"] as const) {
 		test(`main ${path} waiting behind an off publisher reads completed off before revoking, retaining its informational status`, async () => {
 			const w = mainWorld();
