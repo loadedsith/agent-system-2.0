@@ -21,9 +21,10 @@ import { type Ceiling, crossed, effectiveCeiling, parseSpend, type Spend } from 
 import { repoOf } from "./decision-log";
 import { ensureStandingWorkload } from "./identity";
 import {
-	attempts, boundPrs, causeText, consumedIds, controlEntries, heldLive, holdersOf, laneStopRequestBody, type LaunchVerdict,
-	PRIORITY_REASON_PREFIX, priorityPausingOf, queuedOf, verdictOf,
+	attempts, boundPrs, causeText, consumedIds, controlEntries, heldLive, holdersOf, laneStopRequestBody, launchRowsFor,
+	type LaunchVerdict, PRIORITY_REASON_PREFIX, priorityPausingOf, queuedOf, verdictOf,
 } from "./launch";
+import { openTrains } from "./merge-train";
 import { readPairSuggestConfig } from "./pair-suggest";
 import { currentGoals, formatShown, rankOpen, type RankItem, rankPick } from "./rank";
 import { parseTestRequested } from "./test-run";
@@ -83,10 +84,17 @@ export function pendingRequest(rows: ReserveRows): string | null {
  * reservation consumes it); otherwise the workload is refused `ranked: below <wl>` while a higher-ranked workload is
  * launchable now (`tried` does not change this), and under `parallel` refused `parallel: <reason>` when
  * `parallelVerdict` holds it.
+ * A cap-exempt workload (an open merge train, PLAN wl-mvpsrr4tr0p1xc D1) takes no slot, so it is admitted on
+ * `launchable`'s verdict alone in every mode, `show` included, before the queue gate, with a pending request promoted to
+ * its cause so the reservation consumes it.
  */
 export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS): LaunchVerdict {
 	const v = verdictOf(rows);
 	if (!v.launch) return v;
+	if (rows.capExempt) {
+		const request = pendingRequest(rows);
+		return request !== null ? { launch: true, cause: { kind: "request", id: request } } : v;
+	}
 	const request = pendingRequest(rows);
 	if (config.mode === "show") return request !== null ? v : (queueGate(ledger, rows, config, tried) ?? v);
 	if (request !== null) return { launch: true, cause: { kind: "request", id: request } };
@@ -103,7 +111,8 @@ export function rankGate(ledger: Ledger, rows: ReserveRows, config: RankConfig, 
 
 /**
  * `rankGate` in `reserveLane`'s verdict shape: what the starter composes into `decideLaunch` (in `show`, `decideLaunch`
- * plus the queue gate). `tried` is the drain's tried set (`readDrainTried`), so the reservation agrees with `drainPick`.
+ * plus the queue gate; a cap-exempt request promoted). `tried` is the drain's tried set (`readDrainTried`), so the
+ * reservation agrees with `drainPick`.
  */
 export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConfig, tried: ReadonlySet<string> = NO_IDS): ReserveVerdict {
 	const v = rankGate(ledger, rows, config, tried);
@@ -111,15 +120,16 @@ export function decideRanked(ledger: Ledger, rows: ReserveRows, config: RankConf
 }
 
 /**
- * The first workload ranked above `workloadId` that is launchable now (`launchRows` + `verdictOf`), or null. Under
- * `parallel` a higher workload the parallel rule holds does not block the ones below it: the drain tries the next.
+ * The first workload ranked above `workloadId` that is launchable now (`launchRowsFor` + `verdictOf`), or null. Under
+ * `parallel` a higher workload the parallel rule holds does not block the ones below it: the drain tries the next. A
+ * cap-exempt workload never blocks one below it: it takes no slot (PLAN wl-mvpsrr4tr0p1xc D1).
  */
 function higherLaunchable(ledger: Ledger, workloadId: string, now: string, cap: number, config: RankConfig): string | null {
 	for (const item of rankOpen(ledger, now)) {
 		if (item.workloadId === workloadId) return null;
 		if (item.state === "running" || item.mode !== "autonomous") continue;
-		const rows = ledger.launchRows(item.workloadId, cap);
-		if (!rows || !verdictOf(rows).launch) continue;
+		const rows = launchRowsFor(ledger, item.workloadId, cap);
+		if (!rows || rows.capExempt || !verdictOf(rows).launch) continue;
 		if (config.mode === "parallel" && parallelVerdict(ledger, item.workloadId, now, config).verdict === "hold") continue;
 		return item.workloadId;
 	}
@@ -208,8 +218,9 @@ export function queueGate(ledger: Ledger, rows: ReserveRows, config: RankConfig,
 	const at = queue.findIndex((i) => i.workloadId === w.id);
 	for (const item of queue.slice(0, Math.max(0, at))) {
 		if (tried.has(item.workloadId) || item.mode !== "autonomous" || item.state === "running") continue;
-		const above = ledger.launchRows(item.workloadId, rows.cap);
-		if (!above || !verdictOf(above).launch) continue;
+		const above = launchRowsFor(ledger, item.workloadId, rows.cap);
+		// a cap-exempt workload (an open merge train, PLAN wl-mvpsrr4tr0p1xc D1) takes no slot, so it never holds the queue
+		if (!above || above.capExempt || !verdictOf(above).launch) continue;
 		if (config.mode === "parallel" && parallelVerdict(ledger, item.workloadId, rows.now, config).verdict === "hold") continue;
 		return { launch: false, reason: `queued: position ${at + 1}` };
 	}
@@ -240,7 +251,7 @@ export function drainPick(ledger: Ledger, tried: ReadonlySet<string>, cap: numbe
 	const ranked = rankOpen(ledger, now);
 	return drainCandidates(ledger, now, config, ranked).find((id) => {
 		if (tried.has(id)) return false;
-		const rows = ledger.launchRows(id, cap);
+		const rows = launchRowsFor(ledger, id, cap);
 		return rows !== null && verdictOf(rows).launch && queueGate(ledger, rows, config, tried, ranked) === null;
 	}) ?? null;
 }
@@ -267,13 +278,14 @@ export interface PreemptResult {
 export function preemptFor(ledger: Ledger, now: string, cap: number, config: RankConfig, by: string): PreemptResult {
 	if (config.mode !== "order") return { paused: null, reason: `jevRank mode ${config.mode}: priority pause is off` };
 	return ledger.write((): PreemptResult => {
-		const live = ledger.liveLaneHolders(now);
+		// only the lanes the cap counts: an open merge train's lane takes no slot and is never paused (PLAN wl-mvpsrr4tr0p1xc D1)
+		const live = ledger.liveLaneHolders(now, new Set(openTrains(ledger)));
 		if (live.length < cap) return { paused: null, reason: `below cap (${live.length} of ${cap} lanes)` };
 		const ranked = rankOpen(ledger, now);
 		const waiting = ranked.filter((i) => {
 			if (i.pinned === undefined || i.mode !== "autonomous" || i.state === "running") return false;
-			const rows = ledger.launchRows(i.workloadId, Infinity);
-			return rows !== null && verdictOf(rows).launch && queueGate(ledger, rows, config) === null;
+			const rows = launchRowsFor(ledger, i.workloadId, Infinity);
+			return rows !== null && !rows.capExempt && verdictOf(rows).launch && queueGate(ledger, rows, config) === null;
 		});
 		const pending = live.filter((l) => priorityPausingOf(controlEntries(ledger.entries(l.workloadId, "assumption")))?.laneId === l.holder).length;
 		const x = waiting[pending];
@@ -426,7 +438,7 @@ export function rankShadowLine(ledger: Ledger, pid: number, picked: string, trie
 	const now = ledger.now();
 	const would = drainOrder(ledger, now).find((id) => {
 		if (tried.has(id)) return false;
-		const rows = ledger.launchRows(id, cap);
+		const rows = launchRowsFor(ledger, id, cap);
 		return rows !== null && verdictOf(rows).launch;
 	}) ?? null;
 	let parallel = "-";

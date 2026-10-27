@@ -11,7 +11,7 @@
 // forge one, and the lane tools refuse the prefixes outright (surface/extensions/lane-tools.ts).
 import { basename, dirname, isAbsolute, join } from "node:path";
 import {
-	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type QuestionRow, type ReserveRows, type ReserveVerdict,
+	type EntryRow, homeDir, type InstructionRow, LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, type QuestionRow, type ReserveRows, type ReserveVerdict,
 	type SliceRow, TEST_RUNNER_BY, type WorkloadRow,
 } from "../../ledger/src/index";
 import { type CleanShellRead, cleanShellOn } from "../../gates/src/clean-shell";
@@ -19,6 +19,7 @@ import { SHELL_START_HOOK_NAMES } from "../../gates/src/shell-start";
 import { LANE_ENV, WORKLOAD_ENV } from "../../gates/src/types";
 import { SCRATCH_CAP_DEFAULT_MB, SCRATCH_CAP_ENV, SCRATCH_ENV, scratchRootFor } from "../../gates/src/scratch";
 import { labOf } from "../../classifier/src/lab";
+import { consumedByReady, openTrains } from "./merge-train";
 import {
 	ARTIFACT_COMMAND_PREFIX, DUE_PREFIX, ESCALATION_BY, HOLD_HOURS, LANE_DIED_PREFIX, LANE_FULL_TEST_TOOL, MERGE_TRAIN_BY, RANK_BY, ROLE_ENV, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -478,12 +479,17 @@ export function heldLive(w: { holder: string | null; holder_lease_until: string 
  * surface to decide whether to exec the starter and again by `reserveLane` inside its transaction,
  * the run that binds. `receipt` is the holder's standing `done-because:` (`doneBecause`), or null:
  * a finished workload is awaiting close, not a lane's next launch, unless Jo's unconsumed
- * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close). A workload
- * priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause `priority <exit id>`,
- * after first, request and resume; any later launch attempt ends that state, so it is consumed once.
+ * `launch-requested:` says otherwise (Jo's word to relaunch wins over the tick's close).
+ * `capExempt` (an open merge train, PLAN wl-mvpsrr4tr0p1xc D1) skips only the `cap` refusal, and its
+ * resolutions are consumed by D2's rule (`consumedByReady`: a ready lane's first prompt carried them),
+ * not by a `launch:` attempt naming them.
+ * A workload priority-paused (`priorityPausedOf`, PLAN wl-mv8wzytml878b4 D3) relaunches with cause
+ * `priority <exit id>`, after first, request and resume; any later launch attempt ends that state, so it
+ * is consumed once.
  */
 export function launchable(
 	w: WorkloadRow, control: readonly ControlEntry[], receipt: string | null, resolved: readonly Resolution[], now: string, liveLanes: number, cap: number,
+	capExempt = false,
 ): LaunchVerdict {
 	if (w.status !== "open") return { launch: false, reason: "closed" };
 	if (w.id === STANDING_WORKLOAD_ID) return { launch: false, reason: "standing" };
@@ -494,21 +500,33 @@ export function launchable(
 	const consumed = consumedIds(tried);
 	const req = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
 	if (receipt !== null && !req) return { launch: false, reason: "awaiting-close" };
-	if (liveLanes >= cap) return { launch: false, reason: "cap" };
+	if (!capExempt && liveLanes >= cap) return { launch: false, reason: "cap" };
 	if (tried.length === 0) return { launch: true, cause: { kind: "first" } };
 	if (req) return { launch: true, cause: { kind: "request", id: req.id } };
-	const res = resolved.filter((r) => !consumed.has(r.instructionId));
+	const res = resolved.filter((r) => (capExempt ? !consumedByReady(control, r.createdAt) : !consumed.has(r.instructionId)));
 	if (res.length > 0) return { launch: true, cause: { kind: "resume", ids: res.map((r) => r.instructionId) } };
 	const paused = priorityPausedOf(control);
 	if (paused !== null) return { launch: true, cause: { kind: "priority", exitId: paused.exitId } };
 	return { launch: false, reason: "died-not-relaunched" };
 }
 
-/** The predicate over the rows a launch decision reads (`Ledger.launchRows`): the surface's run and `reserveLane`'s. */
+/** The predicate over the rows a launch decision reads (`launchRowsFor`): the surface's run and `reserveLane`'s. */
 export function verdictOf(rows: ReserveRows): LaunchVerdict {
 	const holders = holdersOf(rows.entries, rows.workload.holder, rows.holders);
 	const control = controlEntries(rows.entries, holders);
-	return launchable(rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap);
+	return launchable(
+		rows.workload, control, doneBecause(rows.entries, holders), resolutions(control, rows.questions, rows.instructions, rows.slices), rows.now, rows.liveLanes, rows.cap,
+		rows.capExempt,
+	);
+}
+
+/**
+ * The one way the surface reads a launch decision's rows (PLAN wl-mvpsrr4tr0p1xc D1): `Ledger.launchRows` with the open merge
+ * trains (`openTrains`) as the cap-exempt set, so a train's lane is never counted in `liveLanes` and a train's own rows say
+ * `capExempt`. The starter's reservation passes the same set to `reserveLane`, evaluated inside its transaction.
+ */
+export function launchRowsFor(ledger: Ledger, workloadId: string, cap: number): ReserveRows | null {
+	return ledger.launchRows(workloadId, cap, { capExempt: new Set(openTrains(ledger)) });
 }
 
 /** `reserveLane`'s policy for an autonomous launch: the predicate over the rows the transaction read. */

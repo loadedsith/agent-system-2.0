@@ -49,3 +49,15 @@ Read the kind off your task, then follow the matching line.
   (`AGENT_SYSTEM_SCRATCH_CAP_MB`, default 2048). Anything a later lane needs goes in the plan directory.
 - Any order of workloads, PRs or next steps you give or act on comes from `as2_rank`, never your own
   judgment; Jo's "X first", unpins and goals are the orchestrator's to record.
+
+## Fault tolerance
+
+Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md`) apply to the code you write and the runs you make.
+
+- **Fail loudly.** No swallowed error: no empty `catch`, no silent default. A fallback announces itself.
+- **Fail obviously.** Every error you write or report names what broke, where (file or command), the evidence, and the next step, or says none is known.
+- **Recover by restart.** A rerun is safe to repeat; durable state lives in one store, and the rest is rebuilt from it.
+- **Bound every retry.** Retry in one layer only, with backoff and a limit, then report the failure; no retry inside a retry.
+- **Silence is a failure.** Long work has a deadline that tracks progress; a hang, a job that never started, or a dead watcher is an error you report.
+- **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
+- **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.

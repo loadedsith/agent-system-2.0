@@ -24,6 +24,9 @@
 // and again 2026-10-26 on wl/wl-mvifaz8r8dieps merged with origin/main 2a4f476 (#267's standing rulings and #305's
 // intake-queue rule together):
 //   orchestrator.md  328 lines  23478 bytes
+// Re-measured 2026-10-27 on plumb/fault-tolerance-tiers (base fe6ed4d), where the fault-tolerance section
+// (.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md) filled the old 19249:
+//   lane.md           93 lines  19605 bytes
 //
 // Bound per file and per measure = max(ceil(measured × 1.25), floor). The floor is rootstock's own
 // budget: 200 lines, and 2,000 tokens taken as 8,000 bytes at roughly four bytes per token for
@@ -42,7 +45,7 @@ const WARN_AT = 0.85;
 
 const BOUNDS: Record<string, { lines: number; bytes: number }> = {
 	"orchestrator.md": { lines: 410, bytes: 29348 },
-	"lane.md": { lines: 200, bytes: 19249 },
+	"lane.md": { lines: 200, bytes: 24507 },
 	"fast.md": { lines: 200, bytes: 8000 },
 	"standard.md": { lines: 200, bytes: 8000 },
 	"strong.md": { lines: 200, bytes: 8000 },

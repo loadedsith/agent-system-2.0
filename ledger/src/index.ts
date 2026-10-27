@@ -217,8 +217,10 @@ export interface ReserveRows {
 	slices: SliceRow[];
 	/** Every holder the workload ever had, oldest first (`holders`). */
 	holders: string[];
-	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`. */
+	/** Open autonomous workloads held by a `lane-*` holder whose lease is null or not yet lapsed at `now`, cap-exempt workloads not counted. */
 	liveLanes: number;
+	/** This workload is in the cap-exempt set the caller passed (`launchRows`): the surface's open merge trains, outside the lane cap. */
+	capExempt: boolean;
 	cap: number;
 	now: string;
 }
@@ -566,9 +568,12 @@ export class Ledger {
 	/**
 	 * What a launch decision reads (the surface's own predicate run, and `reserveLane` inside its
 	 * transaction): the workload row, its entries, questions, instructions and slices, and the
-	 * live-lane count at `now`. Null when there is no such workload.
+	 * live-lane count at `now`. Null when there is no such workload. `capExempt` is the set of
+	 * workloads outside the lane cap (the surface's open merge trains; this module knows no trains):
+	 * their holders are not counted in `liveLanes`, and `ReserveRows.capExempt` says whether this
+	 * workload is one of them.
 	 */
-	launchRows(workloadId: string, cap: number): ReserveRows | null {
+	launchRows(workloadId: string, cap: number, opts: { capExempt?: ReadonlySet<string> } = {}): ReserveRows | null {
 		const now = this.now();
 		const workload = this.db.query<WorkloadRow, [string]>("SELECT * FROM workloads WHERE id = ?").get(workloadId);
 		if (!workload) return null;
@@ -579,19 +584,23 @@ export class Ledger {
 			instructions: this.instructions(workloadId),
 			slices: this.slices(workloadId),
 			holders: this.holders(workloadId),
-			liveLanes: this.liveLaneHolders(now).length,
+			liveLanes: this.liveLaneHolders(now, opts.capExempt).length,
+			capExempt: opts.capExempt?.has(workloadId) ?? false,
 			cap,
 			now,
 		};
 	}
 
-	/** The `lane-*` holders of open autonomous workloads under a lease that is null or not yet lapsed at `now`, with their workload ids. */
-	liveLaneHolders(now: string = this.now()): { workloadId: string; holder: string }[] {
+	/**
+	 * The `lane-*` holders of open autonomous workloads under a lease that is null or not yet lapsed at `now`, with their
+	 * workload ids; a workload in `exempt` (outside the lane cap, `launchRows`) is left out.
+	 */
+	liveLaneHolders(now: string = this.now(), exempt?: ReadonlySet<string>): { workloadId: string; holder: string }[] {
 		return this.db.query<{ id: string; holder: string }, [string]>(
 			`SELECT id, holder FROM workloads
 			 WHERE mode = 'autonomous' AND status = 'open' AND holder GLOB 'lane-*'
 			   AND (holder_lease_until IS NULL OR holder_lease_until >= ?) ORDER BY created_at, id`,
-		).all(now).map((r) => ({ workloadId: r.id, holder: r.holder }));
+		).all(now).filter((r) => !exempt?.has(r.id)).map((r) => ({ workloadId: r.id, holder: r.holder }));
 	}
 
 	/**
@@ -600,12 +609,13 @@ export class Ledger {
 	 * launch verdict mints the ordinal, pre-claims for the lane id with `leaseMs` (stamped `by`, the
 	 * starter, so the lane's own claim is a real readiness signal) and writes the attempt entry
 	 * `launch: <laneId> cause <cause> requested-by <who>`. A refusal returns before any write.
+	 * `capExempt`, when given, is evaluated inside the transaction and passed to `launchRows`.
 	 */
 	reserveLane(workloadId: string, input: Stamp & {
-		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict;
+		cap: number; leaseMs: number; requestedBy: string; decide: (rows: ReserveRows) => ReserveVerdict; capExempt?: () => ReadonlySet<string>;
 	}): ReserveResult {
 		return this.write(() => {
-			const rows = this.launchRows(workloadId, input.cap);
+			const rows = this.launchRows(workloadId, input.cap, { capExempt: input.capExempt?.() });
 			if (!rows) return { ok: false as const, reason: "no such workload" };
 			const verdict = input.decide(rows);
 			if (!verdict.launch) return { ok: false as const, reason: verdict.reason };
