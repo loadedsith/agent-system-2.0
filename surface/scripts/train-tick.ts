@@ -162,10 +162,13 @@ export function tick(d: TickDeps): string[] {
 	 * own cause admits it (`first`, an unconsumed resolution) the launcher runs with no request, so the attempt names and
 	 * consumes that cause; only `died-not-relaunched` gets the request; any other refusal (`held` by a lane another path
 	 * launched since step 4 read the train, `awaiting-close`, `user-driven`, …) writes nothing and runs no launcher, so no
-	 * request outlives that lane to wake an idle train (review r1 F2). Returns the launcher's exit code, whether this call wrote
-	 * the request, the id of the request now pending (null when the train's own cause was launched) and the workload's entry
-	 * count before the launch. Null, with nothing written and no launcher, when the workload is stopped at its ceiling
-	 * (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3) or the train's verdict refuses with another reason; one line says which.
+	 * request outlives that lane to wake an idle train (review r1 F2). The pending-request lookup, the verdict read and the
+	 * request's insert are one write transaction (BEGIN IMMEDIATE), so no other starter's reservation lands between the read
+	 * and the insert (review r2 F5); the launcher runs after it commits, as it takes its own reservation transaction. Returns
+	 * the launcher's exit code, whether this call wrote the request, the id of the request now pending (null when the train's
+	 * own cause was launched) and the workload's entry count before the launch. Null, with nothing written and no launcher,
+	 * when the workload is stopped at its ceiling (`ceilingStopped`, PLAN wl-mvgn310dpi5gcg D3) or the train's verdict refuses
+	 * with another reason; one line says which.
 	 */
 	const request = (wl: string, reason: string): { code: number; wrote: boolean; requestId: string | null; before: number } | null => {
 		const entries = ledger.entries(wl);
@@ -176,20 +179,27 @@ export function tick(d: TickDeps): string[] {
 			say(`${wl}: launch (${reason}) not requested: stopped at its ceiling usd ${stopped.spend.usd} of ${stopped.ceiling.usd}`);
 			return null;
 		}
-		const consumed = consumedIds(attempts(control));
-		const pending = control.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
-		const rows = pending === undefined ? launchRowsFor(ledger, wl, laneCap(process.env)) : null;
-		const verdict = rows !== null && rows.capExempt ? verdictOf(rows) : null;
-		if (verdict !== null && !verdict.launch && verdict.reason !== "died-not-relaunched") {
-			say(`${wl}: launch (${reason}) not requested: ${verdict.reason}`);
+		const decided = ledger.write((): { wrote: boolean; requestId: string | null } | { refused: string } => {
+			// re-read inside the transaction: the rows read above may predate another starter's reservation
+			const fresh = ledger.entries(wl);
+			const freshControl = controlEntries(fresh, holdersOf(fresh, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
+			const consumed = consumedIds(attempts(freshControl));
+			const pending = freshControl.find((c) => c.prefix === "launch-requested" && !consumed.has(c.id));
+			if (pending !== undefined) return { wrote: false, requestId: pending.id };
+			const rows = launchRowsFor(ledger, wl, laneCap(process.env));
+			const verdict = rows !== null && rows.capExempt ? verdictOf(rows) : null;
+			if (verdict !== null && !verdict.launch && verdict.reason !== "died-not-relaunched") return { refused: verdict.reason };
+			if (verdict !== null && verdict.launch) return { wrote: false, requestId: null };
+			return { wrote: true, requestId: ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) }) };
+		});
+		if ("refused" in decided) {
+			say(`${wl}: launch (${reason}) not requested: ${decided.refused}`);
 			return null;
 		}
-		const own = verdict !== null && verdict.launch;
-		const requestId = pending?.id ?? (own ? null : ledger.recordEntry({ by: MERGE_TRAIN_BY, workloadId: wl, kind: "assumption", body: launchRequestedBody(MERGE_TRAIN_BY, ledger.now(), reason) }));
 		const before = ledger.entries(wl).length;
 		const r = d.launch(wl);
 		say(`${wl}: launch (${reason}): exit ${r.code}: ${r.line}`);
-		return { code: r.code, wrote: pending === undefined && !own, requestId, before };
+		return { code: r.code, before, ...decided };
 	};
 
 	// 1-2. Facts and settles, per train.

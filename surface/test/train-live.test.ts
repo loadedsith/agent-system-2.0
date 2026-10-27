@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { askJo, raisedId } from "../../gates/src/rulings";
-import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
+import { LANE_RUNNER_BY, LANE_STARTER_BY, Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { launchVerdict, triggerLaunch } from "../extensions/launch";
 import { onFire } from "../src/batch";
 import { recordRepo } from "../src/decision-log";
@@ -16,8 +16,8 @@ import { errorLines } from "../src/errors";
 import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain, interpret } from "../src/input";
 import {
-	controlEntries, LANE_CAP_ENV, laneCap, laneExitBody, laneReadyBody, laneStartedBody, launchFailedBody, launchRequestedBody, launchRowsFor, type LaneOutcome,
-	STARTER_EXIT, trainBoardBody, verdictOf,
+	attempts, consumedIds, controlEntries, LANE_CAP_ENV, laneCap, laneExitBody, laneReadyBody, laneStartedBody, launchFailedBody, launchRequestedBody, launchRowsFor,
+	type LaneOutcome, STARTER_EXIT, trainBoardBody, verdictOf,
 } from "../src/launch";
 import { actionable, fixBindings, recordTrainTask, TRAIN_ALERT_REPO, TRAIN_LAUNCH_OPTIONS, TRAIN_RETRY_OPTIONS, trainLaunchFailures, trainSliceId } from "../src/merge-train";
 import type { PidState } from "../src/omp-probe";
@@ -113,9 +113,12 @@ function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 		c.plusHours(0.001);
 		ready(wl, laneId);
 	};
-	/** `lane.ts launch <wl> --requested-by <who>`: the real reservation, then the fake runner; its exit code and line. */
-	const starter = (wl: string, who: string = MERGE_TRAIN_BY, rank: RankConfig = config): { code: number; line: string } => {
-		const r = laneScript.reserve(ledger, wl, who, false, rank, probeFor);
+	/**
+	 * `lane.ts launch <wl> --requested-by <who>`: the real reservation, then the fake runner; its exit code and line. `on` is the
+	 * connection the reservation runs on (another process's, in a race test); the runner writes on the world's.
+	 */
+	const starter = (wl: string, who: string = MERGE_TRAIN_BY, rank: RankConfig = config, on: Ledger = ledger): { code: number; line: string } => {
+		const r = laneScript.reserve(on, wl, who, false, rank, probeFor);
 		if (!r.ok) return { code: refusalCode(r.reason), line: `${wl} not launched: ${r.reason}` };
 		run(wl, r.laneId, wl === train ? (starts.shift() ?? "ready") : "ready");
 		return { code: 0, line: `launched ${r.laneId} cause ${r.cause}` };
@@ -156,6 +159,11 @@ function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 	const trainLaunches = () => control().filter((c) => c.prefix === "launch").map((c) => `${c.laneId} ${c.rest}`);
 	/** The `launch-requested:` rows the tick wrote on `wl`. */
 	const tickRequests = (wl: string = train) => control(wl).filter((c) => c.prefix === "launch-requested" && c.createdBy === MERGE_TRAIN_BY);
+	/** The tick's `launch-requested:` rows on `wl` that no `launch:` attempt names yet. */
+	const pendingTickRequests = (wl: string = train) => {
+		const consumed = consumedIds(attempts(control(wl)));
+		return tickRequests(wl).filter((c) => !consumed.has(c.id));
+	};
 	/** The train lane the newest attempt reserved. */
 	const lane = () => control().filter((c) => c.prefix === "launch").at(-1)!.laneId!;
 	/** The train lane's exit: its `released-open:` when `open` slices are left (lane_release's marker), its release, the runner's `lane-exit:`. */
@@ -252,8 +260,9 @@ function live(prs: readonly number[] = [101], config: RankConfig = SHOW) {
 		expect(trainLaunches()).toHaveLength(3);
 	};
 	return {
-		c, ledger, path, repo, train, owner, g, views, alive, probeFor, starts, starter, launched, logs, pass, drain, control, trainLaunches, tickRequests, lane,
-		exit, work, park, answer: answer_, busy, ordinary, joRequest, limitQuestions, creates, task, push, ready, started, quiet, threeFailures,
+		c, ledger, path, repo, train, owner, g, views, alive, probeFor, starts, starter, launched, logs, pass, drain, control, trainLaunches, tickRequests,
+		pendingTickRequests, lane, exit, work, park, answer: answer_, busy, ordinary, joRequest, limitQuestions, creates, task, push, ready, started, quiet,
+		threeFailures,
 	};
 }
 
@@ -565,6 +574,55 @@ describe("T4 (acceptance 5): no work, no lane", () => {
 		expect(w.drain().filter((d) => d.wl === w.train)).toEqual([]);
 		expect(w.trainLaunches()).toHaveLength(2);
 		expect(w.tickRequests()).toEqual([]);
+	});
+
+	test("another starter records Jo's request and reserves the train after request() read its rows, before its request is written: the competing write cannot land inside the tick's transaction, so no tick request outlives a lane; after the lane readies and exits with nothing new, nothing launches (review r2 F5)", () => {
+		const w = live();
+		w.pass();
+		// the first lane dies before it works #101: the train is actionable and its verdict reads died-not-relaunched
+		w.exit("died");
+		expect(actionable(w.ledger, w.train)).toEqual(["#101 not yet worked"]);
+		expect(verdictOf(launchRowsFor(w.ledger, w.train, CAP)!)).toEqual({ launch: false, reason: "died-not-relaunched" });
+		// another process (Jo's launch word, then its starter) on its own connection to the same file, with no busy wait and no
+		// retry, runs the moment request()'s read of the train's launch rows returns
+		const other = Ledger.open(w.path, { backup: false, backupOnOpen: false, clock: w.c.now, busyTimeoutMs: 0, busyRetries: 0 });
+		let raced: "busy" | { code: number; line: string } | null = null;
+		const racing = new Proxy(w.ledger, {
+			get(target, key) {
+				const v = Reflect.get(target, key, target);
+				if (typeof v !== "function") return v;
+				if (key !== "launchRows") return v.bind(target);
+				return (wl: string, ...rest: unknown[]) => {
+					const rows = v.apply(target, [wl, ...rest]);
+					if (wl === w.train && raced === null) {
+						try {
+							other.recordEntry({ by: SURFACE_BY, workloadId: w.train, kind: "assumption", body: launchRequestedBody("jo", other.now()) });
+							raced = w.starter(w.train, SURFACE_BY, SHOW, other);
+						} catch (err) {
+							if (!(err instanceof Error && "code" in err && String(err.code).startsWith("SQLITE_BUSY"))) throw err;
+							raced = "busy";
+						}
+					}
+					return rows;
+				};
+			},
+		});
+		try {
+			w.pass(racing);
+			// whichever lane holds the train now gets ready, works #101 and exits with nothing new: no pass and no drain launches it
+			w.work(101);
+			w.exit("open-work", { releasedOpen: 1 });
+			w.pass();
+			w.pass();
+			expect(w.drain().filter((d) => d.wl === w.train)).toEqual([]);
+			expect(w.pendingTickRequests()).toEqual([]);
+			expect(w.trainLaunches()).toHaveLength(2);
+			// the competing write was refused busy while the tick held its transaction, so the tick's own launch served its request
+			expect(raced).toBe("busy");
+			expect(w.trainLaunches()[1]).toBe(`${w.lane()} cause request ${w.tickRequests()[0]!.id} requested-by ${MERGE_TRAIN_BY}`);
+		} finally {
+			other.close();
+		}
 	});
 });
 
