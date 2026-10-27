@@ -11,11 +11,11 @@ import { type EntryRow, type InstructionRow, TEST_RUNNER_BY } from "../../ledger
 import { boundPrs, holdersOf, testPrBody, testPrInstructionBody } from "../src/launch";
 import { SURFACE_BY } from "../src/types";
 import {
-	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
-	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, KEEP_RUNS, lockHolderStale,
+	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
+	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, executedFiles, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, isSecurityPath, KEEP_RUNS, lockHolderStale,
 	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
-	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, stageDirOf, pushDestBody,
+	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, soloPlan, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
 	TestRunShapeError, testRuns, WRAPPER_EXIT, wrapperArgv, workDirOf, failuresOf, parseSecurityRed, securityFailuresOf, securityRedBody, securityRedOf,
 } from "../src/test-run";
@@ -302,6 +302,21 @@ describe("bodies: format and parse round-trip exactly; malformed bodies are reje
 		// the ordinary signal still ignores red-main
 		expect(testRunFailedOf("wl-t", "sl-full-t-1", redMain)).toBeNull();
 	});
+	test("isSecurityPath (PLAN wl-mvq4edh02r5z40 D0): repo-relative with any ./ dropped, starting with a SECURITY_TEST_PATHS entry", () => {
+		for (const p of ["gates/test/a.test.ts", "./gates/test/a.test.ts", "gates/test/sub/b_spec.ts"]) expect(isSecurityPath(p)).toBe(true);
+		for (const p of ["src/gates/test/a.test.ts", "./gates/testing/a.test.ts", "gates/a.test.ts", "surface/test/gates/test/x.test.ts", "?"]) expect(isSecurityPath(p)).toBe(false);
+	});
+	test("compatibility: a frozen pre-wl-mvq4edh02r5z40 red-main body with a `full` baseCompare part and a security failure parses, and securityFailuresOf reads it", () => {
+		const SEC = "gates/test/sec.test.ts > row 3 > fails";
+		const body = `test-run: tr-0old17 red-main sha=${A} pr=17 {"sha":"${A}","pr":17,"reason":"every failing test also fails on base ccccccc","headAtEnd":"${A}","base":"${C}","mergeBase":"${D}","full":{"pass":3,"fail":2,"skip":0,"exit":1,"ms":1200,"error":null},"solo":[{"file":"./gates/test/sec.test.ts","pass":1,"fail":1,"skip":0,"exit":1,"ms":300,"error":null}],"failures":[{"part":"full","name":"${SEC}","firstError":"error: nope"},{"part":"full","name":"x.test.ts > broken","firstError":"error: main"},{"part":"./gates/test/sec.test.ts","name":"${SEC}","firstError":"error: nope"}],"runDir":"/runs/tr-0old17","preflight":"ok","baseCompare":{"sha":"${C}","parts":[{"part":"full","failing":["${SEC}","x.test.ts > broken"],"baseFailing":["${SEC}","x.test.ts > broken"],"baseError":null},{"part":"./gates/test/sec.test.ts","failing":["${SEC}"],"baseFailing":["${SEC}"],"baseError":null}]}}`;
+		const t = parseTestRun(body);
+		expect(t).not.toBeNull();
+		expect(t!.verdict).toBe("red-main");
+		expect(t!.baseCompare!.parts.map((p) => p.part)).toEqual(["full", "./gates/test/sec.test.ts"]);
+		expect(securityFailuresOf(t!).map((f) => [f.part, f.name])).toEqual([["full", SEC], ["./gates/test/sec.test.ts", SEC]]);
+		expect(securityRedOf("wl-t", "sl-full-t-1", t!)).toMatchObject({ runId: "tr-0old17", failing: 2, first: SEC });
+		expect(testRunBody(t!)).toBe(body);
+	});
 	test("security-red: (a pushed signal) formats and parses exactly; malformed bodies are rejected", () => {
 		const s = { workloadId: "wl-mvg1vs0rhnu3gg", slice: "sl-full-mvg1vs0rhnu3gg-1", runId: "tr-0abc12", sha: A, failing: 2, first: "gates/test/sec.test.ts > row 3 > fails" };
 		const body = securityRedBody(s);
@@ -455,6 +470,30 @@ describe("junit: counts and failing names with their first error line; anything 
 		expect(partResult({ junit: green, log: null, exit: null, ms: 1 }).error).toBe("killed before it exited");
 		expect(partResult({ junit: green, log: null, exit: 0, ms: 1, timedOut: true }).error).toBe("timeout");
 	});
+	test("PLAN wl-mvq4edh02r5z40 D0: a timeout comes before an import refusal or a report error, and an imported junit keeps its failures", () => {
+		// the log refused (over the cap) while the junit was imported: the failures stay, the error names the refusal
+		const refusedLog = partResult({ junit: JUNIT_C, log: null, exit: 1, ms: 1, importError: "full.log is over the 5-byte report cap" });
+		expect(refusedLog.error).toBe("report import refused: full.log is over the 5-byte report cap");
+		expect(refusedLog.failures.map((f) => f.name)).toEqual(["c.test.ts > type error", "c.test.ts > string thrown", "c.test.ts > empty message", "c.test.ts > d > b ok", "c.test.ts > timeout"]);
+		expect([refusedLog.pass, refusedLog.fail]).toEqual([0, 5]);
+		// timed out with that refusal: the error starts `timeout`, the junit's failures are kept
+		const both = partResult({ junit: JUNIT_C, log: null, exit: 124, ms: 1, timedOut: true, importError: "full.log is over the 5-byte report cap" });
+		expect(both.error).toBe("timeout; report import refused: full.log is over the 5-byte report cap");
+		expect(both.failures).toHaveLength(5);
+		// a refused junit: no failures to keep, the timeout still first
+		expect(partResult({ junit: null, log: null, exit: 124, ms: 1, timedOut: true, importError: "full.xml is a symlink" }).error).toBe("timeout; report import refused: full.xml is a symlink");
+		// a partial junit that does not parse: timeout, then the report's error
+		expect(partResult({ junit: JUNIT_A.slice(0, 400), log: null, exit: 124, ms: 1, timedOut: true }).error).toMatch(/^timeout; .*does not parse/);
+		// a timed-out part with a readable failing junit: error timeout, failures kept
+		const partial = partResult({ junit: manyFailures(3), log: null, exit: 124, ms: 1, timedOut: true });
+		expect(partial).toMatchObject({ error: "timeout", fail: 3 });
+		expect(partial.failures).toHaveLength(3);
+	});
+	test("PLAN wl-mvq4edh02r5z40 D0: a call timed out when the wrapper exited 124 or the outlive sweep fired on it, whatever its later exit", () => {
+		expect(callTimedOut({ code: WRAPPER_EXIT.timeout, outlived: false })).toBe(true);
+		for (const code of [0, 1, WRAPPER_EXIT.failed, WRAPPER_EXIT.refused, null]) expect(callTimedOut({ code, outlived: true })).toBe(true);
+		for (const code of [0, 1, WRAPPER_EXIT.failed, WRAPPER_EXIT.refused, null]) expect(callTimedOut({ code, outlived: false })).toBe(false);
+	});
 	test("the installed bun's own report and log parse the same way (format drift fails here)", () => {
 		const dir = tmp("junit-live");
 		mkdirSync(join(dir, "sub"));
@@ -473,6 +512,29 @@ describe("junit: counts and failing names with their first error line; anything 
 			{ name: "sub/a.test.ts > outer > fails", firstError: "error: expect(received).toBe(expected)" },
 			{ name: "sub/a.test.ts > throws", firstError: "TypeError: bad type" },
 		]);
+	});
+	test("executedFiles (PLAN wl-mvq4edh02r5z40 D1): a file counts once one of its cases has no <skipped>; skip and todo cases alone never count", () => {
+		const xml = `<testsuites tests="6" failures="1" skipped="3">
+  <testsuite name="a.test.ts" file="a.test.ts"><testcase name="s" file="a.test.ts"><skipped /></testcase><testcase name="t" file="a.test.ts"><skipped message="TODO" /></testcase></testsuite>
+  <testsuite name="sub/b.test.ts" file="sub/b.test.ts"><testsuite name="outer" file="sub/b.test.ts"><testcase name="s" file="sub/b.test.ts"><skipped /></testcase><testcase name="fails" file="sub/b.test.ts"><failure type="AssertionError" /></testcase></testsuite></testsuite>
+  <testsuite name="c.test.ts" file="c.test.ts"><testcase name="ok" file="c.test.ts" /></testsuite>
+  <testsuite name="./d.test.ts" file="./d.test.ts"><testcase name="ok" file="./d.test.ts" /></testsuite>
+</testsuites>`;
+		expect(executedFiles(xml)).toEqual(["sub/b.test.ts", "c.test.ts", "d.test.ts"]);
+		// a report that does not parse, or is not a report, ran nothing
+		for (const bad of ["", JUNIT_A.slice(0, 400), "<testsuite tests='1' failures='0'><testcase name='a'/></testsuite>"]) expect(executedFiles(bad)).toEqual([]);
+		expect(executedFiles(JUNIT_GATES_FULL)).toEqual(["gates/test/sec.test.ts", "surface/test/plain.test.ts"]);
+	});
+	test("executedFiles reads the installed bun's own report: an all-skip and an all-todo file are not executed (format drift fails here)", () => {
+		const dir = tmp("junit-executed");
+		mkdirSync(join(dir, "sub"));
+		writeFileSync(join(dir, "sub", "ran.test.ts"), 'import { test } from "bun:test";\ntest("ok", () => {});\ntest.skip("s", () => {});\n');
+		writeFileSync(join(dir, "skips.test.ts"), 'import { test } from "bun:test";\ntest.skip("s", () => {});\n');
+		writeFileSync(join(dir, "todos.test.ts"), 'import { test } from "bun:test";\ntest.todo("t");\n');
+		const out = join(dir, "out.xml");
+		const p = Bun.spawnSync([process.execPath, "test", "--reporter=junit", `--reporter-outfile=${out}`], { cwd: dir, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: dir, NO_COLOR: "1" }, stdout: "pipe", stderr: "pipe" });
+		expect(p.exitCode).toBe(0);
+		expect(executedFiles(readFileSync(out, "utf8"))).toEqual(["sub/ran.test.ts"]);
 	});
 });
 
@@ -500,7 +562,7 @@ describe("verdict and settle", () => {
 		pass: 10, fail, skip: 0, exit: fail > 0 ? 1 : 0, ms: 5, error: null, failures: Array.from({ length: fail }, (_, i) => ({ name: `f > t${i}`, firstError: `error: e${i}` })), ...over,
 	});
 	const facts = (over: Partial<RunFacts> = {}): RunFacts => ({
-		requestedSha: A, fetchedSha: A, error: null, full: part(), solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", baseRuns: null, ...over,
+		requestedSha: A, fetchedSha: A, error: null, full: part(), fullTimedOut: false, solo: [{ file: "./x.test.ts", ...part() }], headAtStart: A, headAtEnd: A, owner: true, sliceState: "open", baseRuns: null, ...over,
 	});
 	test("green at an unchanged head settles an open slice, and only an open one", () => {
 		expect(decideRun(facts())).toEqual({ verdict: "green", outcome: "green", reason: null, settle: true });
@@ -572,72 +634,155 @@ describe("verdict and settle", () => {
 		expect(notifiesOrchestrator("green", false)).toBe(false);
 		expect(notifiesOrchestrator("superseded", false)).toBe(false);
 	});
-	// PLAN wl-mv8s8srodefytc rev 17.1 D8: each failing part is compared with base's run of the same part.
+	// PLAN wl-mv8s8srodefytc rev 17.1 D8, PLAN wl-mvq4edh02r5z40 D3: each failing file rerun alone is compared with base's run of that file alone.
 	const named = (names: string[], over: Partial<PartResult> = {}): PartResult =>
 		part(names.length, { failures: names.map((name) => ({ name, firstError: `error: ${name}` })), ...over });
 	const onBase = (parts: Record<string, PartResult>) => ({ sha: C, parts });
-	test("red-main: each failing part is compared with base's run of the same part, never another part", () => {
-		const pr = facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...named(["x > t2"]) }] });
-		expect(baseParts(pr)).toEqual(["full", "./x.test.ts"]);
-		// both fail on base, each in its own part: red-main, settled like a green
-		const both = facts({ ...pr, baseRuns: onBase({ full: named(["a > t1", "z > other"]), "./x.test.ts": named(["x > t2"]) }) });
+	const solo = (file: string, r: PartResult) => ({ file, ...r });
+	test("red-main: each failing file's solo part is compared with base's solo run of that file; base never runs the full suite", () => {
+		const pr = facts({ full: named(["x.test.ts > t1", "y.test.ts > t2"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"])), solo("./y.test.ts", named(["y.test.ts > t2"]))] });
+		expect(baseParts(pr)).toEqual(["./x.test.ts", "./y.test.ts"]);
+		// both fail on base, each alone: red-main, settled like a green
+		const both = facts({ ...pr, baseRuns: onBase({ "./x.test.ts": named(["x.test.ts > t1", "x.test.ts > other"]), "./y.test.ts": named(["y.test.ts > t2"]) }) });
 		expect(decideRun(both)).toEqual({ verdict: "red-main", outcome: "red-main", reason: `every failing test also fails on base ${C.slice(0, 7)}`, settle: true });
 		expect(baseCompareFor(both)).toEqual({
-			sha: C, parts: [{ part: "full", failing: ["a > t1"], baseFailing: ["a > t1", "z > other"], baseError: null }, { part: "./x.test.ts", failing: ["x > t2"], baseFailing: ["x > t2"], baseError: null }],
+			sha: C, parts: [
+				{ part: "./x.test.ts", failing: ["x.test.ts > t1"], baseFailing: ["x.test.ts > t1", "x.test.ts > other"], baseError: null },
+				{ part: "./y.test.ts", failing: ["y.test.ts > t2"], baseFailing: ["y.test.ts > t2"], baseError: null },
+			],
 		});
-		// the solo failure fails in base's full run only, not in base's solo run of that file: red
-		const crossed = facts({ ...pr, baseRuns: onBase({ full: named(["a > t1", "x > t2"]), "./x.test.ts": named([]) }) });
-		expect(decideRun(crossed)).toMatchObject({ verdict: "red", settle: false });
+		// a `full` base result (what an older runner cached) is never read: y's own solo run on base is missing, so red
+		const fullOnly = facts({ ...pr, baseRuns: onBase({ full: named(["x.test.ts > t1", "y.test.ts > t2"]), "./x.test.ts": named(["x.test.ts > t1"]) }) });
+		expect(decideRun(fullOnly)).toMatchObject({ verdict: "red", settle: false });
+		expect(baseCompareFor(fullOnly)!.parts.map((p) => [p.part, p.baseError])).toEqual([["./x.test.ts", null], ["./y.test.ts", "not run on base"]]);
 		// red-main settles an open slice only
 		expect(decideRun({ ...both, sliceState: "paused" })).toMatchObject({ verdict: "red-main", settle: false });
 	});
-	test("red-main: a full-only failure that passes alone is red-main when base's full run fails it too", () => {
-		const f = facts({ full: named(["x > flaky in the suite"]), solo: [{ file: "./x.test.ts", ...part() }] });
-		expect(baseParts(f)).toEqual(["full"]);
-		expect(decideRun({ ...f, baseRuns: onBase({ full: named(["x > flaky in the suite"]) }) })).toMatchObject({ verdict: "red-main", settle: true });
-		expect(decideRun({ ...f, baseRuns: onBase({ full: named([]) }) })).toMatchObject({ verdict: "red", settle: false });
+	test("red-main needs every full failure reproduced alone: a failing file that passes alone, or two identical full failures reproduced once, stay red", () => {
+		// the file passed alone: red whatever base says, its full failure kept, the reason names it
+		const passedAlone = facts({ full: named(["x.test.ts > flaky in the suite"]), solo: [solo("./x.test.ts", part())], baseRuns: onBase({}) });
+		expect(baseParts(passedAlone)).toEqual([]);
+		const d = decideRun(passedAlone);
+		expect(d).toEqual({ verdict: "red", outcome: "red", reason: "failing in the full part; passed alone: ./x.test.ts", settle: false });
+		const t = buildTestRun(request("tr-0abc12", 17, A), passedAlone, d, { base: C, mergeBase: B, runDir: "/runs/tr-0abc12", preflight: "ok" });
+		expect(t.failures).toEqual([{ part: "full", name: "x.test.ts > flaky in the suite", firstError: "error: x.test.ts > flaky in the suite" }]);
+		// two identical full failures, reproduced once alone, though base fails it twice: red
+		const twice = facts({
+			full: named(["auth.test.ts > access", "auth.test.ts > access"]), solo: [solo("./auth.test.ts", named(["auth.test.ts > access"]))],
+			baseRuns: onBase({ "./auth.test.ts": named(["auth.test.ts > access", "auth.test.ts > access"]) }),
+		});
+		expect(decideRun(twice)).toMatchObject({ verdict: "red", reason: null, settle: false });
+		// reproduced twice alone and failed twice on base: red-main
+		const reproduced = facts({ ...twice, solo: [solo("./auth.test.ts", named(["auth.test.ts > access", "auth.test.ts > access"]))] });
+		expect(decideRun(reproduced)).toMatchObject({ verdict: "red-main", settle: true });
+		// a failing file with no solo part (not runnable alone): red
+		const unrerun = facts({ full: named(["x.test.ts > t1", "? > t2"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"]))], baseRuns: onBase({ "./x.test.ts": named(["x.test.ts > t1"]) }) });
+		expect(decideRun(unrerun)).toMatchObject({ verdict: "red", settle: false });
 	});
-	test("red-main: one failure absent on base gives red", () => {
-		const f = facts({ full: named(["a > t1", "a > new"]), solo: [], baseRuns: onBase({ full: named(["a > t1"]) }) });
-		expect(decideRun(f)).toMatchObject({ verdict: "red", settle: false });
-		expect(baseCompareFor(f)!.parts).toEqual([{ part: "full", failing: ["a > t1", "a > new"], baseFailing: ["a > t1"], baseError: null }]);
-	});
-	test("red-main: failures compare as a multiset, so a second failure under a name base fails once gives red", () => {
-		// two cases share `auth.test.ts > access`: base fails one, the head fails both
-		const twice = facts({ full: named(["auth.test.ts > access", "auth.test.ts > access"]), solo: [], baseRuns: onBase({ full: named(["auth.test.ts > access"]) }) });
+	test("red-main: base failures compare as a multiset, so a second failure under a name base fails once gives red", () => {
+		const twice = facts({
+			full: named(["auth.test.ts > access", "auth.test.ts > access"]), solo: [solo("./auth.test.ts", named(["auth.test.ts > access", "auth.test.ts > access"]))],
+			baseRuns: onBase({ "./auth.test.ts": named(["auth.test.ts > access"]) }),
+		});
 		expect(decideRun(twice)).toMatchObject({ verdict: "red", settle: false });
-		expect(mainRed({ sha: C, parts: [{ part: "full", failing: ["a > x", "a > x"], baseFailing: ["a > x", "a > x"], baseError: null }] })).toBe(true);
-		expect(mainRed({ sha: C, parts: [{ part: "full", failing: ["a > x"], baseFailing: ["a > x", "a > x"], baseError: null }] })).toBe(true);
+		expect(mainRed({ sha: C, parts: [{ part: "./a.test.ts", failing: ["a > x", "a > x"], baseFailing: ["a > x", "a > x"], baseError: null }] })).toBe(true);
+		expect(mainRed({ sha: C, parts: [{ part: "./a.test.ts", failing: ["a > x"], baseFailing: ["a > x", "a > x"], baseError: null }] })).toBe(true);
+		expect(mainRed({ sha: C, parts: [{ part: "./a.test.ts", failing: ["a > x", "a > new"], baseFailing: ["a > x"], baseError: null }] })).toBe(false);
 	});
-	test("red-main: a base part that errored, or never ran, gives red", () => {
-		const f = facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...named(["x > t2"]) }] });
-		const errored = { ...f, baseRuns: onBase({ full: named(["a > t1"]), "./x.test.ts": named([], { error: "the wrapper refused base-solo (exit 64)" }) }) };
+	test("red-main: a base solo run that errored, or never ran, gives red", () => {
+		const f = facts({ full: named(["x.test.ts > t2"]), solo: [solo("./x.test.ts", named(["x.test.ts > t2"]))] });
+		const errored = { ...f, baseRuns: onBase({ "./x.test.ts": named([], { error: "the wrapper refused base-solo (exit 64)" }) }) };
 		expect(decideRun(errored)).toMatchObject({ verdict: "red", settle: false });
-		expect(baseCompareFor(errored)!.parts[1]).toEqual({ part: "./x.test.ts", failing: ["x > t2"], baseFailing: null, baseError: "the wrapper refused base-solo (exit 64)" });
-		const missing = { ...f, baseRuns: onBase({ full: named(["a > t1"]) }) };
+		expect(baseCompareFor(errored)!.parts).toEqual([{ part: "./x.test.ts", failing: ["x.test.ts > t2"], baseFailing: null, baseError: "the wrapper refused base-solo (exit 64)" }]);
+		const missing = { ...f, baseRuns: onBase({}) };
 		expect(decideRun(missing)).toMatchObject({ verdict: "red" });
-		expect(baseCompareFor(missing)!.parts[1]!.baseError).toBe("not run on base");
+		expect(baseCompareFor(missing)!.parts[0]!.baseError).toBe("not run on base");
 	});
-	test("red-main: no base rerun when a part errored or a part with no failure exited non-zero; such a run stays red", () => {
-		expect(baseParts(facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...part(0, { error: "timeout", exit: null }) }] }))).toEqual([]);
-		expect(baseParts(facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...part(0, { exit: 2 }) }] }))).toEqual([]);
+	test("clean-parts guard: a failing full part with a non-timeout error, or a failing solo beside a broken one, has no base parts and is never red-main, even when base fails the same", () => {
+		const failsOnBase = onBase({ "./x.test.ts": named(["x.test.ts > t1"]), "./y.test.ts": named([]) });
+		const fullBroken = facts({ full: named(["x.test.ts > t1"], { error: "killed before it exited", exit: null }), solo: [solo("./x.test.ts", named(["x.test.ts > t1"]))] });
+		expect(baseParts(fullBroken)).toEqual([]);
+		expect(decideRun({ ...fullBroken, baseRuns: failsOnBase })).toMatchObject({ verdict: "red", settle: false });
+		const brokenSolo = facts({ full: named(["x.test.ts > t1"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"])), solo("./y.test.ts", part(0, { error: "junit report missing" }))] });
+		expect(baseParts(brokenSolo)).toEqual([]);
+		expect(decideRun({ ...brokenSolo, baseRuns: failsOnBase })).toMatchObject({ verdict: "red", settle: false });
+		// a solo with no failing test that exited non-zero is broken too
+		const exited = facts({ full: named(["x.test.ts > t1"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"])), solo("./y.test.ts", part(0, { exit: 2 }))] });
+		expect(baseParts(exited)).toEqual([]);
+		expect(decideRun({ ...exited, baseRuns: failsOnBase }).verdict).toBe("red");
 		expect(baseParts(facts())).toEqual([]);
-		expect(decideRun(facts({ full: named(["a > t1"]), solo: [{ file: "./x.test.ts", ...part(0, { exit: 2 }) }], baseRuns: onBase({ full: named(["a > t1"]) }) })).verdict).toBe("red");
+	});
+	test("security: a failure in a security test, in the full part or a coverage solo, is never red-main and never named for base", () => {
+		const sec = "gates/test/g.test.ts > gate";
+		// a security failure in the full part beside a reproduced, base-failing plain one
+		const inFull = facts({ full: named([sec, "x.test.ts > t1"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"]))], baseRuns: onBase({ "./x.test.ts": named(["x.test.ts > t1"]) }) });
+		expect(baseParts(inFull)).toEqual(["./x.test.ts"]);
+		expect(decideRun(inFull)).toMatchObject({ verdict: "red", settle: false });
+		// a coverage solo of a security file (the full part passed but never ran it) that fails: red, no base part
+		const coverage = facts({ full: part(), solo: [solo("./gates/test/g.test.ts", named([sec]))], baseRuns: onBase({ "./gates/test/g.test.ts": named([sec]) }) });
+		expect(baseParts(coverage)).toEqual([]);
+		expect(baseCompareFor(coverage)!.parts).toEqual([]);
+		expect(decideRun(coverage)).toMatchObject({ verdict: "red", settle: false });
+		expect(securityFailuresOf(buildTestRun(request("tr-0abc12", 17, A), coverage, decideRun(coverage), { base: C, mergeBase: B, runDir: "/r", preflight: "ok" })).map((f) => f.part)).toEqual(["./gates/test/g.test.ts"]);
+	});
+	test("a timed-out full part (PLAN wl-mvq4edh02r5z40 D2) is error naming the timeout, before the failures its partial junit kept, which stay in the entry", () => {
+		const full = named(["x.test.ts > t1"], { error: "timeout", exit: 124 });
+		const f = facts({ full, fullTimedOut: true, solo: [] });
+		const d = decideRun(f);
+		expect(d).toEqual({ verdict: "error", outcome: "error", reason: "full: timeout", settle: false });
+		expect(buildTestRun(request("tr-0abc12", 17, A), f, d, { base: C, mergeBase: B, runDir: "/r", preflight: "ok" }).failures.map((x) => [x.part, x.name])).toEqual([["full", "x.test.ts > t1"]]);
+		// the import refusal rides along; the outlive path (a later exit, no `timeout` error string) still names the timeout
+		expect(decideRun(facts({ full: named(["x.test.ts > t1"], { error: "timeout; report import refused: full.log is over the 5-byte report cap", exit: 124 }), fullTimedOut: true, solo: [] })).reason)
+			.toBe("full: timeout; report import refused: full.log is over the 5-byte report cap");
+		expect(decideRun(facts({ full: named(["x.test.ts > t1"]), fullTimedOut: true, solo: [] })).reason).toBe("full: timeout");
+		expect(decideRun(facts({ full: part(0, { error: "the wrapper failed full (exit 70)", exit: 70 }), fullTimedOut: true, solo: [] })).reason).toBe("full: timeout; the wrapper failed full (exit 70)");
+		// a stale head still outranks it
+		expect(decideRun(facts({ full, fullTimedOut: true, solo: [], headAtEnd: B })).verdict).toBe("stale");
 	});
 	test("red-main: the entry carries base's sha and both failure sets, round-trips, settles with an artifact naming base, and signals no failure", () => {
 		const r = request("tr-0abc12", 17, A);
-		const f = facts({ full: named(["a > t1"]), solo: [], baseRuns: onBase({ full: named(["a > t1", "z > other"]) }) });
+		const f = facts({ full: named(["x.test.ts > t1"]), solo: [solo("./x.test.ts", named(["x.test.ts > t1"]))], baseRuns: onBase({ "./x.test.ts": named(["x.test.ts > t1", "x.test.ts > other"]) }) });
 		const t = buildTestRun(r, f, decideRun(f), { base: C, mergeBase: B, runDir: "/runs/tr-0abc12", preflight: "ok" });
 		expect(t.verdict).toBe("red-main");
-		expect(t.baseCompare).toEqual({ sha: C, parts: [{ part: "full", failing: ["a > t1"], baseFailing: ["a > t1", "z > other"], baseError: null }] });
+		expect(t.baseCompare).toEqual({ sha: C, parts: [{ part: "./x.test.ts", failing: ["x.test.ts > t1"], baseFailing: ["x.test.ts > t1", "x.test.ts > other"], baseError: null }] });
 		expect(parseTestRun(testRunBody(t))).toEqual(t);
-		expect(settleArtifact(t)).toBe(`test-run tr-0abc12: red-main at ${A} on PR #17; full 10/1/0; alone: none; every failure also fails on base ${C} (full 1); /runs/tr-0abc12`);
+		expect(settleArtifact(t)).toBe(`test-run tr-0abc12: red-main at ${A} on PR #17; full 10/1/0; alone: ./x.test.ts 10/1; every failure also fails on base ${C} (./x.test.ts 1); /runs/tr-0abc12`);
 		expect(testRunFailedOf("wl-t", "sl-full-1", t)).toBeNull();
 		expect(notifiesOrchestrator("red-main", false)).toBe(false);
 		// a red-main without the comparison it rests on is no shape the parser or the formatter accepts
 		const { baseCompare: _, ...bare } = t;
 		expect(() => testRunBody(bare)).toThrow(TestRunShapeError);
 		expect(parseTestRun(testRunBody(t).replace(/,"baseCompare":.*\}$/, "}"))).toBeNull();
+	});
+});
+
+describe("the solo policy (PLAN wl-mvq4edh02r5z40 D1)", () => {
+	const ok = (over: Partial<PartResult> = {}): PartResult => ({ pass: 3, fail: 0, skip: 0, exit: 0, ms: 5, error: null, failures: [], ...over });
+	const failing = (names: string[], over: Partial<PartResult> = {}): PartResult => ok({ fail: names.length, exit: 1, failures: names.map((name) => ({ name, firstError: "e" })), ...over });
+	const changed = ["./a.test.ts", "./sub/b_spec.ts", "./gates/test/g.test.ts"];
+	test("a timed-out full part stops the run, whatever its partial junit or the changed files", () => {
+		expect(soloPlan({ full: failing(["a.test.ts > t"], { error: "timeout" }), timedOut: true, changed, executed: ["a.test.ts"] })).toEqual({ stop: true });
+		expect(soloPlan({ full: ok({ error: "timeout", exit: 124 }), timedOut: true, changed, executed: [] })).toEqual({ stop: true });
+		// the outlive path: a part that looks clean but whose call timed out still stops
+		expect(soloPlan({ full: ok(), timedOut: true, changed, executed: [] })).toEqual({ stop: true });
+	});
+	test("an all-pass full part runs alone only the changed files it ran no test of, a security file among them (a first run, not a rerun)", () => {
+		expect(soloPlan({ full: ok(), timedOut: false, changed, executed: ["a.test.ts", "sub/b_spec.ts", "gates/test/g.test.ts", "other.test.ts"] })).toEqual({ stop: false, files: [] });
+		expect(soloPlan({ full: ok(), timedOut: false, changed, executed: ["./a.test.ts"] })).toEqual({ stop: false, files: ["./sub/b_spec.ts", "./gates/test/g.test.ts"] });
+		expect(soloPlan({ full: ok(), timedOut: false, changed, executed: [] })).toEqual({ stop: false, files: changed });
+		expect(soloPlan({ full: ok(), timedOut: false, changed: [], executed: [] })).toEqual({ stop: false, files: [] });
+	});
+	test("a clean red full part runs alone each failing file once, in report order, never a security file, never a file that cannot run alone, never a changed file that did not fail", () => {
+		const full = failing(["sub/b_spec.ts > d > t1", "z.test.ts > t2", "sub/b_spec.ts > t3", "gates/test/g.test.ts > gate", "? > lost", "helpers.ts > t4", "../up.test.ts > t5"]);
+		expect(soloPlan({ full, timedOut: false, changed, executed: [] })).toEqual({ stop: false, files: ["./sub/b_spec.ts", "./z.test.ts"] });
+		expect(soloPlan({ full: failing(["gates/test/g.test.ts > gate"]), timedOut: false, changed, executed: [] })).toEqual({ stop: false, files: [] });
+	});
+	test("any other full error (not a timeout) runs every changed file alone but a security file that failed in the full part", () => {
+		const broken = failing(["gates/test/g.test.ts > gate", "a.test.ts > t"], { error: "killed before it exited", exit: null });
+		expect(soloPlan({ full: broken, timedOut: false, changed: [...changed, "./gates/test/h.test.ts"], executed: [] })).toEqual({ stop: false, files: ["./a.test.ts", "./sub/b_spec.ts", "./gates/test/h.test.ts"] });
+		for (const error of ["junit report missing", "exit 2 with no failing test", "report import refused: full.log is a symlink"]) {
+			expect(soloPlan({ full: ok({ error, exit: 2 }), timedOut: false, changed, executed: [] })).toEqual({ stop: false, files: changed });
+		}
 	});
 });
 
@@ -1074,13 +1219,14 @@ describe("the _as2test wrapper's argv contract", () => {
 		expect(wrapperArgv({ sub: "cleanup", runId: "tr-2", oldRunId: "tr-1" })).toEqual([...head, "cleanup", "tr-2", "tr-1"]);
 		expect(wrapperArgv({ sub: "probe", runId: "tr-1", paths: ["/Users/jo/.ssh", "/Users/jo/.netrc"] })).toEqual([...head, "probe", "tr-1", "/Users/jo/.ssh", "/Users/jo/.netrc"]);
 		expect(wrapperArgv({ sub: "base-prepare", runId: "tr-1", sha: C })).toEqual([...head, "base-prepare", "tr-1", C]);
-		expect(wrapperArgv({ sub: "base-full", runId: "tr-1" })).toEqual([...head, "base-full", "tr-1"]);
 		expect(wrapperArgv({ sub: "base-solo", runId: "tr-1", file: "./surface/test/x.test.ts" })).toEqual([...head, "base-solo", "tr-1", "./surface/test/x.test.ts"]);
 		for (const bad of [
 			{ sub: "full", runId: "tr-UP" }, { sub: "full", runId: "tr-1;rm" }, { sub: "prepare", runId: "tr-1", sha: "HEAD" }, { sub: "solo", runId: "tr-1", file: "x.test.ts" },
 			{ sub: "solo", runId: "tr-1", file: "./../x.test.ts" }, { sub: "solo", runId: "tr-1", file: "./src/x.ts" }, { sub: "cleanup", runId: "tr-1", oldRunId: "tr-1" },
 			{ sub: "cleanup", runId: "tr-1", oldRunId: "../x" }, { sub: "probe", runId: "tr-1", paths: [] }, { sub: "probe", runId: "tr-1", paths: ["rel"] },
 			{ sub: "base-prepare", runId: "tr-1", sha: "main" }, { sub: "base-solo", runId: "tr-1", file: "./../x.test.ts" },
+			// base never runs the full suite (PLAN wl-mvq4edh02r5z40 D3): `base-full` is no wrapper subcommand
+			{ sub: "base-full", runId: "tr-1" },
 		] as Parameters<typeof wrapperArgv>[0][]) expect(() => wrapperArgv(bad)).toThrow(TestRunShapeError);
 		expect(WRAPPER_EXIT).toEqual({ ok: 0, probeReachable: 65, failed: 70, sweepLockHeld: 75, refused: 64, fenced: 77, timeout: 124 });
 	});
