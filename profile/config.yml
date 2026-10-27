@@ -224,7 +224,7 @@ retry:
 task:
   agentModelOverrides:
     fast:
-      - anthropic/claude-haiku-4-5
+      - anthropic/claude-haiku-5-5
       - openai-codex/gpt-5.6-luna
     standard:
       - anthropic/claude-sonnet-5-5
