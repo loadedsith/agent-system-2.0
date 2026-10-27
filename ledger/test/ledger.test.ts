@@ -1004,6 +1004,52 @@ describe("schema v3-v5: routings and entries through the module", () => {
 		l.close();
 	});
 
+	test("recordEntry preserves distinct low-word draws in a same-millisecond burst", () => {
+		const path = join(scratch("entry-id-burst"), "ledger.db");
+		const count = 64;
+		// Keep clock and crypto stubs in a child: parallel test workers must never observe them.
+		const writer = Bun.spawnSync([process.execPath, "-e", `
+			import { Ledger } from ${JSON.stringify(join(REPO, "ledger", "src", "index.ts"))};
+			const l = Ledger.open(${JSON.stringify(path)}, {
+				create: true, backup: false, clock: () => "2026-09-28T21:00:00.000Z",
+			});
+			try {
+				const w = l.openWorkload({
+					id: "wl-low-word-burst", brief: "entry IDs", stakes: "normal", mode: "user-driven", by: "orch-1",
+				});
+				Date.now = () => 1000;
+				let lowWord = 0;
+				Object.defineProperty(crypto, "getRandomValues", {
+					value: (words) => {
+						words[0] = 0xffffffff;
+						words[1] = lowWord++;
+						return words;
+					},
+				});
+				const ids = [];
+				for (let i = 0; i < ${count}; i++) {
+					ids.push(l.recordEntry({ workloadId: w, kind: "assumption", body: "entry-" + i, by: "lane-1" }));
+				}
+				console.log(JSON.stringify(ids));
+			} finally {
+				l.close();
+			}
+		`], { stdout: "pipe", stderr: "pipe" });
+		expect({ exitCode: writer.exitCode, err: writer.stderr.toString() }).toEqual({ exitCode: 0, err: "" });
+		const ids = JSON.parse(writer.stdout.toString()) as string[];
+		expect(ids).toHaveLength(count);
+		expect(new Set(ids).size).toBe(count);
+		for (const id of ids) expect(id).toMatch(/^en-rs[0-9a-z]{6}$/);
+		const l = Ledger.open(path, { backup: false });
+		try {
+			expect(l.entries("wl-low-word-burst").map((entry) => [entry.id, entry.body])).toEqual(
+				ids.map((id, i) => [id, "entry-" + i]),
+			);
+		} finally {
+			l.close();
+		}
+	});
+
 	test("recordEntry/entries: kind filter, optional slice, oldest first, provenance logged, refused on a closed workload", () => {
 		const l = fresh("v3-entries", { backup: false, clock: steppingClock("2026-09-28T21:00:00.000Z") });
 		const w = l.openWorkload({ brief: "b", stakes: "normal", mode: "user-driven", by: "orch-1" });

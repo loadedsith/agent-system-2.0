@@ -412,7 +412,9 @@ const ID_PREFIX = { workload: "wl", slice: "sl", message: "msg", question: "q", 
 /** `<prefix>-<ms since epoch, base36><6 random base36>`: sortable by creation, short enough to type. */
 export function newId(kind: keyof typeof ID_PREFIX): string {
 	const rand = crypto.getRandomValues(new Uint32Array(2));
-	const tail = ((rand[0]! * 2 ** 32 + rand[1]!) % 36 ** 6).toString(36).padStart(6, "0");
+	// Keep 53 random bits so adding the low word is exact before reducing the suffix.
+	const random53 = (rand[0]! & 0x1fffff) * 2 ** 32 + rand[1]!;
+	const tail = (random53 % 36 ** 6).toString(36).padStart(6, "0");
 	return `${ID_PREFIX[kind]}-${Date.now().toString(36)}${tail}`;
 }
 
