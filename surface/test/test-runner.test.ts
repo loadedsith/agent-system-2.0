@@ -281,13 +281,18 @@ interface World {
 /** The executor's test-only detector knobs (PLAN wl-mvq8x4pkjmx69s D3): a groups render carries them into the wrapper's config. */
 interface DetectKnobs { detectTickMs?: number; detectPersistMs?: number; signatureCaptureMs?: number; stopGraceMs?: number }
 
-function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number; stuckStop?: "shadow" | "enforce"; detect?: DetectKnobs } = {}): World {
+/**
+ * `bare` is the origin the world mirrors (the fixture's by default); `runs` the runs root (a fresh `<root>/runs` by default): the
+ * field soak's worlds share one that outlives them.
+ */
+function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number; sweepLockWaitMs?: number; fullWorkers?: number; stuckStop?: "shadow" | "enforce"; detect?: DetectKnobs; bare?: string; runs?: string } = {}): World {
 	const root = realpathSync(tmp("trun"));
 	roots.push(root);
 	const gid = statSync(root).gid;
 	const uid = process.getuid!();
 	const home = join(root, "home");
-	for (const d of [join(home, ".agent-system-2"), join(home, ".config", "git"), join(root, "bin"), join(root, "prs"), join(root, "hooks"), join(root, "runs")]) mkdirSync(d, { recursive: true });
+	const runs = o.runs ?? join(root, "runs");
+	for (const d of [join(home, ".agent-system-2"), join(home, ".config", "git"), join(root, "bin"), join(root, "prs"), join(root, "hooks"), runs]) mkdirSync(d, { recursive: true });
 	// Jo's own config defines the filter the fixture's .gitattributes names; the trusted phase must never read it.
 	// (No `;` in the value: gitconfig would read it as a comment.)
 	const evil = `[filter "evil"]\n\tsmudge = touch ${root}/SMUDGED && cat\n\tclean = cat\n`;
@@ -349,7 +354,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 	chmodSync(join(root, "bin", "sudo"), 0o755);
 
 	const origin = join(root, "origin.git");
-	g(root, "clone", "-q", "--mirror", fx.bare, origin);
+	g(root, "clone", "-q", "--mirror", o.bare ?? fx.bare, origin);
 	const checkout = join(root, "checkout");
 	mkdirSync(checkout);
 	g(checkout, "init", "-q", "-b", "main");
@@ -363,7 +368,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 
 	const env: Record<string, string> = {
 		PATH: `${join(root, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp", LANG: "en_US.UTF-8", USER: process.env.USER ?? "jo",
-		AGENT_SYSTEM_LEDGER_DB: ledgerPath, AGENT_SYSTEM_TEST_RUNS: join(root, "runs"), AGENT_SYSTEM_TEST_RUNNER_CONFIG: config, AGENT_SYSTEM_TEST_RUNNER_ORIGIN: origin,
+		AGENT_SYSTEM_LEDGER_DB: ledgerPath, AGENT_SYSTEM_TEST_RUNS: runs, AGENT_SYSTEM_TEST_RUNNER_CONFIG: config, AGENT_SYSTEM_TEST_RUNNER_ORIGIN: origin,
 		AGENT_SYSTEM_TEST_RUNNER_ROOT: as2,
 		AGENT_SYSTEM_TEST_RUNNER_INSTALL: JSON.stringify({ libexec, sudoers, ids: { root: uid, wheel: gid, jo: uid }, account: { uid, gid } }),
 		AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS: "500", AGENT_SYSTEM_TEST_RUNNER_POLL_MS: "200", AGENT_SYSTEM_TEST_RUNNER_BUSY_MS: "300", AGENT_SYSTEM_TEST_HOOKS: hooks,
@@ -371,7 +376,7 @@ function world(o: { capMin?: number; queueMaxMin?: number; killGraceMs?: number;
 		GH_TOKEN: "secret-gh", ANTHROPIC_API_KEY: "secret-anthropic", OPENAI_API_KEY: "secret-openai", MOONSHOT_API_KEY: "secret-moonshot",
 		SSH_AUTH_SOCK: "/tmp/secret-agent.sock", OMP_SESSION_TOKEN: "secret-omp", AGENT_SYSTEM_SECRET: "secret-as",
 	};
-	return { root, home, runs: join(root, "runs"), as2, libexec, exec, hooks, origin, checkout, env, ledger, ago, pin };
+	return { root, home, runs, as2, libexec, exec, hooks, origin, checkout, env, ledger, ago, pin };
 }
 
 /** An open autonomous workload on the world's checkout, with one open slice. */
@@ -3014,15 +3019,19 @@ const SIG_LINE = /^stuck-signature (\S+) part full worker (\d+) zombie (\d+) /;
  * the world, so the test reads the full part's stdout file (run()'s `as2-runner-command-*` dir) while the call runs.
  */
 function proofWorld(): World {
-	const w = world({ stuckStop: "enforce", fullWorkers: 2, killGraceMs: KILL_GRACE_MS, sweepLockWaitMs: SWEEP_LOCK_WAIT_MS });
+	return productionTimers(world({ stuckStop: "enforce", fullWorkers: 2, killGraceMs: KILL_GRACE_MS, sweepLockWaitMs: SWEEP_LOCK_WAIT_MS }));
+}
+
+/** world()'s runner heartbeat, lock-wait poll and busy timeout removed (the runner's defaults run) and a runner TMPDIR inside the world. */
+function productionTimers(w: World): World {
 	for (const k of ["AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS", "AGENT_SYSTEM_TEST_RUNNER_POLL_MS", "AGENT_SYSTEM_TEST_RUNNER_BUSY_MS"]) delete w.env[k];
 	w.env.TMPDIR = join(w.root, "runner-tmp");
 	mkdirSync(w.env.TMPDIR);
 	return w;
 }
 
-/** The first `stuck-signature` line in a running call's stdout file under the world's runner TMPDIR, once one shows. */
-function signatureInStdout(w: World): RegExpExecArray | null {
+/** The first line matching `re` (the first `stuck-signature` by default) in a running call's stdout file under the world's runner TMPDIR, once one shows. */
+function signatureInStdout(w: World, re: RegExp = SIG_LINE): RegExpExecArray | null {
 	const dir = w.env.TMPDIR!;
 	for (const name of readdirSync(dir)) {
 		if (!name.startsWith("as2-runner-command-")) continue;
@@ -3034,7 +3043,7 @@ function signatureInStdout(w: World): RegExpExecArray | null {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
 			throw e;
 		}
-		const m = new RegExp(SIG_LINE.source, "m").exec(text);
+		const m = new RegExp(re.source, "m").exec(text);
 		if (m) return m;
 	}
 	return null;
@@ -3269,4 +3278,279 @@ describe.if(process.env.AS2_STUCK_BUDGET_PROOF === "1")("budget proof with produ
 			expect(total).toBeLessThanOrEqual(PROOF.boundMs);
 		});
 	}, 240_000);
+});
+
+// ---- the field soak (PLAN wl-mvq8x4pkjmx69s § Field evidence before the workload closes, R10; sl-sd-field) --------------
+
+/** The historically affected test files (PLAN § Field evidence): the only test files the soak's origin keeps. */
+const FIELD_FILES: readonly string[] = ["surface/test/channel.test.ts", "surface/test/batch.test.ts", "surface/test/train-signoff.test.ts", "ledger/test/ledger.test.ts"];
+/** A file `bun test` runs as a test file (`.test`, `_test`, `.spec`, `_spec`; js and ts variants). */
+const BUN_TEST_FILE = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
+/** The soak origin's pull requests: the four files as committed, and the same plus the spin fixture at the repo root. */
+const FIELD_PR = { soak: 1, spin: 2 } as const;
+/** profile/config.yml `testRunner.fullWorkers`. */
+const FIELD_WORKERS = 6;
+/** The soak's runs: AS2_STUCK_FIELD_N, 8 when unset. */
+const FIELD_N = Number(process.env.AS2_STUCK_FIELD_N ?? "8");
+/**
+ * The shadow injection's full cap in minutes. The config parser takes any positive number (test-run.ts `testRunnerConfig`) and
+ * the executor rounds it to ms (test-exec.ts `capMs`), so the world sets no floor of its own; the floor that still lets the
+ * detector decide before the cap is its own path from the spin worker's start: the first signature (tick 1 s), persistence (5 s)
+ * and the signature capture (3 s). 0.5 min leaves about 20 s of margin for bun's start beside the four files.
+ */
+const FIELD_SHADOW_CAP_MIN = 0.5;
+/** world()'s default cap (2 min, full and solo), used by the soak and the enforce injection. */
+const FIELD_CAP_MIN = 2;
+/** The runner.log line that ends the sweep after a part (or says why it did not finish), as the budget proof reads it. */
+const SWEPT_LINE = / sweep tr-[a-z0-9]+ → |the sweep after full (was abandoned|did not finish|failed)/;
+
+interface FieldOrigin {
+	/** The worktree's HEAD the origin was cut from. */
+	commit: string;
+	bare: string;
+	main: string;
+	head: Record<keyof typeof FIELD_PR, string>;
+}
+
+/**
+ * The soak's origin: this worktree's HEAD, history included (ledger.test.ts builds old ledgers from `git show <rev>:…`), with a
+ * commit on it removing every test file but FIELD_FILES (every other file kept: bunfig.toml, its preload and whatever the four
+ * import) as main; PR 1 an empty commit on main (the four files), PR 2 main plus the end-to-end spin fixture as `spin.test.ts`.
+ */
+function fieldOrigin(): FieldOrigin {
+	const top = g(import.meta.dir, "rev-parse", "--show-toplevel");
+	const commit = g(top, "rev-parse", "HEAD");
+	const root = realpathSync(tmp("trun-field"));
+	roots.push(root);
+	const work = join(root, "work");
+	g(root, "clone", "-q", "--no-checkout", top, work);
+	g(work, "checkout", "-q", "-B", "main", commit);
+	const tests = g(work, "ls-tree", "-r", "-z", "--name-only", commit).split("\0").filter((f) => BUN_TEST_FILE.test(f));
+	const missing = FIELD_FILES.filter((f) => !tests.includes(f));
+	if (missing.length > 0) throw new Error(`field soak: ${missing.join(", ")} not among the test files of ${commit}`);
+	g(work, "rm", "-q", "--", ...tests.filter((f) => !FIELD_FILES.includes(f)));
+	g(work, "commit", "-q", "-m", `field soak: ${commit} with only the test files ${FIELD_FILES.join(" ")}`);
+	const main = g(work, "rev-parse", "HEAD");
+	g(work, "commit", "-q", "--allow-empty", "-m", "field soak: the four files");
+	const soak = g(work, "rev-parse", "HEAD");
+	g(work, "update-ref", `refs/pull/${FIELD_PR.soak}/head`, soak);
+	g(work, "checkout", "-q", "--detach", main);
+	writeFileSync(join(work, "spin.test.ts"), SPIN);
+	g(work, "add", "spin.test.ts");
+	g(work, "commit", "-q", "-m", "field soak: the spin fixture beside the four files");
+	const spin = g(work, "rev-parse", "HEAD");
+	g(work, "update-ref", `refs/pull/${FIELD_PR.spin}/head`, spin);
+	const bare = join(root, "origin.git");
+	g(root, "init", "-q", "--bare", "-b", "main", bare);
+	g(work, "push", "-q", bare, "main", "+refs/pull/*:refs/pull/*");
+	return { commit, bare, main, head: { soak, spin } };
+}
+
+/** A soak world: the shared runs root, the soak origin, production's workers, no detector knob, production runner timers. */
+function fieldWorld(o: FieldOrigin, runs: string, stuckStop: "shadow" | "enforce", capMin: number): World {
+	return productionTimers(world({ bare: o.bare, runs, stuckStop, capMin, fullWorkers: FIELD_WORKERS, killGraceMs: KILL_GRACE_MS, sweepLockWaitMs: SWEEP_LOCK_WAIT_MS }));
+}
+
+/** The processes under `rootPids` in `procs` (the roots included). */
+function descendants(procs: Proc[], rootPids: number[]): Proc[] {
+	const tree = procs.filter((p) => rootPids.includes(p.pid));
+	for (let i = 0; i < tree.length; i++) for (const p of procs) if (p.ppid === tree[i]!.pid && !tree.includes(p)) tree.push(p);
+	return tree;
+}
+
+/**
+ * Every 250 ms, the process tree under each live runner child is added to `seen` (by pid and start); returns the stop. A real
+ * interval on purpose: the processes are real and short-lived, and no event announces them, so only sampling the live process
+ * table records them (a fake clock would sample nothing).
+ */
+function watchTrees(kids: Child[], seen: Map<string, Proc>): () => void {
+	const t = setInterval(() => {
+		const live = kids.filter((k) => k.exitCode === null && k.signalCode === null).map((k) => k.pid);
+		if (live.length === 0) return;
+		for (const p of descendants(uidProcs(), live)) seen.set(`${p.pid}:${p.startUs}`, p);
+	}, 250);
+	return () => clearInterval(t);
+}
+
+/** The members of `tree` still alive: printed, SIGKILLed and checked gone; returns them as `<pid> (<comm>, pgid <pgid>)`. */
+async function killLeft(what: string, tree: Proc[]): Promise<string[]> {
+	const left = survivorsOf(tree);
+	const named = left.map((p) => `${p.pid} (${p.comm}, pgid ${p.pgid})`);
+	if (left.length > 0) console.log(`field-soak ${what}: alive: ${named.join(", ")}; killing`);
+	for (const p of left) {
+		try {
+			process.kill(p.pid, "SIGCONT");
+			process.kill(p.pid, "SIGKILL");
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+		}
+	}
+	await until(`no process of ${what} alive`, () => survivorsOf(tree).length === 0, 10_000);
+	return named;
+}
+
+interface FieldRun {
+	role: "soak" | "queued" | "injected";
+	mode: "shadow" | "enforce";
+	runId: string;
+	pr: number;
+	sha: string;
+	capMin: number;
+	verdict: string | null;
+	reason: string | null;
+	/** The runner process's wall time, spawn to exit. */
+	runnerMs: number | null;
+	/** An injected run's spin worker (the fixture's `spin.pid`): its decisions are injected, every other one is on the real files. */
+	spinWorker: number | null;
+	/** What the test killed after the injected run's full part and its sweep (the spin worker a groups-mode sweep leaves). */
+	killedAfterFull: string[];
+}
+
+interface FieldManifest {
+	commit: string;
+	originMain: string;
+	bun: string;
+	files: readonly string[];
+	n: number;
+	fullWorkers: number;
+	spinFixture: string;
+	startedAt: string;
+	endedAt: string | null;
+	runs: FieldRun[];
+	/** Anything of a world found alive at a phase's end (killed, and the phase failed). */
+	survivors: string[];
+	errors: string[];
+}
+
+describe.if(process.env.AS2_STUCK_FIELD_SOAK === "1")("field soak (field-soak.sh)", () => {
+	let origin: FieldOrigin;
+	let runs: string;
+	let manifest: FieldManifest;
+	const save = () => writeFileSync(join(runs, "field-soak.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+
+	beforeAll(() => {
+		const named = process.env.AS2_STUCK_FIELD_RUNS;
+		if (!named) throw new Error("field soak: AS2_STUCK_FIELD_RUNS is not set; it names the runs root the field report reads (field-soak.sh sets it)");
+		if (!Number.isSafeInteger(FIELD_N) || FIELD_N < 1) throw new Error(`field soak: AS2_STUCK_FIELD_N=${process.env.AS2_STUCK_FIELD_N} is not an integer of 1 or more`);
+		runs = resolve(named);
+		mkdirSync(runs, { recursive: true });
+		const there = readdirSync(runs);
+		if (there.length > 0) throw new Error(`field soak: ${runs} already holds ${there.length} entries (an earlier soak's runs); move it aside, the soak deletes nothing`);
+		origin = fieldOrigin();
+		manifest = {
+			commit: origin.commit, originMain: origin.main, bun: Bun.version, files: FIELD_FILES, n: FIELD_N, fullWorkers: FIELD_WORKERS,
+			spinFixture: "spin.test.ts at the repo root: the end-to-end test's SPIN (holds its marker for `true`, leaves /usr/bin/true unreaped, spins forever)",
+			startedAt: new Date().toISOString(), endedAt: null, runs: [], survivors: [], errors: [],
+		};
+		save();
+	});
+	afterAll(() => {
+		if (manifest === undefined) return;
+		manifest.endedAt = new Date().toISOString();
+		save();
+	});
+
+	/** The run's entry in the manifest, written at once so a run that never settles is still named. */
+	function entry(role: FieldRun["role"], mode: FieldRun["mode"], runId: string, pr: number, sha: string, capMin: number): FieldRun {
+		const r: FieldRun = { role, mode, runId, pr, sha, capMin, verdict: null, reason: null, runnerMs: null, spinWorker: null, killedAfterFull: [] };
+		manifest.runs.push(r);
+		save();
+		return r;
+	}
+	/** The run's own `test-run:` and result.json: settled. */
+	async function settled(w: World, wl: string, r: FieldRun, kid: Child, spawnedAt: number): Promise<void> {
+		await kid.exited;
+		r.runnerMs = Date.now() - spawnedAt;
+		const run = await resultOf(w, wl, r.runId);
+		r.verdict = run.verdict;
+		r.reason = run.reason ?? null;
+		save();
+		console.log(`field-soak ${r.role} ${r.mode} ${r.runId} ${run.verdict} runner ${r.runnerMs} ms${run.reason ? `: ${run.reason}` : ""}`);
+		expect(existsSync(join(runs, r.runId, "result.json"))).toBe(true);
+	}
+	/** The phase's end, pass or fail: every runner child reaped, every sampled process of the world checked gone (killed if not). */
+	async function close(what: string, kids: Child[], seen: Map<string, Proc>, stop: () => void, errors: unknown[]): Promise<void> {
+		try {
+			stop();
+			await reap(kids);
+			const left = await killLeft(what, [...seen.values()]);
+			manifest.survivors.push(...left.map((l) => `${what}: ${l}`));
+			console.log(`field-soak ${what}: ${seen.size} processes sampled, ${left.length} alive at the end`);
+			if (left.length > 0) errors.push(new Error(`field soak ${what}: left alive: ${left.join(", ")}`));
+		} catch (e) {
+			errors.push(e);
+		}
+		manifest.errors.push(...errors.map((e) => `${what}: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`));
+		save();
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, `field soak ${what}: more than one failure`);
+	}
+
+	test(`${FIELD_N} shadow runs of the four files back to back: every run settled, nothing of the world left alive`, async () => {
+		const w = fieldWorld(origin, runs, "shadow", FIELD_CAP_MIN);
+		const kids: Child[] = [];
+		const seen = new Map<string, Proc>();
+		const stop = watchTrees(kids, seen);
+		const errors: unknown[] = [];
+		try {
+			for (let i = 1; i <= FIELD_N; i++) {
+				const { wl, slice } = workload(w);
+				const runId = request(w, wl, slice, FIELD_PR.soak, origin.head.soak);
+				const r = entry("soak", "shadow", runId, FIELD_PR.soak, origin.head.soak, FIELD_CAP_MIN);
+				const at = Date.now();
+				const kid = spawnRun(w, runId);
+				kids.push(kid);
+				await settled(w, wl, r, kid, at);
+			}
+		} catch (e) {
+			errors.push(e);
+		}
+		await close("soak", kids, seen, stop, errors);
+	}, FIELD_N * 10 * 60_000 + 5 * 60_000);
+
+	for (const mode of ["shadow", "enforce"] as const) {
+		test(`injected (${mode}): the spin fixture beside the four files, a run of the four queued behind it: both settled, the spin worker gone, nothing of the world left alive`, async () => {
+			const capMin = mode === "shadow" ? FIELD_SHADOW_CAP_MIN : FIELD_CAP_MIN;
+			const w = fieldWorld(origin, runs, mode, capMin);
+			const first = workload(w);
+			const second = workload(w);
+			const runId = request(w, first.wl, first.slice, FIELD_PR.spin, origin.head.spin, 1_000);
+			Bun.sleepSync(5);
+			const nextId = request(w, second.wl, second.slice, FIELD_PR.soak, origin.head.soak);
+			const injected = entry("injected", mode, runId, FIELD_PR.spin, origin.head.spin, capMin);
+			const queued = entry("queued", mode, nextId, FIELD_PR.soak, origin.head.soak, capMin);
+			const kids: Child[] = [];
+			const seen = new Map<string, Proc>();
+			const stop = watchTrees(kids, seen);
+			const errors: unknown[] = [];
+			try {
+				const at = Date.now();
+				kids.push(spawnRun(w, runId));
+				await until(`${runId} took the lock`, () => / took the lock\n/.test(runnerLog(w, runId)), 120_000);
+				const nextAt = Date.now();
+				kids.push(spawnRun(w, nextId));
+				await until(`${nextId} queued behind ${runId}`, () => marks(w, nextId, "queued").length >= 1, 60_000);
+				const execPid = (await until(`${runId}'s full call`, () => marks(w, runId, "spawn-full")[0], 300_000)).pid as number;
+				const spinPid = join(w.as2, "runs", runId, "spin.pid");
+				const worker = await until(`the spin worker's pid in ${spinPid}`, () => existsSync(spinPid) && Number(readFileSync(spinPid, "utf8").trim()), 120_000);
+				injected.spinWorker = worker;
+				save();
+				await until(`the spin worker ${worker}'s first stuck-signature in ${runId}'s full stdout`, () => signatureInStdout(w, new RegExp(`^stuck-signature \\S+ part full worker ${worker} zombie \\d+ `)), 120_000);
+				const tree = execTree(execPid);
+				// The full call's end and the sweep after it: what the groups-mode sweep left of the part is killed here, before the queued run's parts.
+				await until(`${runId}'s full call and the sweep after it`, () => {
+					const lines = runnerLog(w, runId).split("\n");
+					const end = lines.findIndex((l) => / full tr-[a-z0-9]+ → /.test(l));
+					return end >= 0 && lines.slice(end + 1).some((l) => SWEPT_LINE.test(l));
+				}, capMin * 60_000 + 5 * 60_000);
+				injected.killedAfterFull = await killLeft(`${runId}'s full part (${mode})`, tree);
+				save();
+				await settled(w, first.wl, injected, kids[0]!, at);
+				await settled(w, second.wl, queued, kids[1]!, nextAt);
+			} catch (e) {
+				errors.push(e);
+			}
+			await close(`injected ${mode}`, kids, seen, stop, errors);
+		}, 20 * 60_000);
+	}
 });
