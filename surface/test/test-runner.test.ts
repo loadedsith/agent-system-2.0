@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Ledger, LiveLedgerUnderTestError, TEST_RUNNER_BY } from "../../ledger/src/index";
-import { renderExecWrapper } from "../src/as2test";
+import { KILL_GRACE_MS, renderExecWrapper, SWEEP_LOCK_WAIT_MS } from "../src/as2test";
 import { recordRepo } from "../src/decision-log";
 import { trainFixBody } from "../src/launch";
 import {
@@ -25,7 +25,7 @@ import {
 import { trainBody, trainFullSliceId, trainInstructionBody, trainSliceId } from "../src/merge-train";
 import { MERGE_TRAIN_BY, ORCHESTRATOR_RECIPIENT, SURFACE_BY } from "../src/types";
 import { importPart, importReport, lockRow, openLockDb, publishIfOwner, run, START_EXIT } from "../scripts/test-runner";
-import { STUCK_DEFAULTS } from "../src/stuck-detect";
+import { type Proc, snapshot, STUCK_DEFAULTS } from "../src/stuck-detect";
 import { alive, tmp, until } from "./helpers";
 import { carry305 } from "./train-world";
 
@@ -2984,5 +2984,289 @@ exit 125`);
 			await reap(kids);
 			for (const g of pgids) kill(-g);
 		}
+	}, 240_000);
+});
+
+// ---- the budget proof (PLAN wl-mvq8x4pkjmx69s § Budget, R7, R8; sl-sd-proof) ---------------------------------------
+
+/**
+ * The runner's production stuck timers (test-runner.ts defaults, which these tests never override): one deadline over the stuck
+ * sweep's attempts, the stuck run's post-sweep deadline, and the backstop after an enforce signature's line (persist + capture +
+ * grace + verify + STUCK_SLACK_MS 5 s, from STUCK_DEFAULTS). The bounds are PLAN § Budget's: 45 s on the contained path (R8) and
+ * on the slow-cleanup path, and the stalled path's 42.5 s plus 2 s of measurement slack.
+ */
+const PROOF = {
+	sweepMs: 12_000,
+	finalizeMs: 12_000,
+	backstopMs: STUCK_DEFAULTS.persistMs + STUCK_DEFAULTS.signatureCaptureMs + STUCK_DEFAULTS.stopGraceMs + STUCK_DEFAULTS.verifyMs + 5_000,
+	boundMs: 45_000,
+	stalledBoundMs: 42_500 + 2_000,
+} as const;
+/** The executor's first signature line, in the part's stdout and in runner.log's echo of it. */
+const SIG_LINE = /^stuck-signature (\S+) part full worker (\d+) zombie (\d+) /;
+
+/**
+ * The end-to-end world with nothing set but what it needs to run: no detector knob in the wrapper's config (tick 1 s, persist 5 s,
+ * capture 3 s, grace 1.5 s, verify 2 s: STUCK_DEFAULTS) and no runner timer override. Set: enforce (the path under proof);
+ * `fullWorkers: 2` (the spin fixture's worker under --parallel, as the end-to-end test); the sweep's production SIGTERM grace and
+ * sweep-lock wait (as2test.ts KILL_GRACE_MS 10 s, SWEEP_LOCK_WAIT_MS 60 s) in place of world()'s 300 ms and 30 s; world()'s runner
+ * heartbeat, lock-wait poll and busy timeout removed, so the runner runs its defaults (15 s, 2 s, 5 s); and a runner TMPDIR inside
+ * the world, so the test reads the full part's stdout file (run()'s `as2-runner-command-*` dir) while the call runs.
+ */
+function proofWorld(): World {
+	const w = world({ stuckStop: "enforce", fullWorkers: 2, killGraceMs: KILL_GRACE_MS, sweepLockWaitMs: SWEEP_LOCK_WAIT_MS });
+	for (const k of ["AGENT_SYSTEM_TEST_RUNNER_HEARTBEAT_MS", "AGENT_SYSTEM_TEST_RUNNER_POLL_MS", "AGENT_SYSTEM_TEST_RUNNER_BUSY_MS"]) delete w.env[k];
+	w.env.TMPDIR = join(w.root, "runner-tmp");
+	mkdirSync(w.env.TMPDIR);
+	return w;
+}
+
+/** The first `stuck-signature` line in a running call's stdout file under the world's runner TMPDIR, once one shows. */
+function signatureInStdout(w: World): RegExpExecArray | null {
+	const dir = w.env.TMPDIR!;
+	for (const name of readdirSync(dir)) {
+		if (!name.startsWith("as2-runner-command-")) continue;
+		let text: string;
+		try {
+			text = readFileSync(join(dir, name, "stdout"), "utf8");
+		} catch (e) {
+			// run() removes its dir when the call returns
+			if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw e;
+		}
+		const m = new RegExp(SIG_LINE.source, "m").exec(text);
+		if (m) return m;
+	}
+	return null;
+}
+
+/** Every process of this uid now; the spawn-free sysctl list the runner's containment check reads. */
+function uidProcs(): Proc[] {
+	const uid = process.getuid!();
+	const s = snapshot(uid);
+	if (s.kind !== "ok") throw new Error(`budget proof: the process list of uid ${uid} is ${s.kind}: ${s.why}`);
+	return s.procs;
+}
+/** The executor and every process descended from it now, by (pid, start). */
+function execTree(execPid: number): Proc[] {
+	const procs = uidProcs();
+	const tree = procs.filter((p) => p.pid === execPid);
+	if (tree.length === 0) throw new Error(`budget proof: the executor ${execPid} is not among this uid's processes`);
+	for (let i = 0; i < tree.length; i++) for (const p of procs) if (p.ppid === tree[i]!.pid && !tree.includes(p)) tree.push(p);
+	return tree;
+}
+/** The members of `tree` still alive (same pid and start time, not a zombie). */
+const survivorsOf = (tree: Proc[]): Proc[] => uidProcs().filter((p) => !p.zombie && tree.some((t) => t.pid === p.pid && t.startUs === p.startUs));
+
+/** A line's time: an executor line carries its ISO time after the keyword, a runner.log line leads with it. */
+function timeOf(line: string): number {
+	const [a, b] = line.split(" ");
+	const t = Date.parse(/^\d/.test(a!) ? a! : b!);
+	if (Number.isNaN(t)) throw new Error(`budget proof: no time in the line ${JSON.stringify(line)}`);
+	return t;
+}
+/** The first line matching `re` at or after line `from`, with its time and match. */
+function lineAt(lines: string[], re: RegExp, from = 0): { at: number; i: number; m: RegExpExecArray } {
+	for (let i = from; i < lines.length; i++) {
+		const m = re.exec(lines[i]!);
+		if (m) return { at: timeOf(lines[i]!), i, m };
+	}
+	throw new Error(`budget proof: no line after line ${from} matches ${re}\n--- runner.log ---\n${lines.join("\n")}`);
+}
+/** Prints each stage (`budget-proof <path> stage …`) and the total (`budget-proof <path> total <ms> ms bound <ms> ms`); returns the total. */
+function printStages(path: string, stages: [name: string, at: number][], boundMs: number): number {
+	const t0 = stages[0]![1];
+	let prev = t0;
+	for (const [name, at] of stages) {
+		console.log(`budget-proof ${path} stage ${name.padEnd(36)} ${new Date(at).toISOString()} +${String(at - t0).padStart(5)} ms (step ${at - prev} ms)`);
+		prev = at;
+	}
+	const total = stages.at(-1)![1] - t0;
+	console.log(`budget-proof ${path} total ${total} ms bound ${boundMs} ms ${total <= boundMs ? "within" : "OVER"}`);
+	return total;
+}
+
+interface Proof {
+	w: World;
+	first: { wl: string; slice: string };
+	second: { wl: string; slice: string };
+	runId: string;
+	nextId: string;
+	kids: Child[];
+	/** The full call's spawned pid: the executor itself (the fake sudo, the wrapper and `env -i` each exec in place). */
+	execPid: number;
+	/** When the test SIGSTOPped the executor (the stalled path), else null. */
+	stoppedAt: number | null;
+}
+
+/**
+ * The end-to-end shape on the proof world: the spin PR's run takes the lock, a green run queues behind it, the full part's executor
+ * is found by the runner's `spawn-full` hook mark, and once its stdout shows the first `stuck-signature` the executor's process tree
+ * is recorded (and with `stallExec` the executor is SIGSTOPped, so no stop line follows). `holdCleanup` arms the runner's
+ * `head-recheck` hook before the run and the wrapper's `sweep-read1` once the full part has started (after the publish sweep), so
+ * the stuck sweep and the head re-check each run to their deadline. Afterwards, pass or fail: every child resumed and killed, and
+ * every member of the executor's tree still alive printed and SIGKILLed (a groups-mode sweep never reaches a --parallel worker's
+ * group; production's uid sweep does), then checked gone; a check failure and a cleanup failure are both thrown.
+ */
+async function withProof(path: string, o: { stallExec?: boolean; holdCleanup?: boolean }, check: (p: Proof) => Promise<void>): Promise<void> {
+	const w = proofWorld();
+	const first = workload(w);
+	const second = workload(w);
+	const runId = request(w, first.wl, first.slice, PR.spin, fx.head.spin, 1_000);
+	Bun.sleepSync(5);
+	const nextId = request(w, second.wl, second.slice, PR.green, fx.head.green);
+	const kids: Child[] = [];
+	let execPid: number | null = null;
+	let tree: Proc[] = [];
+	const errors: unknown[] = [];
+	try {
+		if (o.holdCleanup) arm(w, runId, "head-recheck");
+		kids.push(spawnRun(w, runId));
+		await until(`${runId} took the lock`, () => / took the lock\n/.test(runnerLog(w, runId)), 60_000);
+		kids.push(spawnRun(w, nextId));
+		await until(`${nextId} queued behind ${runId}`, () => marks(w, nextId, "queued").length >= 1, 60_000);
+		execPid = (await until(`${runId}'s full call`, () => marks(w, runId, "spawn-full")[0], 120_000)).pid as number;
+		if (o.holdCleanup) arm(w, runId, "sweep-read1");
+		await until(`the first stuck-signature in ${runId}'s full stdout`, () => signatureInStdout(w), 120_000);
+		tree = execTree(execPid);
+		let stoppedAt: number | null = null;
+		if (o.stallExec) {
+			process.kill(execPid, "SIGSTOP");
+			stoppedAt = Date.now();
+		}
+		await check({ w, first, second, runId, nextId, kids, execPid, stoppedAt });
+	} catch (e) {
+		errors.push(e);
+	}
+	try {
+		if (o.holdCleanup) go(w, runId, "sweep-read1");
+		if (tree.length === 0 && execPid !== null && alive(execPid)) tree = execTree(execPid);
+		await reap(kids);
+		const left = survivorsOf(tree);
+		if (left.length > 0) console.log(`budget-proof ${path} left alive after the run: ${left.map((p) => `${p.pid} (${p.comm}, pgid ${p.pgid})`).join(", ")}; killing`);
+		for (const p of left) {
+			try {
+				process.kill(p.pid, "SIGCONT");
+				process.kill(p.pid, "SIGKILL");
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+			}
+		}
+		await until(`no process of ${runId}'s executor tree alive`, () => survivorsOf(tree).length === 0, 10_000);
+	} catch (e) {
+		errors.push(e);
+	}
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, `budget proof ${path}: the check and its cleanup both failed`);
+}
+
+describe.if(process.env.AS2_STUCK_BUDGET_PROOF === "1")("budget proof with production defaults (budget-proof.sh)", () => {
+	const partsOf = (w: World, runId: string) => subsOf(w, runId).filter((s) => s !== "sweep");
+	/** The queued run's end: green, and the time it took the lock. */
+	async function nextTook(p: Proof): Promise<number> {
+		await p.kids[1]!.exited;
+		const next = await resultOf(p.w, p.second.wl, p.nextId);
+		expect(next.verdict).toBe("green");
+		return lineAt(runnerLog(p.w, p.nextId).split("\n"), / took the lock$/).at;
+	}
+
+	test("contained path: the executor stops the spin worker; first stuck-signature → the next run took the lock within 45 s", async () => {
+		await withProof("contained", {}, async (p) => {
+			await p.kids[0]!.exited;
+			const run = await resultOf(p.w, p.first.wl, p.runId);
+			const lines = runnerLog(p.w, p.runId).split("\n");
+			const sig = lineAt(lines, SIG_LINE);
+			const [, , worker, zombie] = sig.m;
+			const stop = lineAt(lines, new RegExp(`^stuck-stop \\S+ part full worker ${worker} zombie ${zombie}`));
+			const captured = lineAt(lines, /^stuck-captured \S+ part full file full\.signature\.log ms \d+$/);
+			const killed = lineAt(lines, /^stuck-killed \S+ part full pgids ([\d,]+) ms \d+ contained$/);
+			const exit = lineAt(lines, / full tr-[a-z0-9]+ → exit 125$/);
+			const swept = lineAt(lines, / sweep tr-[a-z0-9]+ → |the sweep after full (was abandoned|did not finish|failed)/, exit.i);
+			const contained = lineAt(lines, / contained after full: no live _as2test process$/, exit.i);
+			const released = lineAt(lines, / lock released$/, exit.i);
+			const took = await nextTook(p);
+			const total = printStages("contained", [
+				["first stuck-signature", sig.at], ["stuck-stop", stop.at], ["stuck-captured", captured.at], ["stuck-killed", killed.at],
+				["exec exit seen (125)", exit.at], ["sweep done", swept.at], ["contained", contained.at], ["lock released", released.at],
+				["next run took the lock", took],
+			], PROOF.boundMs);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toMatch(new RegExp(`^full: stuck: worker ${worker} spun \\d+ ms in Bun\\.spawnSync with unreaped child ${zombie}; \\d+ process groups killed, containment contained$`));
+			expect(run.full).toMatchObject({ exit: WRAPPER_EXIT.stuck });
+			expect(partsOf(p.w, p.runId)).toEqual(["probe", "prepare", "full"]);
+			expect(lines[swept.i]).toMatch(/ sweep tr-[a-z0-9]+ → exit 0$/);
+			expect(lines.join("\n")).not.toContain("stuck-containment-failed");
+			expect(took).toBeGreaterThanOrEqual(released.at);
+			expect(total).toBeLessThanOrEqual(PROOF.boundMs);
+		});
+	}, 240_000);
+
+	test("stalled-executor path: the executor SIGSTOPped after its first stuck-signature: the backstop abandons the call, error `executor stalled during stuck detection`, the next run took the lock within 42.5 s + 2 s", async () => {
+		await withProof("stalled", { stallExec: true }, async (p) => {
+			await p.kids[0]!.exited;
+			const run = await resultOf(p.w, p.first.wl, p.runId);
+			const log = runnerLog(p.w, p.runId);
+			const lines = log.split("\n");
+			const sig = lineAt(lines, SIG_LINE);
+			const worker = sig.m[2]!;
+			const abandoned = lineAt(lines, / full tr-[a-z0-9]+ → exit null \(abandoned by the stuck backstop\)$/);
+			const swept = lineAt(lines, / sweep tr-[a-z0-9]+ → |the sweep after full (was abandoned|did not finish|failed)/, abandoned.i);
+			const contained = lineAt(lines, / contained after full: no live _as2test process$/, abandoned.i);
+			const released = lineAt(lines, / lock released$/, abandoned.i);
+			const took = await nextTook(p);
+			const total = printStages("stalled", [
+				["first stuck-signature", sig.at], ["executor SIGSTOPped (test)", p.stoppedAt!], ["backstop abandoned the call", abandoned.at],
+				["sweep done", swept.at], ["contained", contained.at], ["lock released", released.at], ["next run took the lock", took],
+			], PROOF.stalledBoundMs);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toBe(`full: executor stalled during stuck detection; worker ${worker} was a candidate, not confirmed`);
+			expect(run.reason).not.toContain("stuck:");
+			expect(run.full).toMatchObject({ exit: null });
+			// no stop line followed the stall, and the backstop fired at its deadline after the signature's line
+			expect(log).not.toMatch(/^stuck-stop /m);
+			expect(log).toContain(`executor-stalled part full worker ${worker}\n`);
+			expect(abandoned.at - sig.at).toBeGreaterThanOrEqual(PROOF.backstopMs);
+			expect(abandoned.at - sig.at).toBeLessThan(PROOF.backstopMs + 1_000);
+			expect(alive(p.execPid)).toBe(false);
+			expect(partsOf(p.w, p.runId)).toEqual(["probe", "prepare", "full"]);
+			expect(took).toBeGreaterThanOrEqual(released.at);
+			expect(total).toBeLessThanOrEqual(PROOF.stalledBoundMs);
+		});
+	}, 240_000);
+
+	test("slow-cleanup path: the stuck sweep and the head re-check held by the hooks to their deadlines: the next run took the lock within 45 s", async () => {
+		await withProof("slow-cleanup", { holdCleanup: true }, async (p) => {
+			await p.kids[0]!.exited;
+			const run = await resultOf(p.w, p.first.wl, p.runId);
+			const lines = runnerLog(p.w, p.runId).split("\n");
+			const sig = lineAt(lines, SIG_LINE);
+			const [, , worker, zombie] = sig.m;
+			const stop = lineAt(lines, new RegExp(`^stuck-stop \\S+ part full worker ${worker} zombie ${zombie}`));
+			const captured = lineAt(lines, /^stuck-captured \S+ part full file full\.signature\.log ms \d+$/);
+			const killed = lineAt(lines, /^stuck-killed \S+ part full pgids ([\d,]+) ms \d+ contained$/);
+			const exit = lineAt(lines, / full tr-[a-z0-9]+ → exit 125$/);
+			const swept = lineAt(lines, / the sweep after full was abandoned at its deadline/, exit.i);
+			const contained = lineAt(lines, / contained after full: no live _as2test process$/, exit.i);
+			const finalize = lineAt(lines, / post-sweep finalization started; deadline (\S+)$/, exit.i);
+			const released = lineAt(lines, / lock released$/, exit.i);
+			const took = await nextTook(p);
+			const total = printStages("slow-cleanup", [
+				["first stuck-signature", sig.at], ["stuck-stop", stop.at], ["stuck-captured", captured.at], ["stuck-killed", killed.at],
+				["exec exit seen (125)", exit.at], ["sweep abandoned at its deadline", swept.at], ["contained", contained.at],
+				["finalization started", finalize.at], ["lock released", released.at], ["next run took the lock", took],
+			], PROOF.boundMs);
+			expect(run.verdict).toBe("error");
+			expect(run.reason).toStartWith(`full: stuck: worker ${worker} spun `);
+			expect(run.reason).toContain("post-sweep deadline exceeded");
+			// each held to its own deadline: the sweep's one 12 s deadline, then the head re-check to STUCK_FINALIZE_MS
+			expect(swept.at - exit.at).toBeGreaterThanOrEqual(PROOF.sweepMs);
+			const deadline = Date.parse(finalize.m[1]!);
+			expect(deadline - finalize.at).toBeLessThanOrEqual(PROOF.finalizeMs);
+			expect(released.at).toBeGreaterThanOrEqual(deadline);
+			const paused = JSON.parse(readFileSync(`${hookBase(p.w, p.runId, "sweep-read1")}.reached`, "utf8")) as { pid: number };
+			expect(alive(paused.pid)).toBe(false);
+			expect(took).toBeGreaterThanOrEqual(released.at);
+			expect(total).toBeLessThanOrEqual(PROOF.boundMs);
+		});
 	}, 240_000);
 });
