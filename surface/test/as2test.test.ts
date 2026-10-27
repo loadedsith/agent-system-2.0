@@ -665,6 +665,44 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 		}
 	}, 60_000);
 
+	test("a cap dir filled by a same-account process with 20,000 entries never delays the kill: the group dies within captureMs + grace + slack of the capture's start, the file says the dir was left for after the kill, and the wrapper removes it before it exits timeout", async () => {
+		const captureMs = 2_500;
+		const b = box("fill", { captureMs });
+		prepared(b, "tr-fill1", { "slow.test.ts": SLOW_TEST }, CAPS);
+		const hook = join(b.hooks, "tr-fill1.stuck-capture");
+		writeFileSync(`${hook}.pause`, "");
+		const t0 = Date.now();
+		const p = spawnCall(b, { sub: "full", runId: "tr-fill1" });
+		try {
+			expect(await until(() => existsSync(`${hook}.reached`), 2_400 + 5_000)).toBe(true);
+			// The capture started before its hook was reached, so its deadline is at or before `at + captureMs`.
+			const { at } = JSON.parse(readFileSync(`${hook}.reached`, "utf8")) as { at: number };
+			const work = workOf(b, "tr-fill1");
+			const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
+			pids.push(pid);
+			const capDirs = readdirSync(work).filter((n) => n.startsWith("full.stuck-"));
+			expect(capDirs).toHaveLength(1);
+			const capDir = join(work, capDirs[0]!);
+			// Empty directories: cheap to plant (under 1 s here) and dear to remove recursively (about 2 s for 20,000),
+			// so a recursive removal before the kill would push the kill past the bound below.
+			for (let i = 0; i < 20_000; i++) mkdirSync(join(capDir, `planted-${i}`));
+			// All planted before the deadline (and before the 3 s sample ends), so the cut meets every entry.
+			expect(Date.now()).toBeLessThan(at + captureMs);
+			expect(await until(() => !alive(pid), at + captureMs + 500 + 1_000 - Date.now())).toBe(true);
+			expect(await until(() => p.exitCode !== null, 2_400 + captureMs + 500 + 8_000 - (Date.now() - t0))).toBe(true);
+			expect(p.exitCode).toBe(WRAPPER_EXIT.timeout);
+			expect(await new Response(p.stderr).text()).toContain(TIMEOUT_LINE);
+			const text = readFileSync(join(work, "full.stuck.log"), "utf8");
+			expect(text).toMatch(/^capture cut at \d+ ms$/m);
+			expect(text).toContain("cap dir not empty: left for after the kill\n");
+			expect(text).not.toContain("not removed after the kill");
+			expect(existsSync(capDir)).toBe(false);
+			expect(captureLeftovers(work)).toEqual([]);
+		} finally {
+			writeFileSync(`${hook}.go`, "");
+		}
+	}, 60_000);
+
 	test("a sample report or the part log replaced by a FIFO or a symlink is refused, never followed or blocked on, and the wrapper still exits timeout within the bound", async () => {
 		const b = box("swap");
 		const secret = join(dir("swap-outside"), "secret.txt");

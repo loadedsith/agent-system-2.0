@@ -198,7 +198,7 @@ interface ToolRun {
 
 const errText = (e: unknown): string => (e as NodeJS.ErrnoException)?.code ?? (e instanceof Error ? e.message : String(e));
 
-/** One capture: its O_EXCL output file, its deadline, the capture tools still running (each the leader of its own group), its cap dir. */
+/** One capture: its O_EXCL output file, its deadline, the capture tools still running (each the leader of its own group), its cap dir and the sample reports it named there. */
 class Capture {
 	private fd: number | null;
 	readonly started = Date.now();
@@ -206,6 +206,10 @@ class Capture {
 	/** The capture tools whose pipes have not closed, by process group. */
 	private readonly live = new Map<number, ChildProcess>();
 	capDir: string | null = null;
+	/** The `sample-<pid>.txt` paths this capture named in its cap dir: the only names cleanup unlinks before the kill. */
+	private readonly reports = new Set<string>();
+	/** Whether the stuck log already says the cap dir was left for after the kill. */
+	private capDirLeft = false;
 	/** Set at the cut or the end: nothing after it is spawned, read or written as a section. */
 	over = false;
 
@@ -295,22 +299,63 @@ class Capture {
 		return killed;
 	}
 
-	/** Remove the cap dir without following a link in it (lstat-checked unlinks, then rmdir); a just-killed sample may still be closing. */
-	removeCapDir(): void {
+	/** The path `sample` writes its report for `pid` to, inside the cap dir; recorded so cleanup unlinks exactly it. */
+	reportPath(pid: number): string {
+		const path = join(this.capDir!, `sample-${pid}.txt`);
+		this.reports.add(path);
+		return path;
+	}
+
+	/**
+	 * Before the kill, bounded work only: unlink each sample report this capture named (lstat first; a link is unlinked itself,
+	 * never followed; a directory is left), then one rmdir of the cap dir. When that rmdir fails (something else is in it, or a
+	 * just-killed sample is still closing) the dir is left for `afterKill` and the stuck log says so, once.
+	 */
+	clearCapDir(): void {
 		if (this.capDir === null) return;
-		for (let attempt = 1; ; attempt++) {
+		for (const report of this.reports) {
 			try {
-				removeTree(this.capDir);
+				if (!lstatSync(report).isDirectory()) unlinkSync(report);
+			} catch {
+				// already gone, or not removable here: the rmdir below fails and afterKill removes it
+			}
+		}
+		this.reports.clear();
+		try {
+			rmdirSync(this.capDir);
+			this.capDir = null;
+		} catch (e) {
+			const code = (e as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") {
 				this.capDir = null;
 				return;
-			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
-				if (attempt >= 5) {
-					this.write(`cap dir ${this.capDir} not removed: ${errText(e)}\n`);
-					return;
-				}
-				Bun.sleepSync(20);
 			}
+			if (this.capDirLeft) return;
+			this.capDirLeft = true;
+			this.write(code === "ENOTEMPTY" || code === "EEXIST" ? "cap dir not empty: left for after the kill\n" : `cap dir not removed: ${errText(e)}: left for after the kill\n`);
+		}
+	}
+
+	/**
+	 * After killGroup has killed the part's group: remove a cap dir `clearCapDir` left, without following a link in it
+	 * (removeTree; a just-killed sample may still be closing, so a few tries), then close the stuck log. Never throws.
+	 */
+	async afterKill(): Promise<void> {
+		try {
+			for (let attempt = 1; this.capDir !== null; attempt++) {
+				try {
+					removeTree(this.capDir);
+					this.capDir = null;
+				} catch (e) {
+					if ((e as NodeJS.ErrnoException).code === "ENOENT") this.capDir = null;
+					else if (attempt >= 5) {
+						this.write(`cap dir ${this.capDir} not removed after the kill: ${errText(e)}\n`);
+						this.capDir = null;
+					} else await Bun.sleep(20);
+				}
+			}
+		} finally {
+			this.close();
 		}
 	}
 
@@ -419,7 +464,7 @@ async function processTree(c: Capture, pgid: number): Promise<{ body: string; pr
 /** Section 2, one bun process: `sample` into the cap dir, then (before the deadline only) its report read the safe way. Never rejects. */
 async function sampleOne(cfg: Config, runId: string, c: Capture, pid: number): Promise<string> {
 	try {
-		const report = join(c.capDir!, `sample-${pid}.txt`);
+		const report = c.reportPath(pid);
 		const r = await c.tool(["/usr/bin/sample", String(pid), "3", "-mayDie", "-file", report]);
 		await hook(cfg, runId, "stuck-sample-read", { stop: c.late, info: { report } });
 		if (c.late()) return `${toolBlock(r)}report not read: the capture is over\n`;
@@ -448,7 +493,7 @@ async function captureSections(cfg: Config, runId: string, c: Capture, pgid: num
 	const listed = await Promise.all(lsofs);
 	c.alive();
 	c.section(`3. lsof per process (${procs.length})`, since, procs.length === 0 ? "no process in the tree\n" : listed.map(toolBlock).join("\n"));
-	c.removeCapDir();
+	c.clearCapDir();
 	since = Date.now();
 	const tail = readRegular(logPath, CAPTURE_CAP, "tail");
 	let text = "refused" in tail ? `refused: ${tail.refused}\n` : "";
@@ -462,11 +507,13 @@ async function captureSections(cfg: Config, runId: string, c: Capture, pgid: num
 
 /**
  * D5: before the cap's kill, a bounded stuck capture into `<part stem>.stuck.log` beside the part's log, opened
- * O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one stderr line. One deadline
- * (cfg.captureMs) owns it: at the deadline every capture group still running is SIGKILLed, its readers are abandoned, the
- * cap dir is removed and the file says `capture cut at <ms> ms`. Never throws; nothing it does changes the part's exit.
+ * O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW; when that open fails the capture is skipped with one stderr line and null comes back.
+ * One deadline (cfg.captureMs) owns it: at the deadline every capture group still running is SIGKILLed, its readers are
+ * abandoned, the cap dir is cleared with bounded work only (`clearCapDir`) and the file says `capture cut at <ms> ms`.
+ * The caller kills the part's group, then calls the returned capture's `afterKill` (a leftover cap dir goes, the file
+ * closes). Never throws; nothing it does changes the part's exit.
  */
-async function stuckCapture(cfg: Config, runId: string, work: string, pgid: number, logPath: string, cap: number): Promise<void> {
+async function stuckCapture(cfg: Config, runId: string, work: string, pgid: number, logPath: string, cap: number): Promise<Capture | null> {
 	const stem = basename(logPath, ".log");
 	const path = join(work, `${stem}.stuck.log`);
 	let fd: number;
@@ -474,7 +521,7 @@ async function stuckCapture(cfg: Config, runId: string, work: string, pgid: numb
 		fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
 	} catch (e) {
 		process.stderr.write(`as2test: stuck capture skipped: cannot create ${path}: ${errText(e)}\n`);
-		return;
+		return null;
 	}
 	const c = new Capture(fd, cfg.captureMs);
 	try {
@@ -491,14 +538,13 @@ async function stuckCapture(cfg: Config, runId: string, work: string, pgid: numb
 		const how = await Promise.race([run, deadline.promise]);
 		clearTimeout(timer);
 		const killed = c.stop();
-		c.removeCapDir();
+		c.clearCapDir();
 		if (how === "cut") c.write(`capture cut at ${Date.now() - c.started} ms\nkilled capture groups: ${killed.join(" ") || "none"}\n`);
 		else if (killed.length > 0) c.write(`killed capture groups still running: ${killed.join(" ")}\n`);
 	} catch (e) {
 		c.write(`capture failed: ${errText(e)}\n`);
-	} finally {
-		c.close();
 	}
+	return c;
 }
 
 // ---- prepare ---------------------------------------------------------------------------------------
@@ -644,8 +690,10 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 	const first = await Promise.race([done, capped]);
 	clearTimeout(timer);
 	if (first === "cap") {
-		await stuckCapture(cfg, runId, work, pgid, logPath, cap);
+		const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
 		await killGroup(cfg, pgid);
+		// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
+		await capture?.afterKill();
 		await done;
 		throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
 	}
