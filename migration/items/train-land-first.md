@@ -2,7 +2,7 @@
 title: Fast PR checks gate merges while the full suite verifies main after landing
 status: building
 workload: wl-mvq4edbaf13vnk
-pr:
+pr: https://github.com/thewolff/agent-system-2.0/pull/369
 ---
 
 **Purpose.** Land-first changes the merge train from repeated full-suite PR checks to a small hosted check before merge and a full Mac suite on main after landing. This item records the operator contract and its activation sequence.
