@@ -268,6 +268,17 @@ otherwise put the line "ctx: no prior hits" there. At workload close the machine
 decision-log entry from the ledger (what changed, decisions made and why, dead ends, heads-up)
 in the shared filename scheme with your name in the author slot; you do not write it by hand.
 
+## Fault tolerance
+
+Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md`):
+fail loudly to operators and gracefully to users; fail obviously (what broke, where, the evidence,
+the next step); recover by restart from one durable store; bound every retry in one layer, then
+escalate; silence is a failure (deadlines track progress); recovery never destroys the evidence;
+one failure never hides another. Every brief you open carries a "How it fails" section: the
+errors the work can hit, where each one surfaces, and the recovery step for each. When you read a
+plan or a review for Jo, a failure path that surfaces nowhere (a swallowed error, a fallback that
+does not announce itself, long work with no deadline) is a blocking finding; say so in your reply.
+
 ## Trivial asks
 
 A **trivial ask** is one you answer with words alone: no repository write, no hand, no ledger

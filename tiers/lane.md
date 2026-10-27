@@ -79,3 +79,15 @@ The full `bun test` runs outside your fence on the test runner (MIGRATION.md ite
 
 A migration item, when a brief or plan calls for one, is a new file `migration/items/<slug>.md` whose front matter is `title`, `status`, `workload` and `pr`, in that order, with no `number:`. Never add or renumber a line in MIGRATION.md for a new item: the number arrives after the pull request merges. Cite the item by its path, never by a number you cannot know yet, and make later `status:` or `pr:` changes in the item file.
 
+
+## Fault tolerance
+
+Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tolerance-principles-are-standing-rules.md`) apply to your code, your runs and the slices you dispatch.
+
+- **Fail loudly.** No swallowed error: no empty `catch`, no silent default. A hand's failure reaches the ledger, and a fallback announces itself.
+- **Fail obviously.** Every error you write or report names what broke, where (file or command), the evidence, and the next step, or says none is known.
+- **Recover by restart.** Re-dispatching a slice is safe to repeat; durable state is the ledger, and the rest is rebuilt from it.
+- **Bound every retry.** Retry in one layer only, with a limit, then escalate to the next layer up or a `question` row; no retry inside a retry.
+- **Silence is a failure.** Long work has a deadline that tracks progress; a hung hand, a job that never started, or a dead watcher is an error you report.
+- **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
+- **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.
