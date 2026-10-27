@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { DECISION_LOG_ENTRY_BYTES, DECISION_LOG_MAX_BYTES, decisionLogContext, lastWorkloadOn, localOffset, NOT_RENDERED, parseFrontmatter, readLog, recordRepo, renderClose, repoOf, section, stamp } from "../src/decision-log";
+import { DECISION_LOG_ENTRY_BYTES, DECISION_LOG_MAX_BYTES, decisionLogContext, lastWorkloadOn, localOffset, NOT_RENDERED, parseFrontmatter, readLog, recordRepo, renderClose, renderLogContext, repoOf, section, stamp } from "../src/decision-log";
 import { recordIdentity } from "../src/identity";
 import { clock, tempLedger, tmp, workloadWithSlice } from "./helpers";
 
@@ -142,8 +142,9 @@ describe("byte budget at open", () => {
 			{ label: "multibyte bodies", dir: shape(10, `${"- 決定 é ✓ 🙂 ".repeat(20)}\n`.repeat(400)), maxBytes: budgets(400, [4096, DECISION_LOG_MAX_BYTES], 40) },
 		];
 		for (const s of shapes) {
+			const entries = readLog(s.dir);
 			for (const maxBytes of s.maxBytes) {
-				const out = decisionLogContext(s.dir, { now, since, maxBytes });
+				const out = renderLogContext(entries, s.dir, { now, since, maxBytes });
 				expect({ shape: s.label, maxBytes, bytes: Buffer.byteLength(out, "utf8") <= maxBytes ? "within" : Buffer.byteLength(out, "utf8") }).toEqual({ shape: s.label, maxBytes, bytes: "within" });
 				// never a broken code point
 				expect(out.includes("\uFFFD")).toBe(false);

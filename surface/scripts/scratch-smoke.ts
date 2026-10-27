@@ -53,7 +53,7 @@ const SOURCE = resolve(import.meta.dir, "..", "..");
 const PROFILE = "agent-system-2";
 /** Logs and run directories (the slice brief names this directory). */
 const LOG_DIR = join(homedir(), "agent-scratch", "agent-system-2.0", "wl-mv5oikd5jtquww", "smoke");
-const CHAT_MODEL = "anthropic/claude-haiku-4-5";
+const CHAT_MODEL = "anthropic/claude-haiku-5-5";
 const LEASE_MS = 120_000;
 const PROBE_MS = 120_000;
 /** From the launch to the lane's lane-exit: (or lane-died:). */

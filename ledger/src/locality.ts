@@ -1,6 +1,7 @@
 // Where the ledger file lives, and the refusal to put it on a synced or network folder.
 // SPEC-2.0.md § B2 fix 3: v1 ledger state is local, never on a synced or network folder,
 // because SQLite WAL does not work over a network filesystem.
+import { dlopen, FFIType, ptr, read } from "bun:ffi";
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -227,20 +228,77 @@ function existingAncestor(path: string): string {
 	return p;
 }
 
-function mountPointOf(path: string): string | null {
+type DfResult = { mp: string } | { why: string };
+
+function mountPointOf(path: string): DfResult {
 	const out = Bun.spawnSync(["df", "-P", path], { stdout: "pipe", stderr: "pipe" });
-	if (out.exitCode !== 0) return null;
+	if (out.exitCode !== 0) {
+		const ended = out.exitCode ?? out.signalCode ?? "an unknown status";
+		const first = out.stderr.toString().trim().split("\n")[0] ?? "";
+		return { why: `unknown:df exited ${ended}: ${first}` };
+	}
 	const lines = out.stdout.toString().trim().split("\n");
 	const last = lines[lines.length - 1]?.trim().split(/\s+/);
 	// POSIX df -P: Filesystem, blocks, used, available, capacity, mounted-on (may contain spaces).
-	return last && last.length >= 6 ? last.slice(5).join(" ") : null;
+	return last && last.length >= 6 ? { mp: last.slice(5).join(" ") } : { why: "unknown:df printed no mount point" };
+}
+
+// ---- arm64 macOS: statfs(2) through bun:ffi, no child process ---------------------------------------
+//
+// struct statfs layout (arm64, 64-bit inode statfs), read with
+// `clang -arch arm64 -S` of `offsetof(struct statfs, …)` against <sys/mount.h>:
+//   f_flags      offset 64
+//   f_fstypename offset 72   (char[16], MFSTYPENAMELEN)
+//   f_mntonname  offset 88   (char[1024], MAXPATHLEN)
+//   sizeof(struct statfs) = 2168, MNT_LOCAL = 0x1000
+// ledger/test/ledger.test.ts checks the answers against /sbin/mount, so a layout change fails there.
+const STATFS_SIZE = 2168;
+const STATFS_F_FLAGS = 64;
+const STATFS_F_FSTYPENAME = 72;
+const STATFS_F_MNTONNAME = 88;
+const MNT_LOCAL = 0x1000;
+
+type Libc = { statfs: (path: Uint8Array, buf: Uint8Array) => number; errnoPtr: () => number };
+let libc: Libc | undefined;
+
+function loadLibc(): Libc {
+	if (libc) return libc;
+	const lib = dlopen("/usr/lib/libSystem.B.dylib", {
+		statfs: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+		__error: { args: [], returns: FFIType.ptr },
+	});
+	libc = {
+		statfs: (path, buf) => lib.symbols.statfs(ptr(path), ptr(buf)),
+		errnoPtr: () => {
+			const at = lib.symbols.__error();
+			return at === null ? -1 : read.i32(at);
+		},
+	};
+	return libc;
+}
+
+function cString(buf: Uint8Array, at: number, max: number): string {
+	let end = at;
+	while (end < at + max && buf[end] !== 0) end++;
+	return Buffer.from(buf.subarray(at, end)).toString("utf8");
+}
+
+function statfsLocality(target: string): string {
+	const c = loadLibc();
+	const buf = new Uint8Array(STATFS_SIZE);
+	if (c.statfs(Buffer.from(`${target}\0`), buf) !== 0) return `unknown:statfs failed (errno ${c.errnoPtr()})`;
+	const flags = new DataView(buf.buffer).getUint32(STATFS_F_FLAGS, true);
+	if ((flags & MNT_LOCAL) !== 0) return "local";
+	return `network:${cString(buf, STATFS_F_MNTONNAME, 1024)} is mounted without the local flag (${cString(buf, STATFS_F_FSTYPENAME, 16)})`;
 }
 
 /** "local" | "network:<why>" | "unknown:<why>". */
 export function mountLocality(path: string): string {
 	const target = existingAncestor(path);
-	const mp = mountPointOf(target);
-	if (!mp) return "unknown:df failed";
+	if (process.platform === "darwin" && process.arch === "arm64") return statfsLocality(target);
+	const found = mountPointOf(target);
+	if ("why" in found) return found.why;
+	const mp = found.mp;
 	if (process.platform === "darwin") {
 		const out = Bun.spawnSync(["/sbin/mount"], { stdout: "pipe", stderr: "pipe" });
 		const line = out.stdout.toString().split("\n").find((l) => l.includes(` on ${mp} (`));
