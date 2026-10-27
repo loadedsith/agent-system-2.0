@@ -13,7 +13,7 @@ import { SURFACE_BY } from "../src/types";
 import {
 	AS2TEST_EXEC, authoritativeRun, baseCompareFor, baseParts, boundBranches, buildTestRun, callTimedOut, carriedRun, changedTestFiles, CHILD_ENV_ALLOWLIST, childEnv, childGitconfigText, childLayout,
 	type ClosePr, closeFreshness, decideRun, decisionLogFault, decisionLogOnly, executedFiles, fullSuiteSlice, gitShimText, heartbeatText, isBunTestFile, isSecurityPath, KEEP_RUNS, lockHolderStale,
-	logFirstErrors, mainRed, makeRunId, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
+	logFirstErrors, mainRed, makeRunId, mergedNeedsCover, notifiesOrchestrator, ownerRepoOf, ownsRequest, parseHeartbeat, parseJunit, parsePushDest, parseTestRequested,
 	parseTestRun, parseTestRunFailed, partResult, type PartResult, prAdmissible, type PrView, pruneRuns, queueAhead, queuedTooLong, type QueueRow, queueWaiterLive, type RangeCommit,
 	recordLive, reportCapBytes, reservation, resultJson, type RunFacts, runDirOf, runLive, runnerDiedRun, runsRoot, servedRepo, settleArtifact, soloPlan, stageDirOf, pushDestBody,
 	TEST_RUNNER_DEFAULTS, type TestRequested, testRequestedBody, type TestRun, testRunBody, testRunFailedBody, testRunFailedOf, testRunnerConfig,
@@ -1078,7 +1078,7 @@ describe("retention", () => {
 // ---- 9. close freshness ---------------------------------------------------------------------------------------
 
 describe("close freshness (§ 2.4 item 4)", () => {
-	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha });
+	const green = (sha: string, runId = "tr-1") => ({ runId, verdict: "green" as const, sha, scope: "full" as const });
 	const pr = (over: Partial<ClosePr> = {}): ClosePr => ({
 		number: 17, state: "OPEN", headRefName: "wl/wl-t", headSha: A, result: green(A), headCompare: null, candidateCompare: null, waivedRun: null, trainSkipped: null, onTrain: false,
 		mergeCommit: null, cover: null, waivedByJo: null, ...over,
@@ -1124,7 +1124,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		const recs = testRuns([reqEntry(g), runEntry(run(g, "green")), reqEntry(r), runEntry(run(r, "red"))]);
 		const auth = authoritativeRun(recs, 17)!;
 		expect(auth.result!.verdict).toBe("red");
-		const refused = closeFreshness(facts([pr({ result: { runId: auth.result!.runId, verdict: auth.result!.verdict, sha: auth.result!.sha } })]));
+		const refused = closeFreshness(facts([pr({ result: { runId: auth.result!.runId, verdict: auth.result!.verdict, sha: auth.result!.sha, scope: auth.result!.scope } })]));
 		expect(refused).toEqual({ close: false, reason: "PR #17's newest test-run tr-2 is red: fix it and call lane_full_test (a waiver passes only a merged PR)" });
 		const old = request("tr-3", 17, A);
 		const newer = request("tr-4", 17, A);
@@ -1132,7 +1132,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		const a2 = authoritativeRun(late, 17)!;
 		expect(a2.request.runId).toBe("tr-4");
 		expect(a2.result!.verdict).toBe("green");
-		expect(closeFreshness(facts([pr({ result: { runId: "tr-4", verdict: "green", sha: A } })])).close).toBe(true);
+		expect(closeFreshness(facts([pr({ result: { runId: "tr-4", verdict: "green", sha: A, scope: "full" } })])).close).toBe(true);
 		expect(authoritativeRun(late, 99)).toBeNull();
 	});
 	test("no PR with a code delta refuses; an empty set with no delta closes; decision-log-only is no delta", () => {
@@ -1158,7 +1158,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		expect(closeFreshness({ ...facts([], []), failure: "git: not a repository" }).close).toBe(false);
 	});
 	test("PLAN wl-mv5i3lulwwbbi8 D3: a merged PR passes on Jo's waiver of its authoritative red at its head; an older run, another sha or an open PR do not", () => {
-		const red = (sha: string, runId = "tr-2") => ({ runId, verdict: "red" as const, sha });
+		const red = (sha: string, runId = "tr-2") => ({ runId, verdict: "red" as const, sha, scope: "full" as const });
 		// Tinker's shape: merged, red at the merged head, that run waived, no code delta on the candidate
 		expect(closeFreshness(facts([pr({ state: "MERGED", result: red(A), waivedRun: "tr-2" })], []))).toEqual({
 			close: true, why: "every PR in the set is green at its head or merged with a waived run (#17 (tr-2))",
@@ -1173,7 +1173,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 			close: false, reason: `PR #17's newest test-run tr-2 is red and waived, but at aaaaaaa, not the merged head bbbbbbb${ways}`,
 		});
 		// PLAN wl-mvfjen3q5mqi2o: the same merged red passes on a covering green on main, or on Jo's waive-pr; an open red on neither
-		const cover = { runId: "tr-9", sha: C, workloadId: "wl-other", how: "merge" as const };
+		const cover = { runId: "tr-9", sha: C, workloadId: "wl-other", how: "merge" as const, main: false };
 		expect(closeFreshness(facts([pr({ state: "MERGED", mergeCommit: A, result: red(A), cover })], []))).toEqual({
 			close: true, why: "every other PR in the set is green at its head; PR #17 merged; covered by test-run tr-9 green at ccccccc (wl-other), which contains merge commit aaaaaaa",
 		});
@@ -1191,7 +1191,7 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		});
 	});
 	test("PLAN wl-mv8s8srodefytc rev 17.1 D8: red-main passes only a train PR the train merged, at exactly that head", () => {
-		const mainRed = (sha: string, runId = "tr-5") => ({ runId, verdict: "red-main" as const, sha });
+		const mainRed = (sha: string, runId = "tr-5") => ({ runId, verdict: "red-main" as const, sha, scope: "full" as const });
 		// merged, on a train, at the red-main's sha: it counts as that PR's green and covers the candidate it tested
 		const ok = closeFreshness(facts([pr({ state: "MERGED", onTrain: true, result: mainRed(A) })]));
 		expect(ok.close).toBe(true);
@@ -1205,6 +1205,32 @@ describe("close freshness (§ 2.4 item 4)", () => {
 		expect(!moved.close && moved.reason).toContain("tr-5");
 		// it covers no candidate commit it did not test
 		expect(closeFreshness(facts([pr({ state: "MERGED", onTrain: true, result: mainRed(A) })], ["surface/src/x.ts"], B)).close).toBe(false);
+	});
+	test("PLAN wl-mvq4edbaf13vnk D9: a fast green is never a full-suite green; a merged one passes only on a main run's cover or Jo's waive-pr", () => {
+		const fast = (sha: string, runId = "tr-6") => ({ runId, verdict: "green" as const, sha, scope: "fast" as const });
+		const mainCover = { runId: "tr-0main1", sha: C, workloadId: "wl-orchestrator", how: "merge" as const, main: true };
+		const prCover = { runId: "tr-9", sha: C, workloadId: "wl-other", how: "merge" as const, main: false };
+		const merged = { state: "MERGED" as const, mergeCommit: A, result: fast(A) };
+		// a merged fast green needs a cover even at exactly its merged head; a full green there does not
+		expect(mergedNeedsCover(pr(merged))).toBe(true);
+		expect(mergedNeedsCover(pr({ ...merged, result: green(A) }))).toBe(false);
+		expect(mergedNeedsCover(pr({ result: fast(A) }))).toBe(false);
+		const uncovered = "PR #17 merged at aaaaaaa (merge commit aaaaaaa) with only test-run tr-6, a fast green at aaaaaaa, and no green, believable main run on main holds it yet: it passes once the main run of aaaaaaa or of a later main commit is green and believable, or on Jo's `waive-pr wl-t 17`";
+		expect(closeFreshness(facts([pr(merged)], []))).toEqual({ close: false, reason: uncovered });
+		// a PR's full green that holds the merge covers other PRs, never a fast green
+		expect(closeFreshness(facts([pr({ ...merged, cover: prCover })], []))).toEqual({ close: false, reason: uncovered });
+		expect(closeFreshness(facts([pr({ ...merged, cover: mainCover })], []))).toEqual({
+			close: true, why: "every other PR in the set is green at its head; PR #17 merged; covered by main run tr-0main1 green and believable at ccccccc (wl-orchestrator), which contains merge commit aaaaaaa",
+		});
+		expect(closeFreshness(facts([pr({ ...merged, waivedByJo: "in-1" })], []))).toEqual({ close: true, why: "every other PR in the set is green at its head; waived by Jo: #17 (in-1)" });
+		// covered by a main run, it counts as that PR's green for the candidate it tested; waived, it covers no code delta
+		expect(closeFreshness(facts([pr({ ...merged, cover: mainCover })], ["surface/src/x.ts"], A)).close).toBe(true);
+		expect(closeFreshness(facts([pr({ ...merged, waivedByJo: "in-1" })], ["surface/src/x.ts"], A))).toEqual({ close: false, reason: "local wl/wl-t has untested commit aaaaaaa" });
+		// an open PR's fast green refuses whatever covers it
+		expect(closeFreshness(facts([pr({ result: fast(A), cover: mainCover, waivedByJo: "in-1" })], []))).toEqual({
+			close: false,
+			reason: "PR #17's newest result is test-run tr-6, a fast green at aaaaaaa: the fast check before merge is not a full-suite result, so it passes close only once the PR has merged and a green, believable main run on main holds its merge commit",
+		});
 	});
 });
 

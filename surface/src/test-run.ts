@@ -1532,8 +1532,12 @@ export interface ClosePr {
 	headRefName: string;
 	/** The PR's head; a merged PR's final head. */
 	headSha: string;
-	/** The authoritative result (authoritativeRun(...).result), or null. */
-	result: { runId: string; verdict: TestVerdict; sha: string } | null;
+	/**
+	 * The authoritative result (authoritativeRun(...).result), or null. `scope` is what ran (PLAN wl-mvq4edbaf13vnk D1): a `fast`
+	 * green is the fast check before merge, never a full-suite result (`isFullSuiteGreen`); it passes close only on a merged PR
+	 * whose `cover` is a green believable main run holding its merge commit (D9, R23).
+	 */
+	result: { runId: string; verdict: TestVerdict; sha: string; scope: TestScope } | null;
 	/** Compare from result.sha to headSha; null when there is no result or the two are equal. */
 	headCompare: CompareResult | null;
 	/** For a PR from the workload's branch: compare from result.sha to the candidate; null otherwise. */
@@ -1558,14 +1562,16 @@ export interface ClosePr {
 	/** A MERGED PR's merge commit (gh `mergeCommit.oid`, read in the same call as its head); null for any other state. */
 	mergeCommit: string | null;
 	/**
-	 * For a MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a green its merged head does not keep, a red,
-	 * error or stale run Jo did not waive at that head, or a red-main off a train or not at its merged head): the newest
-	 * test-runner green, on any workload of this repository, whose sha S is on the freshly fetched `origin/<default>` and either is
-	 * the merged head (or the head descends from S through decision-log-only commits, `how: "head"`) or contains the merge commit
-	 * (`how: "merge"`) (PLAN wl-mvfjen3q5mqi2o D2; surface/src/close-entry.ts `gatherCloseFacts`); else null. S is an integration
-	 * snapshot of the main line that contains the merge, not a claim that it still runs every line the PR added.
+	 * For a MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a green its merged head does not keep, a fast
+	 * green, a red, error or stale run Jo did not waive at that head, or a red-main off a train or not at its merged head): the
+	 * newest test-runner green, on any workload of this repository, whose sha S is on the freshly fetched `origin/<default>` and
+	 * either is the merged head (or the head descends from S through decision-log-only commits, `how: "head"`) or contains the
+	 * merge commit (`how: "merge"`) (PLAN wl-mvfjen3q5mqi2o D2; surface/src/close-entry.ts `gatherCloseFacts`); else null. S is a
+	 * full-suite green: a PR's full-scope green, or a main run's green believable verdict (`main`, PLAN wl-mvq4edbaf13vnk D9); a
+	 * fast green never covers, and a fast green is covered only by a main run. S is an integration snapshot of the main line that
+	 * contains the merge, not a claim that it still runs every line the PR added.
 	 */
-	cover: { runId: string; sha: string; workloadId: string; how: "head" | "merge" } | null;
+	cover: { runId: string; sha: string; workloadId: string; how: "head" | "merge"; main: boolean } | null;
 	/** Jo's `waive-pr` instruction naming this PR (PLAN wl-mvfjen3q5mqi2o D3; surface/src/launch.ts `waivedPrs`), or null. It passes only a MERGED PR nothing covers. */
 	waivedByJo: string | null;
 }
@@ -1588,15 +1594,16 @@ export type CloseDecision = { close: true; why: string } | { close: false; reaso
 
 /**
  * Whether a MERGED PR's own results fail the close check, so it needs D2's cover or D3's waiver (PLAN wl-mvfjen3q5mqi2o): no
- * result; a green its merged head does not keep; a red, error, stale or superseded run Jo's run-based `waive` does not pass at
- * that head; or a red-main off a train or not at its merged head. False for any other state and for a PR Jo skipped on a train.
- * It mirrors `closeFreshness`'s rules for a merged PR, which pass these PRs on `cover` or `waivedByJo` only after their own rules.
+ * result; a green its merged head does not keep; a fast green, which is never a full-suite result (PLAN wl-mvq4edbaf13vnk D9);
+ * a red, error, stale or superseded run Jo's run-based `waive` does not pass at that head; or a red-main off a train or not at
+ * its merged head. False for any other state and for a PR Jo skipped on a train. It mirrors `closeFreshness`'s rules for a
+ * merged PR, which pass these PRs on `cover` or `waivedByJo` only after their own rules.
  */
 export function mergedNeedsCover(pr: Pick<ClosePr, "state" | "result" | "headSha" | "headCompare" | "waivedRun" | "trainSkipped" | "onTrain">): boolean {
 	if (pr.state !== "MERGED" || pr.trainSkipped) return false;
 	const r = pr.result;
 	if (r === null) return true;
-	if (r.verdict === "green") return pr.headSha !== r.sha && decisionLogFault(pr.headCompare) !== null;
+	if (r.verdict === "green") return r.scope === "fast" || (pr.headSha !== r.sha && decisionLogFault(pr.headCompare) !== null);
 	if (r.verdict === "red-main") return !pr.onTrain || pr.headSha !== r.sha;
 	return pr.waivedRun !== r.runId || pr.headSha !== r.sha;
 }
@@ -1607,12 +1614,15 @@ export function mergedNeedsCover(pr: Pick<ClosePr, "state" | "result" | "headSha
  * its final head, and an open PR never passes on a waiver. A `red-main` result (D8) passes only a merged train PR
  * (`onTrain`) at exactly its merged head, and then counts as that PR's green. A PR Jo skipped on a merge train (`trainSkipped`)
  * is treated like a closed one and named in the why. A MERGED PR its own results do not pass (`mergedNeedsCover`: no result, a
- * green its merged head does not keep, a red, error or stale run not waived at that head, a red-main off a train) passes on a
- * covering test-runner green on the main line (`cover`, PLAN wl-mvfjen3q5mqi2o D2), else on Jo's `waive-pr` (`waivedByJo`,
- * D3); with neither, a PR with no result or an unkept green is refused naming its merge commit and both ways through (D4), and
- * any other keeps its refusal with the same two ways appended. An open PR never passes on either. A candidate with a code
- * delta needs such a green on a PR from the branch that covers C the same way (a waiver or a cover covers nothing). The one
- * exemption is an empty PR set with no code delta. Anything git or gh could not answer refuses.
+ * green its merged head does not keep, a fast green, a red, error or stale run not waived at that head, a red-main off a train)
+ * passes on a covering test-runner green on the main line (`cover`, PLAN wl-mvfjen3q5mqi2o D2), else on Jo's `waive-pr`
+ * (`waivedByJo`, D3); with neither, a PR with no result or an unkept green is refused naming its merge commit and both ways
+ * through (D4), and any other keeps its refusal with the same two ways appended. A fast green (PLAN wl-mvq4edbaf13vnk D9) is
+ * never a full-suite result: an open PR with one is refused, and a merged one passes only on a cover that is a main run's green
+ * believable verdict on its merge commit or a later main commit (then it counts as that PR's green), or on Jo's `waive-pr`.
+ * An open PR never passes on either. A candidate with a code delta needs such a green on a PR from the branch that covers C the
+ * same way (a waiver or any other cover covers nothing). The one exemption is an empty PR set with no code delta. Anything git
+ * or gh could not answer refuses.
  */
 export function closeFreshness(f: CloseFacts): CloseDecision {
 	if (f.failure !== null) return { close: false, reason: `the close check could not answer: ${f.failure}` };
@@ -1627,13 +1637,17 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 	const covers: string[] = [];
 	const waivedByJo: string[] = [];
 	const mainRedMerged = new Set<number>();
-	// D2 then D3, for a MERGED PR its own results do not pass: true when it passes, and named in the why.
-	const passesMerged = (pr: ClosePr): boolean => {
+	// Merged PRs whose fast green a main run covers (D9): each counts as that PR's green for the candidate.
+	const fastCovered = new Set<number>();
+	// D2 then D3, for a MERGED PR its own results do not pass: true when it passes, and named in the why. A fast green takes only a main run's cover (D9).
+	const passesMerged = (pr: ClosePr, mainOnly = false): boolean => {
 		if (pr.state !== "MERGED") return false;
 		const c = pr.cover;
-		if (c !== null) {
+		if (c !== null && (c.main || !mainOnly)) {
 			const holds = c.how === "merge" ? `which contains merge commit ${pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit)}` : "at its merged head";
-			covers.push(`PR #${pr.number} merged; covered by test-run ${c.runId} green at ${sha7(c.sha)} (${c.workloadId}), ${holds}`);
+			const run = c.main ? `main run ${c.runId} green and believable` : `test-run ${c.runId} green`;
+			covers.push(`PR #${pr.number} merged; covered by ${run} at ${sha7(c.sha)} (${c.workloadId}), ${holds}`);
+			if (mainOnly) fastCovered.add(pr.number);
 			return true;
 		}
 		if (pr.waivedByJo !== null) {
@@ -1692,6 +1706,21 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 			if (passesMerged(pr)) continue;
 			return refusedMerged(pr, refused);
 		}
+		if (r.scope === "fast") {
+			const m = pr.mergeCommit === null ? "unknown" : sha7(pr.mergeCommit);
+			const fast = `test-run ${r.runId}, a fast green at ${sha7(r.sha)}`;
+			if (pr.state === "OPEN") {
+				return {
+					close: false,
+					reason: `PR #${pr.number}'s newest result is ${fast}: the fast check before merge is not a full-suite result, so it passes close only once the PR has merged and a green, believable main run on ${f.defaultBranch} holds its merge commit`,
+				};
+			}
+			if (passesMerged(pr, true)) continue;
+			return {
+				close: false,
+				reason: `PR #${pr.number} merged at ${sha7(pr.headSha)} (merge commit ${m}) with only ${fast}, and no green, believable main run on ${f.defaultBranch} holds it yet: it passes once the main run of ${m} or of a later ${f.defaultBranch} commit is green and believable, or on Jo's \`waive-pr ${f.branch.replace(/^wl\//, "")} ${pr.number}\``,
+			};
+		}
 		const fault = pr.headSha === r.sha ? null : decisionLogFault(pr.headCompare);
 		if (fault !== null) {
 			if (passesMerged(pr)) continue;
@@ -1703,7 +1732,9 @@ export function closeFreshness(f: CloseFacts): CloseDecision {
 		const own = f.prs.filter((p) => p.headRefName === f.branch);
 		if (own.length === 0) return { close: false, reason: `${f.branch} changes ${delta[0]} but has no PR: push and open the PR, then lane_full_test` };
 		const covered = own.some(
-			(p) => p.state !== "CLOSED" && (p.result?.verdict === "green" || mainRedMerged.has(p.number)) && (f.candidate.sha === p.result!.sha || decisionLogOnly(p.candidateCompare)),
+			(p) =>
+				p.state !== "CLOSED" && ((p.result?.verdict === "green" && p.result.scope !== "fast") || mainRedMerged.has(p.number) || fastCovered.has(p.number)) &&
+				(f.candidate.sha === p.result!.sha || decisionLogOnly(p.candidateCompare)),
 		);
 		if (!covered) {
 			if (own.every((p) => p.state === "CLOSED")) return { close: false, reason: `PR #${own.at(-1)!.number} is closed; reopen it, or reset the branch` };

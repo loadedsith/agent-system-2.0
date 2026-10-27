@@ -14,10 +14,11 @@ import { type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { closeWorkloadWithEntry } from "../extensions/workload";
 import { TEST_RUNNER_CONFIG_ENV } from "../src/close-entry";
 import { recordRepo } from "../src/decision-log";
+import { ensureStandingWorkload } from "../src/identity";
 import { applyTrain } from "../src/input";
 import { branchName, withdrawInstructionBody, withdrawnBody, worktreePath } from "../src/launch";
-import { testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
-import { SURFACE_BY, type SurfaceAPI } from "../src/types";
+import { type ExecCounts, testRequestedBody, testRunBody, type TestVerdict } from "../src/test-run";
+import { STANDING_WORKLOAD_ID, SURFACE_BY, type SurfaceAPI } from "../src/types";
 import { clock, tempLedger, tmp } from "./helpers";
 
 // Every test spawns real git and the fake gh many times (3-4 s idle); on a loaded runner the 5 s
@@ -167,8 +168,11 @@ function requested(x: Closable, runId: string, pr: number, sha: string, o: { wl?
 	x.tick();
 	x.ledger.recordEntry({ by: TEST_RUNNER_BY, workloadId: o.wl ?? x.wl, kind: "assumption", body: testRequestedBody({ runId, pr, sha, slice: "sl-full-1", by: "lane-a" }) });
 }
-/** The runner's `test-run:` entry for a request; a red-main carries the base comparison it rests on. `o.wl` writes it on another workload, `o.by` forges the writer. */
-function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict, o: { wl?: string; by?: string } = {}): void {
+/**
+ * The runner's `test-run:` entry for a request; a red-main carries the base comparison it rests on. `o.wl` writes it on another
+ * workload, `o.by` forges the writer, `o.fast` makes it the fast check on Linux (PLAN wl-mvq4edbaf13vnk D1).
+ */
+function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestVerdict, o: { wl?: string; by?: string; fast?: boolean } = {}): void {
 	x.tick();
 	const red = verdict === "red" || verdict === "red-main";
 	const broken = "x.test.ts > broken";
@@ -179,6 +183,24 @@ function ran(x: Closable, runId: string, pr: number, sha: string, verdict: TestV
 			full: { pass: 3, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
 			failures: red ? [{ part: "full", name: broken, firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
 			...(verdict === "red-main" ? { baseCompare: { sha: "b".repeat(40), parts: [{ part: "full", failing: [broken], baseFailing: [broken], baseError: null }] } } : {}),
+			...(o.fast ? { scope: "fast" as const, host: "linux" as const } : {}),
+		}),
+	});
+}
+/** Executed counts a main run's believability passes on: every test file of the tree ran (PLAN wl-mvq4edbaf13vnk § 2 Main state). */
+const BELIEVABLE: ExecCounts = { files: 40, tests: 400, treeFiles: 40 };
+/** The runner's main run of `sha` on the standing workload (pr 0, the full suite on the Mac); `o.exec` sets its counts, `o.by` forges the writer. */
+function mainRan(x: Closable, runId: string, sha: string, verdict: "green" | "red", o: { exec?: ExecCounts; by?: string } = {}): void {
+	x.tick();
+	ensureStandingWorkload(x.ledger);
+	const red = verdict === "red";
+	x.ledger.recordEntry({
+		by: o.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+		body: testRunBody({
+			runId, verdict, sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+			full: { pass: 400, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			scope: "full", main: true, host: "mac", exec: o.exec ?? BELIEVABLE,
 		}),
 	});
 }
@@ -907,11 +929,11 @@ function pushDest(x: Closable, remote: string, branch: string, sha: string): voi
 }
 
 /** Another workload whose `repo:` is `repo` (this clone unless given), with the runner's green (or `o.by`'s imitation) at `sha` for PR `pr`; its id. */
-function foreignGreen(w: World, x: Closable, runId: string, pr: number, sha: string, o: { repo?: string; by?: string } = {}): string {
+function foreignGreen(w: World, x: Closable, runId: string, pr: number, sha: string, o: { repo?: string; by?: string; fast?: boolean } = {}): string {
 	const wl = x.ledger.openWorkload({ by: SURFACE_BY, brief: `Another workload's change, run ${runId}`, stakes: "normal", mode: "autonomous" });
 	recordRepo(x.ledger, wl, o.repo ?? w.work);
 	requested(x, runId, pr, sha, { wl });
-	ran(x, runId, pr, sha, "green", { wl, ...(o.by ? { by: o.by } : {}) });
+	ran(x, runId, pr, sha, "green", { wl, ...(o.by ? { by: o.by } : {}), ...(o.fast ? { fast: true } : {}) });
 	return wl;
 }
 
@@ -1283,6 +1305,129 @@ describe("PLAN wl-mvfjen3q5mqi2o D2-D4: a merged PR no green of its own holds pa
 			expectRefused(w, x, r, shape.reason(x, s), s);
 		}
 	}, 45_000);
+});
+
+/**
+ * PR #7 from wl/<id> at h with a fast green tr-1 at h (PLAN wl-mvq4edbaf13vnk D1), merged into main by Jo's merge commit m
+ * (`--no-ff`) after main moved on to o.
+ */
+function fastMerged(w: World, x: Closable): { h: string; m: string; o: string; other: string } {
+	const { sha: h } = laneWithCode(w, x);
+	requested(x, "tr-1", 7, h);
+	ran(x, "tr-1", 7, h, "green", { fast: true });
+	const other = otherClone(w);
+	const o = commitFile(w, other, "o.txt", "main moves on");
+	g(w, other, "merge", "-q", "--no-ff", "--no-edit", h);
+	const m = g(w, other, "rev-parse", "HEAD");
+	g(w, other, "push", "-q", "origin", "main");
+	g(w, w.work, "fetch", "-q", "origin");
+	prs(w, x.branch, [{ number: 7, state: "MERGED", headRefOid: h, mergeCommit: m }]);
+	return { h, m, o, other };
+}
+/** D9's refusal for a merged PR whose fast green no main run covers yet. */
+const fastUncovered = (x: Closable, h: string, m: string) =>
+	`PR #7 merged at ${s7(h)} (merge commit ${s7(m)}) with only test-run tr-1, a fast green at ${s7(h)}, and no green, believable main run on main holds it yet: it passes once the main run of ${s7(m)} or of a later main commit is green and believable, or on Jo's \`waive-pr ${x.wl} 7\``;
+
+describe("PLAN wl-mvq4edbaf13vnk D9, R23: a fast green at a merged head is covered at close by a green believable main run on its merge commit or later", () => {
+	test("a main run green and believable on the merge commit, or on a later main commit, covers it and the close publishes on the merged head", async () => {
+		for (const later of [false, true]) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const k = fastMerged(w, x);
+			const at = later ? onMain(w, k.other) : k.m;
+			mainRan(x, "tr-0main1", at, "green");
+
+			const r = await close(w, x);
+
+			expect({ later, closed: r.closed }).toEqual({ later, closed: true });
+			expect(r.text).toContain(
+				`Close check: every other PR in the set is green at its head; PR #7 merged; covered by main run tr-0main1 green and believable at ${s7(at)} (${STANDING_WORKLOAD_ID}), which contains merge commit ${s7(k.m)}.`,
+			);
+			expectPublishedOn(w, x, k.h);
+		}
+	}, 40_000);
+
+	test("a fast green alone never closes: no main run, one before the merge, off main, red, implausible, red then green, lane-written, or a PR's full green on main", async () => {
+		const shapes: { name: string; make: (w: World, x: Closable, k: { m: string; o: string; other: string }) => void }[] = [
+			{ name: "no main run yet", make: () => {} },
+			{ name: "a green main run on the commit before the merge", make: (_w, x, k) => mainRan(x, "tr-0main1", k.o, "green") },
+			{
+				name: "a green main run on a commit off main",
+				make: (w, x, k) => {
+					g(w, k.other, "checkout", "-q", "-b", "side");
+					const q = commitFile(w, k.other, "q.txt", "a commit off main");
+					g(w, k.other, "push", "-q", "origin", "side");
+					mainRan(x, "tr-0main1", q, "green");
+				},
+			},
+			{ name: "a red main run on the merge commit", make: (_w, x, k) => mainRan(x, "tr-0main1", k.m, "red") },
+			{
+				name: "an implausible main run: executed tests in a quarter of the tree's files",
+				make: (_w, x, k) => mainRan(x, "tr-0main1", k.m, "green", { exec: { files: 10, tests: 400, treeFiles: 40 } }),
+			},
+			{
+				name: "a red main verdict, then a green run of the same commit (never laundered)",
+				make: (_w, x, k) => {
+					mainRan(x, "tr-0main1", k.m, "red");
+					mainRan(x, "tr-0main2", k.m, "green");
+				},
+			},
+			{ name: "a lane-written main run", make: (_w, x, k) => mainRan(x, "tr-0main1", k.m, "green", { by: "lane-b" }) },
+			{ name: "another workload's full-suite PR green on main that contains the merge", make: (w, x, k) => void foreignGreen(w, x, "tr-9", 8, onMain(w, k.other)) },
+		];
+		for (const shape of shapes) {
+			const w = world();
+			withOrigin(w);
+			const x = closable(w);
+			const k = fastMerged(w, x);
+			shape.make(w, x, k);
+
+			const r = await close(w, x);
+
+			expect({ shape: shape.name, text: r.text }).toEqual({ shape: shape.name, text: `${x.wl} cannot close: ${fastUncovered(x, k.h, k.m)}` });
+			expectRefused(w, x, r, fastUncovered(x, k.h, k.m), k.h);
+		}
+	}, 120_000);
+
+	test("an open PR's fast green refuses even with a green main run on main; a merged one passes on Jo's waive-pr", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const s = merged(w, x, "OPEN");
+		requested(x, "tr-1", 7, s);
+		ran(x, "tr-1", 7, s, "green", { fast: true });
+		mainRan(x, "tr-0main1", s, "green");
+		const open = `PR #7's newest result is test-run tr-1, a fast green at ${s7(s)}: the fast check before merge is not a full-suite result, so it passes close only once the PR has merged and a green, believable main run on main holds its merge commit`;
+		expectRefused(w, x, await close(w, x), open, s);
+
+		const w2 = world();
+		withOrigin(w2);
+		const x2 = closable(w2);
+		const k = fastMerged(w2, x2);
+		const ins = waivePr(x2, [7]);
+		const r = await close(w2, x2);
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(`Close check: every other PR in the set is green at its head; waived by Jo: #7 (${ins}).`);
+		expectPublishedOn(w2, x2, k.h);
+	}, 40_000);
+
+	test("the D2 cover reads main runs and drops fast greens: a merged PR past its green passes on a main run, never on another PR's fast green", async () => {
+		const w = world();
+		withOrigin(w);
+		const x = closable(w);
+		const k = mergedPastGreen(w, x);
+		const n = onMain(w, k.other);
+		foreignGreen(w, x, "tr-9", 8, n, { fast: true });
+		expectRefused(w, x, await close(w, x), uncoveredReason(x, 7, k.h, k.m), k.h);
+
+		mainRan(x, "tr-0main1", n, "green");
+		const r = await close(w, x);
+		expect(r.closed).toBe(true);
+		expect(r.text).toContain(
+			`Close check: every other PR in the set is green at its head; PR #7 merged; covered by main run tr-0main1 green and believable at ${s7(n)} (${STANDING_WORKLOAD_ID}), which contains merge commit ${s7(k.m)}.`,
+		);
+	}, 30_000);
 });
 
 /** A new commit on main in `other`, pushed; its sha. */
