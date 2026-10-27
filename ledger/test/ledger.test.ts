@@ -344,7 +344,8 @@ describe("locality", () => {
 		expect(existsSync(target)).toBe(false);
 	});
 
-	// statfs(2) through bun:ffi is arm64 macOS only; every other platform still runs df.
+	// These run where the statfs(2) layout was measured (arm64 macOS); Linux reads /proc/self/mountinfo,
+	// covered in ledger/test/locality.test.ts.
 	const statfsHost = process.platform === "darwin" && process.arch === "arm64";
 
 	test.skipIf(!statfsHost)("arm64 macOS: the probe asks the kernel and starts no child process (T1)", () => {
