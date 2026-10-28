@@ -92,8 +92,8 @@ Jo's seven standing rules (`.ai/decision-log/2026-10-27--0540--plumb--fault-tole
 
 - **Fail loudly.** No swallowed error: no empty `catch`, no silent default. A hand's failure reaches the ledger, and a fallback announces itself.
 - **Fail obviously.** Every error you write or report names what broke, where (file or command), the evidence, and the next step, or says none is known.
-- **Recover by restart.** Re-dispatching a slice is safe to repeat; durable state is the ledger, and the rest is rebuilt from it.
-- **Bound every retry.** Retry in one layer only, with a limit, then escalate to the next layer up or a `question` row; no retry inside a retry.
+- **Recover by restart.** Restart the smallest piece that failed (the slice, not the workload); re-dispatching a slice is safe to repeat; durable state is the ledger, and the rest is rebuilt from it.
+- **Bound every retry.** Retry in one layer only, with a limit; an attempt counts against the limit only if it made progress, and an attempt that made no progress still counts against the cost budget; then escalate to the next layer up or a `question` row; no retry inside a retry.
 - **Silence is a failure.** Long work has a deadline that tracks progress; a hung hand, a job that never started, or a dead watcher is an error you report.
 - **Keep the evidence.** Cleanup never deletes a log, trace or file a receipt cites.
 - **One failure never hides another.** Chain or join errors so a cleanup error keeps the original; report every failed check, not only the first.
