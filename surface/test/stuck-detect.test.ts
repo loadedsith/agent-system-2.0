@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BIRTH_WINDOW_MS, cpuNs, liveOwned, liveProcs, MARKER_CONTENT_RE, markerContent, observe, procArgv, readMarkers, snapshot, STUCK_DEFAULTS, StuckDetector } from "../src/stuck-detect";
 import type { Marker, Observation, Proc, Signature, Snapshot, TickResult } from "../src/stuck-detect";
+import { unreapedTrue } from "./helpers";
 
 // ---- synthetic observations ----
 
@@ -347,7 +348,7 @@ ftruncateSync(fd, 0);
 const since = Date.now();
 writeSync(fd, process.env.MARKER_CONTENT ?? \`\${since}\\ttrue\\n\`);
 if (process.env.HOLD === "spin") {
-	const kid = Bun.spawn(["/usr/bin/true"], { stdout: "ignore", stderr: "ignore" });
+	const kid = ${unreapedTrue(`{ stdout: "ignore", stderr: "ignore" }`)};
 	writeSync(1, "held " + rc + " " + since + " " + kid.pid + "\\n");
 	for (;;) {}
 }

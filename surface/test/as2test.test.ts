@@ -24,7 +24,7 @@ import {
 } from "../src/as2test";
 import { STUCK_DEFAULTS } from "../src/stuck-detect";
 import { AS2TEST_USER, CHILD_ENV_ALLOWLIST, childEnv, partResult, WRAPPER_EXIT, type WrapperCall } from "../src/test-run";
-import { tmp } from "./helpers";
+import { tmp, unreapedTrue } from "./helpers";
 
 /**
  * This change's new exports (PLAN wl-mv718fxhwwcn40 § 2), reached loosely so the file still loads
@@ -1110,7 +1110,7 @@ const t = setInterval(() => {
 const spinTest = (late: boolean) => `${SPIN_HEAD}test("spins", () => {
 	writeFileSync("../spin.pid", String(process.pid));
 ${late ? `\tspawn(process.execPath, ["-e", ${JSON.stringify(LATE_HELPER)}], { detached: true, stdio: "ignore" });\n` : ""}	holdMarker("true");
-	const z = Bun.spawn(["/usr/bin/true"]);
+	const z = ${unreapedTrue()};
 	writeFileSync("../zombie.pid", String(z.pid));
 	for (;;) {}
 }, 600_000);
@@ -1405,9 +1405,11 @@ test("qualifies", async () => {
 	}
 	await idle();
 	const start = Date.now();
-	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 4 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
+	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 5 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
 	const end = Date.now();
-	await idle(1_500);
+	// Past the test's after-window (end + 300 ms to end + 1950 ms) with room for a late tick's marker read: the lsof call below
+	// is published, and its marker must not land in that window.
+	await idle(2_500);
 	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-p", String(child)]);
 	let alive = true;
 	try {
@@ -1743,10 +1745,10 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const GETTER_HOT_MS = 6_000;
 		const fixtures: Record<string, Record<string, string>> = {
 			"zombie-no-marker": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\t${unreapedTrue()};\n\t${LOOP}\n}, 60_000);\n`,
 			},
 			"returned-call-then-zombie": {
-				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\tBun.spawn(["/usr/bin/true"]);\n\t${LOOP}\n}, 60_000);\n`,
+				"c.test.ts": `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("c", () => {\n\twriteFileSync("../w.pid", String(process.pid));\n\tBun.spawnSync(["/usr/bin/true"]);\n\t${unreapedTrue()};\n\t${LOOP}\n}, 60_000);\n`,
 			},
 			"immutable-marker": {
 				"c.test.ts": `import { test } from "bun:test";
@@ -1760,7 +1762,7 @@ test("c", () => {
 	if (chflags(marker, 2) !== 0) throw new Error("chflags uchg failed");
 	try {
 		Bun.spawnSync(["/usr/bin/true"]);
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		${LOOP}
 	} finally {
 		chflags(marker, 0);
@@ -1798,7 +1800,7 @@ test("c", () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const argv = ["/usr/bin/true"];
 	Object.defineProperty(argv, 1, { enumerable: true, get() {
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 		return "x";
@@ -1818,7 +1820,7 @@ const r3GetterCall = ${r3GetterCall.toString()};
 test("c", async () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const out = r3GetterCall("${shape}", ["/usr/bin/true"], () => {
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 	});
@@ -1838,7 +1840,7 @@ const byteGetterCall = ${byteGetterCall.toString()};
 test("c", async () => {
 	writeFileSync("../w.pid", String(process.pid));
 	const out = byteGetterCall(cp, "own", ["/usr/bin/true"], () => {
-		Bun.spawn(["/usr/bin/true"]);
+		${unreapedTrue()};
 		const end = Date.now() + ${GETTER_HOT_MS};
 		while (Date.now() < end) {}
 	});
