@@ -44,6 +44,8 @@ const SCRIPT = join(REPO, "surface", "scripts", "test-exec.ts");
 const SETUP = join(REPO, "install", "as2test-setup.sh");
 const BUN = process.execPath;
 const SYS_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+/** The tag the refresh helper fetches (PLAN wl-mvq4edbaf13vnk § 2 "The bundle"), spelled out: a rename must break these tests. */
+const VERIFIED_TAG = "as2-verified";
 
 const made: string[] = [];
 /** chmod u+rwx every directory beneath, so rmSync can delete what a test sealed. */
@@ -257,7 +259,7 @@ describe("the wrapper refuses bad argv", () => {
 	test("wrong arity is refused for every subcommand", () => {
 		for (const args of [["full"], ["full", "tr-a1", "x"], ["sweep", "tr-a1", "x"], ["prepare", "tr-a1"], ["prepare", "tr-a1", "a".repeat(40), "x"], ["solo", "tr-a1"],
 			["solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["cleanup", "tr-a1"], ["cleanup", "tr-a1", "tr-b", "tr-c"], ["probe", "tr-a1"], ["bogus", "tr-a1"],
-			["base-prepare", "tr-a1"], ["base-solo", "tr-a1"], ["base-solo", "tr-a1", "./a.test.ts", "./b.test.ts"]]) {
+			["base-prepare", "tr-a1"], ["base-solo", "tr-a1"], ["base-solo", "tr-a1", "./a.test.ts", "./b.test.ts"], ["fast", "tr-a1"]]) {
 			const r = raw(b, args);
 			expect({ args, exit: r.exit }).toEqual({ args, exit: WRAPPER_EXIT.refused });
 		}
@@ -734,6 +736,121 @@ describe("fullWorkers: the PR full part runs its files at once; base and a keyle
 		expect(s.exit).toBe(WRAPPER_EXIT.ok);
 		expect(await until(() => [...workers, ...children].every((pid) => !alive(pid)), 3_000)).toBe(true);
 	}, 90_000);
+});
+
+// ---- fast: the Mac fallback of the hosted fast check (PLAN wl-mvq4edbaf13vnk D4, R9) ----------------------------------
+
+describe("fast: only the named ./ test files inside the clone, in one bun test call (PLAN wl-mvq4edbaf13vnk D4, R9)", () => {
+	const CAPS = { fullCapMin: 1, soloCapMin: 1, fastCapMin: 1 };
+	const FILES = { "a.test.ts": sleeper("a", 10), "dir/b_spec.ts": sleeper("b", 10, false), "c.test.ts": sleeper("c", 10), "dir/d.test.ts": sleeper("d", 10) };
+	/** test-exec reached without the wrapper, as a caller that skipped the sh checks would. */
+	const direct = (b: Box, args: string[]): Ran => {
+		const r = Bun.spawnSync([BUN, SCRIPT, ...args], {
+			env: { PATH: SYS_PATH, AS2TEST_EXEC_CONFIG: JSON.stringify(execConfigOf({ root: b.root, bun: BUN, script: SCRIPT, sweepScope: "groups" })) }, stdout: "pipe", stderr: "pipe",
+		});
+		return { exit: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+	};
+	const groupsOf = (work: string): string[] => (existsSync(join(work, "groups")) ? readFileSync(join(work, "groups"), "utf8").split("\n").filter((l) => l !== "") : []);
+	const ranFiles = (work: string): string[] => readdirSync(work).filter((n) => n.startsWith("pid-")).sort();
+
+	test("runs exactly the named files in one bun call (one process group, one process when serial): junit to fast.xml, console to fast.log, bun's exit passed through", () => {
+		const b = box("fast");
+		prepared(b, "tr-fa1", FILES, CAPS);
+		const r = raw(b, ["fast", "tr-fa1", "./a.test.ts", "./dir/b_spec.ts", "./dir/d.test.ts"]);
+		expect({ exit: r.exit, stderr: r.stderr }).toEqual({ exit: 1, stderr: "" });
+		const work = workOf(b, "tr-fa1");
+		expect(groupsOf(work)).toHaveLength(1);
+		expect(ranFiles(work)).toEqual(["pid-a", "pid-b", "pid-d"]);
+		expect(runners(work).size).toBe(1);
+		const junit = readFileSync(join(work, "fast.xml"), "utf8");
+		const result = partResult({ junit, log: readFileSync(join(work, "fast.log"), "utf8"), exit: r.exit, ms: 0 });
+		expect(result).toMatchObject({ pass: 2, fail: 1, skip: 0, exit: 1, error: null });
+		expect(result.failures.map((f) => f.name)).toEqual(["dir/b_spec.ts > sleeps b"]);
+		expect(junit).not.toContain("sleeps c");
+		for (const n of ["full.xml", "full.log", "solo-1.log"]) expect(existsSync(join(work, n))).toBe(false);
+
+		// A second fast call replaces the reports rather than failing on them, and still runs only what it names.
+		const again = raw(b, ["fast", "tr-fa1", "./c.test.ts"]);
+		expect({ exit: again.exit, stderr: again.stderr }).toEqual({ exit: 0, stderr: "" });
+		expect(partResult({ junit: readFileSync(join(work, "fast.xml"), "utf8"), log: readFileSync(join(work, "fast.log"), "utf8"), exit: 0, ms: 0 })).toMatchObject({ pass: 1, fail: 0 });
+		expect(groupsOf(work)).toHaveLength(2);
+	}, 60_000);
+
+	test("with caps.json fullWorkers 2 the one call spreads its files over workers, still one process group", () => {
+		const b = box("fast-par");
+		prepared(b, "tr-fw1", { "p1.test.ts": sleeper("1", 300), "p2.test.ts": sleeper("2", 300), "p3.test.ts": sleeper("3", 300) }, { ...CAPS, fullWorkers: 2 });
+		const r = raw(b, ["fast", "tr-fw1", "./p1.test.ts", "./p2.test.ts", "./p3.test.ts"]);
+		expect({ exit: r.exit, stderr: r.stderr }).toEqual({ exit: 0, stderr: "" });
+		const work = workOf(b, "tr-fw1");
+		expect(groupsOf(work)).toHaveLength(1);
+		expect(runners(work).size).toBeGreaterThan(1);
+	}, 60_000);
+
+	test("an operand that is not a ./ Bun test file inside the clone, or one named twice, refuses the whole call before bun starts, at the wrapper and at test-exec", () => {
+		const b = box("fast-paths");
+		const outside = dir("fast-outside");
+		writeFileSync(join(outside, "evil.test.ts"), sleeper("evil", 1));
+		prepared(b, "tr-fp1", FILES, CAPS);
+		const work = workOf(b, "tr-fp1");
+		symlinkSync(join(outside, "evil.test.ts"), join(work, "repo", "link.test.ts"));
+		symlinkSync(outside, join(work, "repo", "out"));
+		const bad = [
+			"--preload=./a.test.ts", "-t", "--", "../x.test.ts", "./../x.test.ts", "./dir/../../x.test.ts", "./dir//d.test.ts", "./dir/./d.test.ts", "/etc/x.test.ts",
+			"a.test.ts", "./a.ts", "./dir", "./", "./link.test.ts", "./out/evil.test.ts", "./missing.test.ts",
+		];
+		for (const op of bad) {
+			// The bad operand last, after a good one: one bad operand refuses the call, never a partial run.
+			const r = raw(b, ["fast", "tr-fp1", "./a.test.ts", op]);
+			expect({ op, exit: r.exit }).toEqual({ op, exit: WRAPPER_EXIT.refused });
+			expect(r.stderr).toStartWith("as2test: refused: ");
+		}
+		// test-exec checks every operand itself when the sh wrapper is skipped.
+		for (const op of ["--preload=./a.test.ts", "-t", "../x.test.ts", "./dir//d.test.ts", "./a.ts", "./link.test.ts", "./out/evil.test.ts"]) {
+			const r = direct(b, ["fast", "tr-fp1", "./a.test.ts", op]);
+			expect({ op, exit: r.exit }).toEqual({ op, exit: WRAPPER_EXIT.refused });
+		}
+		const twice = raw(b, ["fast", "tr-fp1", "./a.test.ts", "./dir/d.test.ts", "./a.test.ts"]);
+		expect(twice.exit).toBe(WRAPPER_EXIT.refused);
+		expect(twice.stderr).toContain("./a.test.ts is named more than once");
+		expect(direct(b, ["fast", "tr-fp1"]).exit).toBe(WRAPPER_EXIT.refused);
+		// Nothing ran: no bun group, no report, no test file's mark.
+		expect(groupsOf(work)).toEqual([]);
+		expect(ranFiles(work)).toEqual([]);
+		for (const n of ["fast.xml", "fast.log"]) expect(existsSync(join(work, n))).toBe(false);
+	}, 60_000);
+
+	test("fast is fenced on current, refused before prepare, and refused without caps.json fastCapMin", () => {
+		const b = box("fast-fence");
+		prepared(b, "tr-ff1", FILES, CAPS);
+		setCurrent(b, "tr-other");
+		const fenced = raw(b, ["fast", "tr-ff1", "./a.test.ts"]);
+		expect(fenced.exit).toBe(WRAPPER_EXIT.fenced);
+		expect(fenced.stderr).toContain("fenced");
+
+		setCurrent(b, "tr-ff2");
+		expect(raw(b, ["fast", "tr-ff2", "./a.test.ts"]).exit).toBe(WRAPPER_EXIT.refused);
+		expect(existsSync(workOf(b, "tr-ff2"))).toBe(false);
+
+		prepared(b, "tr-ff3", FILES, { fullCapMin: 1, soloCapMin: 1 });
+		const noCap = raw(b, ["fast", "tr-ff3", "./a.test.ts"]);
+		expect(noCap.exit).toBe(WRAPPER_EXIT.refused);
+		expect(noCap.stderr).toContain("has no positive fastCapMin");
+		expect(groupsOf(workOf(b, "tr-ff3"))).toEqual([]);
+	}, 60_000);
+
+	test("at caps.json fastCapMin the call's group is captured to fast.stuck.log, killed, and the part exits timeout naming the cap", async () => {
+		const b = box("fast-cap", { captureMs: 2_000 });
+		prepared(b, "tr-fc1", { "slow.test.ts": SLOW_TEST, "a.test.ts": OK_TEST }, { fullCapMin: 1, soloCapMin: 1, fastCapMin: 0.04 });
+		const r = raw(b, ["fast", "tr-fc1", "./slow.test.ts"]);
+		expect(r.exit).toBe(WRAPPER_EXIT.timeout);
+		expect(r.stderr).toContain("timeout: the part passed its cap of 2400 ms; its group was killed");
+		const work = workOf(b, "tr-fc1");
+		const pid = Number(readFileSync(join(work, "slow.pid"), "utf8"));
+		pids.push(pid);
+		expect(await until(() => !alive(pid), 3_000)).toBe(true);
+		// The capture ran before the kill (cut at its 2 s deadline here): its file names the stuck process in the group's tree.
+		expect(treePids(stuckSections(readFileSync(join(work, "fast.stuck.log"), "utf8"))["1"]!)).toContain(pid);
+	}, 60_000);
 });
 
 // ---- the stuck capture at the cap (PLAN wl-mvq4edh02r5z40 revision 3, D5) ---------------------------------------
@@ -2315,10 +2432,15 @@ describe("the refresh helper", () => {
 	interface FixtureOrigin {
 		/** A working clone on main, its remote `origin` the bare repo. */
 		work: string;
-		/** The local bare origin the helper fetches main from. */
+		/** The local bare origin the helper fetches the as2-verified tag from; its main and the tag start at one commit. */
 		bare: string;
-		/** Commit these files on top of main and force-push them as main; returns the new sha. */
-		commit: (files: Record<string, string>, message: string) => string;
+		/**
+		 * Commit these files on top of main and force-push them as main; unless `verify` is false, also force-push the
+		 * as2-verified tag there, as the runner does after a green believable main run. Returns the new sha.
+		 */
+		commit: (files: Record<string, string>, message: string, verify?: boolean) => string;
+		/** Force-push the as2-verified tag at `sha`, lightweight or annotated. */
+		verify: (sha: string, o?: { annotated?: boolean }) => void;
 	}
 	function fixtureOrigin(tag: string): FixtureOrigin {
 		const base = dir(`${tag}-origin`);
@@ -2330,17 +2452,24 @@ describe("the refresh helper", () => {
 		git(work, "init", "-q", "-b", "main");
 		git(work, "add", "-A");
 		git(work, "commit", "-q", "-m", "main");
+		git(work, "tag", VERIFIED_TAG);
 		const bare = join(base, "origin.git");
 		git(base, "clone", "-q", "--bare", work, bare);
 		git(work, "remote", "add", "origin", bare);
-		const commit = (files: Record<string, string>, message: string): string => {
+		const verify = (sha: string, o: { annotated?: boolean } = {}): void => {
+			git(work, "tag", "-f", ...(o.annotated ? ["-a", "-m", "verified"] : []), VERIFIED_TAG, sha);
+			git(work, "push", "-q", "-f", "origin", `refs/tags/${VERIFIED_TAG}`);
+		};
+		const commit = (files: Record<string, string>, message: string, verified = true): string => {
 			for (const [rel, text] of Object.entries(files)) writeFileSync(join(work, rel), text);
 			git(work, "add", "-A");
 			git(work, "commit", "-q", "-m", message);
 			git(work, "push", "-q", "-f", "origin", "HEAD:refs/heads/main");
-			return git(work, "rev-parse", "HEAD");
+			const sha = git(work, "rev-parse", "HEAD");
+			if (verified) verify(sha);
+			return sha;
 		};
-		return { work, bare, commit };
+		return { work, bare, commit, verify };
 	}
 
 	/** The bytes of `<sha>:<rel>` in a repo. */
@@ -2431,10 +2560,10 @@ describe("the refresh helper", () => {
 	};
 	const sha12 = (sha: string) => sha.slice(0, 12);
 
-	test("T5: it builds origin/main, never the caller's checkout, branch, env or git, and installDecision accepts the result", () => {
+	test("T5: it builds the as2-verified tag's commit, never the caller's checkout, branch, env or git, and installDecision accepts the result", () => {
 		const o = fixtureOrigin("t5");
 		const mainSha = git(o.work, "rev-parse", "HEAD");
-		// feature differs from main in a test-exec input; a bare repo whose main is feature is where a redirect would lead.
+		// feature differs from main in a test-exec input; a bare repo whose main and as2-verified are feature is where a redirect would lead.
 		expect(fixtureSources().has(INPUT)).toBe(true);
 		git(o.work, "checkout", "-q", "-b", "feature");
 		writeFileSync(join(o.work, INPUT), `${fixtureSources().get(INPUT)}// feature only\n`);
@@ -2443,6 +2572,7 @@ describe("the refresh helper", () => {
 		const featureBare = join(o.work, "..", "feature.git");
 		git(o.work, "clone", "-q", "--bare", o.bare, featureBare);
 		git(featureBare, "update-ref", "refs/heads/main", "refs/heads/feature");
+		git(featureBare, "update-ref", `refs/tags/${VERIFIED_TAG}`, "refs/heads/feature");
 
 		const r = helperRig("t5", o);
 		const hostileBin = join(r.base, "hostile-bin");
@@ -2524,6 +2654,43 @@ describe("the refresh helper", () => {
 		expect(r.decide(o.work)).toMatchObject({ ok: true });
 		expect(r.run()).toMatchObject({ exit: 0, stdout: `current ${sha12(mainSha)}\n` });
 	}, 120_000);
+
+	test("R10 (PLAN wl-mvq4edbaf13vnk § 2 The bundle): it builds the as2-verified tag's commit, never main: main moving alone is current, a re-pointed tag (annotated or back to an older commit) rebuilds at its commit, and a tag gone from the origin exits 70 naming it, install unchanged", () => {
+		expect(loose.AS2_VERIFIED_TAG).toBe(VERIFIED_TAG);
+		const o = fixtureOrigin("r10");
+		const verified = git(o.work, "rev-parse", "HEAD");
+		const r = helperRig("r10", o);
+		expect(r.run()).toMatchObject({ exit: 0, stdout: `refreshed none..${sha12(verified)}\n` });
+
+		// main lands a change the runner has not verified: the helper still answers for the tag's commit.
+		const ahead = o.commit({ [INPUT]: `${fixtureSources().get(INPUT)}// landed, not yet verified\n` }, "main moves past the tag", false);
+		expect(git(o.bare, "rev-parse", "refs/heads/main")).toBe(ahead);
+		expect(r.run()).toMatchObject({ exit: 0, stdout: `current ${sha12(verified)}\n` });
+		expect(sourceOf(r.libexec).sourceSha).toBe(verified);
+		expect(sourceOf(r.libexec).inputs[INPUT]).toBe(sha256(blobAt(o.bare, verified, INPUT)));
+
+		// The runner verifies main and points an annotated tag at it: the helper builds the commit the tag peels to.
+		o.verify(ahead, { annotated: true });
+		expect(git(o.bare, "rev-parse", `refs/tags/${VERIFIED_TAG}`)).not.toBe(ahead);
+		expect(r.run()).toMatchObject({ exit: 0, stdout: `refreshed ${sha12(verified)}..${sha12(ahead)}\n` });
+		expect(sourceOf(r.libexec).sourceSha).toBe(ahead);
+		expect(sourceOf(r.libexec).inputs[INPUT]).toBe(sha256(blobAt(o.bare, ahead, INPUT)));
+		expect(r.decide(o.work)).toMatchObject({ ok: true });
+
+		// A rollback re-points the tag at the older commit: the forced fetch follows it back.
+		o.verify(verified);
+		expect(r.run()).toMatchObject({ exit: 0, stdout: `refreshed ${sha12(ahead)}..${sha12(verified)}\n` });
+		expect(sourceOf(r.libexec).sourceSha).toBe(verified);
+
+		// The tag deleted at the origin: the fetch fails loudly (exit 70, naming the tag and origin); the mirror's old copy is never used.
+		git(o.work, "push", "-q", "origin", `:refs/tags/${VERIFIED_TAG}`);
+		const before = tree(r.libexec, ["refresh.d"]);
+		const gone = r.run();
+		expect(gone.exit).toBe(70);
+		expect(gone.stdout).toBe("");
+		expect(gone.stderr).toContain(`as2test-refresh: fetching the ${VERIFIED_TAG} tag from ${o.bare} failed`);
+		expect(tree(r.libexec, ["refresh.d"])).toEqual(before);
+	}, 180_000);
 
 	test("T6: an argument gets 64 and an asRoot render run as non-root gets 77, and neither changes anything", () => {
 		const r = helperRig("t6-refuse", null);
@@ -3009,6 +3176,8 @@ describe("install/as2test-setup.sh", () => {
 		git(work, "init", "-q", "-b", "main");
 		git(work, "add", "-A");
 		git(work, "commit", "-q", "-m", "main");
+		// The verified tag the helper fetches (PLAN wl-mvq4edbaf13vnk § 2), at main as the runner points it once main is verified.
+		git(work, "tag", VERIFIED_TAG);
 		const bare = join(base, "origin.git");
 		git(base, "clone", "-q", "--bare", work, bare);
 		git(work, "remote", "add", "origin", bare);
@@ -3124,7 +3293,7 @@ esac
 
 	test("T8: setup installs bun, the helper and both sudoers lines; its last sudo step runs the helper, which builds an install installDecision accepts; undo removes it all", () => {
 		const r = rig("setup-t8");
-		const mainSha = git(r.bare, "rev-parse", "refs/heads/main");
+		const mainSha = git(r.bare, "rev-parse", `refs/tags/${VERIFIED_TAG}^{commit}`);
 		const out = r.run([], "y\n");
 		expect(out.stderr).not.toContain("as2test-setup:");
 		expect(out.exit).toBe(0);
@@ -3218,7 +3387,7 @@ esac
 		const env = { AS2TEST_SETUP_TEST_ORIGIN: gone };
 		const out = r.run([], "y\n", env);
 		expect(out.exit).toBe(1);
-		expect(out.stderr).toContain(`fetching main from ${gone} failed`);
+		expect(out.stderr).toContain(`fetching the ${VERIFIED_TAG} tag from ${gone} failed`);
 		expect(out.stderr).toContain("the refresh helper failed (its message is above); everything before it is in place, and the provisional SOURCE records it.");
 		expect(out.stderr).toContain("The runner's next preflight finds exec and test-exec.js unbuilt (file-drift) and runs the helper again");
 		expect(r.sudoCalls().trim().split("\n").at(-1)).toBe(`-n ${join(r.libexec, "refresh")}`);
@@ -3267,13 +3436,13 @@ esac
 		expect(again.stdout).toContain("group _as2test gid 602: exists (recorded)");
 		expect(again.stdout).toContain("user _as2test uid 602: exists (recorded)");
 		expect(again.exit).toBe(1);
-		expect(again.stderr).toContain(`fetching main from ${gone} failed`);
+		expect(again.stderr).toContain(`fetching the ${VERIFIED_TAG} tag from ${gone} failed`);
 		const reparsed = parseSource(readFileSync(join(r.libexec, "SOURCE"), "utf8"));
 		expect(reparsed).toMatchObject({ ok: true, source: { sourceSha: "provisional", created: ["user", "group", r.root, r.libexec, r.sudoers] } });
 
-		// (d) The cause fixed (the origin exists), the helper run again installs main over the provisional SOURCE.
+		// (d) The cause fixed (the origin exists), the helper run again installs the verified commit over the provisional SOURCE.
 		git(r.base, "clone", "-q", "--bare", r.bare, gone);
-		const mainSha = git(gone, "rev-parse", "refs/heads/main");
+		const mainSha = git(gone, "rev-parse", `refs/tags/${VERIFIED_TAG}^{commit}`);
 		const helper = Bun.spawnSync([join(r.libexec, "refresh")], { env: { PATH: SYS_PATH }, cwd: r.base, stdout: "pipe", stderr: "pipe" });
 		expect({ exit: helper.exitCode, stdout: helper.stdout.toString() }).toEqual({ exit: 0, stdout: `refreshed none..${mainSha.slice(0, 12)}\n` });
 		const built = parseSource(readFileSync(join(r.libexec, "SOURCE"), "utf8"));
