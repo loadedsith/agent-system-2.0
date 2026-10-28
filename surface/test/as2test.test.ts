@@ -1408,6 +1408,8 @@ test("qualifies", async () => {
 	const child = Number(Bun.spawnSync(["/bin/sh", "-c", "/bin/sleep 4 >/dev/null 2>&1 & echo $!"]).stdout.toString().trim());
 	const end = Date.now();
 	await idle(1_500);
+	// lsof is itself a published call of this worker; the test's after-window for this phase ends before it starts.
+	const lsofAt = Date.now();
 	const lsof = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-p", String(child)]);
 	let alive = true;
 	try {
@@ -1415,7 +1417,7 @@ test("qualifies", async () => {
 	} catch {
 		alive = false;
 	}
-	log({ name: "inherit", command: null, start, end, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
+	log({ name: "inherit", command: null, start, end, next: lsofAt, out: { child, alive, lsofExit: lsof.exitCode, holdsMarker: lsof.stdout.toString().includes(marker), lsofHasSleep: lsof.stdout.toString().includes("sleep") } });
 }, 240_000);
 `;
 
@@ -1434,7 +1436,7 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		expect(r.exit).toBe(0);
 		// No signature ever forms: the worker blocks in each call (never hot) and no child is left unreaped.
 		expect(keywordsOf(r.stdout)).toEqual([]);
-		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
+		const rows = readFileSync(join(work, "qual.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { name: string; command: string | null; start: number; end: number; next?: number; out: unknown; pid?: number; preloadGlobal?: unknown; wrapped?: boolean });
 		const byName = Object.fromEntries(rows.map((x) => [x.name, x]));
 		expect(byName.start).toMatchObject({ preloadGlobal: 1, wrapped: true });
 		const w = byName.start!.pid!;
@@ -1446,7 +1448,8 @@ describe("the stuck-worker detector in the executor (PLAN wl-mvq8x4pkjmx69s D3)"
 		const ticks = (from: number, to: number) => trace.filter((t) => t.at > from && t.at < to);
 		const phases = rows.filter((x) => typeof x.start === "number");
 		for (const [i, p] of phases.entries()) {
-			const next = phases[i + 1]?.start ?? p.end + 2_000;
+			// The worker's next spawn call: the next phase's, or the one a phase names itself (inherit's lsof).
+			const next = phases[i + 1]?.start ?? p.next ?? p.end + 2_000;
 			const during = ticks(p.start + 300, p.end - 300);
 			if (p.command !== null) {
 				expect({ phase: p.name, during: during.length }).toEqual({ phase: p.name, during: expect.any(Number) });
