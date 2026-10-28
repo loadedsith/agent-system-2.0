@@ -2798,10 +2798,9 @@ exec /bin/sleep 300`);
 	test("enforce: overlapping signatures A and B, A cleared, then a stalled exec: B's deadline still fires", async () => {
 		const w = world({ stuckStop: "enforce" });
 		const { wl, slice } = workload(w);
-		standIn(w, `sig 11 12
-sleep 1
-sig 21 22
-clr 11 12
+		// Whole-second timestamps can make A expire before separately emitted clear data is read; batch the protocol lines to avoid that race.
+		standIn(w, `timestamp="$(now)"
+printf 'stuck-signature %s part full worker 11 zombie 12 since 5000 mode enforce bun 1.3.14 abc\\nstuck-signature %s part full worker 21 zombie 22 since 5000 mode enforce bun 1.3.14 abc\\nstuck-cleared %s part full worker 11 zombie 12 held 800 matched no\\n' "$timestamp" "$timestamp" "$timestamp"
 exec /bin/sleep 300`);
 		const runId = request(w, wl, slice, PR.green, fx.head.green);
 		await spawnRun(w, runId, STUCK_KNOBS).exited;
