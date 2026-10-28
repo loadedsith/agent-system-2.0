@@ -9,22 +9,25 @@
  * - Projection is the window's own pace (Jo, in-mv8spn0cssasjk, answering q-mv8sl9vnex4zr4 "pace"): the window's
  *   length comes from `windowId` (`5h`, `7d`, …), elapsed = length − (resetsAt − now), and the projected use at reset
  *   is `u / elapsed · length`. Projection starts at max(60min, length/5); unknown length/reset cannot project.
- * - A week-pace-only refusal may be retained against the first configured other-lab budget only when its
+ * - Anthropic week-length pace below actual exhaustion is advisory and never refuses dispatch.
+ * - Other labs' week-pace-only refusals may be retained against the first configured other-lab budget only when its
  *   measured pressure is strictly higher over the same recent 15–60min endpoints. Pressure is the maximum
  *   binding-meter rate, in quota points/hour, not token-equivalent capacity. Hard/exhausted limits never relax.
  * - A limit binds a selector when the provider matches and its tier is null or the model id contains the tier
  *   (`fable` binds `anthropic/claude-fable-*` only; Fable's meter never takes Opus out).
- * - Out: a binding limit with a pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
+ * - Out: a binding non-advisory pace projection ≥ 1.0, a binding 5h limit with `u > FIVE_HOUR_CEILING`, or an
  *   exhausted known week with a future reset even before warm-up. A passed reset binds nothing.
  * - Old poll lines (no `limits`) read their `rows` keys as limits with no reset time, so only the 5h rule applies.
  *   A third key segment is a tier unless it is a meter name in `METERS` (`openai-codex/7d/chat` is the shared meter).
- *   An unknown third segment read as a tier binds only models whose id contains it, so a misread fails open.
  * - Stale (newest poll older than `STALE_MIN`), missing, unreadable or empty polls: nothing is out, and `note` says why.
+ * - Jo's OpenAI-reviews-only rule (classifier/src/lab.ts `OPENAI_REVIEWS_ONLY_RULE`, in-mvro2xb4w0918v) applies only to a
+ *   caller that names its `use`, and only before its `endsAt`: a `review` is not refused for OpenAI week pace alone, and an
+ *   `unnamed-lane` is refused every OpenAI model, even when the polls cannot be read.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { labOf } from "./lab";
+import { labOf, OPENAI_REVIEWS_ONLY_RULE } from "./lab";
 
 export const STALE_MIN = 15;
 /** Fixed floor and window fraction of elapsed time required for pace projection. */
@@ -37,6 +40,8 @@ const UNIT_MS: Readonly<Record<string, number>> = { m: 60_000, h: 3_600_000, d: 
 const METERS: Readonly<Record<string, true>> = { chat: true };
 const MIN_MS = 60_000;
 const WEEK_MS = 7 * 24 * 60 * MIN_MS;
+/** Inclusive ECMAScript Date timestamp bound, checked numerically at the advisory snapshot boundary. */
+const MAX_DATE_MS = 8_640_000_000_000_000;
 
 /** Length in ms of a window named like `5h` or `7d`; null when the id is not of that shape. */
 function windowMs(windowId: string): number | null {
@@ -57,6 +62,7 @@ interface Limit {
 interface Poll {
 	t: number; // ms
 	limits: Limit[];
+	anthropicWeek: Headroom["anthropicWeek"];
 }
 
 export interface HeadroomDecision {
@@ -65,16 +71,44 @@ export interface HeadroomDecision {
 	retained: string | null;
 }
 
+/**
+ * Who asks, for Jo's OpenAI-reviews-only rule (lab.ts `OPENAI_REVIEWS_ONLY_RULE`): a review hand's spawn or plan, or an
+ * unnamed lane's own model (its start and its move). Absent for everything else: the decision is the quota alone.
+ */
+export type HeadroomUse = "review" | "unnamed-lane";
+
 export interface Headroom {
-	/** Base refusal, or exceptional retention against ordered configured budget comparators. */
-	decisionFor(selector: string, comparators?: readonly string[]): HeadroomDecision;
+	/** Base refusal, or exceptional retention against ordered configured budget comparators; `use` applies Jo's rule. */
+	decisionFor(selector: string, comparators?: readonly string[], use?: HeadroomUse): HeadroomDecision;
+	/** Newest fresh, non-future shared Anthropic week with valid usage and an unexpired, Date-representable reset. */
+	anthropicWeek: { used: number; resetsAt: number } | null;
 	/** Why nothing can be out (fail-open), or null when the polls were read. */
 	note: string | null;
 }
 
+/** A quota decision and whether its refusal, if any, is week pace alone (no used-up limit, 5h ceiling or other pace). */
+type QuotaDecision = HeadroomDecision & { weekPaceOnly: boolean };
+
+/**
+ * Jo's OpenAI-reviews-only rule around the quota decision `decide`. Without `use`, for another lab, or from the rule's
+ * `endsAt` on, it is `decide`'s answer exactly. An `unnamed-lane` is refused an OpenAI model without consulting the quota;
+ * a `review` refused for OpenAI week pace alone is admitted, its explanation in `retained`.
+ */
+function underRule(selector: string, use: HeadroomUse | undefined, now: number, decide: () => QuotaDecision): HeadroomDecision {
+	const rule = OPENAI_REVIEWS_ONLY_RULE;
+	const ruled = use !== undefined && now < rule.endsAt && labOf(selector) === rule.lab;
+	const until = `${new Date(rule.endsAt).toISOString().slice(0, 16)}Z`;
+	if (ruled && use === "unnamed-lane") return { out: `OpenAI is for reviews only until ${until} (Jo, ${rule.input})`, retained: null };
+	const { out, retained, weekPaceOnly } = decide();
+	if (ruled && use === "review" && out !== null && weekPaceOnly) {
+		return { out: null, retained: `admitted ${selector} for review: ${out}; OpenAI week pace does not hold back a review until ${until} (Jo, ${rule.input})` };
+	}
+	return { out, retained };
+}
+
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 
-function parsePoll(line: string): Poll | null {
+function parsePoll(line: string, now: number): Poll | null {
 	let raw: unknown;
 	try {
 		raw = JSON.parse(line);
@@ -85,12 +119,21 @@ function parsePoll(line: string): Poll | null {
 	const { t, rows, limits } = raw as { t?: unknown; rows?: unknown; limits?: unknown };
 	if (!isNum(t)) return null;
 	const found: Limit[] = [];
+	let anthropicWeek: Headroom["anthropicWeek"] = null;
 	if (Array.isArray(limits)) {
 		for (const l of limits) {
 			if (!l || typeof l !== "object") continue;
 			const { provider, windowId, tier, resetsAt, usedFraction } = l as Record<string, unknown>;
 			if (typeof provider !== "string" || typeof windowId !== "string" || !isNum(usedFraction)) continue;
 			found.push({ provider, windowId, tier: typeof tier === "string" && tier ? tier : null, used: usedFraction, resetsAt: isNum(resetsAt) ? resetsAt : null });
+			// Snapshot identity is strict even though legacy admission normalizes absent/invalid tiers to shared.
+			if (provider === "anthropic" && tier === null && windowMs(windowId) === WEEK_MS
+				&& usedFraction >= 0 && usedFraction <= 1 && isNum(resetsAt) && resetsAt > now
+				&& Math.abs(resetsAt) <= MAX_DATE_MS
+				&& (anthropicWeek === null || usedFraction > anthropicWeek.used
+					|| (usedFraction === anthropicWeek.used && resetsAt > anthropicWeek.resetsAt))) {
+				anthropicWeek = { used: usedFraction, resetsAt };
+			}
 		}
 	} else if (rows && typeof rows === "object") {
 		for (const [key, used] of Object.entries(rows as Record<string, unknown>)) {
@@ -99,7 +142,7 @@ function parsePoll(line: string): Poll | null {
 			found.push({ provider, windowId, tier: third && !METERS[third] ? third : null, used, resetsAt: null });
 		}
 	} else return null;
-	return { t: t * 1000, limits: found };
+	return { t: t * 1000, limits: found, anthropicWeek };
 }
 
 const pct = (n: number) => n.toFixed(2);
@@ -138,11 +181,19 @@ function bindingLimits(poll: Poll, selector: string): Limit[] {
 	return poll.limits.filter(l => l.provider === provider && (l.tier === null || model.includes(l.tier.toLowerCase())));
 }
 
-/** Read/parse once and keep the snapshot plus common rate evidence. `lines` replaces the file read (tests). */
-export function headroom(opts: { path?: string; now?: number; lines?: string[] } = {}): Headroom {
+/**
+ * Read/parse once and keep the snapshot plus common rate evidence. `lines` replaces the file read (tests). `ruleNow` is the
+ * clock Jo's OpenAI-reviews-only rule is read on, `now` when absent (surface/scripts/lane.ts's process tests set it apart).
+ */
+export function headroom(opts: { path?: string; now?: number; lines?: string[]; ruleNow?: number } = {}): Headroom {
 	const now = opts.now ?? Date.now();
+	const ruleNow = opts.ruleNow ?? now;
 	const path = opts.path ?? (process.env.AS2_HEADROOM_POLLS || DEFAULT_POLLS);
-	const open = (note: string): Headroom => ({ decisionFor: () => ({ out: null, retained: null }), note });
+	const open = (note: string): Headroom => ({
+		decisionFor: (selector, _comparators, use) => underRule(selector, use, ruleNow, () => ({ out: null, retained: null, weekPaceOnly: false })),
+		anthropicWeek: null,
+		note,
+	});
 
 	let lines = opts.lines;
 	if (!lines) {
@@ -153,7 +204,7 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 		}
 	}
 	const source = opts.lines ? "inline lines" : path;
-	const polls = lines.flatMap(l => (l.trim() ? (parsePoll(l) ?? []) : [])).sort((a, b) => a.t - b.t);
+	const polls = lines.flatMap(l => (l.trim() ? (parsePoll(l, now) ?? []) : [])).sort((a, b) => a.t - b.t);
 	const newest = polls.at(-1);
 	if (!newest) return open(`headroom polls empty: ${source}`);
 	const age = now - newest.t;
@@ -191,7 +242,7 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 		const name = `${l.provider} ${l.windowId}${l.tier ? ` ${l.tier}` : ""} ${pct(l.used)} used`;
 		const ceiling = l.windowId === "5h" && l.used > FIVE_HOUR_CEILING;
 		const pace = paceAtReset(l);
-		if (pace && pace.projected >= 1.0) {
+		if (pace && pace.projected >= 1.0 && !(l.provider === "anthropic" && windowMs(l.windowId) === WEEK_MS && l.used < 1)) {
 			const reset = `${new Date(l.resetsAt!).toISOString().slice(0, 16)}Z`;
 			return {
 				reason: `${name}, window pace +${(pace.perHour * 100).toFixed(1)} pts/h, projected ${pct(pace.projected)} at reset ${reset}`,
@@ -202,45 +253,50 @@ export function headroom(opts: { path?: string; now?: number; lines?: string[] }
 		return null;
 	};
 
+	/** The quota decision alone, with whether its refusal is week pace alone (read by `underRule`). */
+	const decide = (selector: string, comparators: readonly string[]): QuotaDecision => {
+		let out: string | null = null;
+		let exhausted: Limit | null = null;
+		let weekPaceOnly = true;
+		for (const l of bindingLimits(newest, selector)) {
+			if (l.resetsAt !== null && l.resetsAt <= now) continue;
+			if (l.used >= 1) {
+				weekPaceOnly = false;
+				if (l.resetsAt !== null && windowMs(l.windowId) === WEEK_MS) exhausted ??= l;
+			}
+			const refusal = refusalOf(l);
+			if (!refusal) continue;
+			out ??= refusal.reason;
+			if (!refusal.weekPaceOnly) weekPaceOnly = false;
+		}
+		// Exhaustion closes only the week warm-up gap; keep the first existing ordinary refusal and its wording.
+		if (out === null && exhausted !== null) {
+			out = `${exhausted.provider} ${exhausted.windowId}${exhausted.tier ? ` ${exhausted.tier}` : ""} ${pct(exhausted.used)} used, quota exhausted`;
+		}
+		const base = { out, retained: null, weekPaceOnly };
+		if (out === null || !weekPaceOnly || !older) return base;
+		const sourceLab = labOf(selector);
+		if (sourceLab === null) return base;
+		// Stopping at the first known other lab also preserves its first occurrence across aliases.
+		const comparator = comparators.find(s => {
+			const lab = labOf(s);
+			return lab !== null && lab !== sourceLab;
+		});
+		if (comparator === undefined) return base;
+		const sourcePressure = pressureOf(selector);
+		const comparatorPressure = pressureOf(comparator);
+		if (sourcePressure === null || comparatorPressure === null || !greaterDelta(comparatorPressure, sourcePressure)) return base;
+		const pointsPerHour = (delta: UsageDelta) => (Number(`${delta.units}e-${delta.places}`) * 6000 / spanMin!).toFixed(2);
+		return {
+			out: null,
+			retained: `retained ${selector}: ${out}; ${comparator} recent pressure ${pointsPerHour(comparatorPressure)} pts/h > source ${pointsPerHour(sourcePressure)} pts/h over ${spanMin} min`,
+			weekPaceOnly,
+		};
+	};
+
 	return {
 		note: null,
-		decisionFor(selector: string, comparators: readonly string[] = []): HeadroomDecision {
-			let out: string | null = null;
-			let exhausted: Limit | null = null;
-			let weekPaceOnly = true;
-			for (const l of bindingLimits(newest, selector)) {
-				if (l.resetsAt !== null && l.resetsAt <= now) continue;
-				if (l.used >= 1) {
-					weekPaceOnly = false;
-					if (l.resetsAt !== null && windowMs(l.windowId) === WEEK_MS) exhausted ??= l;
-				}
-				const refusal = refusalOf(l);
-				if (!refusal) continue;
-				out ??= refusal.reason;
-				if (!refusal.weekPaceOnly) weekPaceOnly = false;
-			}
-			// Exhaustion closes only the week warm-up gap; keep the first existing ordinary refusal and its wording.
-			if (out === null && exhausted !== null) {
-				out = `${exhausted.provider} ${exhausted.windowId}${exhausted.tier ? ` ${exhausted.tier}` : ""} ${pct(exhausted.used)} used, quota exhausted`;
-			}
-			const base = { out, retained: null };
-			if (out === null || !weekPaceOnly || !older) return base;
-			const sourceLab = labOf(selector);
-			if (sourceLab === null) return base;
-			// Stopping at the first known other lab also preserves its first occurrence across aliases.
-			const comparator = comparators.find(s => {
-				const lab = labOf(s);
-				return lab !== null && lab !== sourceLab;
-			});
-			if (comparator === undefined) return base;
-			const sourcePressure = pressureOf(selector);
-			const comparatorPressure = pressureOf(comparator);
-			if (sourcePressure === null || comparatorPressure === null || !greaterDelta(comparatorPressure, sourcePressure)) return base;
-			const pointsPerHour = (delta: UsageDelta) => (Number(`${delta.units}e-${delta.places}`) * 6000 / spanMin!).toFixed(2);
-			return {
-				out: null,
-				retained: `retained ${selector}: ${out}; ${comparator} recent pressure ${pointsPerHour(comparatorPressure)} pts/h > source ${pointsPerHour(sourcePressure)} pts/h over ${spanMin} min`,
-			};
-		},
+		anthropicWeek: age < 0 ? null : newest.anthropicWeek,
+		decisionFor: (selector, comparators = [], use) => underRule(selector, use, ruleNow, () => decide(selector, comparators)),
 	};
 }

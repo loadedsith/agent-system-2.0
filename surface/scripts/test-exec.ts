@@ -9,13 +9,16 @@
 //   exec solo    <run id> ./<file>     bun test ./<file> alone, to solo-<i>.xml/.log, under the solo cap
 //   exec base-prepare <run id> <sha>   the same bundle cloned into runs/<run id>/base/repo at base's <sha> (PLAN wl-mv8s8srodefytc D8)
 //   exec base-solo <run id> ./<file>   `solo` in the base clone, to base-solo-<i>.xml/.log
+//   exec fast    <run id> ./<file>...  the given test files in one bun test call in the PR clone, junit to fast.xml, console
+//                                      to fast.log, under caps.json `fastCapMin`, with full's workers (PLAN wl-mvq4edbaf13vnk
+//                                      D4: the Mac fallback of the hosted fast check)
 //   exec sweep   <run id>              SIGTERM, then SIGKILL, to the run's processes, holding locks/sweep.db
 //   exec cleanup <run id> <old run id> delete runs/<old run id>
 //   exec probe   <run id> <path>...    whether this user can open or write each path (the preflight)
 //
 // The wrapper fixes the root, bun, the env and the sweep's reach in AS2TEST_EXEC_CONFIG; argv picks
 // only the subcommand and its operands. Every subcommand is fenced: it refuses unless
-// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo` and `base-solo`
+// <root>/stage/current names its run. Exit codes are test-run.ts WRAPPER_EXIT; `full`, `solo`, `base-solo` and `fast`
 // otherwise pass bun's own exit through (128 + the signal number when bun died by a signal), except 125
 // (`WRAPPER_EXIT.stuck`) after a stuck-worker stop.
 //
@@ -177,12 +180,72 @@ function signalGroup(pgid: number, sig: NodeJS.Signals): void {
 	}
 }
 
-/** SIGTERM the group, wait up to the grace for it to empty, then SIGKILL it (the cap, § 2.3 step 3). */
-async function killGroup(cfg: Config, pgid: number): Promise<void> {
-	signalGroup(pgid, "SIGTERM");
+/** Append once through a validated descriptor: a child may have replaced this pathname while it ran. */
+function persistGroups(work: string, groups: number[]): void {
+	const path = groupsFile(work);
+	const text = groups.map((g) => `${g}\n`).join("");
+	const errors: string[] = [];
+	let fd: number | undefined;
+	let operation = "open";
+	try {
+		fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		operation = "validate";
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error("not a regular file");
+		operation = "append";
+		const n = writeSync(fd, text);
+		if (n !== text.length) throw new Error(`short write: ${n} of ${text.length} bytes`);
+	} catch (e) {
+		errors.push(`${operation} failed: ${errText(e)}`);
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch (e) {
+				errors.push(`close failed: ${errText(e)}`);
+			}
+		}
+	}
+	if (errors.length > 0) failed(`timeout cleanup: cannot persist descendant groups to ${path}: ${errors.join("; ")}`);
+}
+
+/**
+ * Snapshot descendant group leaders before TERM can orphan them. Bun's parallel workers lead their own groups, so
+ * killing only `pgid` relies on bun forwarding the signal. Persist those groups for a later sweep as well.
+ * Discovery has one 2 s deadline; even a failed discovery must not prevent killing the groups already known.
+ */
+async function killGroup(cfg: Config, pgid: number, work: string): Promise<void> {
+	const groups = new Set([pgid]);
+	let cleanupError: unknown;
+	try {
+		const deadline = Date.now() + 2_000;
+		const query = (flag: "-g" | "-P", ids: number[]): number[] => {
+			const left = deadline - Date.now();
+			if (left <= 0) failed(`timeout cleanup: discovering descendants of group ${pgid} exceeded 2000 ms`);
+			const r = spawnSync("/usr/bin/pgrep", [flag, ids.join(",")], { encoding: "utf8", timeout: left, maxBuffer: PS_CAP });
+			if (r.error || (r.status !== 0 && r.status !== 1)) {
+				failed(`timeout cleanup: pgrep ${flag} ${ids.join(",")}: ${r.error?.message ?? (r.stderr.trim() || `exit ${r.status}, signal ${r.signal}`)}`);
+			}
+			return r.stdout.split("\n").filter((s) => /^[1-9]\d*$/.test(s)).map(Number);
+		};
+		const seen = new Set([pgid]);
+		let frontier = [...new Set([pgid, ...query("-g", [pgid])])];
+		for (let depth = 0; frontier.length > 0; depth++) {
+			if (depth >= 32) failed(`timeout cleanup: descendants of group ${pgid} exceeded 32 levels`);
+			for (const pid of frontier) if (groupAlive(pid)) groups.add(pid);
+			frontier = query("-P", frontier).filter((pid) => !seen.has(pid));
+			for (const pid of frontier) seen.add(pid);
+		}
+		persistGroups(work, [...groups].filter((g) => g !== pgid));
+	} catch (e) {
+		cleanupError = e;
+	}
+	const targets = [...groups];
+	for (const g of targets) signalGroup(g, "SIGTERM");
 	const until = Date.now() + cfg.killGraceMs;
-	while (groupAlive(pgid) && Date.now() < until) await Bun.sleep(50);
-	signalGroup(pgid, "SIGKILL");
+	while (targets.some(groupAlive) && Date.now() < until) await Bun.sleep(50);
+	for (const g of targets) signalGroup(g, "SIGKILL");
+	if (cleanupError !== undefined) throw cleanupError;
 }
 
 // ---- the stuck capture (PLAN wl-mvq4edh02r5z40 revision 3, D5) -------------------------------------------
@@ -352,7 +415,7 @@ class Capture {
 	}
 
 	/**
-	 * After killGroup has killed the part's group: remove a cap dir `clearCapDir` left, without following a link in it
+	 * After killGroup has killed the part's groups: remove a cap dir `clearCapDir` left, without following a link in it
 	 * (removeTree; a just-killed sample may still be closing, so a few tries), then close the stuck log. Never throws.
 	 */
 	async afterKill(): Promise<void> {
@@ -679,7 +742,7 @@ function caps(a: Areas, runId: string): { path: string; v: Record<string, unknow
 	return { path, v: v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {} };
 }
 
-function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin"): number {
+function capMs(a: Areas, runId: string, key: "fullCapMin" | "soloCapMin" | "fastCapMin"): number {
 	const { path, v } = caps(a, runId);
 	const n = v[key];
 	if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return refuse(`${path} has no positive ${key}`);
@@ -1041,7 +1104,7 @@ class StuckWatch {
 				this.shadowCapture ??= this.capture({ sig: m, spunMs, snap: obs.snap, owned: r.owned }).then((c) => c?.afterKill());
 			}
 		} catch (e) {
-			this.line("stuck-detector-off", `reason detector failed: ${errText(e)}`);
+			this.line("stuck-detector-off", `reason detector failed: ${e instanceof Error ? e.message : errText(e)}`);
 			this.end();
 		}
 	}
@@ -1054,8 +1117,8 @@ class StuckWatch {
 	private recordGroups(owned: readonly Seen[]): void {
 		const fresh = [...new Set(owned.map((p) => p.pgid))].filter((g) => g > 1 && g !== this.p.leader && !this.recordedGroups.has(g));
 		if (fresh.length === 0) return;
+		persistGroups(this.p.work, fresh);
 		for (const g of fresh) this.recordedGroups.add(g);
-		appendFileSync(groupsFile(this.p.work), fresh.map((g) => `${g}\n`).join(""));
 	}
 
 	/** `detectTrace` (tests): the tick's markers, candidates (with CPU), live part tree and its zombies, as one JSON line. */
@@ -1139,7 +1202,7 @@ async function signatureSections(cfg: Config, runId: string, c: Capture, d: Stop
 interface Teardown {
 	pgids: number[];
 	ms: number;
-	/** null when contained; else the `stuck-killed` token (`<pid,pid>` or `inspection-denied`) and the stderr reason. */
+	/** null when contained; else the `stuck-killed` token (`<pid,pid>`, `inspection-denied` or `cleanup-failed`) and stderr reason. */
 	unconfirmed: { token: string; why: string } | null;
 }
 
@@ -1148,7 +1211,7 @@ interface Teardown {
  * every live descendant of one in a fresh snapshot (new during the capture included). The stop set is the pgids with a live
  * owned member, matched by pid and start; it joins the groups file. SIGTERM each, wait ≤ stopGraceMs for the owned processes to
  * go, SIGKILL each, then poll ≤ verifyMs until no owned identity is alive (a zombie is dead). A denied fresh snapshot signals
- * nothing from stale data. Signal errors other than ESRCH go to stderr.
+ * nothing from stale data. Persistence refusal never skips the kill; it and signal errors leave containment unconfirmed.
  */
 async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teardown> {
 	const uid = process.getuid!();
@@ -1158,14 +1221,18 @@ async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teard
 	const live = liveOwned(fresh, owned);
 	const self = fresh.procs.find((p) => p.pid === process.pid)?.pgid;
 	const pgids = [...new Set(live.map((p) => p.pgid))].filter((g) => g > 1 && g !== self);
-	if (pgids.length > 0) appendFileSync(groupsFile(work), pgids.map((g) => `${g}\n`).join(""));
+	const errors: string[] = [];
+	try {
+		if (pgids.length > 0) persistGroups(work, pgids);
+	} catch (e) {
+		errors.push(e instanceof Error ? e.message : String(e));
+	}
 	const tracked = [...owned, ...live];
 	/** The owned processes still alive, or null when the snapshot is denied. */
 	const left = (): Seen[] | null => {
 		const s = snapshot(uid);
 		return s.kind === "ok" ? liveOwned(s, tracked) : null;
 	};
-	const errors: string[] = [];
 	const signal = (sig: NodeJS.Signals) => {
 		for (const g of pgids) {
 			try {
@@ -1183,14 +1250,17 @@ async function teardown(cfg: Config, work: string, owned: Seen[]): Promise<Teard
 		now = left();
 		for (const until = Date.now() + STUCK_DEFAULTS.verifyMs; (now === null || now.length > 0) && Date.now() < until; now = left()) await Bun.sleep(50);
 	}
-	for (const e of errors) process.stderr.write(`as2test: stuck stop: ${e}\n`);
 	const ms = Date.now() - t0;
-	if (now === null) return { pgids, ms, unconfirmed: { token: "inspection-denied", why: "inspection denied after the kill" } };
-	if (now.length > 0) {
-		const pids = now.map((p) => p.pid).join(",");
-		return { pgids, ms, unconfirmed: { token: pids, why: `${pids} still alive ${STUCK_DEFAULTS.verifyMs} ms after SIGKILL` } };
+	let token = "cleanup-failed";
+	if (now === null) {
+		token = "inspection-denied";
+		errors.push("inspection denied after the kill");
+	} else if (now.length > 0) {
+		token = now.map((p) => p.pid).join(",");
+		errors.push(`${token} still alive ${STUCK_DEFAULTS.verifyMs} ms after SIGKILL`);
 	}
-	return { pgids, ms, unconfirmed: null };
+	for (const e of errors) process.stderr.write(`as2test: stuck stop: ${e}\n`);
+	return { pgids, ms, unconfirmed: errors.length > 0 ? { token, why: errors.join("; ") } : null };
 }
 
 /**
@@ -1247,11 +1317,24 @@ async function part(cfg: Config, runId: string, work: string, dir: string, argv:
 		clearTimeout(timer);
 		if (first === "cap") {
 			const capture = await stuckCapture(cfg, runId, work, pgid, logPath, cap);
-			await killGroup(cfg, pgid);
-			// Off the kill path: a cap dir the capture could not clear with bounded work goes now that the group is dead.
-			await capture?.afterKill();
-			await done;
-			throw new Exit(WRAPPER_EXIT.timeout, `timeout: the part passed its cap of ${cap} ms; its group was killed`);
+			const errors: string[] = [];
+			try {
+				await killGroup(cfg, pgid, work);
+			} catch (e) {
+				errors.push(e instanceof Error ? e.message : String(e));
+			} finally {
+				// Off the kill path: a cap dir the capture could not clear goes after the groups are killed.
+				try {
+					await capture?.afterKill();
+				} catch (e) {
+					errors.push(`stuck capture finalization failed: ${e instanceof Error ? e.message : String(e)}`);
+				} finally {
+					await done;
+				}
+			}
+			const timeout = `timeout: the part passed its cap of ${cap} ms; its group was killed`;
+			if (errors.length > 0) throw new Exit(WRAPPER_EXIT.failed, `${timeout}\n${errors.join("\n")}`);
+			throw new Exit(WRAPPER_EXIT.timeout, timeout);
 		}
 		if ("sig" in first) {
 			const capture = await watch!.capture(first);
@@ -1296,14 +1379,17 @@ async function full(cfg: Config, a: Areas, runId: string): Promise<number> {
 	return part(cfg, runId, work, work, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : [])], log, cap, mode);
 }
 
-async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
+/** A test operand's repo-relative path: `./<plain relative path>` naming a Bun test file, checked before anything is touched. */
+function testRel(file: string): string {
 	if (!file.startsWith("./")) refuse(`${file} must be ./<relative path>`);
 	const rel = file.slice(2);
 	if (rel === "" || rel.includes("\0") || rel.split("/").some((s) => s === "" || s === "." || s === "..")) refuse(`${file} is not a plain relative path`);
 	if (!isBunTestFile(rel)) refuse(`${file} is not a Bun test file name`);
-	fence(a, runId);
-	const work = workDir(a, runId);
-	const dir = sideDir(a, runId, side);
+	return rel;
+}
+
+/** `<dir>/repo`, the side's clone: its realpath, which must be the path itself (prepare first). */
+function cloneOf(dir: string): string {
 	const repo = join(dir, "repo");
 	let realRepo: string;
 	try {
@@ -1312,9 +1398,22 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 		return refuse(`${repo} is missing (prepare first)`);
 	}
 	if (realRepo !== repo) refuse(`${repo} is not a plain directory`);
+	return realRepo;
+}
+
+/** `file` (`./<rel>`) resolves, symlinks followed, to a regular file inside the clone `repo`. */
+function inClone(repo: string, file: string, rel: string): void {
 	const target = join(repo, rel);
-	if (!inside(target, realRepo) || realpathSync(target) === realRepo) refuse(`${file} resolves outside the clone`);
+	if (!inside(target, repo) || realpathSync(target) === repo) refuse(`${file} resolves outside the clone`);
 	if (!lstatSync(realpathSync(target)).isFile()) refuse(`${file} is not a file`);
+}
+
+async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Side): Promise<number> {
+	const rel = testRel(file);
+	fence(a, runId);
+	const work = workDir(a, runId);
+	const dir = sideDir(a, runId, side);
+	inClone(cloneOf(dir), file, rel);
 	const cap = capMs(a, runId, "soloCapMin");
 	const mode = stuckMode(a, runId);
 	// Claim the lowest free index: <stem>-<i>.log is created exclusively.
@@ -1333,6 +1432,31 @@ async function solo(cfg: Config, a: Areas, runId: string, file: string, side: Si
 	for (const stale of [".xml", ".stuck.log", ".signature.log", ".stuck-trace.jsonl"]) unlinkIfPresent(join(work, `${stem}-${i}${stale}`));
 	writeSync(1, `part ${stem}-${i}\n`);
 	return part(cfg, runId, work, dir, ["test", "--reporter=junit", `--reporter-outfile=${xml}`, `./${rel}`], log, cap, mode);
+}
+
+/**
+ * PLAN wl-mvq4edbaf13vnk D4, the Mac fallback of the hosted fast check: the fast set's files, each `./<path>` to a regular file
+ * inside the PR clone and named once, in ONE `bun test` call to `fast.xml`/`fast.log` under caps.json `fastCapMin`. It runs as
+ * `full` does (the child env, its own process group, `fullWorkers`, the stuck capture at the cap); every operand is checked
+ * before the fence, and every file before bun starts, so a refusal runs nothing.
+ */
+async function fast(cfg: Config, a: Areas, runId: string, files: string[]): Promise<number> {
+	if (files.length === 0) refuse("fast takes one or more ./<test file>");
+	const rels = files.map(testRel);
+	const twice = rels.find((r, i) => rels.indexOf(r) !== i);
+	if (twice !== undefined) refuse(`./${twice} is named more than once`);
+	fence(a, runId);
+	const work = workDir(a, runId);
+	const repo = cloneOf(work);
+	rels.forEach((rel, i) => inClone(repo, files[i]!, rel));
+	const cap = capMs(a, runId, "fastCapMin");
+	const workers = fullWorkers(a, runId);
+	const mode = stuckMode(a, runId);
+	const xml = join(work, "fast.xml");
+	const log = join(work, "fast.log");
+	for (const stale of ["fast.xml", "fast.log", "fast.stuck.log", "fast.signature.log", "fast.stuck-trace.jsonl"]) unlinkIfPresent(join(work, stale));
+	const argv = ["test", "--reporter=junit", `--reporter-outfile=${xml}`, ...(workers > 1 ? [`--parallel=${workers}`] : []), ...rels.map((r) => `./${r}`)];
+	return part(cfg, runId, work, work, argv, log, cap, mode);
 }
 
 // ---- sweep -------------------------------------------------------------------------------------------
@@ -1516,6 +1640,8 @@ async function main(argv: string[]): Promise<number> {
 	if (!RUN_ID_RE.test(runId)) return refuse("run id must match ^tr-[a-z0-9]+$");
 	if (sub === "probe") {
 		if (ops.length < 1) return refuse("probe takes <run id> and one or more paths");
+	} else if (sub === "fast") {
+		if (ops.length < 1) return refuse("fast takes <run id> and one or more ./<test file>");
 	} else if (!Object.hasOwn(ARITY, sub)) return refuse(`unknown subcommand ${sub}`);
 	else if (ops.length !== ARITY[sub]) return refuse(`${sub} takes exactly ${ARITY[sub]} operand(s) after the run id`);
 	const a = areas(cfg);
@@ -1529,6 +1655,8 @@ async function main(argv: string[]): Promise<number> {
 		case "solo":
 		case "base-solo":
 			return solo(cfg, a, runId, ops[0]!, sub === "solo" ? "pr" : "base");
+		case "fast":
+			return fast(cfg, a, runId, ops);
 		case "sweep":
 			return sweep(cfg, a, runId);
 		case "cleanup":

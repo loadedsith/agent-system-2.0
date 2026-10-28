@@ -16,7 +16,7 @@ import { LANE_RUNNER_BY, Ledger, type Stakes } from "../../ledger/src/index";
 import { createClassifierExtension, REVIEW_FINDINGS_PARAGRAPH } from "../extension";
 import { loadCalibration } from "../src/classify";
 import { reviewStopBody, stopReviewsInstructionBody } from "../src/review-stop";
-import { handSpawnBody } from "../src/lab";
+import { handSpawnBody, OPENAI_REVIEWS_ONLY_RULE } from "../src/lab";
 import { countRounds, parseReviewRound, reviewRoundsBody, reviewRoundsExtendBody, roundsInstructionBody } from "../src/rounds";
 import { tierTableFromConfig, type TierTable } from "../src/tier-table";
 import { JO_HOLDER } from "../../surface/src/launch";
@@ -2202,14 +2202,15 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		process.env.AS2_HEADROOM_POLLS = path;
 	};
 
-	/** Shared 26-minute endpoints: OpenAI's week is mature and projects to 1.05 at the newest poll. */
-	const comparisonPolls = (opts: { claude?: [number, number]; sourceUsed?: number; sourceHard?: boolean } = {}) => {
+	/** Shared 26-minute endpoints: OpenAI's week is mature and projects to 1.05 at the newest poll, on the lane clock `at`. */
+	const comparisonPolls = (opts: { claude?: [number, number]; sourceUsed?: number; sourceHard?: boolean; at?: number } = {}) => {
 		const claude = opts.claude ?? [0.04, 0.34];
-		const newest = RULE_END - MIN;
+		const at = opts.at ?? RULE_END;
+		const newest = at - MIN;
 		const weekReset = newest + (7 * 24 * 60 - 2016) * MIN;
 		return [27, 1].map((ago, index) =>
 			JSON.stringify({
-				t: (RULE_END - ago * MIN) / 1000,
+				t: (at - ago * MIN) / 1000,
 				rows: {},
 				limits: [
 					{ provider: "openai-codex", windowId: "7d", tier: null, resetsAt: weekReset, usedFraction: index === 0 ? 0.2 : (opts.sourceUsed ?? 0.21) },
@@ -2331,10 +2332,12 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 	});
 
 	test("production review compares its configured review row, not a credentialed Claude from another tier", async () => {
-		usePolls(...comparisonPolls());
+		// After Jo's OpenAI-reviews-only rule ends: before it, OpenAI week pace alone never skips a review (next test).
+		const after = OPENAI_REVIEWS_ONLY_RULE.endsAt;
+		usePolls(...comparisonPolls({ at: after }));
 		const w = world({ stakes: "production" });
 		down(w, FABLE); // The deep review's Claude budget is Fable; the still-credentialed Opus cannot stand in.
-		const h = lane(w);
+		const h = lane(w, { now: () => after });
 		h.laneMessage(OPUS);
 		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", "production") }, "c1");
 		expect(out?.block).toBeUndefined();
@@ -2343,6 +2346,21 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(spawn?.model).toEqual([K3]);
 		expect(spawn?.note).not.toContain("retained");
 		expect(bodies(w, "headroom-skip:").some(body => body.startsWith(`headroom-skip: ${SOL} `))).toBe(true);
+	});
+
+	test("Jo's OpenAI-reviews-only rule (in-mvro2xb4w0918v): before its end, OpenAI week pace alone does not skip the review's OpenAI leg", async () => {
+		usePolls(...comparisonPolls());
+		const w = world({ stakes: "production" });
+		down(w, FABLE);
+		const h = lane(w);
+		h.laneMessage(OPUS);
+		const out = await h.toolCall({ agent: "strong", name: "sl-x", task: brief(w, "review the change", "production") }, "c1");
+		expect(out?.block).toBeUndefined();
+		expect(out?.input?.tasks.map(item => item.name)).toEqual(["sl-x--openai", "sl-x--kimi"]);
+		const spawn = await h.spawn(out!.input.tasks[0]!.agent, "sl-x--openai");
+		expect(spawn?.model).toEqual([SOL]);
+		expect(spawn?.note).toContain("OpenAI week pace does not hold back a review until 2026-11-02T18:03Z (Jo, in-mvro2xb4w0918v)");
+		expect(bodies(w, "headroom-skip:").some(body => body.startsWith(`headroom-skip: ${SOL} `))).toBe(false);
 	});
 
 	test("panel planning retains its OpenAI leg without substituting another lab at the pinned spawn", async () => {
@@ -2392,6 +2410,27 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 				expect(spawn?.note).toContain("retained");
 				expect(bodies(w, "headroom-skip:")).toEqual([]);
 			}
+		}
+	});
+
+	test("Anthropic weekly overpace below .70 does not withhold Sonnet at dispatch or settlement", async () => {
+		for (const windowId of ["7d", "1w"]) {
+			usePolls(poll(1, [
+				{ windowId: "5h", used: 0.1, resetsIn: 4 * HOUR },
+				{ windowId, used: 0.69, resetsIn: 5 * 24 * HOUR },
+				{ windowId, tier: "sonnet", used: 0.69, resetsIn: 5 * 24 * HOUR },
+			]));
+			// Put Sonnet first in this change-large row; admission must preserve both Anthropic entries.
+			const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, standard: ROWS.standard.slice(1), strong: [SONNET, OPUS, SOL, KIMI] } } });
+			const w = world({ table });
+			const h = lane(w, { laneModel: SONNET });
+			const build = await settled(h, w, "sl-work", "change the loader", SONNET, "c1");
+			expect(build.spawn?.model).toEqual([SONNET, OPUS]);
+			expect(build.spawn?.note ?? "").not.toContain("retained");
+			expect(build.result).toBeUndefined();
+			expect(bodies(w, "headroom-skip:")).toEqual([]);
+			expect(bodies(w, "hand-spawn:")).toEqual([expect.stringContaining(` row ${SONNET},${OPUS}`)]);
+			expect(questions(w)).toEqual([]);
 		}
 	});
 
@@ -2451,13 +2490,13 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(bodies(w, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${OPUS} token dt-\\S+ ${OUT_085}$`))]);
 	});
 
-	test("anthropic 7d fable at 0.99, burning, reset days away: an Opus build still spawns; only a Fable build is refused", async () => {
+	test("anthropic 7d fable actually exhausted at 1.00: an Opus build still spawns; only a Fable build is refused", async () => {
 		const fable = (used: number): Limit => ({ windowId: "7d", tier: "fable", used, resetsIn: 4 * 24 * HOUR });
 		const shared: Limit[] = [
 			{ windowId: "5h", used: 0.1, resetsIn: 2 * HOUR },
 			{ windowId: "7d", used: 0.3, resetsIn: 4 * 24 * HOUR },
 		];
-		usePolls(poll(121, [...shared, fable(0.9)]), poll(1, [...shared, fable(0.99)]));
+		usePolls(poll(121, [...shared, fable(0.9)]), poll(1, [...shared, fable(1)]));
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
@@ -2473,8 +2512,8 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		const out = await g.toolCall({ agent: "strong", name: "sl-work", task: brief(f, "change the loader") }, "c1");
 		const spawn = await g.spawn(out!.input.agent, "sl-work");
 		expect(spawn?.block).toBe(true);
-		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 0.99 used, window pace +`);
-		expect(bodies(f, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${FABLE} token dt-\\S+ anthropic 7d fable 0\\.99 used`))]);
+		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 1.00 used, window pace +`);
+		expect(bodies(f, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${FABLE} token dt-\\S+ anthropic 7d fable 1\\.00 used`))]);
 	});
 
 	test("stale polls (newest 30 min old) with anthropic 5h at 0.85: nothing is skipped", async () => {

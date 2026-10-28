@@ -298,6 +298,45 @@ testRunner:
   # line and wait back per day. Reversal: `fullWorkers: 1`.
   fullWorkers: 6
 
+  # Land-first fast Linux gate and full Mac main verification (PLAN wl-mvq4edbaf13vnk § 2).
+  # Every fast set includes these smoke files. Files in macOnly run only in the full main suite:
+  # macOS-specific sandbox, shell, filesystem and process APIs cannot be exercised on Linux;
+  # the remaining portability cases depend on Linux filesystem identity/order/timing behavior.
+  # The 13 macOS-only files and four portability files found by the Linux probe (each reason below)
+  # stay out of hosted Linux and run only in the post-merge Mac full suite. Keep zsh and bubblewrap
+  # tests in the fast set; the hosted workflow installs both. Activation is a ledger word, not a flag.
+  fastSmoke:
+    - surface/test/fast-set.test.ts
+    - surface/test/main-state.test.ts
+  macOnly:
+    gates/test/fence.test.ts: sandbox-exec macOS OS fence
+    gates/test/r18-typed-wrapper.test.ts: requires sandbox-exec on PATH
+    gates/test/r18-typed-wrapper-exec.test.ts: requires sandbox-exec on PATH
+    gates/test/scratch-fence.test.ts: inspects sandbox-exec fence command
+    gates/test/r08-tree-evidence.test.ts: exercises lane under sandbox-exec fence
+    gates/test/probe-suite.test.ts: exercises real gate chain under sandbox-exec fence
+    surface/test/lane.test.ts: exercises lane under sandbox-exec wrapper
+    gates/test/shell-start-bash.test.ts: asserts macOS /bin/bash 3.2 and /private/tmp semantics
+    gates/test/printf-property.test.ts: models macOS /bin/bash 3.2 printf behavior
+    gates/test/shell-start.test.ts: reads macOS _NSGetEnviron from libSystem
+    surface/test/ps-shim.test.ts: shim loads macOS libSystem.B.dylib
+    surface/test/as2test.test.ts: uses /private/tmp and macOS as2test helpers
+    surface/test/phoenix-run.test.ts: assumes /usr/sbin/lsof on macOS
+    surface/test/scratch-audit.test.ts: Linux ext4 directory size and /tmp alias behavior differ
+    surface/test/scratch-remove.test.ts: Linux inode reuse affects directory identity check
+    surface/test/decision-log.test.ts: Linux directory iteration ordering differs
+    surface/test/test-runner.test.ts: Linux timing/signal behavior differs in test T2c
+  fullBeforeMerge:
+    - package.json
+    - bun.lock
+    - bunfig.toml
+    - tsconfig.json
+    - Cargo.toml
+    - Cargo.lock
+    - build.sh
+  fastCapMin: 10
+  fastWaitMin: 15
+
 # ── Tracing switch (wl-mv65t5d34lts00 PLAN.md §§ 2, 8; surface/src/tracing.ts) ──
 # Which omp processes export their spans to the local Phoenix (install/phoenix-agent.sh): all (the
 # default: every lane, the orchestrator and every OMP seat), off, or a flow list of workload ids (their
