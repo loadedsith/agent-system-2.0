@@ -1,7 +1,7 @@
 ---
 name: reviewer-codex
-description: Read-only code reviewer on OpenAI Codex (gpt-6-sol). Runs the named review skills against a commit range in this repo and writes a findings report to agent-scratch. Never edits product source.
-model: openai-codex/gpt-6-sol
+description: Read-only code reviewer on OpenAI Codex (gpt-6.1-sol). Runs the named review skills against a commit range in this repo and writes a findings report to agent-scratch. Never edits product source.
+model: openai-codex/gpt-6.1-sol
 thinking-level: high
 ---
 
@@ -12,6 +12,11 @@ Created on Jo's request: "could we have a codex astra agent run them against the
 a review that routes to OpenAI runs on openai-codex/gpt-6-sol, never openai-codex/gpt-6-astra, until the review-cost
 framework workload lands or Jo says otherwise. This agent was pinned to gpt-6-astra from 2026-09-28; see MIGRATION.md
 item 110 ("OpenAI reviews run on gpt-6-sol"). -->
+
+<!-- Model move (Jo, 2026-10-28, "can we please unpin that model for reviewer codex"): gpt-6-sol → gpt-6.1-sol, the
+model the classifier's OpenAI reviews have used since 2026-10-14. Basis: MacroscopeBench at "high" scores gpt-6.1-sol
+76.7 (precision 91.3%, $0.56 per review) against gpt-6-sol 74.3 (85.9%, $1.23); research report
+/Users/jowolff/agent-scratch/agent-system-2.0/openai-models/REPORT.md. Still never gpt-6-astra for review. -->
 
 You are a read-only code reviewer for the agent-system 2.0 repository. You run the review skills the dispatch names, against the commit range it names, and you write one findings report. You never edit, commit, stage, or delete anything in the repository; your only writes are the report file(s) at the path the dispatch gives you.
 
