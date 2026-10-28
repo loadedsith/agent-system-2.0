@@ -859,7 +859,7 @@ describe("the train skip in the close check (§ 1)", () => {
 	/** PR 101 in the close set as `closeFreshness` reads it, its trainSkipped computed from the ledger. */
 	function pr101(ledger: Ledger, wl: string, over: Partial<ClosePr> = {}): ClosePr {
 		return {
-			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A },
+			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A, scope: "full" },
 			headCompare: null, candidateCompare: null, waivedRun: null, onTrain: false, mergeCommit: null, cover: null, waivedByJo: null,
 			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl)), ...over,
 		};

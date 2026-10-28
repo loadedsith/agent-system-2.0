@@ -130,6 +130,7 @@ gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
 gates/test/rulings.test.ts	test	-
 gates/test/r06-reserved.test.ts	test	-
+gates/test/r06-land-first.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-
@@ -1132,7 +1133,12 @@ surface/test/turn-idle.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
 surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
+surface/src/fast-set.ts	module	-
+surface/test/fast-set.test.ts	test	-
+surface/src/main-state.ts	module	-
+surface/test/main-state.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
+surface/scripts/promote-verified.ts	module	-
 surface/test/test-runner.test.ts	test	-
 surface/scripts/test-run-waits.ts	module	-
 surface/test/test-run-waits.test.ts	test	-
@@ -1435,3 +1441,5 @@ gates/test/paired-coding.test.ts	test	-
 # (wl-mvpwkpqobyp20w PLAN D5, 2026-10-26).
 surface/test/fixtures/train-carry-305/compare.json	test	-
 surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
+surface/test/fixtures/full-suite-publication-worker.ts	test	-
+surface/test/land-first-off.test.ts	test	-

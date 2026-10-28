@@ -6,7 +6,7 @@
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
@@ -18,19 +18,42 @@ import {
 import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import laneToolsRow, { liveVerifierReads, planAutoStartRound, planReviewRefusal, TEST_RUNNER_SCRIPT, type VerifierReads, verifierSelfCheck } from "../extensions/lane-tools";
+import { ensureStandingWorkload } from "../src/identity";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
 import { renderWake } from "../src/render";
-import { planAutoStartRound, planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst, planFirstBody, doneBody,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, landFirstBody, landFirstInstructionBody, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst,
+	planFirstBody, doneBody,
 } from "../src/launch";
-import { testRequestedBody } from "../src/test-run";
+import { type ExecCounts, testRequestedBody, testRunBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo, renderClose } from "../src/decision-log";
 import { openPlanPath } from "../src/plan-paths";
-import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ctxOf, fakePi, notices, tempLedger, tempRepo, tmp } from "./helpers";
+
+/** Jo's `land-first <repo> on|off` as the surface records it: his instruction, then `land-first:` naming it, on the standing workload. */
+function landFirst(ledger: Ledger, repo: string, on: boolean): void {
+	ensureStandingWorkload(ledger);
+	const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(repo, on) });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(repo, on, id) });
+}
+/** The runner's main run of `sha` on the standing workload; `exec` sets its counts (believable by default), `by` forges the writer. */
+function mainRun(ledger: Ledger, runId: string, sha: string, verdict: "green" | "red", o: { exec?: ExecCounts; by?: string } = {}): void {
+	ensureStandingWorkload(ledger);
+	const red = verdict === "red";
+	ledger.recordEntry({
+		by: o.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+		body: testRunBody({
+			runId, verdict, sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+			full: { pass: 400, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			scope: "full", main: true, host: "mac", exec: o.exec ?? { files: 40, tests: 400, treeFiles: 40 },
+		}),
+	});
+}
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
@@ -447,6 +470,172 @@ describe("lane_full_test (PLAN wl-muraerdsgw7gn4 § 2.1, § 4)", () => {
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
 		expect(ledger.questions(wl).length).toBe(before.questions);
+	});
+});
+
+describe("PLAN wl-mvq4edbaf13vnk D9, R28: lane_full_test on a land-first repo, and the lane extension's self-check", () => {
+	const LINE = "test-run tr-0abc1234wxyz runner 4242 sha " + "a".repeat(40) + " slice sl-full-x-1 log /runs/tr-0abc1234wxyz/runner.log";
+	const G = "c".repeat(40);
+	const OLD = "d".repeat(40);
+	const FAST = 'a fast result is marked fast (`"scope":"fast"` in its test-run record), and a fast green is not a full-suite green: close takes it only after the merge, once a green believable main run holds the merge commit';
+	const TAIL = "The result arrives as an aside; until then work on something else or `sleep 60` in bash.";
+
+	test("the same request reaches the runner whether land-first is on or off, and the result says which result the lane gets", async () => {
+		const { ledger, wl, f, call } = laneFixture({ exec: true });
+		f.execs.answer = () => ({ stdout: `${LINE}\n`, stderr: "", code: 0, killed: false });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(
+			`${LINE}\nWhether land-first is on could not be read (${wl} has no repo: checkout with a GitHub origin), so this may be the fast check or the full suite; ${FAST}.\n${TAIL}`,
+		);
+		const repo = tempRepo();
+		expect(Bun.spawnSync(["git", "-C", repo, "remote", "add", "origin", "https://github.com/thewolff/agent-system-2.0.git"]).exitCode).toBe(0);
+		recordRepo(ledger, wl, repo);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(`${LINE}\nLand-first is off for thewolff/agent-system-2.0: this is the full suite.\n${TAIL}`);
+		// Jo names the repo by its short name; it is the same repository
+		landFirst(ledger, "agent-system-2.0", true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(
+			`${LINE}\nLand-first is on for thewolff/agent-system-2.0: the runner applies the gate, so this is the fast check when the PR's diff allows it, else the full suite; ${FAST}.\n${TAIL}`,
+		);
+		// another repository's land-first does not turn it on; Jo's later off turns it off
+		landFirst(ledger, "agent-system-2.0", false);
+		landFirst(ledger, "thewolff/other-repo", true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toContain("Land-first is off for thewolff/agent-system-2.0: this is the full suite.");
+		const args = [TEST_RUNNER_SCRIPT, "start", wl, "17", "--requested-by", "lane-t-1"];
+		expect(f.execs.calls.map((c) => c.args)).toEqual([args, args, args, args]);
+	});
+
+	/** Reads of a verified root: `/v/c` is verified/current, its HEAD is G, nothing is modified; `over` replaces any read. */
+	const reads = (over: Partial<VerifierReads> = {}): VerifierReads => ({
+		root: () => "/v/c", current: () => "/v/c", ownerRepo: () => "thewolff/agent-system-2.0", head: () => G, modified: () => [], ...over,
+	});
+	/** A ledger with land-first on for agent-system-2.0 and a green believable main verdict on G. */
+	const onLedger = () => {
+		const { ledger } = tempLedger();
+		landFirst(ledger, "agent-system-2.0", true);
+		mainRun(ledger, "tr-0main1", G, "green");
+		return ledger;
+	};
+	const NEXT = "Next: run `install/install.sh --control-root=verified` so lanes load ~/.agent-system-2/verified/current.";
+
+	test("a verified root passes, and so does an older verified release; with land-first off nothing is shown whatever fails", () => {
+		const ledger = onLedger();
+		expect(verifierSelfCheck(ledger, reads())).toBeNull();
+		mainRun(ledger, "tr-0main2", OLD, "green");
+		mainRun(ledger, "tr-0main3", "e".repeat(40), "green");
+		expect(verifierSelfCheck(ledger, reads({ head: () => OLD }))).toBeNull();
+		const broken = reads({ root: () => "/dev/checkout", current: () => null, head: () => "f".repeat(40), modified: () => ["x.ts"] });
+		const { ledger: off } = tempLedger();
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+		landFirst(off, "agent-system-2.0", true);
+		landFirst(off, "agent-system-2.0", false);
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+		// land-first on for another repository leaves this one off
+		landFirst(off, "thewolff/other-repo", true);
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+	});
+
+	test("each failed check is named on one line, and all of them at once on the same line", () => {
+		const ledger = onLedger();
+		const lead = "verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from";
+		expect(verifierSelfCheck(ledger, reads({ current: () => "/v/b" }))).toBe(`${lead} /v/c at ${G.slice(0, 12)}: root /v/c is not verified/current (/v/b). ${NEXT}`);
+		expect(verifierSelfCheck(ledger, reads({ current: () => null }))).toBe(
+			`${lead} /v/c at ${G.slice(0, 12)}: no verified control root: ~/.agent-system-2/verified/current does not exist. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ modified: () => ["surface/src/test-run.ts", "gates/src/rows/r06-reserved.ts"] }))).toBe(
+			`${lead} /v/c at ${G.slice(0, 12)}: tracked files modified: surface/src/test-run.ts, gates/src/rows/r06-reserved.ts. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ root: () => "/dev/checkout", current: () => "/v/c", head: () => OLD, modified: () => ["a.ts"] }))).toBe(
+			`${lead} /dev/checkout at ${OLD.slice(0, 12)}: root /dev/checkout is not verified/current (/v/c); HEAD ${OLD.slice(0, 12)} has no green believable main verdict; tracked files modified: a.ts. ${NEXT}`,
+		);
+	});
+
+	test("HEAD passes only on a green believable verdict: none, red, implausible, red then green, or a lane-written green each fail", () => {
+		const cases: { name: string; seed: (l: Ledger) => void }[] = [
+			{ name: "none", seed: () => {} },
+			{ name: "red", seed: (l) => mainRun(l, "tr-0main9", OLD, "red") },
+			{ name: "implausible", seed: (l) => mainRun(l, "tr-0main9", OLD, "green", { exec: { files: 10, tests: 400, treeFiles: 40 } }) },
+			{
+				name: "red then green",
+				seed: (l) => {
+					mainRun(l, "tr-0main8", OLD, "red");
+					mainRun(l, "tr-0main9", OLD, "green");
+				},
+			},
+			{ name: "lane-written green", seed: (l) => mainRun(l, "tr-0main9", OLD, "green", { by: "lane-t-1" }) },
+		];
+		for (const c of cases) {
+			const ledger = onLedger();
+			c.seed(ledger);
+			expect({ name: c.name, line: verifierSelfCheck(ledger, reads({ head: () => OLD })) }).toEqual({
+				name: c.name,
+				line: `verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from /v/c at ${OLD.slice(0, 12)}: HEAD ${OLD.slice(0, 12)} has no green believable main verdict. ${NEXT}`,
+			});
+		}
+	});
+
+	test("a failed read leaves the check unrun and is named with every other; an unreadable root or origin says land-first's state is unknown", () => {
+		const ledger = onLedger();
+		const boom = (what: string) => () => {
+			throw new Error(what);
+		};
+		const lead = "verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools' self-check could not check their root /v/c:";
+		expect(verifierSelfCheck(ledger, reads({ head: boom("git rev-parse HEAD exited 128: not a git repository"), modified: boom("git status failed") }))).toBe(
+			`${lead} HEAD could not be read: git rev-parse HEAD exited 128: not a git repository; tracked files could not be read: git status failed; ~/.agent-system-2/verified/current's HEAD could not be read: git rev-parse HEAD exited 128: not a git repository. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ head: (at) => (at === "/v/c" ? "not-a-sha" : G) }))).toBe(
+			`${lead} HEAD could not be read: git rev-parse HEAD in /v/c printed "not-a-sha", not a sha; ~/.agent-system-2/verified/current's HEAD could not be read: git rev-parse HEAD in /v/c printed "not-a-sha", not a sha. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ current: boom("EACCES") }))).toBe(`${lead} ~/.agent-system-2/verified/current could not be read: EACCES. ${NEXT}`);
+		expect(verifierSelfCheck(ledger, reads({ root: boom("git rev-parse --show-toplevel exited 128") }))).toBe(
+			`verifier: the lane tools' self-check could not read their own repository (git rev-parse --show-toplevel exited 128), so whether land-first is on for it is unknown. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ ownerRepo: () => null }))).toBe(
+			`verifier: the lane tools load from /v/c, which has no GitHub origin, so whether land-first is on for it is unknown and the self-check did not run. ${NEXT}`,
+		);
+	});
+
+	test("at session start a bound lane shows the line once as a warning; a passing root and an unbound session show nothing", async () => {
+		const { ledger, path } = tempLedger();
+		landFirst(ledger, "agent-system-2.0", true);
+		mainRun(ledger, "tr-0main1", G, "green");
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "a lane's work", stakes: "normal", mode: "autonomous" });
+		const bound = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-t-1", HOME: "/nonexistent-home" };
+		const start = async (env: Record<string, string>, r: VerifierReads) => {
+			const f = fakePi();
+			laneToolsRow(f.pi, env, r);
+			const before = notices.length;
+			await f.emit("session_start", { type: "session_start" }, ctxOf());
+			return notices.slice(before);
+		};
+		expect(await start(bound, reads({ modified: () => ["a.ts"] }))).toEqual([
+			`verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from /v/c at ${G.slice(0, 12)}: tracked files modified: a.ts. ${NEXT}`,
+		]);
+		expect(await start(bound, reads())).toEqual([]);
+		expect(await start({ AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, reads({ modified: () => ["a.ts"] }))).toEqual([]);
+	});
+
+	test("the live reads: the verified/current symlink resolved or missing, HEAD, the origin, and modified tracked paths with a rename's new name", () => {
+		const repo = tempRepo();
+		const home = tmp("home");
+		const live = liveVerifierReads({ HOME: home });
+		expect(live.current()).toBeNull();
+		mkdirSync(join(home, ".agent-system-2", "verified"), { recursive: true });
+		symlinkSync(repo, join(home, ".agent-system-2", "verified", "current"));
+		expect(live.current()).toBe(repo);
+		const git = (...args: string[]) => {
+			const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+			expect({ args, code: r.exitCode }).toEqual({ args, code: 0 });
+			return r.stdout.toString().trim();
+		};
+		expect(live.head(repo)).toBe(git("rev-parse", "HEAD"));
+		expect(live.ownerRepo(repo)).toBeNull();
+		git("remote", "add", "origin", "git@github.com:thewolff/agent-system-2.0.git");
+		expect(live.ownerRepo(repo)).toBe("thewolff/agent-system-2.0");
+		expect(live.modified(repo)).toEqual([]);
+		writeFileSync(join(repo, "untracked.txt"), "never named\n");
+		writeFileSync(join(repo, "README.md"), "changed\n");
+		git("mv", ".gitignore", "kept.ignore");
+		expect(live.modified(repo).sort()).toEqual(["README.md", "kept.ignore"]);
+		expect(() => live.head(join(home, "nowhere"))).toThrow(/rev-parse HEAD exited/);
 	});
 });
 
