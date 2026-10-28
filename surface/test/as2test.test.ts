@@ -13,7 +13,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
+	chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -898,6 +898,12 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 		prepared(b, "tr-fill1", { "slow.test.ts": SLOW_TEST }, CAPS);
 		const hook = join(b.hooks, "tr-fill1.stuck-capture");
 		writeFileSync(`${hook}.pause`, "");
+		// Empty directories: cheap to plant and dear to remove recursively (about 2 s for 20,000), so a recursive removal before
+		// the kill would push the kill past the bound below. They are planted before the run, so the cap dir is filled by one
+		// rename inside the capture window: 20,000 mkdirs there raced the deadline on a loaded host (tr-0mvs6sjezd3t06f).
+		const filled = join(dir("fill-planted"), "planted");
+		mkdirSync(filled);
+		for (let i = 0; i < 20_000; i++) mkdirSync(join(filled, `planted-${i}`));
 		const t0 = Date.now();
 		const p = spawnCall(b, { sub: "full", runId: "tr-fill1" });
 		try {
@@ -910,10 +916,10 @@ describe("the stuck capture at the cap: bounded, safe reads, never blocks the ki
 			const capDirs = readdirSync(work).filter((n) => n.startsWith("full.stuck-"));
 			expect(capDirs).toHaveLength(1);
 			const capDir = join(work, capDirs[0]!);
-			// Empty directories: cheap to plant (under 1 s here) and dear to remove recursively (about 2 s for 20,000),
-			// so a recursive removal before the kill would push the kill past the bound below.
-			for (let i = 0; i < 20_000; i++) mkdirSync(join(capDir, `planted-${i}`));
-			// All planted before the deadline (and before the 3 s sample ends), so the cut meets every entry.
+			// The planted dir takes the cap dir's place while it is still empty (the 3 s sample writes its report at its end),
+			// all before the deadline, so the cut meets every entry.
+			renameSync(filled, capDir);
+			expect(readdirSync(capDir)).toHaveLength(20_000);
 			expect(Date.now()).toBeLessThan(at + captureMs);
 			expect(await until(() => !alive(pid), at + captureMs + 500 + 1_000 - Date.now())).toBe(true);
 			expect(await until(() => p.exitCode !== null, 2_400 + captureMs + 500 + 8_000 - (Date.now() - t0))).toBe(true);
