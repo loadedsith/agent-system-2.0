@@ -5,7 +5,8 @@
 // (PLAN wl-mupu0sx2o046io D8, and its D9 round-limit exception), and the terminal pair ending the
 // lane without a death.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { rmSync, truncateSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	handSettledBody, handSpawnBody, laneBuilderBody, PARK_OPTIONS, reviewParkBody, reviewSameLabBody, reviewWithheldBody,
@@ -17,19 +18,42 @@ import {
 import { gateSession } from "../../gates/src/session";
 import { Ledger, type RoutingOutcome, TEST_RUNNER_BY } from "../../ledger/src/index";
 import orchestratorSurface from "../index";
+import laneToolsRow, { liveVerifierReads, planAutoStartRound, planReviewRefusal, TEST_RUNNER_SCRIPT, type VerifierReads, verifierSelfCheck } from "../extensions/lane-tools";
+import { ensureStandingWorkload } from "../src/identity";
 import { errorLines, reservedStates, waitingReserved } from "../src/errors";
 import { renderWake } from "../src/render";
-import { planAutoStartRound, planReviewRefusal, TEST_RUNNER_SCRIPT } from "../extensions/lane-tools";
 import { apply, interpret } from "../src/input";
 import {
-	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst, planFirstBody, doneBody,
+	CLASSIFIER_MACHINERY_PREFIXES, controlEntries, holdersOf, landFirstBody, landFirstInstructionBody, PLAN_FILE_MAX_BYTES, PLAN_OPTIONS, PLAN_REQUIREMENTS_SHAPE, planApprovedBody, planFirst,
+	planFirstBody, doneBody,
 } from "../src/launch";
-import { testRequestedBody } from "../src/test-run";
+import { type ExecCounts, testRequestedBody, testRunBody } from "../src/test-run";
 import { releasedOpen } from "../src/turn-end";
 import { recordRepo, renderClose } from "../src/decision-log";
 import { openPlanPath } from "../src/plan-paths";
-import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, SURFACE_BY } from "../src/types";
-import { ctxOf, fakePi, notices, tempLedger, tmp } from "./helpers";
+import { ESCALATION_BY, LANE_FULL_TEST_TOOL, LANE_RAISE_QUESTION_TOOL, LANE_READ_FACTS_TOOL, LANE_TOOLS, STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
+import { ctxOf, fakePi, notices, tempLedger, tempRepo, tmp } from "./helpers";
+
+/** Jo's `land-first <repo> on|off` as the surface records it: his instruction, then `land-first:` naming it, on the standing workload. */
+function landFirst(ledger: Ledger, repo: string, on: boolean): void {
+	ensureStandingWorkload(ledger);
+	const id = ledger.recordInstruction({ by: SURFACE_BY, author: "jo", channel: "surface", workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(repo, on) });
+	ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(repo, on, id) });
+}
+/** The runner's main run of `sha` on the standing workload; `exec` sets its counts (believable by default), `by` forges the writer. */
+function mainRun(ledger: Ledger, runId: string, sha: string, verdict: "green" | "red", o: { exec?: ExecCounts; by?: string } = {}): void {
+	ensureStandingWorkload(ledger);
+	const red = verdict === "red";
+	ledger.recordEntry({
+		by: o.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+		body: testRunBody({
+			runId, verdict, sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+			full: { pass: 400, fail: red ? 1 : 0, skip: 0, exit: red ? 1 : 0, ms: 900, error: null }, solo: [],
+			failures: red ? [{ part: "full", name: "x.test.ts > broken", firstError: "error: nope" }] : [], runDir: `/runs/${runId}`, preflight: "ok",
+			scope: "full", main: true, host: "mac", exec: o.exec ?? { files: 40, tests: 400, treeFiles: 40 },
+		}),
+	});
+}
 
 const LANE_MODEL = "anthropic/claude-opus-5-5";
 const OTHER_LAB = "openai-codex/gpt-6-astra";
@@ -77,6 +101,14 @@ const PROMPT_ONLY_LINES = [
 ];
 /** A plan-question body on `path`: one slice line, `promptOnly` lines, one tradeoff, the review line. */
 const bodyOn = (path: string, promptOnly: string[]) => [path, "- sl-1: slice 1, one line", ...promptOnly, "tradeoff: tradeoff 1", REVIEW_LINE].join("\n");
+/**
+ * The holder's `plan-question:` entry for `id` as lane_raise_question writes it (fix round 1, F1): the sha256 of the plan file
+ * and of the verdict file it was checked on. Hashed here with node:crypto, so this file loads on the baseline.
+ */
+const boundPlanQuestion = (id: string, plan = PLAN_FILE, verdict = VERDICT_FILE) => {
+	const sha = (p: string) => createHash("sha256").update(readFileSync(p)).digest("hex");
+	return `plan-question: ${id} plan-sha256 ${sha(plan)} verdict-sha256 ${sha(verdict)}`;
+};
 
 function laneFixture(over: { planFirst?: boolean; mode?: "autonomous" | "user-driven"; exec?: boolean; stakes?: "normal" | "production" } = {}) {
 	const { ledger, path } = tempLedger();
@@ -226,7 +258,7 @@ describe("lane tools: reserved and pushed prefixes are refused and write nothing
 		const before = { entries: ledger.entries(wl).length, held: ledger.workload(wl)!.held_messages, questions: ledger.questions(wl).length };
 		// The scratch lines (PLAN wl-mv5oikd5jtquww § 1.5) are machinery's too: a lane cannot hide its over-cap line with a forged scratch-under-cap:.
 		const scratch = ["scratch-over-cap", "scratch-under-cap", "scratch-disk", "scratch-disk-ok", "scratch-removed", "scratch-remove-failed"];
-		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "superseded", "test-pr", "lane-headroom", ...scratch]) {
+		for (const p of ["launch", "launch-failed", "launch-requested", "lane-started", "lane-ready", "lane-exit", "lane-parked", "lane-stop", "lane-decided", "worktree", "branch", "plan", "done", "artifact-tree", "reserved-withdrawn", "released-open", "plan-question", "test-requested", "test-run", "push-dest", "superseded", "test-pr", "lane-headroom", "queued", "withdrawn", ...scratch]) {
 			expect(await call("lane_record_entry", { body: `${p}: forged` })).toContain(`\`${p}:\` is a reserved control line`);
 			expect(await call("lane_message", { body: `${p}: forged` })).toContain("reserved control line");
 			expect(await call("lane_raise_question", { slice: sl, body: `${p}: forged`, options: ["a", "b"] })).toContain("reserved control line");
@@ -438,6 +470,172 @@ describe("lane_full_test (PLAN wl-muraerdsgw7gn4 § 2.1, § 4)", () => {
 		expect(ledger.entries(wl).length).toBe(before.entries);
 		expect(ledger.workload(wl)!.held_messages).toBe(before.held);
 		expect(ledger.questions(wl).length).toBe(before.questions);
+	});
+});
+
+describe("PLAN wl-mvq4edbaf13vnk D9, R28: lane_full_test on a land-first repo, and the lane extension's self-check", () => {
+	const LINE = "test-run tr-0abc1234wxyz runner 4242 sha " + "a".repeat(40) + " slice sl-full-x-1 log /runs/tr-0abc1234wxyz/runner.log";
+	const G = "c".repeat(40);
+	const OLD = "d".repeat(40);
+	const FAST = 'a fast result is marked fast (`"scope":"fast"` in its test-run record), and a fast green is not a full-suite green: close takes it only after the merge, once a green believable main run holds the merge commit';
+	const TAIL = "The result arrives as an aside; until then work on something else or `sleep 60` in bash.";
+
+	test("the same request reaches the runner whether land-first is on or off, and the result says which result the lane gets", async () => {
+		const { ledger, wl, f, call } = laneFixture({ exec: true });
+		f.execs.answer = () => ({ stdout: `${LINE}\n`, stderr: "", code: 0, killed: false });
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(
+			`${LINE}\nWhether land-first is on could not be read (${wl} has no repo: checkout with a GitHub origin), so this may be the fast check or the full suite; ${FAST}.\n${TAIL}`,
+		);
+		const repo = tempRepo();
+		expect(Bun.spawnSync(["git", "-C", repo, "remote", "add", "origin", "https://github.com/thewolff/agent-system-2.0.git"]).exitCode).toBe(0);
+		recordRepo(ledger, wl, repo);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(`${LINE}\nLand-first is off for thewolff/agent-system-2.0: this is the full suite.\n${TAIL}`);
+		// Jo names the repo by its short name; it is the same repository
+		landFirst(ledger, "agent-system-2.0", true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toBe(
+			`${LINE}\nLand-first is on for thewolff/agent-system-2.0: the runner applies the gate, so this is the fast check when the PR's diff allows it, else the full suite; ${FAST}.\n${TAIL}`,
+		);
+		// another repository's land-first does not turn it on; Jo's later off turns it off
+		landFirst(ledger, "agent-system-2.0", false);
+		landFirst(ledger, "thewolff/other-repo", true);
+		expect(await call(LANE_FULL_TEST_TOOL, { pr: "17" })).toContain("Land-first is off for thewolff/agent-system-2.0: this is the full suite.");
+		const args = [TEST_RUNNER_SCRIPT, "start", wl, "17", "--requested-by", "lane-t-1"];
+		expect(f.execs.calls.map((c) => c.args)).toEqual([args, args, args, args]);
+	});
+
+	/** Reads of a verified root: `/v/c` is verified/current, its HEAD is G, nothing is modified; `over` replaces any read. */
+	const reads = (over: Partial<VerifierReads> = {}): VerifierReads => ({
+		root: () => "/v/c", current: () => "/v/c", ownerRepo: () => "thewolff/agent-system-2.0", head: () => G, modified: () => [], ...over,
+	});
+	/** A ledger with land-first on for agent-system-2.0 and a green believable main verdict on G. */
+	const onLedger = () => {
+		const { ledger } = tempLedger();
+		landFirst(ledger, "agent-system-2.0", true);
+		mainRun(ledger, "tr-0main1", G, "green");
+		return ledger;
+	};
+	const NEXT = "Next: run `install/install.sh --control-root=verified` so lanes load ~/.agent-system-2/verified/current.";
+
+	test("a verified root passes, and so does an older verified release; with land-first off nothing is shown whatever fails", () => {
+		const ledger = onLedger();
+		expect(verifierSelfCheck(ledger, reads())).toBeNull();
+		mainRun(ledger, "tr-0main2", OLD, "green");
+		mainRun(ledger, "tr-0main3", "e".repeat(40), "green");
+		expect(verifierSelfCheck(ledger, reads({ head: () => OLD }))).toBeNull();
+		const broken = reads({ root: () => "/dev/checkout", current: () => null, head: () => "f".repeat(40), modified: () => ["x.ts"] });
+		const { ledger: off } = tempLedger();
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+		landFirst(off, "agent-system-2.0", true);
+		landFirst(off, "agent-system-2.0", false);
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+		// land-first on for another repository leaves this one off
+		landFirst(off, "thewolff/other-repo", true);
+		expect(verifierSelfCheck(off, broken)).toBeNull();
+	});
+
+	test("each failed check is named on one line, and all of them at once on the same line", () => {
+		const ledger = onLedger();
+		const lead = "verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from";
+		expect(verifierSelfCheck(ledger, reads({ current: () => "/v/b" }))).toBe(`${lead} /v/c at ${G.slice(0, 12)}: root /v/c is not verified/current (/v/b). ${NEXT}`);
+		expect(verifierSelfCheck(ledger, reads({ current: () => null }))).toBe(
+			`${lead} /v/c at ${G.slice(0, 12)}: no verified control root: ~/.agent-system-2/verified/current does not exist. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ modified: () => ["surface/src/test-run.ts", "gates/src/rows/r06-reserved.ts"] }))).toBe(
+			`${lead} /v/c at ${G.slice(0, 12)}: tracked files modified: surface/src/test-run.ts, gates/src/rows/r06-reserved.ts. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ root: () => "/dev/checkout", current: () => "/v/c", head: () => OLD, modified: () => ["a.ts"] }))).toBe(
+			`${lead} /dev/checkout at ${OLD.slice(0, 12)}: root /dev/checkout is not verified/current (/v/c); HEAD ${OLD.slice(0, 12)} has no green believable main verdict; tracked files modified: a.ts. ${NEXT}`,
+		);
+	});
+
+	test("HEAD passes only on a green believable verdict: none, red, implausible, red then green, or a lane-written green each fail", () => {
+		const cases: { name: string; seed: (l: Ledger) => void }[] = [
+			{ name: "none", seed: () => {} },
+			{ name: "red", seed: (l) => mainRun(l, "tr-0main9", OLD, "red") },
+			{ name: "implausible", seed: (l) => mainRun(l, "tr-0main9", OLD, "green", { exec: { files: 10, tests: 400, treeFiles: 40 } }) },
+			{
+				name: "red then green",
+				seed: (l) => {
+					mainRun(l, "tr-0main8", OLD, "red");
+					mainRun(l, "tr-0main9", OLD, "green");
+				},
+			},
+			{ name: "lane-written green", seed: (l) => mainRun(l, "tr-0main9", OLD, "green", { by: "lane-t-1" }) },
+		];
+		for (const c of cases) {
+			const ledger = onLedger();
+			c.seed(ledger);
+			expect({ name: c.name, line: verifierSelfCheck(ledger, reads({ head: () => OLD })) }).toEqual({
+				name: c.name,
+				line: `verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from /v/c at ${OLD.slice(0, 12)}: HEAD ${OLD.slice(0, 12)} has no green believable main verdict. ${NEXT}`,
+			});
+		}
+	});
+
+	test("a failed read leaves the check unrun and is named with every other; an unreadable root or origin says land-first's state is unknown", () => {
+		const ledger = onLedger();
+		const boom = (what: string) => () => {
+			throw new Error(what);
+		};
+		const lead = "verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools' self-check could not check their root /v/c:";
+		expect(verifierSelfCheck(ledger, reads({ head: boom("git rev-parse HEAD exited 128: not a git repository"), modified: boom("git status failed") }))).toBe(
+			`${lead} HEAD could not be read: git rev-parse HEAD exited 128: not a git repository; tracked files could not be read: git status failed; ~/.agent-system-2/verified/current's HEAD could not be read: git rev-parse HEAD exited 128: not a git repository. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ head: (at) => (at === "/v/c" ? "not-a-sha" : G) }))).toBe(
+			`${lead} HEAD could not be read: git rev-parse HEAD in /v/c printed "not-a-sha", not a sha; ~/.agent-system-2/verified/current's HEAD could not be read: git rev-parse HEAD in /v/c printed "not-a-sha", not a sha. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ current: boom("EACCES") }))).toBe(`${lead} ~/.agent-system-2/verified/current could not be read: EACCES. ${NEXT}`);
+		expect(verifierSelfCheck(ledger, reads({ root: boom("git rev-parse --show-toplevel exited 128") }))).toBe(
+			`verifier: the lane tools' self-check could not read their own repository (git rev-parse --show-toplevel exited 128), so whether land-first is on for it is unknown. ${NEXT}`,
+		);
+		expect(verifierSelfCheck(ledger, reads({ ownerRepo: () => null }))).toBe(
+			`verifier: the lane tools load from /v/c, which has no GitHub origin, so whether land-first is on for it is unknown and the self-check did not run. ${NEXT}`,
+		);
+	});
+
+	test("at session start a bound lane shows the line once as a warning; a passing root and an unbound session show nothing", async () => {
+		const { ledger, path } = tempLedger();
+		landFirst(ledger, "agent-system-2.0", true);
+		mainRun(ledger, "tr-0main1", G, "green");
+		const wl = ledger.openWorkload({ by: SURFACE_BY, brief: "a lane's work", stakes: "normal", mode: "autonomous" });
+		const bound = { AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_LEDGER_DB: path, AGENT_SYSTEM_WORKLOAD_ID: wl, AGENT_SYSTEM_LANE_ID: "lane-t-1", HOME: "/nonexistent-home" };
+		const start = async (env: Record<string, string>, r: VerifierReads) => {
+			const f = fakePi();
+			laneToolsRow(f.pi, env, r);
+			const before = notices.length;
+			await f.emit("session_start", { type: "session_start" }, ctxOf());
+			return notices.slice(before);
+		};
+		expect(await start(bound, reads({ modified: () => ["a.ts"] }))).toEqual([
+			`verifier: land-first is on for thewolff/agent-system-2.0, but the lane tools load unverified code from /v/c at ${G.slice(0, 12)}: tracked files modified: a.ts. ${NEXT}`,
+		]);
+		expect(await start(bound, reads())).toEqual([]);
+		expect(await start({ AGENT_SYSTEM_LEDGER_DB: path, HOME: "/nonexistent-home" }, reads({ modified: () => ["a.ts"] }))).toEqual([]);
+	});
+
+	test("the live reads: the verified/current symlink resolved or missing, HEAD, the origin, and modified tracked paths with a rename's new name", () => {
+		const repo = tempRepo();
+		const home = tmp("home");
+		const live = liveVerifierReads({ HOME: home });
+		expect(live.current()).toBeNull();
+		mkdirSync(join(home, ".agent-system-2", "verified"), { recursive: true });
+		symlinkSync(repo, join(home, ".agent-system-2", "verified", "current"));
+		expect(live.current()).toBe(repo);
+		const git = (...args: string[]) => {
+			const r = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
+			expect({ args, code: r.exitCode }).toEqual({ args, code: 0 });
+			return r.stdout.toString().trim();
+		};
+		expect(live.head(repo)).toBe(git("rev-parse", "HEAD"));
+		expect(live.ownerRepo(repo)).toBeNull();
+		git("remote", "add", "origin", "git@github.com:thewolff/agent-system-2.0.git");
+		expect(live.ownerRepo(repo)).toBe("thewolff/agent-system-2.0");
+		expect(live.modified(repo)).toEqual([]);
+		writeFileSync(join(repo, "untracked.txt"), "never named\n");
+		writeFileSync(join(repo, "README.md"), "changed\n");
+		git("mv", ".gitignore", "kept.ignore");
+		expect(live.modified(repo).sort()).toEqual(["README.md", "kept.ignore"]);
+		expect(() => live.head(join(home, "nowhere"))).toThrow(/rev-parse HEAD exited/);
 	});
 });
 
@@ -675,7 +873,11 @@ describe("plan review (PLAN D8): the plan question waits for a review by another
 		expect(await ask()).toContain("Raised question");
 		const first = ledger.questions(wl)[0]!.id;
 		seedReview(ledger, wl, planId);
-		expect(await ask()).toContain(planReviewRefusal(planId)); // the previous question is still open
+		// The previous question is still open: the same plan question asked again is that open question, reused (PLAN wl-mvg1vs0rhnu3gg § 1.0).
+		expect(await ask()).toBe(`Question ${first} on ${planId} is already open with this body and options; nothing new was raised. The slice stays paused until Jo answers ${first}.`);
+		expect(ledger.questions(wl)).toHaveLength(1);
+		// A changed plan question while the first is open is refused: it keeps every plan check.
+		expect(await ask(undefined, planId, planBody(3))).toContain(planReviewRefusal(planId));
 		jo(ledger, first, "revise");
 		expect(await ask()).toContain(planReviewRefusal(planId));
 		seedReview(ledger, wl, planId);
@@ -837,7 +1039,7 @@ describe("the plan question's shape (PLAN wl-muq22rnjcfrrpc D7)", () => {
 		const q = ledger.questions(wl)[0]!;
 		expect(q.body).toBe(body);
 		const marker = ledger.entries(wl).at(-1)!;
-		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, `plan-question: ${q.id}`, q.created_at]);
+		expect([marker.kind, marker.created_by, marker.slice_id, marker.body, marker.created_at]).toEqual(["assumption", "lane-t-1", planId, boundPlanQuestion(q.id), q.created_at]);
 	});
 
 	test("control: a plan-slice question without approve is not shape-checked, gets no plan-question: entry, and is cut at 120 on the needs-you line", async () => {
@@ -1041,7 +1243,7 @@ describe("the plan slice moves past a closed one (PLAN wl-muq22rnjcfrrpc D9)", (
 		seedReview(ledger, wl, planId);
 		expect(await ask()).toContain("Raised question");
 		const planQ = ledger.questions(wl).find((q) => q.slice_id === planId)!;
-		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([`plan-question: ${planQ.id}`]);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("plan-question:")).map((e) => e.body)).toEqual([boundPlanQuestion(planQ.id)]);
 	});
 
 	test("D4 control: once the plan is approved, an approve question on another slice is ordinary: raised, no plan-question:, no plan receipt", async () => {
@@ -1466,4 +1668,148 @@ describe("plan auto-start (PLAN wl-mvfkv7llkp7nk0 § 3, R7, R8)", () => {
 			}
 		});
 	}
+
+	test("PLAN wl-mvg1vs0rhnu3gg § 1.0 (R1): an auto-start-eligible plan asked with now: guard goes to Jo tagged NOW and writes no plan: approved auto; the same plan without now starts", async () => {
+		for (const now of ["guard", null]) {
+			const { ledger, wl, planId, call } = await planFixture();
+			endFlowRepair(ledger);
+			passedRound(ledger, wl, planId);
+			tick();
+			const reply = await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], ...(now === null ? {} : { now }) });
+			if (now === null) {
+				expect(reply).toContain("The plan is approved");
+				expect(autoEntries(ledger, wl)).toHaveLength(1);
+				expect(ledger.questions(wl)).toHaveLength(0);
+				continue;
+			}
+			const questions = ledger.questions(wl);
+			expect(questions).toHaveLength(1);
+			const id = questions[0]!.id;
+			expect(reply).toBe(`Raised question ${id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers. It reaches Jo at once, marked NOW (guard).`);
+			expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} guard`, ESCALATION_BY]]);
+			expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+			expect(autoEntries(ledger, wl)).toHaveLength(0);
+			expect(noticesOf(ledger, wl)).toHaveLength(0);
+		}
+	});
+});
+
+/** The `now:` marks on `wl` as [body, writer]; a literal prefix, so this file loads on the baseline. */
+const nowEntries = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("now: ")).map((e) => [e.body, e.created_by]);
+/** The holder's `plan-question:` entries on `wl`. */
+const planQuestions = (ledger: Ledger, wl: string) => ledger.entries(wl).filter((e) => e.body.startsWith("plan-question: ")).map((e) => e.body);
+/** The reply to an ask that repeats the open question `id` on `slice`. */
+const reusedReply = (id: string, slice: string, now?: string) =>
+	`Question ${id} on ${slice} is already open with this body and options; nothing new was raised.${now ? ` It reaches Jo at once, marked NOW (${now}).` : ""} The slice stays paused until Jo answers ${id}.`;
+
+describe("escalation phase 2 through the lane tools (PLAN wl-mvg1vs0rhnu3gg § 1.0, § 3.3, § 3.5; R1, R7)", () => {
+	test("an unknown now word is refused and nothing is written", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_raise_question", { slice: sl, body: "Which header keeps the offset?", options: ["left", "right"], now: "urgent" })).toBe(
+			"`now` is one of integrity, security, incident, guard, boundary, irreversible, money, not urgent; nothing was asked.",
+		);
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(before);
+		expect(ledger.slice(sl)!.state).toBe("open");
+	});
+
+	test("now: security raises a normal-stakes merge question past the merges ruling, with ESCALATION_BY's now: mark and no ruling-applied", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const sl = ledger.addSlice({ by: "lane-t-1", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+		const reply = await call("lane_raise_question", { slice: sl, body: "PR #4 is green; merge it?", options: ["merge", "wait"], now: "security" });
+		const questions = ledger.questions(wl);
+		expect(questions).toHaveLength(1);
+		const id = questions[0]!.id;
+		expect(reply).toBe(`Raised question ${id} on ${sl} (merge / wait); the slice is paused until Jo answers. It reaches Jo at once, marked NOW (security).`);
+		expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} security`, ESCALATION_BY]]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("ruling-applied:"))).toBe(false);
+		expect(ledger.slice(sl)!.state).toBe("paused");
+	});
+
+	test("a plan question with now still needs its review: unreviewed, it is refused with nothing written", async () => {
+		const { ledger, wl, planId, call } = await planFixture();
+		const before = ledger.entries(wl).length;
+		expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(before);
+	});
+
+	test("an unchanged plan question asked twice is the open one, reused: no second question row and no second plan-question:", async () => {
+		const { ledger, wl, planId, ask } = await planFixture();
+		seedReview(ledger, wl, planId);
+		expect(await ask()).toContain("Raised question");
+		const id = ledger.questions(wl)[0]!.id;
+		expect(await ask()).toBe(reusedReply(id, planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+	});
+
+	test("a reviewed production plan: repeated unchanged with no new review it is the same id; repeated with now: guard it gains one trusted now: mark; a changed plan with no fresh review is refused", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture("production");
+		seedReview(ledger, wl, planId);
+		const raised = await ask();
+		const id = ledger.questions(wl)[0]!.id;
+		expect(raised).toBe(`Raised question ${id} on ${planId} (approve / revise / cancel); the slice is paused until Jo answers.`);
+		expect(await ask()).toBe(reusedReply(id, planId));
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		for (let i = 0; i < 2; i++) {
+			tick();
+			expect(await call("lane_raise_question", { slice: planId, body: PLAN_BODY, options: [...PLAN_OPTIONS], now: "guard" })).toBe(reusedReply(id, planId, "guard"));
+		}
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toEqual([[`now: ${id} guard`, ESCALATION_BY]]);
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id)]);
+		expect(ledger.entries(wl).some((e) => e.body.startsWith("plan: approved auto"))).toBe(false);
+		// Changed: one more slice line. No review ran since the open question, so it keeps every check.
+		expect(await ask(undefined, planId, planBody(3))).toContain(planReviewRefusal(planId));
+		expect(await call("lane_raise_question", { slice: planId, body: planBody(3), options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toHaveLength(1);
+	});
+
+	test("fix round 1 (F1): a reviewed plan whose PLAN.md is edited after the raise (R2 made prompt-only), its question bytes unchanged, is refused on repeat with and without now: guard; no now: mark, no new row", async () => {
+		const { ledger, wl, planId, ask, call } = await planFixture("production");
+		const lines = ["# PLAN", "", "## Requirements", "", "- R1: the header offset lives in one token => test surface/test/tokens.test.ts", "- R2: the old constant is gone => test surface/test/tokens.test.ts"];
+		const path = planFile("PLAN-edited.md", lines);
+		const body = bodyOn(path, [NONE_LINE]);
+		seedReview(ledger, wl, planId);
+		expect(await ask(undefined, planId, body)).toContain("Raised question");
+		const id = ledger.questions(wl)[0]!.id;
+		// Unchanged: the repeat is the open question.
+		expect(await ask(undefined, planId, body)).toBe(reusedReply(id, planId));
+		const entries = ledger.entries(wl).length;
+		// The plan file changes under the same path: R2 is now prompt-only, which the body's `prompt-only: none` no longer matches.
+		planFile("PLAN-edited.md", [...lines.slice(0, -1), "- R2: the old constant is gone => prompt-only: no test can see a deleted name"]);
+		expect(await ask(undefined, planId, body)).toContain(planReviewRefusal(planId));
+		tick();
+		expect(await call("lane_raise_question", { slice: planId, body, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		expect(ledger.questions(wl).map((q) => q.id)).toEqual([id]);
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		// The verdict file changing alone is refused the same way, once the plan file is back as it was.
+		planFile("PLAN-edited.md", lines);
+		expect(await ask(undefined, planId, body)).toBe(reusedReply(id, planId));
+		writeFileSync(VERDICT_FILE, "verdict: revise\n");
+		try {
+			tick();
+			expect(await call("lane_raise_question", { slice: planId, body, options: [...PLAN_OPTIONS], now: "guard" })).toContain(planReviewRefusal(planId));
+		} finally {
+			writeFileSync(VERDICT_FILE, "verdict: approve-as-is\n");
+		}
+		expect(nowEntries(ledger, wl)).toEqual([]);
+		expect(ledger.entries(wl)).toHaveLength(entries);
+		// The question's holder entry carries the two hashes the raise checked (the plan file is back as it was then).
+		expect(planQuestions(ledger, wl)).toEqual([boundPlanQuestion(id, path)]);
+	});
+
+	test("a lane message opening with security-red: (the test runner's signal) is refused and nothing is sent", async () => {
+		const { ledger, wl, call } = laneFixture();
+		const held = ledger.workload(wl)!.held_messages;
+		expect(await call("lane_message", { body: `security-red: ${wl} sl-x tr-0abc1234wxyz ${"a".repeat(40)} 1 gates/test/r06-reserved.test.ts > refuses a deploy` })).toBe(
+			"A message opening with `security-red:` is a signal the machinery pushes to Jo; a lane's words must not read as one. Nothing was sent.",
+		);
+		expect(ledger.workload(wl)!.held_messages).toBe(held);
+	});
 });

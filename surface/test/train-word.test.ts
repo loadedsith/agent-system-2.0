@@ -167,12 +167,30 @@ describe("train <N…> opens a merge train (§ 1)", () => {
 		expect(lines[record]).toContain("`merged by train <merge commit sha> (run <id>)`");
 		// the merged / skip / stop question is production's only
 		expect(lines.filter((l) => l.includes("merged / skip / stop"))).toEqual([lines[production]!]);
+		// PLAN wl-mvg8itbt0rz3ls D3 (R9): the production question goes through Jo's rulings; a train-signoff decision is acted on at once
+		const prod = lines[production]!;
+		expect(prod).toContain("goes through Jo's rulings");
+		expect(prod).toContain("`decided by Jo's ruling train-signoff`");
+		expect(prod.indexOf("decided by Jo's ruling train-signoff")).toBeLessThan(prod.indexOf("Otherwise do not wait for it"));
+		for (const s of ["c. to e. with the head a. read", "no question and no wait"]) expect(prod).toContain(s);
+		const rules = lines.find((l) => l.startsWith("Rules: "))!;
+		expect(rules).toContain("a production PR's merge is Jo's: his merged answer, or his ruling train-signoff deciding the question");
+		expect(rules).not.toContain("a production PR's merge is Jo's;");
 		const returning = lines.find((l) => l.startsWith("Returning a PR to its owner"))!;
 		expect(returning).toContain(`${LANE_TRAIN_RETURN_TOOL} { pr: <n>, kind: red | conflict | stack, detail: <absolute path of the detail file> }`);
 		// a red and a conflict go back to the owner; none asks Jo
 		expect(lines[step(4)]).toContain("return the PR with kind `conflict`");
 		expect(lines[step(6)]).toContain("return the PR with kind `red`");
 		for (const old of ["resolve / skip / stop", "rerun / skip / stop", "retarget-done", "merge only by Jo", "owner delivery"]) expect(brief).not.toContain(old);
+	});
+
+	test("step 6's local artifact runs migration-items only; the PR's changed test files are left to lane_full_test outside the fence (jo-issues #240)", () => {
+		const lines = trainBrief("wl-mv8s8srodefytc", [101]).split("\n");
+		const s6 = lines.find((l) => l.startsWith("6. "))!;
+		const artifact = /a bare `(bun test [^`]*)`/.exec(s6)?.[1];
+		expect(artifact).toBe("bun test surface/test/migration-items.test.ts");
+		expect(s6).toContain("lane_full_test");
+		expect(s6).not.toContain("changed test files>");
 	});
 
 	test("the brief returns PRs through lane_train_return and files main-red; train-passed is gone, and the lane's notes are no control prefix", () => {
@@ -841,7 +859,7 @@ describe("the train skip in the close check (§ 1)", () => {
 	/** PR 101 in the close set as `closeFreshness` reads it, its trainSkipped computed from the ledger. */
 	function pr101(ledger: Ledger, wl: string, over: Partial<ClosePr> = {}): ClosePr {
 		return {
-			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A },
+			number: 101, state: "OPEN", headRefName: "feature/x", headSha: SHA_A, result: { runId: "tr-red-1", verdict: "red", sha: SHA_A, scope: "full" },
 			headCompare: null, candidateCompare: null, waivedRun: null, onTrain: false, mergeCommit: null, cover: null, waivedByJo: null,
 			trainSkipped: trainSkippedOf(101, ledger.entries(wl), ledger.questions(wl), ledger.instructions(wl)), ...over,
 		};

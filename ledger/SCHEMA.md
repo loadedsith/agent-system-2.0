@@ -18,10 +18,11 @@ explains it. Ruling: `SPEC-2.0.md` § B2 ("Ruled 2026-09-24").
     followed to its target, then the not-yet-existing rest), so a symlink into a synced folder, a
     synced folder that is itself a symlink, a symlinked `$HOME`, and an existing or dangling
     database symlink are all refused ("… is inside …, a synced folder");
-  - any path whose mount is not local: on macOS, the mount entry for the path's mount point
-    (from `df -P` then `/sbin/mount`) must carry the `local` flag; on Linux, the `/proc/mounts`
-    filesystem type must not be a network type (`nfs`, `cifs`, `smbfs`, `sshfs`, and the rest
-    listed in `locality.ts`). A mount that cannot be determined is refused too.
+  - any path whose mount is not local, judged on the nearest existing ancestor in process (no
+    child process): on macOS, native `statfs` must report the `MNT_LOCAL` flag; on Linux, the
+    `/proc/self/mountinfo` entries of the path's device (`major:minor` of its `st_dev`) must not
+    carry a network filesystem type (`nfs`, `cifs`, `smbfs`, `fuse.sshfs`, and the rest listed in
+    `locality.ts`). A mount that cannot be determined is refused too.
 
   The module then opens the canonical path, so what was checked is what is opened
   (`Ledger#path` is that canonical path).
@@ -138,6 +139,10 @@ time; any other writer may choose any id with the right prefix. A slice a lane d
 hand must also be a valid OMP agent id, `[A-Za-z0-9_-]{1,48}`, because the dispatch's `name` is the
 slice id and OMP would rename anything else (SPEC-2.0.md § B9; the classifier refuses the dispatch);
 the module's generated ids always are (`sl-` plus base36 characters, 17 in 2026).
+
+The suffix calculation reduces a safely representable integer, preserving low-word entropy rather
+than rounding a 64-bit random draw through a JavaScript Number. Six base36 characters remain a
+finite random space, not a uniqueness guarantee; duplicate IDs are still refused by the file.
 
 ### `workloads`
 

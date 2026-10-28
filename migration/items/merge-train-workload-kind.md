@@ -9,6 +9,8 @@ number: 140
 
 **The word.** Typing `train <N> [<N> …]` at the surface opens an autonomous, normal-stakes workload with no plan step. Its brief (`trainBrief`, `surface/src/merge-train.ts`) carries the procedure. A surface-only `train:` entry binds the PRs, the way `test-pr` binds them, so the lane runs `lane_full_test` on them without pushing to them. `train <wl-…> <N> …` adds PRs to an open train and relaunches its lane if none is live. The word refuses: a PR already on the train, a PR on another open train of the same repo (unless Jo skipped it there), a workload that is not a train, and a standing or closed workload. A bare `train`, or `train q-…`, still answers an open question that offers the word.
 
+**Land-first checks.** On repositories with the ledger activation `land-first <repo> on`, `lane_full_test` uses the hosted fast PR gate except for schema, dependency/lockfile and production-stakes exceptions, which require a full Mac suite. The full suite then runs on main after landing; red or unknown main holds further landings. See `migration/items/train-land-first.md` for the unchanged strict `as2/full-suite` ruleset, close coverage, recovery, and activation order. When land-first is off, the train retains its existing full-suite-before-merge behavior.
+
 **The procedure.** One PR at a time:
 - work out the PR's stakes (`merge-train.ts stakes`). Normal means a same-repo `wl/<id>` branch of a normal-stakes workload **and** a main protected by an active ruleset that requires `as2/full-suite` on an up-to-date head (read from `GET /repos/{o}/{r}/rules/branches/main`, which needs no admin). Anything else is production;
 - merge `origin/main` into the PR branch, never rebasing;

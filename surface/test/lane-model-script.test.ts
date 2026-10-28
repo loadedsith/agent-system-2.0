@@ -107,7 +107,7 @@ describe("T1–T3: the runner starts on Jo's model and keeps the session only on
 		expect(starts[0]).toMatchObject({ model: X, ranModel: null, resumeSkipped: null });
 		expect(starts[1]).toMatchObject({ model: X, ranModel: X, resumeSkipped: null });
 		const order = laneSnapshot(r, wl).control.filter((c) => c.laneId === lane1 && c.prefix !== "ctx-index").map((c) => c.prefix);
-		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "spend", "lane-exit"]);
+		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "lane-metrics", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec.pid)).toEqual(["prompt", "eof"]);
 	}, 60_000);
 
@@ -258,10 +258,11 @@ describe("T5c: lane-ready: only just before the first prompt", () => {
 		const realGit = Bun.which("git");
 		if (realGit === null) throw new Error("git is required by the lane fixture");
 		const shim = join(r.root, "bin", "git");
-		// Only the runner's prepare is delayed, not the starter. Its 4s consumes the old
-		// readiness clock before omp exists; the delayed model reply then misses the first poll.
+		// Only the runner's prepare is delayed, not the starter or the child's verifier
+		// self-check in the extension's repository. Its 4s consumes the old readiness clock
+		// before omp exists; the delayed model reply then misses the first poll.
 		writeFileSync(shim, `#!/bin/sh
-if [ -n "$AGENT_SYSTEM_LANE_ID" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
+if [ -n "$AGENT_SYSTEM_LANE_ID" ] && [ "$2" = ${JSON.stringify(r.repo)} ] && [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
   sleep 4
 fi
 exec ${JSON.stringify(realGit)} "$@"

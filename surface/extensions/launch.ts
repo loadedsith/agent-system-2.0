@@ -14,11 +14,15 @@
 // pick`, PLAN wl-mv8k039gvogt8g D6) before the request. The pre-check applies Jev ranking's gate
 // (`rankGate`, D7) as the starter's reservation does, so in `order` / `parallel` a workload ranked
 // below a launchable one is reported queued behind it and no starter runs; in `show` it is `verdictOf`.
+// At cap it runs `preemptFor` (PLAN wl-mv8wzytml878b4 D3): in `order`, a Jo-ruled workload waiting at
+// cap gets a priority stop written on the lowest-ranked running lane below it, told as
+// `priority-pausing <lane> on <wl> for <X>`.
 import type { Ledger } from "../../ledger/src/index";
 import {
-	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
+	byHandLine, JO_HOLDER, LANE_SCRIPT, laneCap, laneModelBody, launchRowsFor, type LaunchVerdict, launchRequestedBody, modelProblem, STARTER_EXIT,
 } from "../src/launch";
-import { rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import { openTrains } from "../src/merge-train";
+import { preemptFor, rankGate, readRankConfig, writePickSnapshot } from "../src/rank-launch";
 import { surfaceSession } from "../src/session";
 import { DUE_PREFIX, LAUNCH_LANE_TOOL, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, type ToolResult } from "../src/types";
 
@@ -27,6 +31,12 @@ const inactive = text("This session is not the orchestrator surface; nothing was
 /** The open and tick line for a workload the rank gate queues behind a higher-ranked launchable one. */
 const queuedLine = (workloadId: string, above: string): string =>
 	`${workloadId} queued behind ${above} (Jev rank); it launches once nothing ranked above it is launchable`;
+/** The open and tick line for a queued workload the intake queue's gate holds behind a launchable one ranked above it (PLAN wl-mvbcjadqgblr7k D5). */
+const intakeQueuedLine = (workloadId: string, position: string): string =>
+	`${workloadId} queued at position ${position} (intake queue, rank order); it launches once no queued workload ranked above it is launchable`;
+/** The open and tick line for a priority stop `preemptFor` wrote (PLAN wl-mv8wzytml878b4 D4). */
+export const priorityPausingLine = (p: { laneId: string; workloadId: string; forWl: string }): string =>
+	`priority-pausing ${p.laneId} on ${p.workloadId} for ${p.forWl}`;
 
 export interface LaunchOutcome {
 	/** The predicate said launch and the starter was run. */
@@ -42,21 +52,31 @@ export interface LaunchOutcome {
  * `requested-by` the starter records. Never throws: an exec failure is a line.
  */
 export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<string, string | undefined>, workloadId: string, who: string): Promise<LaunchOutcome> {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = launchRowsFor(ledger, workloadId, laneCap(env));
 	if (!rows) return { attempted: false, code: null, line: `no workload ${workloadId}` };
-	const verdict = rankGate(ledger, rows, readRankConfig(env));
+	const config = readRankConfig(env);
+	const verdict = rankGate(ledger, rows, config);
 	if (!verdict.launch) {
 		switch (verdict.reason) {
 			case "standing":
 			case "due":
 				return { attempted: false, code: null, line: null };
+			case "withdrawn":
+				return { attempted: false, code: null, line: `${workloadId} was withdrawn by Jo and is awaiting close; nothing launched` };
 			case "user-driven":
 				return { attempted: false, code: null, line: `${workloadId} is user-driven: no lane launches by itself; run it by hand with \`${byHandLine(workloadId)}\`` };
 			case "held":
 				return { attempted: false, code: null, line: `${workloadId} is held by ${rows.workload.holder} (lease until ${rows.workload.holder_lease_until ?? "none"}); nothing launched` };
 			case "cap": {
-				const live = ledger.liveLaneHolders(rows.now).map((l) => `${l.holder} on ${l.workloadId}`);
-				return { attempted: false, code: null, line: `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees` };
+				// Only the lanes the cap counts: an open merge train's lane takes no slot (PLAN wl-mvpsrr4tr0p1xc D1).
+				const live = ledger.liveLaneHolders(rows.now, new Set(openTrains(ledger))).map((l) => `${l.holder} on ${l.workloadId}`);
+				const queued = `${workloadId} queued behind ${live.join(", ")} (cap ${rows.cap}); the tick launches it when a slot frees`;
+				try {
+					const { paused } = preemptFor(ledger, rows.now, rows.cap, config, SURFACE_BY);
+					return { attempted: false, code: null, line: paused ? `${queued}; ${priorityPausingLine(paused)}` : queued };
+				} catch (err) {
+					return { attempted: false, code: null, line: `${queued}; the priority pause check failed: ${String(err)}` };
+				}
 			}
 			case "awaiting-close":
 				return { attempted: false, code: null, line: `${workloadId} is finished and awaiting close: its holder wrote done-because:; nothing launched` };
@@ -65,9 +85,11 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 			case "closed":
 				return { attempted: false, code: null, line: `${workloadId} is closed; nothing launched` };
 			default: {
-				// Jev ranking's refusals (D7): `ranked: below <wl>` and `parallel: <reason>`.
+				// Jev ranking's refusals (D7): `ranked: below <wl>`, `queued: position <n>` (the intake queue) and `parallel: <reason>`.
 				const below = /^ranked: below (\S+)$/.exec(verdict.reason);
 				if (below) return { attempted: false, code: null, line: queuedLine(workloadId, below[1]!) };
+				const position = /^queued: position (\d+)$/.exec(verdict.reason);
+				if (position) return { attempted: false, code: null, line: intakeQueuedLine(workloadId, position[1]!) };
 				return { attempted: false, code: null, line: `${workloadId} held by the parallel rule (Jev rank) — ${verdict.reason.replace(/^parallel: /, "")}; it launches when no lane it would run beside holds it` };
 			}
 		}
@@ -78,8 +100,11 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 		const out = (r.stdout.trim() || r.stderr.trim()).split("\n").filter(Boolean);
 		const last = out[out.length - 1] ?? (r.killed ? "the starter was killed before it printed" : `the starter exited ${r.code} without a line`);
 		// The reservation's own gate run binds: a higher-ranked workload that became launchable after the pre-check queues this one.
-		const below = r.code === STARTER_EXIT["not-launchable"] ? /not launched: ranked: below (\S+)$/.exec(last) : null;
+		const refused = r.code === STARTER_EXIT["not-launchable"] ? last : "";
+		const below = /not launched: ranked: below (\S+)$/.exec(refused);
 		if (below) return { attempted: true, code: r.code, line: queuedLine(workloadId, below[1]!) };
+		const position = /not launched: queued: position (\d+)$/.exec(refused);
+		if (position) return { attempted: true, code: r.code, line: intakeQueuedLine(workloadId, position[1]!) };
 		return { attempted: true, code: r.code, line: r.code === 0 ? `${workloadId}: ${last}` : `${workloadId}: launch failed (starter exit ${r.code}): ${last}` };
 	} catch (err) {
 		return { attempted: true, code: null, line: `${workloadId}: the starter could not be run: ${String(err)}` };
@@ -88,12 +113,12 @@ export async function triggerLaunch(pi: SurfaceAPI, ledger: Ledger, env: Record<
 
 /**
  * The verdict alone, for the tick: whether a launch would be attempted now (the rank gate applied,
- * as `triggerLaunch` applies it), or the workload is awaiting close (the tick closes it). The tick
- * execs only on a launch verdict, so a refused workload — a queued one included — costs one read per
- * poll and no process. Null when there is no such workload.
+ * as `triggerLaunch` applies it), or the workload is awaiting close or withdrawn (the tick closes it).
+ * The tick execs only on a launch verdict, so a refused workload — a queued one included — costs one
+ * read per poll and no process. Null when there is no such workload.
  */
 export function launchVerdict(ledger: Ledger, env: Record<string, string | undefined>, workloadId: string): LaunchVerdict | null {
-	const rows = ledger.launchRows(workloadId, laneCap(env));
+	const rows = launchRowsFor(ledger, workloadId, laneCap(env));
 	return rows && rankGate(ledger, rows, readRankConfig(env));
 }
 

@@ -98,6 +98,25 @@
 // surface's `plan: halted <instruction>` (so `planFirst` reads it unapproved again, change slices are refused, the plan
 // never starts on its own again, and `prStakes` holds its PRs), and a `lane-stop:` request when a lane holds it live.
 // A workload not open, the standing one, or one already halted with no approve since is `refused`, never prose.
+//
+// Withdrawing a workload with no done-because: receipt (PLAN wl-mv8s939084z1ts D1–D4): `withdraw <wl-…>`
+// (exactly one workload id; a line whose second word starts `wl-` is the command or `refused`, at
+// any length, never prose and never a numbered-batch piece) writes Jo's instruction `withdraw <wl>`
+// on the workload, then the surface's `withdrawn: <instruction id>` naming it, in one transaction;
+// the close reads both (`withdrawnBy`) in place of the holder's receipt, and the surface closes the
+// workload right after (surface/extensions/surface-input.ts `closeAfter`). Refused, writing nothing
+// (`withdrawRefusal`, checked again inside `apply`): no such workload, the standing one, one not
+// open, a scheduled `due:` row, any open or paused slice (named), any open question, or a holder
+// under a live lease. Done and cancelled slices are both allowed. Bare `withdraw` and `withdraw
+// <q-…>` keep their question meaning.
+//
+// Land-first activation and main retries (PLAN wl-mvq4edbaf13vnk § 2 Activation, Attempts; D12): `land-first <repo> on|off`
+// writes Jo's instruction `land-first <repo> on|off` and the surface's `land-first:` binding in one transaction.
+// Off also writes `land-first-off-pending:` there: merges stay held until tick revocation completes under the publication mutex.
+// On is refused until § 2's bootstrap holds (`bootstrapRefusal`, surface/src/main-state.ts, read from the standing workload's entries), checked
+// again inside `apply`. `main-retry <repo>` writes Jo's `main-retry <repo>` and the surface's `main-retry: <repo> <instruction
+// id>` the same way; it opens the next attempt block of an exhausted main commit (`mainRetries`). Both words are the command
+// or `refused` with the reason, at any length, never prose.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parkQuestions } from "../../classifier/src/lab";
@@ -115,8 +134,10 @@ import { recordRepo, repoOf } from "./decision-log";
 import { closedReservedRefusal, waitingReserved, wordsOf } from "./errors";
 import {
 	attempts, byHandLine, consumedIds, type ControlEntry, controlEntries, doneBody, heldLive, holdersOf, isPlanQuestionIn, laneStopRequestBody, launchRequestedBody, planApprovedBody, planFirst, planHaltedBody,
-	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody,
+	supersededBody, supersedeInstructionBody, testPrBody, testPrInstructionBody, waivePrBody, waivePrInstructionBody, withdrawInstructionBody, withdrawnBody,
+	LAND_FIRST_WORD, landFirstBody, landFirstInstructionBody, landFirstOffBody, landFirstOffPending, MAIN_RETRY_WORD, mainRetryBody, mainRetryInstructionBody, REPO_WORD_RE,
 } from "./launch";
+import { bootstrapRefusal } from "./main-state";
 import { onOtherTrain, TRAIN_DONE, trainBody, trainBrief, trainHold, trainInstructionBody, trainPrs, trainSlicePr } from "./merge-train";
 import type { Numbering, Target } from "./numbering";
 import { ensureStandingWorkload } from "./identity";
@@ -124,7 +145,7 @@ import { answerOrchestratorQuestion } from "./orchestrator-question";
 import { PAIR_OPTION, type PairSite, pairOfferLine, pairTakenBody, parsePairOffer, shownOptions } from "./pair-suggest";
 import { parseHeartbeat, recordLive, type RunRecord, runDirOf, runsRoot, testRuns } from "./test-run";
 import { pendingWrapperLines } from "./pending";
-import { MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
+import { DUE_PREFIX, MODE_WORDS, STAKES_WORDS, STANDING_WORKLOAD_ID, SURFACE_BY } from "./types";
 
 /** A "which one?" candidate: a needs-you row (`Target`) or, for a bare stakes, mode, `ceiling`, `rounds` or `stop-reviews` word, a workload in view. */
 export type Candidate = Target | { kind: "workload"; workloadId: string };
@@ -150,6 +171,10 @@ export type Command =
 	| { kind: "test-pr"; workloadId: string; prs: number[] }
 	/** `waive-pr <wl-…> <N…>`: Jo waives these merged PR numbers on the workload for the close check. */
 	| { kind: "waive-pr"; workloadId: string; prs: number[] }
+	/** `land-first <repo> on|off`: Jo turns land-first on or off for a repository (PLAN wl-mvq4edbaf13vnk D12). */
+	| { kind: "land-first"; repo: string; on: boolean }
+	/** `main-retry <repo>`: Jo opens the next attempt block of the repository's exhausted main commits (PLAN wl-mvq4edbaf13vnk § 2 Attempts). */
+	| { kind: "main-retry"; repo: string }
 	/** `train <N…>`: Jo opens a merge train on these PRs (`applyTrain`, never `apply`: the open needs the surface's repo). */
 	| { kind: "train"; prs: number[] }
 	/** `train <wl-…> <N…>`: Jo adds these PRs to the open merge train `workloadId`. */
@@ -158,6 +183,8 @@ export type Command =
 	| { kind: "end-ruling"; ruling: RulingId }
 	/** `halt <wl-…>`: Jo stops a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3): plan-first again, its live lane stopped, its PRs held. */
 	| { kind: "halt"; workloadId: string }
+	/** `withdraw <wl-…>`: Jo withdraws the workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1). */
+	| { kind: "withdraw-workload"; workloadId: string }
 	/** A bare word that fits more than one row or workload: refused, never applied. */
 	| { kind: "ambiguous"; word: string; candidates: Candidate[] }
 	/** A command naming a row it cannot take (`deny en-…` for a request no longer waiting): refused with `why`, never applied and never prose. */
@@ -189,8 +216,10 @@ export function runHeartbeat(env: Record<string, string | undefined>): Heartbeat
  * sl-…` names one slice's loop. An answer word (`approve`/`deny`, `withdraw`, an option) alone
  * applies only when it fits exactly one row; fitting several it is `ambiguous`, and the second word
  * (an entry or question id) picks the row. `cancel-slice` and `supersede` always name their rows
- * and are the command or `refused`, never prose; `heartbeatOf` reads a test run's heartbeat for
- * `cancel-slice`'s live-run refusal (the surface passes its own env's).
+ * and are the command or `refused`, never prose; so is a `withdraw` whose second word is a `wl-…`
+ * id, at any length (PLAN wl-mv8s939084z1ts D1), while bare `withdraw` and `withdraw q-…` withdraw
+ * a question as before. `heartbeatOf` reads a test run's heartbeat for `cancel-slice`'s live-run
+ * refusal (the surface passes its own env's).
  */
 export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf = runHeartbeat(process.env)): Command | null {
 	const words = stripTail(text).trim().split(/\s+/);
@@ -215,11 +244,15 @@ export function interpret(ledger: Ledger, text: string, heartbeatOf: HeartbeatOf
 	if (word === EXTEND_WORD && words.length === 2 && /^wl-/i.test(words[1]!)) return extendCommand(ledger, words[1]!);
 	// Always the command or `refused`, at any length, so a long binding never passes as prose.
 	if (word === "test-pr" || word === "waive-pr") return prWordCommand(ledger, word, words.slice(1));
+	if (word === LAND_FIRST_WORD) return landFirstCommand(ledger, words.slice(1));
+	if (word === MAIN_RETRY_WORD) return mainRetryCommand(words.slice(1));
 	// The command or `refused` at any length, except `train` alone and `train <q-…>`, which fall through to the answer path.
 	if (word === "train") {
 		const c = trainCommand(ledger, words.slice(1));
 		if (c) return c;
 	}
+	// PLAN wl-mv8s939084z1ts D1: `withdraw wl-…` is the command or `refused` at any length; bare `withdraw` and `withdraw q-…` go on below.
+	if (word === "withdraw" && /^wl-/i.test(words[1] ?? "")) return withdrawWorkloadCommand(ledger, words.slice(1));
 	if (words.length === 0 || words.length > 2) return null;
 	const arg = words[1];
 	const target = (): string | null => (arg && view.includes(arg) ? arg : view.length === 1 ? view[0]! : null);
@@ -315,12 +348,16 @@ export type BatchResult = { ok: true; items: BatchItem[] } | { ok: false; lines:
 
 /**
  * The words a single-line command may run to: `ceiling <usd> [<hours>] [wl-…]` is four, `rounds <n> [wl-…]` and
- * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]` and
- * `train [<wl-…>] <N> [<N> …]` any number (`interpret` refuses past `TEST_PR_MAX`), everything else two.
+ * `supersede <wl-A> <wl-B>` three, `test-pr <wl-…> <N> [<N> …]`, `waive-pr <wl-…> <N> [<N> …]`,
+ * `train [<wl-…>] <N> [<N> …]`, `withdraw wl-…` (PLAN wl-mv8s939084z1ts D1), `land-first …` and `main-retry …` any number
+ * (`interpret` refuses past `TEST_PR_MAX`, `withdraw` past one id, and the land-first words past their shape), everything else two.
  */
 export function maxWords(text: string): number {
-	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
-	return long === "ceiling" ? 4 : long === "rounds" || long === "supersede" ? 3 : long === "test-pr" || long === "waive-pr" || long === "train" ? Number.POSITIVE_INFINITY : 2;
+	if (/^withdraw\s+wl-/i.test(text)) return Number.POSITIVE_INFINITY;
+	const long = /^(ceiling|rounds|supersede|test-pr|waive-pr|train|land-first|main-retry)(?:\s|$)/i.exec(text)?.[1]!.toLowerCase() ?? null;
+	if (long === "ceiling") return 4;
+	if (long === "rounds" || long === "supersede") return 3;
+	return long === null ? 2 : Number.POSITIVE_INFINITY;
 }
 
 /** Could `text` (one line, trimmed) be a command: a numbered batch (a train word inside one included, to be refused), or short enough for a word command. A false means prose, with no ledger read. */
@@ -476,7 +513,7 @@ function looseWorkloadPair(text: string): boolean {
 	return workloadWord && words.length === 2 && !/^wl-/i.test(words[1]!) && !ANSWER_ID.test(words[1]!);
 }
 
-/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels, the workload it supersedes or halts, or the ruling it ends; else null. */
+/** What a command resolves, for the once-per-row check across a paste: the question it answers or withdraws, the reserved request it decides, the slice it cancels, the workload it supersedes, withdraws or halts, or the ruling it ends; else null. */
 function resolves(cmd: Command): string | null {
 	switch (cmd.kind) {
 		case "answer":
@@ -487,6 +524,7 @@ function resolves(cmd: Command): string | null {
 		case "cancel-slice":
 			return cmd.sliceId;
 		case "supersede":
+		case "withdraw-workload":
 			return cmd.workloadId;
 		case "end-ruling":
 			return cmd.ruling;
@@ -576,7 +614,8 @@ export function interpretPaste(ledger: Ledger, numbering: Numbering, text: strin
 		if (id === null) return null;
 		if (first[id] !== undefined) {
 			const done =
-				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "end-ruling" ? "ended" : cmd.kind === "halt" ? "halted" : "answered";
+				cmd.kind === "reserved" ? "decided" : cmd.kind === "cancel-slice" ? "cancelled" : cmd.kind === "supersede" ? "superseded" : cmd.kind === "withdraw-workload" ? "withdrawn"
+				: cmd.kind === "end-ruling" ? "ended" : cmd.kind === "halt" ? "halted" : "answered";
 			return `${id} is already ${done} on ${first[id]}; once per row`;
 		}
 		first[id] = where;
@@ -839,6 +878,38 @@ function supersedeCommand(ledger: Ledger, rest: readonly string[]): Command {
 	return why === null ? { kind: "supersede", workloadId: a, by: b } : { kind: "refused", why };
 }
 
+/**
+ * Why `withdraw <wl>` cannot withdraw the workload as the ledger stands (PLAN wl-mv8s939084z1ts D2), or null: it exists,
+ * is not the standing workload, is open, is no scheduled `due:` row (closed with its receipt through the close tool),
+ * has no open or paused slice and no open question (one refusal names every one: a question always pauses its slice), and
+ * no holder holds it under a live lease. Done and cancelled slices are both allowed, and so is no slice at all. `apply`
+ * checks it again inside its transaction.
+ */
+function withdrawRefusal(ledger: Ledger, wl: string): string | null {
+	if (wl === STANDING_WORKLOAD_ID) return "the standing workload is never withdrawn";
+	const w = ledger.workload(wl);
+	if (!w) return `no workload ${wl}`;
+	if (w.status !== "open") return `${wl} is ${w.status}: only an open workload is withdrawn`;
+	if (w.brief.startsWith(DUE_PREFIX)) return `${wl} is a scheduled row: close it with its receipt through the close tool`;
+	const live = ledger.slices(wl).filter((s) => s.state === "open" || s.state === "paused").map((s) => `${s.id} (${s.state})`);
+	const asked = ledger.questions(wl).filter((q) => q.state === "open").map((q) => q.id);
+	if (live.length > 0 || asked.length > 0) {
+		const questions = asked.length === 0 ? [] : [`open question${asked.length === 1 ? "" : "s"} ${asked.join(", ")}`];
+		const what = [...(live.length === 0 ? [] : [live.join(", ")]), ...questions].join(" and ");
+		return `${wl} has ${what}: cancel-slice each first (it withdraws the slice's questions too); only a workload with no open or paused slice and no open question is withdrawn`;
+	}
+	if (heldLive(w, ledger.now())) return `${wl} is held by ${w.holder} under a live lease: stop it first (as2 lane stop ${wl})`;
+	return null;
+}
+
+/** `withdraw <wl-…>` after the word (PLAN wl-mv8s939084z1ts D1): exactly one workload id, `withdrawRefusal` clear; anything else is `refused` with the reason, never prose. */
+function withdrawWorkloadCommand(ledger: Ledger, rest: readonly string[]): Command {
+	if (rest.length !== 1 || !/^wl-\S+$/i.test(rest[0]!)) return { kind: "refused", why: "withdraw names one workload: withdraw wl-…" };
+	const wl = rest[0]!;
+	const why = withdrawRefusal(ledger, wl);
+	return why === null ? { kind: "withdraw-workload", workloadId: wl } : { kind: "refused", why };
+}
+
 /** Why `end-ruling <id>` cannot apply, or null: the id names a standing ruling Jo has not ended. `apply` checks it again. */
 function endRulingRefusal(ledger: Ledger, id: string): string | null {
 	if (!isRulingId(id)) return `${id} is no standing ruling (${STANDING_RULINGS.map((r) => r.id).join(", ")})`;
@@ -851,6 +922,29 @@ function endRulingCommand(ledger: Ledger, rest: readonly string[]): Command {
 	const id = rest[0]!.toLowerCase();
 	const why = endRulingRefusal(ledger, id);
 	return why === null ? { kind: "end-ruling", ruling: id as RulingId } : { kind: "refused", why };
+}
+
+/** Why `land-first <repo> on` cannot apply, or null: § 2's bootstrap holds (`bootstrapRefusal`). `off` always applies. `apply` checks it again. */
+function landFirstRefusal(ledger: Ledger, repo: string, on: boolean): string | null {
+	if (!on) return null;
+	const reasons = bootstrapRefusal(ledger.entries(STANDING_WORKLOAD_ID));
+	return reasons.length === 0 ? null : `land-first ${repo} on waits for the bootstrap (PLAN wl-mvq4edbaf13vnk § 2): ${reasons.join("; ")}`;
+}
+
+/** `land-first <repo> on|off` after the word: a repository and `on` or `off`, `landFirstRefusal` clear; anything else is `refused` with the reason, never prose. */
+function landFirstCommand(ledger: Ledger, rest: readonly string[]): Command {
+	const state = rest[1]?.toLowerCase();
+	if (rest.length !== 2 || !REPO_WORD_RE.test(rest[0]!) || (state !== "on" && state !== "off")) {
+		return { kind: "refused", why: `${LAND_FIRST_WORD} names one repository and on or off: ${LAND_FIRST_WORD} <repo> on|off` };
+	}
+	const why = landFirstRefusal(ledger, rest[0]!, state === "on");
+	return why === null ? { kind: "land-first", repo: rest[0]!, on: state === "on" } : { kind: "refused", why };
+}
+
+/** `main-retry <repo>` after the word: one repository; anything else is `refused` with the reason, never prose. */
+function mainRetryCommand(rest: readonly string[]): Command {
+	if (rest.length !== 1 || !REPO_WORD_RE.test(rest[0]!)) return { kind: "refused", why: `${MAIN_RETRY_WORD} names one repository: ${MAIN_RETRY_WORD} <repo>` };
+	return { kind: "main-retry", repo: rest[0]! };
 }
 
 /** Jo's word that halts a workload's plan (PLAN wl-mvfkv7llkp7nk0 § 3). */
@@ -1360,6 +1454,29 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 				return `Jo's ruling ${cmd.ruling} is ended (instruction ${id}); its questions go to you again`;
 			});
 		}
+		case "land-first": {
+			// Raw word and pending off marker commit together; acknowledgement is not revocation completion.
+			return ledger.write(() => {
+				const why = landFirstRefusal(ledger, cmd.repo, cmd.on);
+				if (why !== null) throw new Error(why);
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: landFirstInstructionBody(cmd.repo, cmd.on) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstBody(cmd.repo, cmd.on, id) });
+				if (!cmd.on) ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: landFirstOffBody(cmd.repo, "pending", id) });
+				const pending = landFirstOffPending(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), cmd.repo);
+				if (pending.length > 0) return `land-first ${cmd.on ? "on" : "off"} requested for ${cmd.repo} (instruction ${id}); off reconciliation pending: merges held until the tick revokes fast/tree successes`;
+				return `land-first is on for ${cmd.repo} (instruction ${id})`;
+			});
+		}
+		case "main-retry": {
+			// Jo's instruction, then the surface's `main-retry:` naming it, on the standing workload in one transaction (`mainRetries`).
+			return ledger.write(() => {
+				ensureStandingWorkload(ledger);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: STANDING_WORKLOAD_ID, body: mainRetryInstructionBody(cmd.repo) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body: mainRetryBody(cmd.repo, id) });
+				return `main runs of ${cmd.repo} may retry: an exhausted main commit's next block of 3 attempts is open (instruction ${id})`;
+			});
+		}
 		case "halt": {
 			// Jo's instruction, the surface's `plan: halted <instruction>`, and a stop request to a lane holding it live, in one write.
 			return ledger.write(() => {
@@ -1374,6 +1491,17 @@ export function apply(ledger: Ledger, cmd: Command, heartbeatOf: HeartbeatOf = r
 					stop = `; stop requested of ${w.holder} (it accepts at its next poll)`;
 				}
 				return `${cmd.workloadId} is halted (instruction ${id}): its plan needs your approve again, change slices are refused and the train holds its PRs${stop}`;
+			});
+		}
+		case "withdraw-workload": {
+			// PLAN wl-mv8s939084z1ts D2, D3: refusal re-checked, then Jo's instruction and the surface's `withdrawn:` naming it, in one
+			// transaction; the close reads both (`withdrawnBy`) in place of a done-because: receipt.
+			return ledger.write(() => {
+				const why = withdrawRefusal(ledger, cmd.workloadId);
+				if (why !== null) throw new Error(why);
+				const id = ledger.recordInstruction({ ...stamp, workloadId: cmd.workloadId, body: withdrawInstructionBody(cmd.workloadId) });
+				ledger.recordEntry({ by: SURFACE_BY, workloadId: cmd.workloadId, kind: "assumption", body: withdrawnBody(id) });
+				return `withdrew ${cmd.workloadId} (instruction ${id}); closing it with no done-because: receipt`;
 			});
 		}
 		case "ambiguous":

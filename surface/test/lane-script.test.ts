@@ -131,7 +131,7 @@ describe("lane script: launch, run, log, cleanup against the fake omp", () => {
 		// lane-decided: before EOF (item 40, wl-mv049108m8whds), the final spend: before the exit
 		// (the ctx index's entries follow the exit from a detached worker; the ctx index scenario below orders them)
 		const order = snap.control.filter((c) => c.laneId === laneId && c.prefix !== "ctx-index").map((c) => c.prefix);
-		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "spend", "lane-exit"]);
+		expect(order).toEqual(["launch", "lane-started", "lane-started", "lane-ready", "lane-decided", "lane-metrics", "spend", "lane-exit"]);
 		expect(eventsOf(r, rec!.pid)).toEqual(["prompt", "eof"]);
 		expect(readFileSync(rec!.session!, "utf8")).toContain(`You are lane ${laneId} on workload ${wl}.`);
 		expect(snap.bodies).toContain(`${laneId} done-because: the probe is done`);
@@ -452,7 +452,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const stops = snap.control.filter((c) => c.prefix === "lane-stop" && c.laneId === laneId);
 		expect(stops.map((s) => s.createdBy)).toEqual([LANE_STARTER_BY, LANE_RUNNER_BY]);
 		expect(stops[1]!.rest).toBe(`accepted ${stops[0]!.id}`);
-		expect(snap.control.filter((c) => c.prefix !== "ctx-index").map((c) => c.prefix).slice(-4)).toEqual(["lane-stop", "lane-stop", "spend", "lane-exit"]);
+		expect(snap.control.filter((c) => c.prefix !== "ctx-index").map((c) => c.prefix).slice(-5)).toEqual(["lane-stop", "lane-stop", "lane-metrics", "spend", "lane-exit"]);
 		// abort, then EOF, then the kill: omp saw both frames and outlived them until the grace ran out
 		expect(eventsOf(r, started.pid)).toEqual(["prompt", "abort", "eof"]);
 		expect(ms).toBeGreaterThanOrEqual(1500);
@@ -464,7 +464,8 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const r = makeRoot();
 		const { wl } = openWorkload(r, { slice: true });
 		setScript(r, { steps: [{ hang: true }] });
-		expect(lane(r, ["launch", wl, "--requested-by", "test"]).code).toBe(0);
+		const launched = lane(r, ["launch", wl, "--requested-by", "test"]);
+		expect({ code: launched.code, err: launched.err }).toMatchObject({ code: STARTER_EXIT.ok });
 		const laneId = laneIdOf(wl, 1);
 		await readyOf(r, wl, laneId);
 		const started = (await startedOf(r, wl, laneId))!;
@@ -657,6 +658,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		const code = await tui.exited;
 		tui.stdin.end();
 		expect(code).toBe(0);
+		expect(eventsOf(r, started.pid)).toContain("sigterm");
 		const snap = laneSnapshot(r, wl);
 		expect(snap.bodies.filter((b) => b.includes(`lane-exit: ${laneId} `))).toEqual([`${LANE_STARTER_BY} ${laneExitBody(laneId, { code: null, signal: null, outcome: "stop", reason: "by-hand" })}`]);
 		expect(laneExit(snap.control, laneId)).toMatchObject({ outcome: "stop", reason: "by-hand" });
@@ -684,6 +686,7 @@ describe("lane script: every exit is classified (decision 14; Codex review B1, B
 		process.kill(started.pid, "SIGTERM");
 		await tui.exited;
 		tui.stdin.end();
+		expect(eventsOf(r, started.pid)).toContain("sigterm");
 		const snap = laneSnapshot(r, wl);
 		expect(snap.control.filter((c) => c.prefix === "lane-exit" && c.laneId === laneId)).toHaveLength(1);
 		expect(laneExit(snap.control, laneId)).toMatchObject({ code: "0", outcome: "stop", reason: "by-hand" });
@@ -1548,10 +1551,8 @@ describe("item 71: a queued launch starts when a lane slot frees (the runner's d
 		const recB = fakeRecords(r).find((x) => x.env?.AGENT_SYSTEM_WORKLOAD_ID === b)!;
 		expect(recB.env).toMatchObject({ AGENT_SYSTEM_ROLE: "lane", AGENT_SYSTEM_WORKLOAD_ID: b, AGENT_SYSTEM_LANE_ID: laneB });
 		const pid = await drainSettled(r, laneA);
-		// show (no jevRank in the profile): the pick is today's, and the drain logs what `order` would have tried (PLAN wl-mv8k039gvogt8g D7)
-		expect(drainLinesOf(r, pid).map((l) => l.replace(/: .*$/, ""))).toEqual([
-			`start ${pid} after ${a}`, `rank-shadow ${pid} picked ${b} ranked-would ${b} parallel start`, `attempt ${pid} ${b} exit 0`, `end ${pid} attempts 1`,
-		]);
+		// order (no jevRank in the profile reads order since PLAN wl-mv8wzytml878b4 D2): the drain walks the rank and logs no rank-shadow line
+		expect(drainLinesOf(r, pid).map((l) => l.replace(/: .*$/, ""))).toEqual([`start ${pid} after ${a}`, `attempt ${pid} ${b} exit 0`, `end ${pid} attempts 1`]);
 	}, 60_000);
 
 	test("control, cap 1: C has an earlier attempt and no cause; A's lane exits and C is not launched", async () => {

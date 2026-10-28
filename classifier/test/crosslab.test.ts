@@ -24,7 +24,7 @@ import { SURFACE_BY } from "../../surface/src/types";
 import { asyncDelivery, currentModel, DEFAULT_LANE_MODEL, dist, fakeRegistry, recordedQuestion } from "./helpers";
 
 const ROWS = {
-	fast: ["anthropic/claude-haiku-4-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
+	fast: ["anthropic/claude-haiku-5-5", "openai-codex/gpt-5.6-luna", "moonshot/kimi-k2.7-code-highspeed"],
 	standard: ["anthropic/claude-sonnet-5-5", "openai-codex/gpt-6-luna", "moonshot/kimi-k2.5"],
 	strong: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-sol", "moonshot/kimi-k2.7-code"],
 	deep: ["anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra", "moonshot/kimi-k3"],
@@ -2395,6 +2395,27 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		}
 	});
 
+	test("Anthropic weekly overpace below .70 does not withhold Sonnet at dispatch or settlement", async () => {
+		for (const windowId of ["7d", "1w"]) {
+			usePolls(poll(1, [
+				{ windowId: "5h", used: 0.1, resetsIn: 4 * HOUR },
+				{ windowId, used: 0.69, resetsIn: 5 * 24 * HOUR },
+				{ windowId, tier: "sonnet", used: 0.69, resetsIn: 5 * 24 * HOUR },
+			]));
+			// Put Sonnet first in this change-large row; admission must preserve both Anthropic entries.
+			const table = tierTableFromConfig({ task: { agentModelOverrides: { ...ROWS, standard: ROWS.standard.slice(1), strong: [SONNET, OPUS, SOL, KIMI] } } });
+			const w = world({ table });
+			const h = lane(w, { laneModel: SONNET });
+			const build = await settled(h, w, "sl-work", "change the loader", SONNET, "c1");
+			expect(build.spawn?.model).toEqual([SONNET, OPUS]);
+			expect(build.spawn?.note ?? "").not.toContain("retained");
+			expect(build.result).toBeUndefined();
+			expect(bodies(w, "headroom-skip:")).toEqual([]);
+			expect(bodies(w, "hand-spawn:")).toEqual([expect.stringContaining(` row ${SONNET},${OPUS}`)]);
+			expect(questions(w)).toEqual([]);
+		}
+	});
+
 	test("anthropic 5h at 0.85: a build on an anthropic lane is refused naming 0.85, with one headroom-skip: per anthropic entry", async () => {
 		usePolls(poll(1, FIVE_HOUR_085));
 		// Two anthropic entries in the strong row (Sonnet moved up from standard: a model sits in one tier).
@@ -2451,13 +2472,13 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		expect(bodies(w, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${OPUS} token dt-\\S+ ${OUT_085}$`))]);
 	});
 
-	test("anthropic 7d fable at 0.99, burning, reset days away: an Opus build still spawns; only a Fable build is refused", async () => {
+	test("anthropic 7d fable actually exhausted at 1.00: an Opus build still spawns; only a Fable build is refused", async () => {
 		const fable = (used: number): Limit => ({ windowId: "7d", tier: "fable", used, resetsIn: 4 * 24 * HOUR });
 		const shared: Limit[] = [
 			{ windowId: "5h", used: 0.1, resetsIn: 2 * HOUR },
 			{ windowId: "7d", used: 0.3, resetsIn: 4 * 24 * HOUR },
 		];
-		usePolls(poll(121, [...shared, fable(0.9)]), poll(1, [...shared, fable(0.99)]));
+		usePolls(poll(121, [...shared, fable(0.9)]), poll(1, [...shared, fable(1)]));
 		const w = world();
 		const h = lane(w);
 		h.laneMessage(OPUS);
@@ -2473,8 +2494,8 @@ describe("quota headroom at hand spawns (PLAN wl-mv71x5rwdu7eo0 § 3)", () => {
 		const out = await g.toolCall({ agent: "strong", name: "sl-work", task: brief(f, "change the loader") }, "c1");
 		const spawn = await g.spawn(out!.input.agent, "sl-work");
 		expect(spawn?.block).toBe(true);
-		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 0.99 used, window pace +`);
-		expect(bodies(f, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${FABLE} token dt-\\S+ anthropic 7d fable 0\\.99 used`))]);
+		expect(spawn?.reason).toContain(`${FABLE} (projected out: anthropic 7d fable 1.00 used, window pace +`);
+		expect(bodies(f, "headroom-skip:")).toEqual([expect.stringMatching(new RegExp(`^headroom-skip: ${FABLE} token dt-\\S+ anthropic 7d fable 1\\.00 used`))]);
 	});
 
 	test("stale polls (newest 30 min old) with anthropic 5h at 0.85: nothing is skipped", async () => {

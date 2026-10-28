@@ -56,22 +56,25 @@
 // Jev rank (PLAN wl-mv8k039gvogt8g D5, D6): every render but a one-workload read carries the rank line under needs-you (surface/src/render.ts
 // `rankLines`, stored rows only, labelled with the rank mode in force), and every tick tries the weekly audit
 // (surface/src/rank-audit.ts `runAudit`), which never throws out of the tick.
+import { join } from "node:path";
 import { CONTRACT_MARKER, contractPath, injectContract } from "../../gates/src/rows/r02-contract";
 import { BACK_HEADING, countLine, lineKey, NEEDS_YOU_HEADING, onFire, pendingText, present, QUIET_HEADING, surfaceWord } from "../src/batch";
 import { consumeAllToOrchestrator, consumeLines, needsYouBlock } from "../src/delivery";
 import { type ErrorLine, errorLines } from "../src/errors";
+import { notifyAnthropicWeek } from "../src/headroom-notice";
 import { ensureStandingWorkload } from "../src/identity";
 import { linkTerminal } from "../src/linked-api";
+import { laneCap } from "../src/launch";
 import { withPlanPathsOrWarn } from "../src/plan-paths";
 import { renderWake } from "../src/render";
 import { trainMembers } from "../src/merge-train";
 import { RANK_AUDIT_DIR, runAudit } from "../src/rank-audit";
-import { readRankConfig } from "../src/rank-launch";
+import { preemptFor, readRankConfig } from "../src/rank-launch";
 import { type SurfaceSession, surfaceSession, voiceInPrompt, voiceSection, type WakeTrigger } from "../src/session";
 import { recordLapsedLeases } from "../src/signals";
 import type { ResultTextConstructor, ResultTextLoader } from "../src/types";
 import { type Ctx, HOLD_HOURS, type HostMessage, LEDGER_TOOL, PUSH_TRIES, STANDING_WORKLOAD_ID, type SurfaceAPI, SURFACE_BY, WAKE_READ_TOOL } from "../src/types";
-import { launchVerdict, triggerLaunch } from "./launch";
+import { launchVerdict, priorityPausingLine, triggerLaunch } from "./launch";
 import { showPending } from "./surface-input";
 import { closeWorkloadWithEntry } from "./workload";
 
@@ -90,11 +93,18 @@ function tick(s: SurfaceSession, ctx: Ctx, line: string): void {
 	s.tickNotices.push(planned(s, ctx, line));
 }
 
+/** Use this surface's injected environment, never the classifier reader's ambient poll default. */
+function observeHeadroom(s: SurfaceSession, now: string): void {
+	const path = s.env.AS2_HEADROOM_POLLS || join(s.env.HOME || "/", "agent-scratch", "agent-system-2.0", "quota-watch", "polls.jsonl");
+	notifyAnthropicWeek(s.ledger(), { now: Date.parse(now), path });
+}
+
 /** The lines owed now, after this read's own writes (lapsed leases persisted as lane-died rows), numbered with the session's numbering. */
 function readLines(s: SurfaceSession): ErrorLine[] {
 	const ledger = s.ledger();
 	const now = s.now();
 	recordLapsedLeases(ledger, SURFACE_BY, now);
+	observeHeadroom(s, now);
 	return s.numbering.assign(errorLines(ledger, ledger.inFlight(), { now, holdHours: HOLD_HOURS }));
 }
 
@@ -172,6 +182,7 @@ function renderWakeTurn(s: SurfaceSession, ctx: Ctx, trigger: WakeTrigger, ticks
 		ensureStandingWorkload(ledger);
 		const now = s.now();
 		recordLapsedLeases(ledger, SURFACE_BY, now);
+		observeHeadroom(s, now);
 		const rendered = renderWake(ledger, { trigger, holdHours: HOLD_HOURS, now, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 		text = planned(s, ctx, rendered.text);
 		s.delivered.take(rendered.lines);
@@ -275,6 +286,7 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 			}
 			const now = s.now();
 			recordLapsedLeases(ledger, SURFACE_BY, now);
+			observeHeadroom(s, now);
 			const rendered = renderWake(ledger, { heading: `read on demand${wl ? `: ${wl}` : ""}`, holdHours: HOLD_HOURS, now, workloadId: wl, numbering: s.numbering, rankMode: readRankConfig(s.env).mode });
 			s.delivered.take(rendered.lines);
 			unhold(s, rendered.lines);
@@ -384,7 +396,8 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * The tick catch-up (DESIGN-lane-launcher.md decision 7): every open workload the predicate says
 	 * to launch now gets one starter run, so a resolution or a cap slot that arrived with nobody
 	 * typing does not wait for Jo's next turn. A workload the predicate refuses as `awaiting-close`
-	 * (its holder's `done-because:` stands, nobody holds it) with no open or paused slice and no open
+	 * (its holder's `done-because:` stands, nobody holds it) or as `withdrawn` (Jo's `withdraw <wl>`
+	 * stands, PLAN wl-mv8s939084z1ts D6, in either mode) with no open or paused slice and no open
 	 * question is closed through the close tool's own path (`closeWorkloadWithEntry`, decision 13:
 	 * the entry committed, the close stamped as the surface); one that still has an open or paused
 	 * slice or an open question is told once as "finished but cannot close", again only when its
@@ -393,17 +406,27 @@ export default function wakeRow(pi: SurfaceAPI, env: Record<string, string | und
 	 * (`s.refusedClose`), cleared when the workload closes or stops being ready to close. Runs after
 	 * the poll persisted lapsed leases; one catch-up at a time; a line per attempt goes to the tick's
 	 * queue, pushed when the catch-up ends. The session's `cwd` is the close tool's fallback repository.
+	 * A withdrawn close the word could not finish (a git failure, an open PR Jo then closes) completes
+	 * here on a later poll with no new word.
+	 * Before the per-workload loop, `preemptFor` runs once (PLAN wl-mv8wzytml878b4 D3): in `order`, a
+	 * Jo-ruled workload waiting at cap gets one priority stop on the lowest-ranked running lane below it.
 	 */
 	const catchUp = async (s: SurfaceSession, ctx: Ctx): Promise<void> => {
 		if (s.launching || !pi.exec) return;
 		s.launching = true;
 		try {
 			const ledger = s.ledger();
+			try {
+				const pause = preemptFor(ledger, ledger.now(), laneCap(env), readRankConfig(env), SURFACE_BY).paused;
+				if (pause) tick(s, ctx, `tick: ${priorityPausingLine(pause)}`);
+			} catch (err) {
+				tick(s, ctx, `tick: the priority pause check failed: ${String(err)}`);
+			}
 			for (const w of ledger.inFlight()) {
 				const id = w.workload.id;
 				if (id === STANDING_WORKLOAD_ID) continue;
 				const verdict = launchVerdict(ledger, env, id);
-				if (verdict?.launch === false && verdict.reason === "awaiting-close") {
+				if (verdict?.launch === false && (verdict.reason === "awaiting-close" || verdict.reason === "withdrawn")) {
 					const { open_slices: open, paused_slices: paused, open_questions: questions } = w.workload;
 					if (open > 0 || paused > 0 || questions > 0) {
 						s.refusedClose.delete(id);

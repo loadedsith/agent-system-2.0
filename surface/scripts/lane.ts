@@ -8,7 +8,7 @@
 //                                        system prompt, spawn `run` detached; prints `lane <laneId> runner <pid>`
 //   run <wl> <laneId>                    the runner: one `omp --mode rpc --no-ui` child, the first prompt and
 //                                        up to CONTINUE_LIMIT continue prompts on it, lane-started:/lane-ready:/
-//                                        lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
+//                                        lane-metrics:/lane-exit:, the turn-end decision once omp is settled (src/turn-end.ts),
 //                                        stop requests, its own deadline and the ceiling meter (spend:, the 80 %
 //                                        notice, the 100 % stop and its notice) polled every STOP_POLL_MS. It first takes the
 //                                        lane id's run lock (takeRunnerLock, one owner per lane id) and then checks
@@ -48,7 +48,7 @@
 // `ctx-index`, which writes as the one its `--by` names. `drain` writes nothing itself: its starters write as `lane-starter`.
 // Exit codes for launch/interactive: surface/src/launch.ts STARTER_EXIT.
 import { type Subprocess, spawn, spawnSync } from "bun";
-import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { headroom } from "../../classifier/src/headroom";
 import { loadTierTable, modelIdentity } from "../../classifier/src/tier-table";
@@ -68,12 +68,12 @@ import { newLaneSession, runCtxIndex, topLevelSessions } from "../src/ctx-index"
 import { decisionLogContext, repoOf } from "../src/decision-log";
 import { factsBlock } from "../src/facts";
 import { loadTestRunnerConfig } from "../src/close-entry";
-import { checkoutOwnerRepo, isTrainOrFix, ownerTasks } from "../src/merge-train";
+import { checkoutOwnerRepo, isTrainOrFix, openTrains, ownerTasks, TRAIN_LAUNCH_LIMIT, trainLaunchFailures } from "../src/merge-train";
 import {
-	branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, holdersOf,
+	attempts, branchBody, branchName, BY_HAND_ENV, ceilingMaxTime, type ControlEntry, controlEntries, decideInteractive, doneBecause, exitClass, fencedBy, firstPrompt, heldLive, holdersOf,
 	INTENDED_OUTCOMES, interactiveArgv, JO_HOLDER, joInstructionsFor, LANE_MAX_TIME_ENV, laneArgv, laneCap, laneDiedDeadlineBody, laneDiedExitBody, laneDiedLaunchBody, laneDir, laneEnv, laneExit,
 	laneExitBody, laneDecidedBody, laneHeadroomBody, laneMaxTime, laneModel, type LaneOutcome, laneReadyBody, laneStarted, laneStartedBody, laneStopAcceptedBody, laneStopRequestBody, launchFailedBody, doneLine,
-	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumePlan, scratchCapMb, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, verdictOf, worktreeBody, worktreePath,
+	maxTimeMs, pendingStop, planFirst, PRECLAIM_LEASE_MS, resolutions, resumeOrigin, resumePlan, scratchCapMb, sessionOrigin, STARTER_EXIT, stateModelCheck, stateModelOf, STOP_POLL_MS, worktreeBody, worktreePath,
 } from "../src/launch";
 import {
 	BACKGROUND_SUFFIX, CONTINUE_LIMIT, continueCounter, continuePrompt, deadRunPrompt, type DeadTestRun, deadTestRuns, enqueueRunnerDeath, exitOutcome, heldOpenBody, IDLE_CHECK, IDLE_LIMIT, idleActivity,
@@ -81,9 +81,12 @@ import {
 	type TurnEndInput, unsettledHandsOf,
 } from "../src/turn-end";
 import { waitingReserved } from "../src/errors";
+import { laneMetrics, laneMetricsBody, psSampler, RSS_SAMPLE_MS, rssMeter } from "../src/metrics";
 import { ompPidState, type PidState, psAnswer, type PsRun, runPs, statStart } from "../src/omp-probe";
 import { sendNotice } from "../src/notice";
-import { decideRanked, drainOrder, type RankConfig, rankShadowLine, readRankConfig, writePickSnapshot } from "../src/rank-launch";
+import {
+	decideRanked, DRAIN_TRIED_ENV, drainPick, formatDrainTried, type RankConfig, rankShadowLine, readDrainTried, readRankConfig, writePickSnapshot,
+} from "../src/rank-launch";
 import { renderWorkload } from "../src/render";
 import { laneDeaths } from "../src/signals";
 import { readTracingSetting, tracingEnv } from "../src/tracing";
@@ -104,6 +107,8 @@ const READY_MS = msEnv("AGENT_SYSTEM_LANE_READY_MS", PRECLAIM_LEASE_MS);
 const READY_POLL_MS = 1_000;
 /** After `abort` and stdin EOF, the wait before SIGKILL (§ 3 stop path). */
 const END_GRACE_MS = msEnv("AGENT_SYSTEM_LANE_END_GRACE_MS", 30_000);
+/** The least time between two RSS samples of the omp tree (PLAN wl-mvbcjageg7o2yo § 2.2); the fake-omp tests shorten it. */
+const RSS_SAMPLE_INTERVAL_MS = msEnv("AGENT_SYSTEM_LANE_RSS_SAMPLE_MS", RSS_SAMPLE_MS);
 /** The settle wait with no omp activity that makes a session idle (PLAN wl-mv5i3lulwwbbi8 D6); the fake-omp tests shorten it. */
 const SETTLE_IDLE = msEnv("AGENT_SYSTEM_LANE_SETTLE_IDLE_MS", SETTLE_IDLE_MS);
 const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "agent-system-2";
@@ -111,9 +116,9 @@ const PROFILE = process.env.AGENT_SYSTEM_PROFILE || process.env.OMP_PROFILE || "
 const profileAgentDir = (): string => join(homeDir(), ".omp", "profiles", PROFILE, "agent");
 /** The installed profile's config.yml: the file preflight checks and the tracing switch is read from at each spawn. */
 const profileConfig = (): string => join(profileAgentDir(), "config.yml");
-/** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn. */
+/** The lane's env (laneEnv), with the clean-shell switch read from the installed profile's agent dir at this spawn; a drain's tried set (`DRAIN_TRIED_ENV`) is this starter's alone and never reaches the runner. */
 const boundEnv = (workloadId: string, laneId: string): Record<string, string> =>
-	laneEnv(process.env, { workloadId, laneId }, readCleanShell(profileAgentDir()));
+	laneEnv({ ...process.env, [DRAIN_TRIED_ENV]: undefined }, { workloadId, laneId }, readCleanShell(profileAgentDir()));
 /**
  * PLAN wl-mv71x5rwdu7eo0 § 4 (Jo's in-mv8p5m2t005tts, in-mv8qzqym1ihmv4): the stage a quota refusal or a failed move names in
  * `launch-failed:` and `lane-died:`, and the ids of the move's `set_model` and its confirming `get_state`.
@@ -321,11 +326,102 @@ function byHandPromptFor(ledger: Ledger, w: WorkloadRow, laneId: string, p: Prep
  * profile default) and the session `resumeOrigin` picks (decisions 6, 7, 14), resumed only when its origin lane ran on that
  * same model (`resumePlan`, MIGRATION.md item 85); `skipped` says why a recorded session was not resumed.
  */
-function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: string | null; resume: string | null; skipped: string | null } {
+function resumeOf(ledger: Ledger, w: WorkloadRow, laneId: string): { model: string | null; resume: string | null; skipped: string | null; recovered: string | null } {
 	const entries = ledger.entries(w.id);
 	const control = controlEntries(entries, holdersOf(entries, w.holder));
 	const model = laneModel(control);
-	return { model, ...resumePlan(control, laneId, resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id)), model) };
+	const resolved = resolutions(control, ledger.questions(w.id), ledger.instructions(w.id), ledger.slices(w.id));
+	const origin = resumeOrigin(control, laneId, resolved);
+	if (origin === null || regularRealpath(origin.session) !== null) {
+		return { model, ...resumePlan(control, laneId, resolved, model), recovered: null };
+	}
+	const dir = join(laneDir(w.id, homeDir()), "sessions");
+	let newest: { path: string; canonical: string; mtime: number } | null = null;
+	for (const name of topLevelSessions(dir)) {
+		const path = join(dir, name);
+		try {
+			const stat = statSync(path);
+			if (!stat.isFile()) continue;
+			const canonical = realpathSync(path);
+			if (newest === null || stat.mtimeMs > newest.mtime || (stat.mtimeMs === newest.mtime && path > newest.path)) {
+				newest = { path, canonical, mtime: stat.mtimeMs };
+			}
+		} catch {
+			// A candidate removed during discovery is not usable.
+		}
+	}
+	const missing = `recorded session ${origin.session} is missing`;
+	if (newest === null) return { model, resume: null, skipped: `${missing}; no usable top-level workload session`, recovered: null };
+	let candidateLane: string | null = null;
+	for (let i = control.length - 1; i >= 0; i--) {
+		const candidate = sessionOrigin([control[i]!]);
+		if (candidate !== null && regularRealpath(candidate.session) === newest.canonical) {
+			candidateLane = candidate.laneId;
+			break;
+		}
+	}
+	const started = candidateLane === null ? null : laneStarted(control, candidateLane);
+	const ran = started === null ? undefined : started.model;
+	if (ran !== model) {
+		return { model, resume: null, skipped: `${missing}; newest ${newest.path} ran on ${ran === undefined ? "unknown" : ran ?? "default"}`, recovered: null };
+	}
+	return { model, resume: newest.path, skipped: null, recovered: `${missing}; recovering newest workload session ${newest.path}` };
+}
+
+/** Existing regular files only: aliases may prove provenance, nonexistent paths never do. */
+function regularRealpath(path: string): string | null {
+	try {
+		return statSync(path).isFile() ? realpathSync(path) : null;
+	} catch {
+		return null;
+	}
+}
+
+interface StderrCapture {
+	settle: () => Promise<void>;
+	context: () => string;
+}
+
+/** Drain immediately after spawn; retain only the final 8 KiB, independent of frames or newlines. */
+function captureStderr(stream: ReadableStream<Uint8Array>): StderrCapture {
+	const reader = stream.getReader();
+	const tail = new Uint8Array(8192);
+	let used = 0;
+	let truncated = false;
+	const drained = (async () => {
+		try {
+			for (;;) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				const keep = Math.min(value.length, tail.length);
+				const retained = Math.min(used, tail.length - keep);
+				truncated ||= used + value.length > tail.length;
+				tail.copyWithin(0, used - retained, used);
+				tail.set(value.subarray(value.length - keep), retained);
+				used = retained + keep;
+				process.stderr.write(value);
+			}
+		} catch (err) {
+			process.stderr.write(`runner: omp stderr drain failed: ${oneLine(err)}\n`);
+		}
+	})();
+	let settling: Promise<void> | null = null;
+	return {
+		settle: () => settling ??= (async () => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([drained, new Promise<void>((done) => { timer = setTimeout(done, 250); })]);
+			} finally {
+				clearTimeout(timer);
+				// Cancellation may itself wait on an inherited pipe: never await it.
+				void reader.cancel().catch(() => undefined);
+			}
+		})(),
+		context: () => {
+			const text = new TextDecoder().decode(tail.subarray(0, used)).replace(/\s+/g, " ").trim();
+			return text ? `stderr: ${truncated || text.length > 1000 ? "…" : ""}${text.slice(-1000)}` : "no stderr";
+		},
+	};
 }
 
 /**
@@ -359,17 +455,27 @@ class Refused extends Error {
  * The reservation (decision 8) under the policy for the path. Autonomous: `decideLaunch` with Jev ranking's gate composed
  * (`decideRanked`, PLAN wl-mv8k039gvogt8g D7; `config` is the profile's `jevRank`, read fresh here), inside
  * `reserveLane`'s one transaction, so the drain, the open tool and the wake tick are gated alike; in `show` it is
- * `decideLaunch` exactly. Interactive: `decideInteractive`, never gated; an admit writes Jo's pick snapshot
+ * `decideLaunch` with only the intake queue's gate (PLAN wl-mvbcjadqgblr7k D5). `tried` is the tried set the drain that
+ * ran this starter handed it (`DRAIN_TRIED_ENV`, `readDrainTried`; empty on every other path), so the queue gate here
+ * agrees with the drain's pick: a workload the drain already tried never holds the queue. Interactive:
+ * `decideInteractive`, never gated (D6), `tried` unused; an admit writes Jo's pick snapshot
  * (`rank-shown: … by pick`, D6) in the same transaction, before `launch: … cause interactive`, and a refusal writes neither.
  * Both policies first run the live-lane check (`liveRefusal`, PLAN wl-mvgn310dpi5gcg D2) in that transaction, its ps through
- * `probeFor` (the tests pass a fake), so no other reservation lands between the probe and the claim.
+ * `probeFor` (the tests pass a fake), so no other reservation lands between the probe and the claim. The open merge trains
+ * are the cap-exempt set (`openTrains`, PLAN wl-mvpsrr4tr0p1xc D1), read inside the transaction; an admitted train then
+ * passes `trainGate` (D3, D4) in the same transaction.
  */
 export function reserve(
 	ledger: Ledger, wl: string, who: string, interactive: boolean, config: RankConfig = readRankConfig(),
-	probeFor: (laneId: string) => RunnerProbe = (laneId) => runnerProbe(wl, laneId),
+	probeFor: (laneId: string, workloadId: string) => RunnerProbe = (laneId, of) => runnerProbe(of, laneId),
+	tried: ReadonlySet<string> = readDrainTried(process.env),
 ): ReserveResult {
-	const input = { by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who };
-	if (!interactive) return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? decideRanked(ledger, rows, config) });
+	const input = {
+		by: LANE_STARTER_BY, cap: laneCap(process.env), leaseMs: PRECLAIM_LEASE_MS, requestedBy: who, capExempt: () => new Set(openTrains(ledger)),
+	};
+	if (!interactive) {
+		return ledger.reserveLane(wl, { ...input, decide: (rows) => liveRefusal(rows, probeFor) ?? trainGate(ledger, rows, probeFor, decideRanked(ledger, rows, config, tried)) });
+	}
 	try {
 		return ledger.write(() => {
 			const r = ledger.reserveLane(wl, {
@@ -377,7 +483,7 @@ export function reserve(
 				decide: (rows) => {
 					const held = liveRefusal(rows, probeFor);
 					if (held !== null) return held;
-					const v = decideInteractive(rows);
+					const v = trainGate(ledger, rows, probeFor, decideInteractive(rows));
 					if (v.launch) writePickSnapshot(ledger, rows.now);
 					return v;
 				},
@@ -392,10 +498,57 @@ export function reserve(
 }
 
 /** D2: `held: <laneId> still running (<omp|runner> pid <n>)` while an earlier lane on the workload is live (`liveLaneOf`), else null. */
-function liveRefusal(rows: ReserveRows, probeFor: (laneId: string) => RunnerProbe): ReserveVerdict | null {
+function liveRefusal(rows: ReserveRows, probeFor: (laneId: string, workloadId: string) => RunnerProbe): ReserveVerdict | null {
 	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.workload.holder, rows.holders));
-	const live = liveLaneOf(control, probeFor);
+	const live = liveLaneOf(control, (laneId) => probeFor(laneId, rows.workload.id));
 	return live === null ? null : { launch: false, reason: `held: ${live.laneId} still running (${live.what} pid ${live.pid})` };
+}
+
+/**
+ * PLAN wl-mvpsrr4tr0p1xc D3 and D4 on an admitted cap-exempt train (`rows.capExempt`), inside the reservation's transaction;
+ * any other verdict passes unchanged. D3: `held: train lane <laneId> live on <wl>` while another open train has a lane
+ * (`liveTrainLane`, its pre-claimed attempts included). D4: `not-launchable: train launch limit: <n> consecutive failed
+ * launches (<lane ids>)` once `trainLaunchFailures` counts TRAIN_LAUNCH_LIMIT, whatever the cause: Jo's fresh word is a
+ * reset, so it already counts from zero.
+ */
+function trainGate(ledger: Ledger, rows: ReserveRows, probeFor: (laneId: string, workloadId: string) => RunnerProbe, v: ReserveVerdict): ReserveVerdict {
+	if (!v.launch || !rows.capExempt) return v;
+	const other = liveTrainLane(ledger, rows.workload.id, rows.now, probeFor, true);
+	if (other !== null) return { launch: false, reason: `held: train lane ${other.laneId} live on ${other.workloadId}` };
+	const failed = trainLaunchFailures({
+		entries: rows.entries, instructions: rows.instructions, questions: rows.questions, holder: rows.workload.holder, holderLeaseUntil: rows.workload.holder_lease_until, now: rows.now,
+	});
+	if (failed.count >= TRAIN_LAUNCH_LIMIT) {
+		return { launch: false, reason: `not-launchable: train launch limit: ${TRAIN_LAUNCH_LIMIT} consecutive failed launches (${failed.lanes.join(", ")})` };
+	}
+	return v;
+}
+
+/**
+ * D3 (PLAN wl-mvpsrr4tr0p1xc): a lane of an open merge train other than `wl`, or null: one holding it under a live lease, one
+ * `liveLaneOf` finds alive (its ps through `probeFor`), and with `pending` (the reservation) a `launch:` attempt with no
+ * `lane-started:`, `launch-failed:` or `lane-exit:` whose pre-claim lease (PRECLAIM_LEASE_MS from the attempt) has not
+ * lapsed at `now`. Global across repositories: one served repository today, and no git call inside the transaction.
+ */
+function liveTrainLane(
+	ledger: Ledger, wl: string, now: string, probeFor: (laneId: string, workloadId: string) => RunnerProbe, pending: boolean,
+): { laneId: string; workloadId: string } | null {
+	for (const other of openTrains(ledger)) {
+		if (other === wl) continue;
+		const w = ledger.workload(other);
+		if (w === null) continue;
+		if (w.holder !== null && heldLive(w, now)) return { laneId: w.holder, workloadId: other };
+		const entries = ledger.entries(other);
+		const control = controlEntries(entries, holdersOf(entries, w.holder, ledger.holders(other)));
+		const live = liveLaneOf(control, (laneId) => probeFor(laneId, other));
+		if (live !== null) return { laneId: live.laneId, workloadId: other };
+		if (!pending) continue;
+		for (const a of attempts(control)) {
+			const ended = control.some((c) => c.laneId === a.laneId && (c.prefix === "lane-started" || c.prefix === "launch-failed" || c.prefix === "lane-exit"));
+			if (!ended && Date.parse(a.createdAt) + PRECLAIM_LEASE_MS >= Date.parse(now)) return { laneId: a.laneId, workloadId: other };
+		}
+	}
+	return null;
 }
 
 function reserveOrExit(ledger: Ledger, wl: string, who: string, interactive: boolean): string {
@@ -468,10 +621,14 @@ function drainLine(text: string): void {
 	}
 }
 
-/** The starter's environment for a launch the drain makes: the caller's, without the lane binding `laneEnv` writes, so the next lane's starter never carries the ended lane's role, workload, lane id or scratch root. */
+/**
+ * The starter's environment for a launch the drain makes: the caller's, without the lane binding `laneEnv` writes, so the
+ * next lane's starter never carries the ended lane's role, workload, lane id or scratch root, and without a drain's tried
+ * set (`DRAIN_TRIED_ENV`), which `runStarter` sets for each starter from its own drain.
+ */
 export function starterEnv(env: Record<string, string | undefined>): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV) out[k] = v;
+	for (const [k, v] of Object.entries(env)) if (v !== undefined && k !== ROLE_ENV && k !== WORKLOAD_ENV && k !== LANE_ENV && k !== SCRATCH_ENV && k !== DRAIN_TRIED_ENV) out[k] = v;
 	return out;
 }
 
@@ -502,11 +659,12 @@ function spawnDrain(wl: string, laneId: string): void {
  * before its runner spawns, leaving the pre-claim holding the slot until its lease lapses with no
  * runner to release it and no drain to follow, so the queue behind it waits for an orchestrator tick.
  * The starter's own exception path (`cmdLaunch` → `failAfterReserve`) is what releases a failed
- * reservation, so the drain waits for it.
+ * reservation, so the drain waits for it. `tried` (the drain's tried set, `wl` included) goes to the
+ * starter as `DRAIN_TRIED_ENV`, so its reservation's queue gate skips the workloads the pick skipped.
  */
-async function runStarter(wl: string): Promise<{ code: number; line: string }> {
+async function runStarter(wl: string, tried: ReadonlySet<string>): Promise<{ code: number; line: string }> {
 	const p = spawn(["bun", import.meta.path, "launch", wl, "--requested-by", LANE_RUNNER_BY], {
-		cwd: dirname(drainLogPath()), env: starterEnv(process.env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
+		cwd: dirname(drainLogPath()), env: { ...starterEnv(process.env), [DRAIN_TRIED_ENV]: formatDrainTried(tried) }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
 	});
 	const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
 	const lines = (out.trim() || err.trim()).split("\n").filter(Boolean);
@@ -516,10 +674,12 @@ async function runStarter(wl: string): Promise<{ code: number; line: string }> {
 /**
  * `drain <wl>`: sequential. Each round reads the open workloads in the order Jev ranking's mode names
  * (`jevRank`, read fresh each round, PLAN wl-mv8k039gvogt8g D7): oldest first (`inFlight`, the tick's
- * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, and runs the
- * starter for the first one not yet tried whose predicate says launch, awaiting its own exit with no
+ * order) in `show`, `rankOpen` order (`drainOrder`, pins first) in `order` and `parallel`, with the intake
+ * queue's workloads in queue order in the positions they occupy (`drainCandidates`, PLAN wl-mvbcjadqgblr7k D5),
+ * and runs the starter for the first one not yet tried whose predicate says launch and the queue gate admits
+ * (`drainPick`, where a tried workload never holds the queue; the starter gets the tried set, `runStarter`), awaiting its own exit with no
  * timeout (`runStarter`: a killed starter could strand its committed reservation; its exception path
- * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:` or `parallel:`
+ * releases a failed one). The starter's reservation applies the rank gate, so a `ranked:`, `parallel:` or `queued:`
  * refusal is an attempt line like any other and the drain goes on to the next. Exit `cap` stops the
  * drain; any other exit (launched, failed after the reservation, refused) re-reads and goes on. Each
  * workload is tried at most once, so the drain ends after at most one attempt per open workload. Logs
@@ -538,13 +698,8 @@ async function cmdDrain(after: string): Promise<number> {
 			const cap = laneCap(process.env);
 			for (;;) {
 				const config = readRankConfig();
-				const order = config.mode === "show" ? ledger.inFlight().map((w) => w.workload.id) : drainOrder(ledger, ledger.now());
-				const next = order.find((id) => {
-					if (tried.has(id)) return false;
-					const rows = ledger.launchRows(id, cap);
-					return rows !== null && verdictOf(rows).launch;
-				});
-				if (next === undefined) break;
+				const next = drainPick(ledger, tried, cap, config);
+				if (next === null) break;
 				if (config.mode === "show") {
 					try {
 						drainLine(rankShadowLine(ledger, process.pid, next, tried, cap, config));
@@ -553,7 +708,7 @@ async function cmdDrain(after: string): Promise<number> {
 					}
 				}
 				tried.add(next);
-				const r = await runStarter(next);
+				const r = await runStarter(next, tried);
 				drainLine(`attempt ${process.pid} ${next} exit ${r.code}: ${r.line}`);
 				if (r.code === STARTER_EXIT.cap) break;
 			}
@@ -813,14 +968,23 @@ export function stillReserved(workload: Pick<WorkloadRow, "holder"> | null, lane
  * D2b: the spawn, inside the one ledger write that spawns omp and records its `lane-started:` (the runner's `startAsOwner`
  * body, `cmdInteractive`'s spawn write). With nothing spawned yet (`current` null), the workload must still be held by
  * `laneId` (`stillReserved`), else nothing is spawned and a `held` Fail (stage `reserve`) rolls the write back: another
- * starter reserved after this reservation's pre-claim lapsed. A busy-retried write passes the child it already spawned,
- * which is returned as is: one spawn per lane.
+ * starter reserved after this reservation's pre-claim lapsed. On an open merge train (PLAN wl-mvpsrr4tr0p1xc D3) the same
+ * refusal follows while another open train holds a live lease or has a started lane `liveLaneOf` finds alive (its ps
+ * through `probeFor`): the spawn and its record share this write, so two trains' spawns serialize and the second sees the
+ * first's `lane-started:`. A busy-retried write passes the child it already spawned, which is returned as is: one spawn per lane.
  */
-export function spawnIfReserved<C>(ledger: Pick<Ledger, "workload">, wl: string, laneId: string, current: C | null, spawnChild: () => C): C {
+export function spawnIfReserved<C>(
+	ledger: Ledger, wl: string, laneId: string, current: C | null, spawnChild: () => C,
+	probeFor: (laneId: string, workloadId: string) => RunnerProbe = (l, of) => runnerProbe(of, l),
+): C {
 	if (current !== null) return current;
 	const w = ledger.workload(wl);
 	if (!stillReserved(w, laneId)) {
 		throw new Fail("reserve", `${laneId} not started: held: ${wl} is held by ${w?.holder ?? "no one"}, not ${laneId}; another starter reserved it after this reservation's pre-claim lapsed; no omp spawned`, STARTER_EXIT.held!);
+	}
+	if (openTrains(ledger).includes(wl)) {
+		const other = liveTrainLane(ledger, wl, ledger.now(), probeFor, false);
+		if (other !== null) throw new Fail("reserve", `${laneId} not started: held: train lane ${other.laneId} live on ${other.workloadId}; no omp spawned`, STARTER_EXIT.held!);
 	}
 	return spawnChild();
 }
@@ -1106,7 +1270,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 	let deadlineAt = Number.MAX_SAFE_INTEGER;
 	const readyMinutes = READY_MS >= 60_000 ? `${Math.round(READY_MS / 60_000)}m` : `${Math.round(READY_MS / 1000)}s`;
 
-	let child: Subprocess<"pipe", "pipe", "inherit"> | null = null;
+	let child: Subprocess<"pipe", "pipe", "pipe"> | null = null;
+	let stderrCapture: StderrCapture | null = null;
+	let childExited = false;
 	let outcome: LaneOutcome | null = null;
 	/** The accepted stop's reason for `lane-exit: … outcome stop reason <r>` (decision 6; Codex review 2, R6). */
 	let stopReason: string | null = null;
@@ -1227,6 +1393,10 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		if (sessionsDir !== null) tally = scanSpend(sessionsDir, offsets, tally);
 		return { ...tally, wallMin: wallMinutes(control, Date.now(), runStart) };
 	};
+	/** This run's spend baseline, measured once right after the spawn record: lane-metrics: reports the final measure minus it. */
+	let baseline: Spend | null = null;
+	/** The omp tree's peak RSS, sampled on the stop poll (PLAN wl-mvbcjageg7o2yo § 2.2). */
+	const rss = rssMeter(psSampler, RSS_SAMPLE_INTERVAL_MS);
 	/**
 	 * One meter poll (`meterPoll`): the 80 % notice once per ceiling value; at 100 % the stop notice once per ceiling value
 	 * and the stop through the stop path (acceptance `ceiling`, outcome stop, no lane-died:), the ceiling read and the
@@ -1292,6 +1462,18 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			} catch (err) {
 				process.stderr.write(`runner: the final spend scan failed: ${String(err)}\n`);
 			}
+			// This run's metrics (PLAN wl-mvbcjageg7o2yo § 2.2) in a write of their own before the finalization's, so a failure
+			// here never rolls back the release, spend: or lane-exit: below.
+			if (runStart !== null) {
+				try {
+					const metrics = laneMetrics({
+						runStartMs: runStart, runEndMs: Date.now(), final: spend, baseline, model, ranModel, prompts, continues, outcome: final, peakRssMb: rss.peakMb, rssSamples: rss.samples,
+					});
+					writeAsOwner(ledger, lock, () => record(laneMetricsBody(laneId, metrics)));
+				} catch (err) {
+					process.stderr.write(`runner: the lane-metrics: entry could not be written: ${String(err)}\n`);
+				}
+			}
 			let drained = false;
 			const owned = writeAsOwner(ledger, lock, () => {
 				if (exit?.death) enqueueRunnerDeath(ledger, { workloadId: wl, laneId, body: exit.death });
@@ -1301,7 +1483,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						: final === "deadline" ? laneDiedDeadlineBody(laneId, maxTime, inFlight) : laneDiedExitBody(laneId, final, code, signal);
 					ledger.enqueue({ by: LANE_RUNNER_BY, workloadId: wl, sender: LANE_RUNNER_BY, recipient: ORCHESTRATOR_RECIPIENT, body });
 				}
-				if (final === "never-ready") record(launchFailedBody(laneId, readinessStage, `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
+				if (final === "never-ready") record(launchFailedBody(laneId, readinessStage, readinessStage === "startup"
+					? readinessFailure!
+					: `${readinessFailure ?? `never ready in ${readyMinutes}`} (omp exit code ${code ?? "-"} signal ${signal ?? "-"})`));
 				if (held) ledger.releaseWorkload(wl, { by: LANE_RUNNER_BY, holder: laneId });
 				if (spend !== null && laneExit(control, laneId) === null) record(spendBody(laneId, spend));
 				if (laneExit(control, laneId) === null) record(laneExitBody(laneId, { code, signal, outcome: final, reason: final === "stop" ? stopReason : null }));
@@ -1470,6 +1654,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				worktree: p.worktree, sessionDir: p.sessionDir, systemPromptPath: p.systemPromptPath, maxTime, resume: start.resume, model,
 				remainingWallMin: shorter ? null : remainingWallMin,
 			});
+			if (start.recovered !== null) process.stderr.write(`runner: ${laneId} ${start.recovered}; argv ${JSON.stringify(argv)}\n`);
 			maxTime = argv[argv.indexOf("--max-time") + 1]!;
 		}
 		const ordinal = (/-(\d+)$/.exec(laneId) ?? [])[1] ?? "0";
@@ -1493,7 +1678,9 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		const omp = startAsOwner(ledger, lock, () => {
 			child = spawnIfReserved(ledger, wl, laneId, child, () => {
 				runStart = Date.now();
-				return spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+				const omp = spawn(["omp", ...argv], { cwd: p.worktree, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+				stderrCapture = captureStderr(omp.stderr);
+				return omp;
 			});
 			record(startRecord());
 			return child;
@@ -1509,10 +1696,25 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			lostLock = true;
 			throw new Fail("run", `${laneId} not started: lost the run lock ${lock.path} before the spawn (${now}); no omp spawned, nothing recorded or released`, STARTER_EXIT.held!);
 		}
+		try {
+			baseline = measure(controlNow().control);
+		} catch (err) {
+			process.stderr.write(`runner: the baseline spend scan failed: ${String(err)}\n`);
+		}
 		// Preparation can block on git and profile reads. The child's readiness window and
 		// max-time start at its actual spawn, just like the ceiling meter's live wall time.
 		const spawnedAt = runStart!;
 		deadlineAt = spawnedAt + (maxTimeMs(maxTime) ?? Number.MAX_SAFE_INTEGER);
+		const exited = omp.exited.then(async (code) => {
+			childExited = true;
+			await stderrCapture?.settle();
+			if (!ready && outcome === null && fatal === null) {
+				readinessStage = "startup";
+				readinessFailure = `omp exit code ${code} signal ${omp.signalCode ?? "-"} before ready; ${stderrCapture?.context() ?? "no stderr"}`;
+				outcome = "never-ready";
+			}
+			return code;
+		});
 		send({ id: STATE_ID, type: "get_state" });
 
 		// Readiness (B1): the lane's own claim, stamped with its id, within the pre-claim lease; no renewal before it. Every lane also
@@ -1520,7 +1722,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 		// unnamed lane still out after budget comparison is moved first (`moveOff`). Ready means the claim, the model, the lane-ready:
 		// receipt and the prompt all landed; a failure in any of them is fatal (review 2, R2).
 		const readyPoll = setInterval(() => {
-			if (ready || finished || outcome !== null || fatal !== null) return;
+			if (ready || finished || childExited || outcome !== null || fatal !== null) return;
 			try {
 				const cur = ledger.workload(wl);
 				const claimed = cur !== null && cur.holder === laneId && cur.changed_by === laneId;
@@ -1534,9 +1736,12 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 						return;
 					}
 					const ceilingLine = ceilingPromptLine(effectiveCeiling(control, ledger.instructions(wl), stakes), measure(control));
+					// The prompt's row cut (PLAN wl-mvpsrr4tr0p1xc D2): taken before `promptFor` reads the rows, so every instruction older
+					// than lane-ready:'s time was in this prompt, and a train's resolution counts as delivered only then (`consumedByReady`).
+					const readAt = ledger.now();
 					const prompt = promptFor(ledger, w, laneId, p, ceilingLine);
 					// lane-ready: immediately before the first prompt (item 85): a runner lane that ended without one never got a prompt (builderLabs).
-					record(laneReadyBody(laneId, ledger.now()));
+					record(laneReadyBody(laneId, readAt));
 					sendPrompt(prompt);
 					ready = true;
 				} else if (Date.now() - spawnedAt >= READY_MS) {
@@ -1605,6 +1810,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 
 		const stopPoll = setInterval(() => {
 			if (finished) return;
+			if (omp.exitCode === null && omp.signalCode === null) void rss.tick(omp.pid, Date.now());
 			try {
 				const { workload: cur, control } = controlNow();
 				const req = pendingStop(control, laneId);
@@ -1751,7 +1957,7 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 				}
 			}
 		}
-		const code = await omp.exited;
+		const code = await exited;
 		if (fatal !== null) throw fatal;
 		finish(code, omp.signalCode ?? null);
 	} catch (err) {
@@ -1766,10 +1972,15 @@ async function runOwned(ledger: Ledger, w: WorkloadRow, wl: string, laneId: stri
 			if (!lostLock) failAfterReserve(ledger, wl, laneId, f, lock, f.stage === HEADROOM_STAGE ? LANE_RUNNER_BY : LANE_STARTER_BY);
 			return f.code;
 		}
+		// Decide before killing: the child-exit handler must not turn this runner failure into startup SIGKILL.
+		if (!ready && outcome === null) {
+			readinessStage = f.stage;
+			readinessFailure = `${f.stage} failed: ${f.message}`;
+		}
+		outcome ??= ready ? "died" : "never-ready";
 		child.kill("SIGKILL");
 		const code = await child.exited;
-		if (!ready) readinessFailure = `${f.stage} failed: ${f.message}`;
-		outcome ??= ready ? "died" : "never-ready";
+		await stderrCapture?.settle();
 		finish(code, child.signalCode ?? null);
 		return f.code;
 	}
@@ -1799,7 +2010,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 	try {
 		const p = prepare(ledger, wl, true);
 		// Jo's named model, and a session recorded on another model is not resumed, as in the runner (item 85).
-		const { model, resume, skipped } = resumeOf(ledger, w, laneId);
+		const { model, resume, skipped, recovered } = resumeOf(ledger, w, laneId);
 		ledger.write(() => {
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: worktreeBody(p.worktree) });
 			ledger.recordEntry({ by: LANE_STARTER_BY, workloadId: wl, kind: "assumption", body: branchBody(p.branch, p.base) });
@@ -1815,6 +2026,7 @@ async function cmdInteractive(wl: string): Promise<number> {
 		for (const n of notes) process.stderr.write(`lane: tracing: ${n}\n`);
 		line(`lane ${laneId} on ${wl} in ${p.worktree} (branch ${p.branch}); first prompt supplied from ${firstPromptPath}`);
 		if (skipped !== null) line(`a fresh session on ${model ?? "the profile default"}: ${skipped}`);
+		if (recovered !== null) line(recovered);
 		// The TUI's ^C belongs to omp (a foreground process group signal reaches both); this wrapper waits for the exit.
 		process.on("SIGINT", () => undefined);
 		// The session files already here belong to earlier lanes: the one this OMP creates is the one not in this snapshot.

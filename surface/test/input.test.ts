@@ -12,12 +12,13 @@ import { countRounds, effectiveRoundLimit, type Findings, reviewLimitBody, revie
 import { LANE_RUNNER_BY, LANE_STARTER_BY, type Ledger, TEST_RUNNER_BY } from "../../ledger/src/index";
 import { errorLines } from "../src/errors";
 import { apply, type BatchResult, commandShaped, interpret, interpretBatch, interpretPaste, maxWords, parseBatch, type PasteResult, TEST_PR_MAX, workloadsInView } from "../src/input";
-import { boundPrs, controlEntries, holdersOf, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody } from "../src/launch";
+import { boundPrs, controlEntries, holdersOf, landFirstOn, mainRetries, planFirst, planFirstBody, verdictOf, waivedPrs, waivePrBody, withdrawnBy } from "../src/launch";
+import { runnerPreflightBody } from "../src/main-state";
 import { pendingBlock, pendingItems, pendingWaits } from "../src/pending";
 import { ensureStandingWorkload } from "../src/identity";
 import { Numbering } from "../src/numbering";
 import { inferMode, inferStakes, saidPlanIt } from "../src/stakes";
-import { testRequestedBody } from "../src/test-run";
+import { testRequestedBody, testRunBody } from "../src/test-run";
 import { STANDING_WORKLOAD_ID, SURFACE_BY } from "../src/types";
 import { clock, tempLedger, workloadWithSlice } from "./helpers";
 
@@ -1158,8 +1159,8 @@ describe("end-ruling (PLAN wl-mvfkv7llkp7nk0 § 1, R1)", () => {
 	test("an unknown ruling id, or no id, is refused with nothing written", () => {
 		const { ledger } = tempLedger();
 		ensureStandingWorkload(ledger);
-		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes)" });
-		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes>" });
+		expect(interpret(ledger, "end-ruling nope")).toEqual({ kind: "refused", why: "nope is no standing ruling (kimi-out, flow-repair, merges, models, gates-stakes, train-signoff)" });
+		expect(interpret(ledger, "end-ruling")).toEqual({ kind: "refused", why: "end-ruling names one ruling: end-ruling <kimi-out | flow-repair | merges | models | gates-stakes | train-signoff>" });
 		expect(ledger.instructions(STANDING_WORKLOAD_ID)).toEqual([]);
 	});
 });
@@ -1287,6 +1288,138 @@ describe("test-pr: Jo binds PRs to a workload for a test run with no push (PLAN 
 			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: `test-pr ${wl} 79 x`, why: ["x is not a PR number (a positive whole number): test-pr <wl-…> <N> [<N> …]"] }],
 			held: [],
 		});
+	});
+});
+
+describe("withdraw <wl-…>: Jo withdraws a workload, closed with no done-because: receipt (PLAN wl-mv8s939084z1ts D1–D3)", () => {
+	/** Every row the word could write on `wl`: its instructions and the surface's `withdrawn:` entries. */
+	const written = (ledger: Ledger, wl: string) => [...ledger.instructions(wl), ...ledger.entries(wl).filter((e) => e.body.startsWith("withdrawn"))];
+	/** An open workload whose slices ended in `states`, in order (none: a workload with no slice). */
+	const settled = (ledger: Ledger, states: readonly ("done" | "cancelled")[], brief = "Prototype the data-viz panel"): string => {
+		const wl = ledger.openWorkload({ by: "lane-a", brief, stakes: "normal", mode: "autonomous" });
+		for (const state of states) {
+			const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "t", doneCondition: "d", inputs: "i" });
+			if (state === "done") ledger.completeSlice(sl, { by: "lane-a", artifact: "x" });
+			else ledger.cancelSlice(sl, { by: SURFACE_BY });
+		}
+		return wl;
+	};
+	/** The refusal `interpret` gives, and that `apply` of it throws; nothing is written on `wl`. */
+	const refusedWithNothing = (ledger: Ledger, text: string, why: string, wl: string) => {
+		const cmd = interpret(ledger, text);
+		expect(cmd).toEqual({ kind: "refused", why });
+		expect(() => apply(ledger, cmd!)).toThrow("refused, never applied");
+		expect(written(ledger, wl)).toEqual([]);
+	};
+
+	test("writes Jo's instruction on the workload, then the surface's `withdrawn:` naming it; withdrawnBy finds it", () => {
+		const { ledger } = tempLedger();
+		const wl = settled(ledger, ["cancelled", "cancelled"]);
+		const cmd = interpret(ledger, `withdraw ${wl}`);
+		expect(cmd).toEqual({ kind: "withdraw-workload", workloadId: wl });
+		const receipt = apply(ledger, cmd!);
+		const ins = ledger.instructions(wl);
+		expect(ins.map((i) => [i.kind, i.body, i.author, i.channel, i.created_by])).toEqual([["instruction", `withdraw ${wl}`, "jo", "surface", SURFACE_BY]]);
+		expect(receipt).toBe(`withdrew ${wl} (instruction ${ins[0]!.id}); closing it with no done-because: receipt`);
+		expect(ledger.entries(wl).filter((e) => e.body.startsWith("withdrawn")).map((e) => [e.kind, e.created_by, e.body])).toEqual([["assumption", SURFACE_BY, `withdrawn: ${ins[0]!.id}`]]);
+		expect(controlEntries(ledger.entries(wl)).filter((e) => e.prefix === "withdrawn").map((e) => e.body)).toEqual([`withdrawn: ${ins[0]!.id}`]);
+		expect(withdrawnBy(ledger.entries(wl), ledger.instructions(wl))).toEqual({ instructionId: ins[0]!.id });
+		expect(verdictOf(ledger.launchRows(wl, 3)!)).toMatchObject({ launch: false, reason: "withdrawn" });
+	});
+
+	test("accepted for an all-cancelled, a done-only, a done+cancelled and a no-slice workload; the word is case-insensitive", () => {
+		const { ledger } = tempLedger();
+		for (const states of [["cancelled"], ["done"], ["done", "cancelled", "done"], []] as const) {
+			const wl = settled(ledger, states);
+			expect(interpret(ledger, `withdraw ${wl}`)).toEqual({ kind: "withdraw-workload", workloadId: wl });
+			apply(ledger, interpret(ledger, `Withdraw ${wl}`)!);
+			expect(withdrawnBy(ledger.entries(wl), ledger.instructions(wl))).not.toBeNull();
+		}
+	});
+
+	test("each D2 refusal is the reason, never prose, and writes nothing", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		ensureStandingWorkload(ledger);
+		// an open slice, named
+		const { wl: openWl, sl: openSl } = workloadWithSlice(ledger);
+		ledger.cancelSlice(ledger.addSlice({ by: "lane-a", workloadId: openWl, task: "old", doneCondition: "d", inputs: "i" }), { by: SURFACE_BY });
+		const tail = "cancel-slice each first (it withdraws the slice's questions too); only a workload with no open or paused slice and no open question is withdrawn";
+		refusedWithNothing(ledger, `withdraw ${openWl}`, `${openWl} has ${openSl} (open): ${tail}`, openWl);
+		// a paused slice and its open question, both named
+		const { wl: askWl, sl: askSl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: askWl, sliceId: askSl, body: "Which?", options: ["left", "right"] });
+		expect(ledger.slice(askSl)!.state).toBe("paused");
+		refusedWithNothing(ledger, `withdraw ${askWl}`, `${askWl} has ${askSl} (paused) and open question ${q}: ${tail}`, askWl);
+		// a holder under a live lease; once the lease lapses the word is accepted
+		const heldWl = settled(ledger, ["done"]);
+		expect(ledger.claimWorkload(heldWl, { by: "lane-a", holder: "lane-a", leaseMs: 60_000 }).won).toBe(true);
+		refusedWithNothing(ledger, `withdraw ${heldWl}`, `${heldWl} is held by lane-a under a live lease: stop it first (as2 lane stop ${heldWl})`, heldWl);
+		// closed, standing, scheduled, missing
+		const closedWl = settled(ledger, ["done"]);
+		ledger.closeWorkload(closedWl, { by: SURFACE_BY });
+		refusedWithNothing(ledger, `withdraw ${closedWl}`, `${closedWl} is closed: only an open workload is withdrawn`, closedWl);
+		refusedWithNothing(ledger, `withdraw ${STANDING_WORKLOAD_ID}`, "the standing workload is never withdrawn", STANDING_WORKLOAD_ID);
+		const dueWl = settled(ledger, [], "due:2026-11-01 re-measure the threshold");
+		refusedWithNothing(ledger, `withdraw ${dueWl}`, `${dueWl} is a scheduled row: close it with its receipt through the close tool`, dueWl);
+		refusedWithNothing(ledger, "withdraw wl-nope", "no workload wl-nope", "wl-nope");
+		c.plusHours(1);
+		expect(interpret(ledger, `withdraw ${heldWl}`)).toEqual({ kind: "withdraw-workload", workloadId: heldWl });
+	});
+
+	test("apply checks the refusal again: a slice opened between the reading and the apply throws and writes nothing", () => {
+		const { ledger } = tempLedger();
+		const wl = settled(ledger, ["cancelled"]);
+		const cmd = interpret(ledger, `withdraw ${wl}`)!;
+		expect(cmd.kind).toBe("withdraw-workload");
+		const sl = ledger.addSlice({ by: "lane-a", workloadId: wl, task: "late", doneCondition: "d", inputs: "i" });
+		expect(() => apply(ledger, cmd)).toThrow(`${wl} has ${sl} (open): cancel-slice each first`);
+		expect(written(ledger, wl)).toEqual([]);
+	});
+
+	test("bare `withdraw` and `withdraw q-…` keep their question meaning; past one workload id it is refused, and command-shaped only for a wl- id", () => {
+		const { ledger } = tempLedger();
+		const { wl, sl } = workloadWithSlice(ledger);
+		const q = ledger.raiseQuestion({ by: "lane-a", workloadId: wl, sliceId: sl, body: "Which?", options: ["left", "right"] });
+		const question = { kind: "withdraw", workloadId: wl, questionId: q } as const;
+		expect(interpret(ledger, "withdraw")).toEqual(question);
+		expect(interpret(ledger, `withdraw ${q}`)).toEqual(question);
+		expect(interpret(ledger, `withdraw ${q} please`)).toBeNull();
+		expect(commandShaped(`withdraw ${q} please`)).toBe(false);
+		expect(commandShaped("withdraw q-1 please")).toBe(false);
+		expect(maxWords("withdraw q-1")).toBe(2);
+		const arity = { kind: "refused", why: "withdraw names one workload: withdraw wl-…" } as const;
+		for (const text of ["withdraw wl-x please", `withdraw ${wl} ${wl}`, "withdraw wl-", `withdraw ${wl} ${q}`]) expect(interpret(ledger, text)).toEqual(arity);
+		expect(commandShaped("withdraw wl-x please")).toBe(true);
+		expect(maxWords("withdraw wl-x please")).toBe(Number.POSITIVE_INFINITY);
+		expect(parseBatch(`withdraw ${wl}`)).toBeNull();
+		expect(written(ledger, wl)).toEqual([]);
+		expect(ledger.question(q)!.state).toBe("open");
+	});
+
+	test("in a paste: a withdrawal is a command line; `withdraw wl-nope` refuses the paste; the same workload twice is refused once per row", () => {
+		const { ledger } = tempLedger();
+		const wl = settled(ledger, ["cancelled"]);
+		const numbering = numbered(ledger);
+		expect(interpretPaste(ledger, numbering, `normal ${wl}\nwithdraw ${wl}\nthe panel moved to the next sprint`)).toEqual({
+			ok: true,
+			items: [
+				{ line: 1, text: `normal ${wl}`, kind: "command", cmd: { kind: "stakes", workloadId: wl, stakes: "normal" } },
+				{ line: 2, text: `withdraw ${wl}`, kind: "command", cmd: { kind: "withdraw-workload", workloadId: wl } },
+				{ kind: "instruction", from: 3, to: 3, text: "the panel moved to the next sprint" },
+			],
+		});
+		expect(interpretPaste(ledger, numbering, `normal ${wl}\nwithdraw wl-nope`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `normal ${wl}`, why: null }, { line: 2, text: "withdraw wl-nope", why: ["wl-nope is not an open workload"] }],
+			held: [],
+		});
+		expect(interpretPaste(ledger, numbering, `withdraw ${wl}\nwithdraw ${wl}`)).toEqual({
+			ok: false,
+			refused: [{ line: 1, text: `withdraw ${wl}`, why: null }, { line: 2, text: `withdraw ${wl}`, why: [`${wl} is already withdrawn on line 1; once per row`] }],
+			held: [],
+		});
+		expect(written(ledger, wl)).toEqual([]);
 	});
 });
 
@@ -1424,5 +1557,186 @@ describe("waive-pr: Jo waives merged PRs on a workload for the close check (PLAN
 		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `waive-pr: ${forged[0]![1]}` });
 		expect(waivedPrs(ledger.entries(wl), ledger.instructions(wl))).toEqual([]);
 		expect(waivedPrs(ledger.entries(wl), [...ledger.instructions(wl), ...ledger.instructions(other)])).toEqual([]);
+	});
+});
+
+describe("land-first and main-retry: Jo's words on the standing workload (PLAN wl-mvq4edbaf13vnk D12, R33)", () => {
+	const G = "a".repeat(40);
+	const OTHER = "b".repeat(40);
+	const ROOT = "/Users/jo/.agent-system-2/verified/current";
+	/** Every row the words could write on the standing workload: its instructions and the surface's entries. */
+	const written = (ledger: Ledger) => [
+		...ledger.instructions(STANDING_WORKLOAD_ID),
+		...ledger.entries(STANDING_WORKLOAD_ID).filter((e) => /^(land-first|main-retry)/.test(e.body)),
+	];
+	/** The runner's main run of `sha` on the standing workload: green and believable unless `over` says otherwise. */
+	const mainRun = (ledger: Ledger, sha: string, over: { verdict?: "green" | "red" | "error"; files?: number; by?: string } = {}) => {
+		ensureStandingWorkload(ledger);
+		ledger.recordEntry({
+			by: over.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+			body: testRunBody({
+				runId: `tr-0main${sha.slice(0, 4)}`, verdict: over.verdict ?? "green", sha, pr: 0, reason: null, headAtEnd: sha, base: null, mergeBase: null,
+				full: { pass: 1000, fail: over.verdict === "red" ? 1 : 0, skip: 0, exit: over.verdict === "red" ? 1 : 0, ms: 60_000, error: null }, solo: [], failures: [],
+				runDir: null, preflight: "ok", scope: "full", main: true, host: "mac", exec: { files: over.files ?? 100, tests: 1000, treeFiles: 100 },
+			}),
+		});
+	};
+	const preflight = (ledger: Ledger, p: { ok?: boolean; source?: string; root?: string; by?: string } = {}) => {
+		ensureStandingWorkload(ledger);
+		ledger.recordEntry({
+			by: p.by ?? TEST_RUNNER_BY, workloadId: STANDING_WORKLOAD_ID, kind: "assumption",
+			body: runnerPreflightBody({ ok: p.ok ?? true, reason: p.ok === false ? "bundle SOURCE differs from the tag" : null, source: p.source ?? G, root: p.root ?? ROOT }),
+		});
+	};
+	const on = (ledger: Ledger, repo = "agent-system-2.0") =>
+		landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
+
+	test("with the bootstrap held, `land-first <repo> on` writes Jo's instruction and the surface's land-first: naming it; landFirstOn reads the newest", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		mainRun(ledger, G);
+		preflight(ledger);
+		expect(on(ledger)).toBe(false);
+		const cmd = interpret(ledger, "land-first agent-system-2.0 on")!;
+		expect(cmd).toEqual({ kind: "land-first", repo: "agent-system-2.0", on: true });
+		apply(ledger, cmd);
+		const [i] = ledger.instructions(STANDING_WORKLOAD_ID);
+		expect(i).toMatchObject({ kind: "instruction", body: "land-first agent-system-2.0 on", author: "jo", channel: "surface", created_by: SURFACE_BY });
+		expect(ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("land-first")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `land-first: agent-system-2.0 on ${i!.id}`]]);
+		// the runner's config names owner/repo; another repository is not on; the word is case-insensitive
+		expect(on(ledger)).toBe(true);
+		expect(on(ledger, "thewolff/agent-system-2.0")).toBe(true);
+		expect(on(ledger, "thewolff/newdle-web")).toBe(false);
+		c.at("2026-10-01T10:05:00.000Z");
+		apply(ledger, interpret(ledger, "LAND-FIRST agent-system-2.0 OFF")!);
+		expect(on(ledger)).toBe(false);
+		c.at("2026-10-01T10:10:00.000Z");
+		apply(ledger, interpret(ledger, "land-first agent-system-2.0 on")!);
+		// The latest word is on, but off's already-requested revocations must reconcile first.
+		expect(on(ledger)).toBe(false);
+	});
+
+	test("`land-first <repo> off` needs no bootstrap; `on` is refused, writing nothing, until every bootstrap reason clears", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		expect(interpret(ledger, "land-first agent-system-2.0 off")).toEqual({ kind: "land-first", repo: "agent-system-2.0", on: false });
+		const refusal = (text = "land-first agent-system-2.0 on") => {
+			const cmd = interpret(ledger, text)!;
+			expect(cmd.kind).toBe("refused");
+			expect(() => apply(ledger, cmd)).toThrow("refused, never applied");
+			return cmd.kind === "refused" ? cmd.why : "";
+		};
+		// nothing yet: no G and no preflight row
+		let why = refusal();
+		expect(why).toContain("no verified commit yet");
+		expect(why).toContain("no runner-preflight row");
+		// a lane's forged main run and preflight are no evidence
+		mainRun(ledger, G, { by: "lane-a" });
+		preflight(ledger, { by: "lane-a" });
+		why = refusal();
+		expect(why).toContain("no verified commit yet");
+		expect(why).toContain("no runner-preflight row");
+		// an implausible green (90 % of files) is no G
+		mainRun(ledger, G, { files: 90 });
+		expect(refusal()).toContain("no verified commit yet");
+		// a later run of the same commit never launders its verdict
+		mainRun(ledger, G);
+		expect(refusal()).toContain("no verified commit yet");
+		// a G, but the runner's newest preflight refused, names a SOURCE that is not verified, and runs from the checkout
+		mainRun(ledger, OTHER);
+		preflight(ledger, { ok: false, source: G, root: "/Users/jo/code/agent-system-2.0" });
+		why = refusal();
+		expect(why).not.toContain("no verified commit yet");
+		expect(why).toContain("refused: bundle SOURCE differs from the tag");
+		expect(why).toContain(`bundle SOURCE ${G.slice(0, 7)}`);
+		expect(why).toContain("root /Users/jo/code/agent-system-2.0");
+		// an older ok row does not count: only the newest preflight does
+		preflight(ledger, { source: OTHER });
+		preflight(ledger, { ok: false, source: OTHER });
+		expect(refusal()).toContain("refused: bundle SOURCE differs from the tag");
+		expect(written(ledger)).toEqual([]);
+		preflight(ledger, { source: OTHER });
+		expect(interpret(ledger, "land-first agent-system-2.0 on")).toEqual({ kind: "land-first", repo: "agent-system-2.0", on: true });
+	});
+
+	test("apply checks the bootstrap again: a refused preflight between the reading and the apply throws and writes nothing", () => {
+		const { ledger } = tempLedger();
+		mainRun(ledger, G);
+		preflight(ledger);
+		const cmd = interpret(ledger, "land-first agent-system-2.0 on")!;
+		preflight(ledger, { ok: false });
+		expect(() => apply(ledger, cmd)).toThrow("waits for the bootstrap");
+		expect(written(ledger)).toEqual([]);
+	});
+
+	test("the instruction and the entry are one transaction: a failed entry write leaves no instruction", () => {
+		const { ledger } = tempLedger();
+		ensureStandingWorkload(ledger);
+		const cmd = interpret(ledger, "main-retry agent-system-2.0")!;
+		const real = ledger.recordEntry.bind(ledger);
+		ledger.recordEntry = ((input: Parameters<typeof real>[0]) => {
+			if (input.body.startsWith("main-retry:")) throw new Error("disk full");
+			return real(input);
+		}) as typeof ledger.recordEntry;
+		expect(() => apply(ledger, cmd)).toThrow("disk full");
+		ledger.recordEntry = real;
+		expect(written(ledger)).toEqual([]);
+	});
+
+	test("`main-retry <repo>` writes Jo's instruction and the surface's main-retry: naming it; mainRetries reads the times for that repository", () => {
+		const c = clock();
+		const { ledger } = tempLedger(c.now);
+		const cmd = interpret(ledger, "main-retry agent-system-2.0")!;
+		expect(cmd).toEqual({ kind: "main-retry", repo: "agent-system-2.0" });
+		apply(ledger, cmd);
+		const [i] = ledger.instructions(STANDING_WORKLOAD_ID);
+		expect(i).toMatchObject({ body: "main-retry agent-system-2.0", author: "jo", created_by: SURFACE_BY });
+		expect(ledger.entries(STANDING_WORKLOAD_ID).filter((e) => e.body.startsWith("main-retry")).map((e) => [e.created_by, e.body])).toEqual([[SURFACE_BY, `main-retry: agent-system-2.0 ${i!.id}`]]);
+		const entries = ledger.entries(STANDING_WORKLOAD_ID);
+		const instructions = ledger.instructions(STANDING_WORKLOAD_ID);
+		expect(mainRetries(entries, instructions, "thewolff/agent-system-2.0")).toEqual(["2026-10-01T10:00:00.000Z"]);
+		expect(mainRetries(entries, instructions, "newdle-web")).toEqual([]);
+	});
+
+	test("malformed words are refused with the usage at any length, never prose; both are command-shaped", () => {
+		const { ledger } = tempLedger();
+		const cases: [string, string][] = [
+			["land-first", "land-first names one repository and on or off: land-first <repo> on|off"],
+			["land-first agent-system-2.0", "land-first names one repository and on or off: land-first <repo> on|off"],
+			["land-first agent-system-2.0 maybe", "land-first names one repository and on or off: land-first <repo> on|off"],
+			["land-first on agent-system-2.0", "land-first names one repository and on or off: land-first <repo> on|off"],
+			["land-first agent-system-2.0 on now please", "land-first names one repository and on or off: land-first <repo> on|off"],
+			["land-first ../etc off", "land-first names one repository and on or off: land-first <repo> on|off"],
+			["main-retry", "main-retry names one repository: main-retry <repo>"],
+			["main-retry agent-system-2.0 now", "main-retry names one repository: main-retry <repo>"],
+		];
+		for (const [text, why] of cases) {
+			expect(commandShaped(text)).toBe(true);
+			expect(interpret(ledger, text)).toEqual({ kind: "refused", why });
+		}
+		expect(maxWords("land-first a b c d e f")).toBe(Number.POSITIVE_INFINITY);
+		expect(written(ledger)).toEqual([]);
+	});
+
+	test("an entry naming no matching instruction of Jo's, or written by anyone but the surface, turns nothing on", () => {
+		const { ledger } = tempLedger();
+		ensureStandingWorkload(ledger);
+		const jo = (body: string, over: { by?: string; author?: "jo" | "orchestrator" } = {}) =>
+			ledger.recordInstruction({ by: over.by ?? SURFACE_BY, workloadId: STANDING_WORKLOAD_ID, author: over.author ?? "jo", channel: "surface", body });
+		const forged: [string, string][] = [
+			[`land-first: agent-system-2.0 on ${jo("land-first agent-system-2.0 off")}`, SURFACE_BY],
+			[`land-first: agent-system-2.0 on ${jo("land-first newdle-web on")}`, SURFACE_BY],
+			[`land-first: agent-system-2.0 on ${jo("land-first agent-system-2.0 on", { author: "orchestrator" })}`, SURFACE_BY],
+			[`land-first: agent-system-2.0 on ${jo("land-first agent-system-2.0 on", { by: "lane-a" })}`, SURFACE_BY],
+			["land-first: agent-system-2.0 on in-nope", SURFACE_BY],
+			[`land-first: agent-system-2.0 on ${jo("land-first agent-system-2.0 on")}`, "lane-a"],
+		];
+		for (const [body, by] of forged) ledger.recordEntry({ by, workloadId: STANDING_WORKLOAD_ID, kind: "assumption", body });
+		expect(on(ledger)).toBe(false);
+		// the same words on another workload are not the standing workload's
+		const { wl } = workloadWithSlice(ledger);
+		const id = ledger.recordInstruction({ by: SURFACE_BY, workloadId: wl, author: "jo", channel: "surface", body: "land-first agent-system-2.0 on" });
+		ledger.recordEntry({ by: SURFACE_BY, workloadId: wl, kind: "assumption", body: `land-first: agent-system-2.0 on ${id}` });
+		expect(landFirstOn(ledger.entries(wl), ledger.instructions(wl), "agent-system-2.0")).toBe(false);
 	});
 });

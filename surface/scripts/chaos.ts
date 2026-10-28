@@ -86,7 +86,7 @@ const REPORTS_DIR = join(homedir(), "agent-scratch", "agent-system-2.0", "chaos"
 /** The scratch lease (§ 2.1): a runner killed with its lane surfaces through the lapse inside the window. */
 const LEASE_MS = 120_000;
 /** The chat model every chat role is pinned to (writeStubProfile's default). */
-const CHAT_MODEL = "anthropic/claude-haiku-4-5";
+const CHAT_MODEL = "anthropic/claude-haiku-5-5";
 /** The egress self-test: an un-routed provider, with a fake key given only to that probe. */
 const EGRESS_PROBE = { provider: "groq", model: "groq/gemma2-9b-it", host: "api.groq.com", keyEnv: "GROQ_API_KEY" };
 const JUDGE_MODEL = "jev-1.13.0";

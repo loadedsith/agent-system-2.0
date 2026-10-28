@@ -1,7 +1,9 @@
 // The merge-train workload kind (PLAN wl-mv8s8srodefytc rev 17.1 § 1, part 1): Jo's `train <N> [<N> …]` opens a
 // workload that takes green PRs one at a time, merges main in without rebasing, lets the resolver
 // (surface/scripts/merge-train.ts) fix the conflicts it knows, runs the full suite, then merges a normal-stakes PR
-// itself and asks Jo about a production-stakes one; a PR it cannot land goes back to its owner as a task (part 2).
+// itself and asks Jo about a production-stakes one, unless Jo's ruling train-signoff decides that question (his train word
+// is the sign-off, PLAN wl-mvg8itbt0rz3ls D1-D3: `trainSignoff`), when it merges it as a normal one; a PR it cannot land
+// goes back to its owner as a task (part 2).
 // This module holds the procedure text the lane reads as its brief (`trainBrief`), a PR's stakes (`prStakes`, D1; it
 // reads the ledger and the `repo:` checkout's origin), the check on main's protection (`mainProtectionGap`, D2), the
 // bodies of Jo's instruction and the surface's `train:` entry, the train's PR order (`trainPrs`), the slice id rule
@@ -18,17 +20,22 @@
 // repository's newest open train (pending when held or done, opening one only when none exists), and `trainBrief` reads its members from `merge-train.ts list`.
 // Part 4 (PLAN wl-mvbjiettjrfpxc D1, D6, D7): the train tick's boarding scan (`autoboardCandidates`, `boardedWorkloads`,
 // `boardSkips`), main's protection read live (`protectionGap`) with its episodes, and the main-red notices, on the standing workload.
-import { parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
+import { basename, dirname } from "node:path";
+import { parseHandSpawn } from "../../classifier/src/lab";
+import { parseReviewGroup, parseReviewLoopEnd, parseReviewRound } from "../../classifier/src/rounds";
 import {
-	type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard, parseTrainFix,
-	planFirst, prBindingInstructionBody, prBindings, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
+	attempts, type ControlEntry, controlEntries, doneBecause, doneBody, heldLive, holdersOf, JO_HOLDER, laneExit, landFirstHeld, landFirstOn, launchRequestedBody, type OwnerTrainTask, PLAN_AUTO_STARTED, parseTrainBoard,
+	parseTrainFix, planFirst, planSlice, prBindingInstructionBody, prBindings, sameRepo, supersededBy, type TrainBinding, trainBindings, trainBoardBody, type TrainFix, trainFixBody,
 } from "./launch";
-import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
-import { askJo, raisedId } from "../../gates/src/rulings";
+import { CLASSIFIER_BY, type EntryRow, type InstructionRow, type Ledger, type MessageRow, newId, type QuestionRow, type SliceRow, type Stakes, type WorkloadStatusRow } from "../../ledger/src/index";
+import { askJo, raisedId, type TrainSignoffFact } from "../../gates/src/rulings";
 import { canonicalPath } from "../../ledger/src/locality";
+import { mainResults, mainVerdicts } from "./main-state";
 import { DEFAULT_BRANCH } from "./merge-train-stack";
 import { NOTICE_PREFIX } from "./notice";
-import { ownerRepoOf, pushDestBody, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns } from "./test-run";
+import {
+	type CompareResult, decisionLogFault, isFullSuiteGreen, ownerRepoOf, pushDestBody, type RangeCommit, type RunRecord, SETTLING_VERDICTS, SHA_RE, type TestRunnerConfig, testRuns,
+} from "./test-run";
 import {
 	ESCALATION_BY, HOLD_HOURS, LANE_FULL_TEST_TOOL, LANE_RECORD_ENTRY_TOOL, LANE_TRAIN_RETURN_TOOL, MERGE_TRAIN_BY, STANDING_WORKLOAD_ID, SURFACE_BY, TRAIN_TASK_FAILED_PREFIX,
 } from "./types";
@@ -380,7 +387,8 @@ export const HOLD_PREFIX = "hold: main protection unverified";
  * lane-written `train-hold:` and is passed over, its slices open, until the tick's `hold-expired` wake. Step 6 takes a green, or a `red-main` (every failure also fails on main: the lane
  * files or finds the `main-red` issue, records `main-red:`, and goes on). Step 7 lands a green PR: one readiness check for both
  * stakes (the tested head, mergeable, main contained), the stakes read again, then a normal PR merges itself (merge with
- * `--match-head-commit`, verify, record) and a production PR gets Jo's question while the train goes on. A moved head goes
+ * `--match-head-commit`, verify, record) and a production PR's question goes through Jo's rulings (PLAN wl-mvg8itbt0rz3ls
+ * D3): decided by `train-signoff`, the lane merges it at once as c. to e.; otherwise it is Jo's question while the train goes on. A moved head goes
  * back to step 2's fresh worktree, a moved main to step 3. A red, a conflict or a stack problem goes back to the PR's owner
  * through `lane_train_return` (D6), and the train passes over the PR; a second refused merge or runner error is a lane-written
  * `train-error:` the tick retries. Before done-because the lane reads `list` once more and works any PR it has not seen.
@@ -432,7 +440,11 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			"Run every resolver command below with that PR worktree as cwd (the script works on the repo of its cwd) and always your " +
 			"lane worktree's copy of the script, never the PR branch's: an older PR branch may not have it. Run " +
 			`\`${RESOLVE_COMMAND} check --base origin/main\`: exit 0 = no PR-added numbered MIGRATION.md item is left. If the head ` +
-			"contains origin/main, `check` exits 0, and its last full suite at that head is green → step 7.",
+			"contains origin/main, `check` exits 0, and its last full suite at that head is green → step 7. If the head contains origin/main and " +
+			"`check` exits 0 but the head is ahead of its last green only by decision-log commits (each touching only `.ai/decision-log/`, a " +
+			`close's entry, say), it is tested by calling \`lane_full_test { pr: <n>, slice: ${full} }\` (the PR's open \`${full}\`, or the next r) with no push: ` +
+			"a starter line ending ` carried <R>` means the slice is already green at that head (run R's green carried, no new run) → step 7; " +
+			"any other answer spawned a run, and step 6's result handling applies as for any run.",
 		"3. `git merge --no-ff origin/main` (a merge commit). Never rebase, never force-push.",
 		`4. On conflict: \`${RESOLVE_COMMAND} resolve --pr <n> --workload <head workload>\`, where <head workload> is the head branch's ` +
 			"workload id when the branch is `wl/<wl-…>`, else `none`. Exit 0: it wrote and staged MIGRATION.md / migration/items / " +
@@ -442,10 +454,20 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 		`5. Conversion commit: \`${RESOLVE_COMMAND} convert --pr <n> --workload <head workload> --base origin/main\`. When it wrote ` +
 			"files, `git add` them and commit `migration: #<n>'s item to migration/items/<slug>.md`. Then `check` must exit 0, and " +
 			"`git status --porcelain` must be empty.",
-		"6. Declare the slice artifact (a bare `bun test <the PR's changed test files> surface/test/migration-items.test.ts`), pass it " +
+		"6. Declare the slice artifact (a bare `bun test surface/test/migration-items.test.ts`; the PR's changed test files run in `lane_full_test`, " +
+			"outside the lane fence where lane tests' `ps` calls work, so this step does not run them), pass it " +
 			`on that clean tree, then \`${TRAIN_PUSH}\` (no force) in a bash call of its own from the PR worktree (its cwd, or a leading \`cd\`). Use the PR's open \`${full}\`, or add the next r when ` +
-			`none is open. Then \`lane_full_test { pr: <n>, slice: ${full} }\`; a green or a \`red-main\` completes that slice itself. Green → step 7. ` +
-			"`red-main` (every failing test also fails in the runner's run of main's base, so the PR adds none; the result names base's sha): " +
+			`none is open. Then \`lane_full_test { pr: <n>, slice: ${full} }\`; a green or a \`red-main\` completes that slice itself. Green → step 7; ` +
+			"on a land-first repository (Jo's `land-first <owner/repo> on`: the runner checks a PR before merge with the fast check, the full suite " +
+			"only by exception, and runs the full suite on main after) an answer or result ending ` fast` is the fast check's green, a green like " +
+			"any other → step 7. The STATUS of a run is `gh api repos/<owner/repo>/commits/<the tested head>/statuses --jq " +
+			"'[.[] | select(.context == \"as2/full-suite\")][0]'` (the newest `as2/full-suite` the runner posted). While landing is stopped on a " +
+			"land-first repository (that STATUS is failure naming `landing stopped`, or the merge hold holds step 7 c.'s merge as a reserved action " +
+			"for Jo), the PR is passed over: lane_record_entry `train-error: pr <n> landing-stopped <the reason the status or the hold names>`, " +
+			"no question, no merge, no return to its owner; the tick wakes the train when landing reopens. A `red-main` never lands on a " +
+			"land-first repository: its gate posts failure, so when that STATUS is failure, file nothing and merge nothing: lane_record_entry " +
+			"`train-error: pr <n> red-main <run id>` and pass the PR over (main itself is red; the tick's main runs and repair handle it). " +
+			"Otherwise, `red-main` (every failing test also fails in the runner's run of main's base, so the PR adds none; the result names base's sha): " +
 			"`gh issue list -R <owner/repo> --label main-red --state open --search \"<the run's first failing test>\"`; when no issue matches, " +
 			"`gh label create main-red -R <owner/repo> --force --description \"main is red (as2 merge train)\"` (--force: no failure when the label exists), then " +
 			"`gh issue create -R <owner/repo> --label main-red --title \"main red: <the first failing test>\" --body-file <a file under $AS2_SCRATCH " +
@@ -459,8 +481,9 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 		"7. Land the green PR, both stakes through a. and b. in order; only b.'s answer picks the merge or Jo's question:",
 		"   a. Ready: `git fetch origin`, then `gh pr view <n> -R <owner/repo> --json headRefOid,mergeable,mergeStateStatus`. The head must " +
 			"equal the sha the green run tested, `mergeable` must be `MERGEABLE` (an `UNKNOWN` is re-queried once and never read as " +
-			"mergeable), and `git merge-base --is-ancestor origin/main <head>` must exit 0. A moved head (not the tested sha) → back to " +
-			"step 2 (a new PR worktree at the new head, and on from there); never merge main into the older local tree. The tested " +
+			"mergeable), and `git merge-base --is-ancestor origin/main <head>` must exit 0. A moved head (not the tested sha, a head " +
+			"ahead of it only by decision-log commits included) → back to step 2 (a new PR worktree at the new head, and on from there, " +
+			"where such a head is tested by lane_full_test, which may carry); never merge main into the older local tree. The tested " +
 			"head not containing origin/main, or not `MERGEABLE` → back to step 3 (merge main in, push, a new suite run).",
 		`   b. Stakes, again: run step 1's \`${RESOLVE_COMMAND} stakes --hold-ok\` command now, just before the merge; its answer decides, not step ` +
 			"1's (the workload's stakes, its plan's hold or main's protection may have changed while the suite ran). `normal` → c. " +
@@ -470,17 +493,42 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			"the PR's slices open (it is not terminal) and go on to the next PR; the tick wakes the train once the hold ends, and that pass works the PR from step 1.",
 		"   c. Merge: `gh pr merge <n> -R <owner/repo> --merge --match-head-commit <head>`, a merge commit, never `--admin`, `--squash`, " +
 			"`--rebase` or `--auto`. Main's protection, which b. verified (a strict rule requiring `as2/full-suite`, which the test runner " +
-			"posts, in a ruleset the merging account can never bypass), makes GitHub refuse a merge whose head lacks the current main or a green status, so a race ends in a refused merge.",
-		"   d. Verify: `gh pr view <n> -R <owner/repo> --json state,mergeCommit` shows `MERGED`. A refused merge (gh exits non-zero, or the " +
-			"state is not MERGED) → back to a. once; a second refusal on the same head: lane_record_entry `train-error: pr <n> merge-refused " +
+			"posts, in a ruleset the merging account can never bypass), makes GitHub refuse a merge whose head lacks the current main or a green status, so a race ends in a refused merge. " +
+			"On a land-first repository the merge hold may hold this merge as a reserved action for Jo while the tick has not found landing open: " +
+			"that is step 6's landing-stopped pass-over, never a reason to retry the merge another way.",
+		"   d. Verify: `gh pr view <n> -R <owner/repo> --json state,mergeCommit` shows `MERGED`. The FIRST refused merge (gh exits non-zero, " +
+			"or the state is not MERGED) → back to a. Only when a. then passes again on the same head, which has a green (head unchanged, " +
+			`\`MERGEABLE\`, main contained), the head may lack its status (a carried green whose \`as2/full-suite\` post failed): add the next \`${sl}-full-<r+1>\` ` +
+			"slice and call `lane_full_test` on it once. An answer ending ` carried <R>` (the starter posted the status again from the identical " +
+			"green) → c. again; any other answer is a spawned run → step 6's result handling, never an assumed green. A moved head or main in a. " +
+			"routes to step 2 or 3 as a. says, with no repair request. A second refusal on the same head: lane_record_entry `train-error: pr <n> merge-refused " +
 			"<gh's messages>` and pass the PR over (the tick retries it).",
 		`   e. Record: complete \`${sl}\` with artifact \`merged by train <merge commit sha> (run <id>)\`, then the next PR.`,
 		`   Production stakes, reached only from b. after a. passed: raise the question on \`${sl}\`: PR green and mergeable at <the ` +
 			"head a. read> on main <the origin/main a. fetched>, run <the green run at that head>, <pass>/<fail>/<skip>, b.'s stakes " +
-			"reason, the chain, item file if any; options merged / skip / stop. Do not wait for it: go on to the next PR while it is " +
+			"reason, the chain, item file if any; options merged / skip / stop. The question goes through Jo's rulings: when " +
+			"lane_raise_question answers `decided by Jo's ruling train-signoff` (Jo's train word on this PR is his sign-off), no question " +
+			"was raised: do what it says at once, c. to e. with the head a. read, no question and no wait. Otherwise do not wait for it: go on to the next PR while it is " +
 			`open. merged → \`gh pr view\` shows MERGED, complete \`${sl}\` with artifact \`merged by Jo <merge commit>\`; skip → Jo's ` +
 			"answer cancels the PR's open train slices; stop → record it and release the lane with no done-because (slices stay open, " +
 			`the workload stays open; Jo's ${append} relaunches it).`,
+		"   Repair, step 7g (a land-first repository, a regression only): the tick wakes the train with `repair <T 7>` (the launch reason) when " +
+			"main's run at tip T is red or implausible, and files the jo-issues issue `landing stopped on <owner/repo>` with G (the newest verified " +
+			"commit), the suspects (main's first-parent merge commits after G up to T, each with its PR and workload), the failing files and the " +
+			"attribution (which suspects' changes reach a failing test). One attempt per wake, before any other PR: " +
+			"(1) when any suspect changed `ledger/schema.sql` or the `SCHEMA_VERSION` line of `ledger/src/index.ts` (`git show --stat <suspect>`, " +
+			"`git show <suspect> -- ledger/src/index.ts`): no revert; comment on the issue that a schema migration needs a reviewed repair, " +
+			"lane_record_entry `train-error: repair <T 7> schema <that suspect's sha>`, and stop the repair (the tick tells Jo). " +
+			"(2) Otherwise, when the attribution names exactly one suspect and it is the only suspect, or names none, or names several: revert " +
+			"every suspect, newest first, on a new branch `train/revert-<T 7>` from origin/main (`git revert -m 1 <merge sha>` each, in one " +
+			"worktree), so the tree equals G's and carries G's green with no run; when it names exactly one of several suspects, revert only that " +
+			"one, which takes the full suite on the Mac before landing. A revert conflict: `git revert --abort`, lane_record_entry " +
+			"`train-error: revert <T 7> conflict <the files>`, stop the repair. (3) Push the branch, `gh pr create -R <owner/repo> --base main " +
+			"--head train/revert-<T 7> --title \"revert: main red at <T 7>\" --body <the issue url and the reverted PRs>`, then work it like a train PR " +
+			`(its own \`${sl}\` and \`${full}\` slices, lane_full_test, step 7 a. to e.); the gate posts \`repair: …\` success on it and the merge hold ` +
+			"admits exactly that head once the tick's next pass names it. (4) On each reverted PR, `gh pr comment <n> -R <owner/repo> --body " +
+			"<the failing tests and the issue url>`, and lane_record_entry `reverted: #<n> <its merge sha> repair <T 7>`. A fix PR an owner names " +
+			"in the issue may land instead through the full suite. Never revert, retry or merge anything else for the incident: a second attempt is the tick's next wake or Jo's.",
 		"",
 		`Returning a PR to its owner (no question to Jo): write the detail to a file under \`$AS2_SCRATCH\`, then \`${LANE_TRAIN_RETURN_TOOL} ` +
 			"{ pr: <n>, kind: red | conflict | stack, detail: <absolute path of the detail file> }`. It records the task on this workload " +
@@ -489,8 +537,9 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 			"(`train-task-settled:`), the train's next pass works the PR from step 1 at its current head: green → merge; red, conflict or " +
 			`stack → return it again (the tool sets the next attempt). When ${LANE_TRAIN_RETURN_TOOL} refuses because attempt 2 settled failed, pass the ` +
 			"PR over: the tick raises Jo's alert. A PR passed over with `train-error:` is worked again on a later pass.",
-		"Rules: one live run per workload; no code edit beyond the resolver's output; merge only at step 7 c., on b.'s `normal`, as a " +
-			"merge commit; a production PR's merge is Jo's; a held PR is never merged while its hold stands. Record per PR with lane_record_entry: stakes and reason, head tested, run id, " +
+		"Rules: one live run per workload; no code edit beyond the resolver's output; merge only at step 7 c., on b.'s `normal` or Jo's " +
+			"ruling train-signoff deciding the production question, as a merge commit; a production PR's merge is Jo's: his merged answer, " +
+			"or his ruling train-signoff deciding the question; a held PR is never merged while its hold stands. Record per PR with lane_record_entry: stakes and reason, head tested, run id, " +
 			"verdict and counts, item file written if any, and its outcome.",
 		`The train's stop: after Jo answers stop on a question on one of this train's slices, the test runner refuses lane_full_test for every PR until Jo's next ${append}. No other question holds a run.`,
 		`Terminal outcomes: \`${sl}\` completed (\`merged by train …\`, \`merged by Jo …\`, \`skipped: <state>\`) ` +
@@ -599,13 +648,13 @@ function controlOf(ledger: Ledger, wl: string): ControlEntry[] {
 	return controlEntries(entries, holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl)));
 }
 
-/** The open workloads carrying an entry by `by` whose body starts with `prefix`, oldest first. */
-function openWithEntry(ledger: Ledger, by: string, prefix: string): string[] {
-	return ledger.db.query<{ id: string }, [string, string]>(
-		`SELECT w.id AS id FROM workloads w WHERE w.status = 'open' AND EXISTS (
+/** The workloads carrying an entry by `by` whose body starts with `prefix`, open ones only unless `closed`, oldest first. */
+function withEntry(ledger: Ledger, by: string, prefix: string, closed = false): string[] {
+	return ledger.db.query<{ id: string }, [string, string, number]>(
+		`SELECT w.id AS id FROM workloads w WHERE (?3 OR w.status = 'open') AND EXISTS (
 		   SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption' AND e.created_by = ?1 AND substr(e.body, 1, length(?2)) = ?2)
 		 ORDER BY w.created_at, w.id`,
-	).all(by, prefix).map((r: { id: string }) => r.id);
+	).all(by, prefix, closed ? 1 : 0).map((r: { id: string }) => r.id);
 }
 
 /** Every open merge train: an open workload with a surface `train:` or a merge-train `train-board:` that is a valid member (`trainMembers`). */
@@ -664,31 +713,33 @@ export function onOtherTrain(ledger: Ledger, repo: string, prs: readonly number[
 	return null;
 }
 
-/** One `train-fix:` on an open fix workload. */
+/** One `train-fix:` on a fix workload. */
 export interface FixBinding extends TrainFix {
 	workloadId: string;
 	entryId: string;
 }
 
-/** Every `train-fix:` on an open workload (the tick's, MERGE_TRAIN_BY), oldest workload first. */
-export function fixBindings(ledger: Ledger): FixBinding[] {
-	return openWithEntry(ledger, MERGE_TRAIN_BY, "train-fix:").flatMap((wl) =>
+/** Every `train-fix:` on an open workload (the tick's, MERGE_TRAIN_BY), oldest workload first; on closed ones too with `closed`. */
+export function fixBindings(ledger: Ledger, opts: { closed?: boolean } = {}): FixBinding[] {
+	return withEntry(ledger, MERGE_TRAIN_BY, "train-fix:", opts.closed).flatMap((wl) =>
 		controlEntries(ledger.entries(wl)).flatMap((c) => {
 			const f = c.prefix === "train-fix" ? parseTrainFix(c.rest) : null;
 			return f ? [{ ...f, workloadId: wl, entryId: c.id }] : [];
 		}));
 }
 
+/** Fix binding `f` binds PR `pr` on `train`: it names both, and its `train-entry` is a membership entry on that train listing the PR (`trainBindings`), as `boundPrs` rules. */
+export function fixBinds(ledger: Pick<Ledger, "entries" | "instructions">, f: FixBinding, train: string, pr: number): boolean {
+	return f.train === train && f.pr === pr && trainBindings(ledger.entries(train), ledger.instructions(train)).some((b) => b.entryId === f.trainEntry && b.prs.includes(pr));
+}
+
 /**
  * The workloads that own task `t`: its D1 owner, and every fix workload bound to its train and PR (owner none, or an owner closed
- * since). A fix binding counts only when its `train-entry` is a membership entry on that train listing the PR (`trainBindings`), as `boundPrs` rules.
+ * since; `fixBinds`).
  */
 function taskOwners(ledger: Ledger, t: TrainTask, fixes: readonly FixBinding[]): string[] {
 	const out = t.owner === null ? [] : [t.owner];
-	for (const f of fixes) {
-		if (f.train !== t.train || f.pr !== t.pr || out.includes(f.workloadId)) continue;
-		if (trainBindings(ledger.entries(f.train), ledger.instructions(f.train)).some((b) => b.entryId === f.trainEntry && b.prs.includes(f.pr))) out.push(f.workloadId);
-	}
+	for (const f of fixes) if (!out.includes(f.workloadId) && fixBinds(ledger, f, t.train, t.pr)) out.push(f.workloadId);
 	return out;
 }
 
@@ -827,15 +878,76 @@ export function trainPushesOf(json: unknown, branch: string): TrainPush[] | null
 	return out.sort((a, b) => a.at.localeCompare(b.at));
 }
 
+/** GitHub's get-a-commit lists at most this many files across its pages (300 a page): a commit listing this many may have more. */
+export const COMMIT_FILES_CAP = 3000;
+
+/** The statuses GitHub's compare answers; any other is a misshapen answer. */
+const COMPARE_STATUSES: Record<CompareResult["status"], true> = { identical: true, ahead: true, behind: true, diverged: true };
+
+/** `json[key]` when `json` is an object, else undefined. */
+const jsonField = (json: unknown, key: string): unknown => (typeof json === "object" && json !== null ? Reflect.get(json, key) : undefined);
+
+/**
+ * The `CompareResult` of `from`..`to` on `repo` as GitHub answers it (PLAN wl-mvpwkpqobyp20w D1), for `decisionLogFault` to judge:
+ * it decides nothing. `gh api repos/<r>/compare/<from>...<to>` gives the status, `total_commits` and each commit's sha and parent
+ * count; each single-parent commit's own files come from every page of `gh api repos/<r>/commits/<sha> --paginate --slurp` (never
+ * the net diff), a rename contributing the path it left as well as the one it made; a merge's files are not read. `from === to`
+ * is `identical` with no gh call. What GitHub cannot answer completely is `ok: false` with its reason: a compare listing fewer
+ * commits than `total_commits`, a commit listing COMMIT_FILES_CAP files (it may have more GitHub does not list), a rename that
+ * names no previous path. `ghJson` is gh's JSON for `args` and throws on a failed call; a misshapen answer throws too.
+ */
+export function ghCompare(
+	repo: string, from: string, to: string, ghJson: (args: string[]) => unknown,
+): { ok: true; compare: CompareResult } | { ok: false; reason: string } {
+	if (from === to) return { ok: true, compare: { status: "identical", commits: [] } };
+	const cmp = ghJson(["api", `repos/${repo}/compare/${from}...${to}`]);
+	const [status, listed, total] = [jsonField(cmp, "status"), jsonField(cmp, "commits"), jsonField(cmp, "total_commits")];
+	if (typeof status !== "string" || !Object.hasOwn(COMPARE_STATUSES, status) || !Array.isArray(listed) || typeof total !== "number") {
+		throw new Error(`gh api repos/${repo}/compare/${from}...${to} returned an unexpected shape`);
+	}
+	if (status !== "ahead") return { ok: true, compare: { status: status as CompareResult["status"], commits: [] } };
+	if (listed.length !== total) return { ok: false, reason: `${to} is ${total} commits ahead of ${from}, more than the compare lists (${listed.length})` };
+	const commits: RangeCommit[] = [];
+	for (const c of listed as unknown[]) {
+		const [sha, parents] = [jsonField(c, "sha"), jsonField(c, "parents")];
+		if (typeof sha !== "string" || !SHA_RE.test(sha) || !Array.isArray(parents)) throw new Error(`gh api repos/${repo}/compare listed a commit with no sha or parents`);
+		if (parents.length !== 1) {
+			commits.push({ sha, parents: parents.length, files: [] });
+			continue;
+		}
+		// Every page of the commit's files: an array of pages, each the commit object with its share of `files`.
+		const pages = ghJson(["api", `repos/${repo}/commits/${sha}`, "--paginate", "--slurp"]);
+		const lists = Array.isArray(pages) && pages.length > 0 ? (pages as unknown[]).map((p) => jsonField(p, "files")) : null;
+		if (lists === null || !lists.every(Array.isArray)) throw new Error(`gh api repos/${repo}/commits/${sha} returned an unexpected shape`);
+		const entries = (lists as unknown[][]).flat();
+		if (entries.length >= COMMIT_FILES_CAP) return { ok: false, reason: `commit ${sha} lists ${entries.length} files, the most GitHub lists; its other files cannot be read` };
+		const files: string[] = [];
+		for (const f of entries) {
+			const [name, prev] = [jsonField(f, "filename"), jsonField(f, "previous_filename")];
+			if (typeof name !== "string") throw new Error(`gh api repos/${repo}/commits/${sha} listed a file with no filename`);
+			files.push(name);
+			// A rename touches the path it left as well as the one it made; a rename that names no previous path fails closed.
+			if (prev === undefined && jsonField(f, "status") !== "renamed") continue;
+			if (typeof prev !== "string") return { ok: false, reason: `commit ${sha} renames ${name} from no listed path` };
+			files.push(prev);
+		}
+		commits.push({ sha, parents: 1, files });
+	}
+	return { ok: true, compare: { status: "ahead", commits } };
+}
+
 /**
  * What the tick knows from GitHub when it settles: each PR's current head (`gh pr view <n> --json headRefOid`), and the pushes
  * to its head branch (`trainActivityArgs`). A PR missing from `heads` cannot settle fixed this pass; one missing from `pushes`
- * (the listing failed or was unreadable) has no push evidence this pass, so no push-based rule settles it.
+ * (the listing failed or was unreadable) has no push evidence this pass, so no push-based rule settles it. `compares` holds
+ * `ghCompare`'s result for each pair `carryPairs` lists, keyed `<S> <head>`: a pair missing from it (the fetch failed or GitHub
+ * could not answer completely) is no compare, so no green carries over it (PLAN wl-mvpwkpqobyp20w D2).
  */
 export interface SettleFacts {
 	train: string;
 	heads: ReadonlyMap<number, string>;
 	pushes: ReadonlyMap<number, readonly TrainPush[]>;
+	compares: ReadonlyMap<string, CompareResult | null>;
 }
 
 interface SettleEvent {
@@ -844,17 +956,28 @@ interface SettleEvent {
 	evidence: string;
 }
 
+/** The runner results on task `t`'s owners for its PR requested after t0, oldest request first, each with its result when it has one. */
+function taskRuns(ledger: Ledger, t: TrainTask, owners: readonly string[]) {
+	return owners.flatMap((o) => testRuns(ledger.entries(o)).filter((r) => r.request.pr === t.pr && r.request.createdAt > t.createdAt))
+		.sort((a, b) => a.request.createdAt.localeCompare(b.request.createdAt));
+}
+
 /**
  * Task `t`'s first terminal event among its owners' rows, or null while none has happened (D8). `pushes` is GitHub's record of
- * pushes to the PR's head branch (`SettleFacts.pushes`), undefined when this pass could not read it.
+ * pushes to the PR's head branch (`SettleFacts.pushes`), undefined when this pass could not read it; `compares` is
+ * `SettleFacts.compares`.
  */
-function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], head: string | null, pushes: readonly TrainPush[] | undefined, now: string): SettleEvent | null {
+function settleEvent(
+	ledger: Ledger, t: TrainTask, owners: readonly string[], head: string | null, pushes: readonly TrainPush[] | undefined, compares: SettleFacts["compares"], now: string,
+): SettleEvent | null {
 	const t0 = t.createdAt;
 	const events: SettleEvent[] = [];
 	// The first runner result requested after t0 that is not an error decides; stale and superseded runs settle nothing either.
-	// A green (or red-main) decides only at a head other than H0 that is the PR's current head; until then the next result is read.
-	const runs = owners.flatMap((o) => testRuns(ledger.entries(o)).filter((r) => r.request.pr === t.pr && r.request.createdAt > t0))
-		.sort((a, b) => a.request.createdAt.localeCompare(b.request.createdAt));
+	// A green (or red-main) decides only at a head other than H0 that is the PR's current head; a green at S, not H0, also
+	// decides when it is the task's NEWEST request's own result and the current head descends from S only by decision-log
+	// commits (`decisionLogFault` on GitHub's compare of S and the head, PLAN wl-mvpwkpqobyp20w D2). A later request of any
+	// kind (pending, red, error) means no carry from S: that request's result is what is read next. Until then the next result is read.
+	const runs = taskRuns(ledger, t, owners);
 	for (const r of runs) {
 		const res = r.result;
 		if (!res) continue;
@@ -864,6 +987,10 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 		}
 		if (SETTLING_VERDICTS.includes(res.verdict) && res.sha !== t.head && res.sha === head) {
 			events.push({ at: res.createdAt, outcome: "fixed", evidence: `run ${res.runId} ${res.verdict} at ${res.sha}` });
+			break;
+		}
+		if (r === runs.at(-1) && carries(res.verdict, res.sha, t, head) && decisionLogFault(compares.get(`${res.sha} ${head}`) ?? null) === null) {
+			events.push({ at: res.createdAt, outcome: "fixed", evidence: `run ${res.runId} green at ${res.sha}, head ${head} decision-log only` });
 			break;
 		}
 	}
@@ -909,7 +1036,8 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 /**
  * The settles the tick writes now on train `facts.train` (D8): the `train-task-settled:` bodies, one per unsettled task whose
  * first terminal event has happened. fixed: the first non-error runner result requested after t0 on the owner is green at a
- * head other than H0 that is the PR's current head. failed: that result is red; the owner's holder wrote
+ * head other than H0 that is the PR's current head, or the task's newest request is green at S (not H0) with the current head
+ * past S only by decision-log commits (`decisionLogFault` on `facts.compares`' `<S> <head>`, PLAN wl-mvpwkpqobyp20w D2). failed: that result is red; the owner's holder wrote
  * `train-task-failed: <id>`; an owner lane exited with no push before it; or some stretch of 2 h since t0 had no push. A push
  * is one GitHub records on the head branch (`facts.pushes`, at GitHub's time), never a runner request or row 8's `push-dest:`;
  * with no record this pass, or one that does not name the PR's current head, the two push rules wait. An `error` result never
@@ -918,9 +1046,33 @@ function settleEvent(ledger: Ledger, t: TrainTask, owners: readonly string[], he
 export function settleTasks(ledger: Ledger, facts: SettleFacts, now: string): string[] {
 	const fixes = fixBindings(ledger);
 	return unsettledTasks(ledger, facts.train).flatMap((t) => {
-		const e = settleEvent(ledger, t, taskOwners(ledger, t, fixes), facts.heads.get(t.pr) ?? null, facts.pushes.get(t.pr), now);
+		const e = settleEvent(ledger, t, taskOwners(ledger, t, fixes), facts.heads.get(t.pr) ?? null, facts.pushes.get(t.pr), facts.compares, now);
 		return e ? [trainTaskSettledBody(t.id, e.outcome, e.evidence)] : [];
 	});
+}
+
+/** A result of `verdict` at `sha` may carry to the PR's `head` for task `t`: a green at S, neither H0 nor the head, while the head is not H0. */
+function carries(verdict: string, sha: string, t: TrainTask, head: string | null): head is string {
+	return verdict === "green" && head !== null && head !== t.head && sha !== t.head && sha !== head;
+}
+
+/**
+ * The compares `settleTasks` on `facts.train` would read now (PLAN wl-mvpwkpqobyp20w D2): per unsettled task, the carry of its
+ * NEWEST runner request, when that request's own result is a green at S that carries to the PR's current head; one row per
+ * (pr, S, head). An older green never carries (a later request, pending or not, may be a red at the head), and a newest request
+ * with no result or any other result lists nothing. The tick fetches each with `ghCompare` before its settle transaction, so no
+ * gh call holds the ledger's lock.
+ */
+export function carryPairs(ledger: Ledger, facts: Pick<SettleFacts, "train" | "heads">): { pr: number; from: string; to: string }[] {
+	const fixes = fixBindings(ledger);
+	const out = new Map<string, { pr: number; from: string; to: string }>();
+	for (const t of unsettledTasks(ledger, facts.train)) {
+		const head = facts.heads.get(t.pr) ?? null;
+		const runs = taskRuns(ledger, t, taskOwners(ledger, t, fixes));
+		const res = runs.at(-1)?.result;
+		if (res && carries(res.verdict, res.sha, t, head)) out.set(`${t.pr} ${res.sha} ${head}`, { pr: t.pr, from: res.sha, to: head });
+	}
+	return [...out.values()];
 }
 
 /**
@@ -1018,50 +1170,179 @@ export interface TrainRetries {
 }
 
 /**
+ * D13 (PLAN wl-mvq4edbaf13vnk): the owner workload of PR `pr` on train `wl`: the workload its `train-board:` names, or, for a PR
+ * only Jo's `train:` names, the workload whose lane branch `wl/<id>` is the PR's head ref (`headRef`, the tick's `gh pr view`);
+ * null when neither names an existing workload.
+ */
+export function prOwner(ledger: Ledger, wl: string, pr: number, headRef: string | null): string | null {
+	const board = trainBindings(ledger.entries(wl), ledger.instructions(wl)).findLast((b) => b.source === "board" && b.prs.includes(pr))?.board ?? null;
+	const id = board?.workload ?? (headRef === null ? null : (/^wl\/(wl-[a-z0-9]+)$/.exec(headRef)?.[1] ?? null));
+	return id !== null && ledger.workload(id) ? id : null;
+}
+
+/**
+ * D13: why owner workload `owner` is busy, or null. Busy while it holds a live lane lease (`heldLive`: a lease past its expiry
+ * is not live, so a dead owner never holds the train), or while every one of its open or paused slices (at least one) carries a
+ * `test-requested:` with no settle yet: its full-suite run is queued or running (`testRuns`; the runner's reap settles a dead one).
+ */
+export function ownerBusy(ledger: Ledger, owner: string): string | null {
+	const w = ledger.workload(owner);
+	if (!w || w.status !== "open") return null;
+	const now = ledger.now();
+	if (heldLive(w, now)) return `${owner} is held live by ${w.holder}${w.holder_lease_until === null ? "" : ` until ${w.holder_lease_until}`}`;
+	const open = ledger.slices(owner).filter((s) => s.state === "open" || s.state === "paused");
+	if (open.length === 0) return null;
+	const unsettled = testRuns(ledger.entries(owner)).filter((r) => r.results.length === 0);
+	const waiting = open.map((s) => unsettled.findLast((r) => r.request.slice === s.id));
+	if (waiting.some((r) => r === undefined)) return null;
+	return `${owner}'s only open work waits on its test run${waiting.length > 1 ? "s" : ""} ${waiting.map((r) => r!.request.runId).join(", ")}`;
+}
+
+/** D13: a per-PR wake reason the tick held back this pass because the PR's owner is busy. */
+export interface WakeDeferral {
+	pr: number;
+	owner: string;
+	busy: string;
+	reasons: string[];
+}
+
+/**
  * Why the tick wakes train `wl` (D10 step 1), or empty when nothing is actionable: a `train:` entry (the open, or Jo's append),
  * a `train-board:` (`#n boarded`, PLAN wl-mvbjiettjrfpxc D3)
- * or a task settle written after the train's last lane exit, a PR no lane has given its disposition slice since one exited,
- * a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last pass), or Jo's answer to (or
- * withdrawal of) the tick's own alert question (D9) after the last exit: no lane raised that question, so no resume follows it.
+ * or a task settle written after the train's last ready lane exit (`lastReadyExit`), a PR no lane has worked since one exited
+ * (`#<n> not yet worked`: no disposition slice, or a slice the tick added that `trainLaneWorked` says no lane of the train has
+ * worked), a PR among `mergedDeps` (PRs whose dependency the tick saw merge on GitHub since the last ready exit), Jo's answer to
+ * (or withdrawal of) the tick's own alert question (D9) after the last ready exit: no lane raised that question, so no resume
+ * follows it, and Jo's answer to (or withdrawal of) a question the train's lane raised whose instruction no ready lane's first
+ * prompt carried yet (`consumedByReady`, PLAN wl-mvpsrr4tr0p1xc D2). A lane that never got ready swallows nothing: the
+ * cutoffs read `lastReadyExit`, so the work that woke it wakes the train again (bounded by `trainLaunchFailures`).
  * After a lane exit, also every PR `trainRetries` lists: a passed-over PR whose retry is due, and a head the train has not seen;
- * a PR in `heldPassOvers` (passed over for main's protection while its episode is open, PLAN wl-mvbjiettjrfpxc D6) waits instead;
+ * a PR in `heldPassOvers` (passed over for main's protection while its episode is open, PLAN wl-mvbjiettjrfpxc D6, or for a
+ * stopped landing, PLAN wl-mvq4edbaf13vnk D9) waits instead;
  * and every held PR whose hold has ended (`expiredHolds`, `hold-expired`; `stakesOf` is the tick's current `prStakes`).
+ * D13 (PLAN wl-mvq4edbaf13vnk), with `owners`: a per-PR reason (`#n boarded`, not yet worked, a passed-over retry, an untested
+ * head, `hold-expired`, a merged dependency, a settled task on that PR) is deferred while the PR's owner (`prOwner`, the head
+ * refs from the tick's views) is busy (`ownerBusy`); each deferred PR goes to `owners.defer` once. Deferred, not dropped: the
+ * same cutoffs give the reason again on the first pass after the owner is free. Train-wide reasons (`train:` entries, alerts,
+ * answered questions) are never deferred.
  */
 export function actionable(
 	ledger: Ledger, wl: string, mergedDeps: readonly number[] = [], heads: ReadonlyMap<number, string> = new Map(), heldPassOvers: ReadonlySet<number> = new Set(),
 	stakesOf: (pr: number) => PrStakes | null = () => null,
+	owners: { headRefs: ReadonlyMap<number, string>; defer: (d: WakeDeferral) => void } | null = null,
 ): string[] {
 	const control = controlOf(ledger, wl);
 	const exit = control.filter((c) => c.prefix === "lane-exit").at(-1) ?? null;
-	const lastExit = exit?.createdAt ?? null;
+	const lastExit = lastReadyExit(control);
 	const after = (at: string) => lastExit === null || at > lastExit;
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
-	const out: string[] = [];
+	const questions = ledger.questions(wl);
+	const out: { pr: number | null; text: string }[] = [];
 	for (const b of trainBindings(entries, instructions)) {
 		if (!after(b.createdAt)) continue;
-		out.push(b.source === "board" ? `#${b.prs[0]} boarded` : `train: ${b.prs.map((n) => `#${n}`).join(" ")} (${b.entryId})`);
+		out.push(b.source === "board" ? { pr: b.prs[0]!, text: `#${b.prs[0]} boarded` } : { pr: null, text: `train: ${b.prs.map((n) => `#${n}`).join(" ")} (${b.entryId})` });
 	}
 	const tasks = parseTrainTasks(wl, control);
 	const settles = taskSettles(control);
 	for (const s of settles.values()) {
-		if (after(s.createdAt)) out.push(`task ${s.taskId} on #${tasks.find((t) => t.id === s.taskId)?.pr ?? "?"} settled ${s.outcome}`);
+		const pr = tasks.find((t) => t.id === s.taskId)?.pr ?? null;
+		if (after(s.createdAt)) out.push({ pr, text: `task ${s.taskId} on #${pr ?? "?"} settled ${s.outcome}` });
 	}
 	const prs = trainPrs(entries, instructions);
 	if (exit !== null) {
-		const slices = new Set(ledger.slices(wl).map((s) => s.id));
-		for (const n of prs) if (!slices.has(trainSliceId(wl, n))) out.push(`#${n} not yet worked`);
+		const slices = new Map(ledger.slices(wl).map((s) => [s.id, s]));
+		for (const n of prs) {
+			const sl = slices.get(trainSliceId(wl, n));
+			if (!sl || (sl.created_by === MERGE_TRAIN_BY && !trainLaneWorked(wl, sl, control, entries, questions))) out.push({ pr: n, text: `#${n} not yet worked` });
+		}
 		const r = trainRetries(ledger, wl, heads);
-		for (const p of r.passedOver) if (!heldPassOvers.has(p.pr)) out.push(`#${p.pr} passed over ${p.count}x (train-error:), retry due`);
-		for (const h of r.untested) out.push(`#${h.pr} head ${h.sha} untested by the train${h.woken > 0 ? ` after ${h.woken} wake(s), retry due` : ""}`);
-		for (const h of expiredHolds(ledger, wl, stakesOf)) out.push(`#${h.pr} hold-expired (${h.holdId})`);
+		for (const p of r.passedOver) if (!heldPassOvers.has(p.pr)) out.push({ pr: p.pr, text: `#${p.pr} passed over ${p.count}x (train-error:), retry due` });
+		for (const h of r.untested) out.push({ pr: h.pr, text: `#${h.pr} head ${h.sha} untested by the train${h.woken > 0 ? ` after ${h.woken} wake(s), retry due` : ""}` });
+		for (const h of expiredHolds(ledger, wl, stakesOf)) out.push({ pr: h.pr, text: `#${h.pr} hold-expired (${h.holdId})` });
 	}
-	for (const n of mergedDeps) if (prs.includes(n)) out.push(`#${n}'s dependency merged`);
-	for (const q of ledger.questions(wl)) {
+	for (const n of mergedDeps) if (prs.includes(n)) out.push({ pr: n, text: `#${n}'s dependency merged` });
+	for (const q of questions) {
 		const n = q.created_by === MERGE_TRAIN_BY && q.state !== "open" ? trainSlicePr(q.slice_id, wl) : null;
-		if (n !== null && after(q.changed_at)) out.push(`alert ${q.id} on #${n} ${q.state}`);
+		if (n !== null && after(q.changed_at)) out.push({ pr: null, text: `alert ${q.id} on #${n} ${q.state}` });
 	}
-	return out;
+	const lane = trainLanePattern(wl);
+	for (const q of questions) {
+		if (q.state === "open" || !lane.test(q.created_by) || q.resolved_by === null) continue;
+		const ins = instructions.find((i) => i.id === q.resolved_by);
+		if (ins && !consumedByReady(control, ins.created_at)) out.push({ pr: null, text: `question ${q.id} ${q.state}, not yet resumed` });
+	}
+	if (owners === null) return out.map((r) => r.text);
+	const busy = new Map<number, { owner: string; busy: string } | null>();
+	const busyOf = (pr: number) => {
+		if (!busy.has(pr)) {
+			const owner = prOwner(ledger, wl, pr, owners.headRefs.get(pr) ?? null);
+			const why = owner === null ? null : ownerBusy(ledger, owner);
+			busy.set(pr, owner !== null && why !== null ? { owner, busy: why } : null);
+		}
+		return busy.get(pr)!;
+	};
+	const deferred = new Map<number, WakeDeferral>();
+	const wake: string[] = [];
+	for (const r of out) {
+		const b = r.pr === null ? null : busyOf(r.pr);
+		if (b === null) {
+			wake.push(r.text);
+			continue;
+		}
+		const d = deferred.get(r.pr!) ?? { pr: r.pr!, owner: b.owner, busy: b.busy, reasons: [] };
+		d.reasons.push(r.text);
+		deferred.set(r.pr!, d);
+	}
+	for (const d of deferred.values()) owners.defer(d);
+	return wake;
+}
+
+/**
+ * D2 (PLAN wl-mvpsrr4tr0p1xc): the lanes that never got their first prompt: a runner launch (a `launch:` attempt whose cause is
+ * not `interactive`) with no `lane-ready:`. A lane Jo ran by hand (`cause interactive`) or one no `launch:` names had no
+ * readiness step, so it is never one of them.
+ */
+function neverReadyLanes(control: readonly ControlEntry[]): Set<string> {
+	const ready = new Set(control.flatMap((c) => (c.prefix === "lane-ready" && c.laneId !== null ? [c.laneId] : [])));
+	return new Set(attempts(control).flatMap((a) => (a.cause?.kind !== "interactive" && !ready.has(a.laneId) ? [a.laneId] : [])));
+}
+
+/**
+ * D2 (PLAN wl-mvpsrr4tr0p1xc): the time of the newest `lane-exit:` of a lane that got its first prompt (not `neverReadyLanes`),
+ * or null. The train's "since the last lane exit" cutoffs read it, so a launch that never got ready swallows no work.
+ */
+export function lastReadyExit(control: readonly ControlEntry[]): string | null {
+	const never = neverReadyLanes(control);
+	return control.filter((c) => c.prefix === "lane-exit" && c.laneId !== null && !never.has(c.laneId)).at(-1)?.createdAt ?? null;
+}
+
+/** The `lane-exit:` outcomes by which a ready lane ended its pass by its own word (D2's `#<n> not yet worked` rule). */
+const OWN_WORD_ENDS: readonly string[] = ["parked", "released", "completed"];
+
+/**
+ * D2 (PLAN wl-mvpsrr4tr0p1xc): whether train `wl`'s own lanes worked slice `sl` (one the tick added to carry an alert) since it
+ * was added: one of the train's lanes (`lane-<wl without wl->-<n>`; machinery writers do not count) wrote an entry or a question
+ * on it or last changed its state, or a lane that got its first prompt (not `neverReadyLanes`) ended its pass by its own word
+ * (its `released-open:`, or a `lane-exit:` outcome parked, released or completed). Readiness alone, a crash, or an `open-work`
+ * exit with no `released-open:` is no work: the PR stays `not yet worked`.
+ */
+function trainLaneWorked(wl: string, sl: SliceRow, control: readonly ControlEntry[], entries: readonly EntryRow[], questions: readonly QuestionRow[]): boolean {
+	const since = sl.created_at;
+	const lane = trainLanePattern(wl);
+	if (lane.test(sl.changed_by) && sl.changed_at >= since) return true;
+	if (entries.some((e) => e.slice_id === sl.id && lane.test(e.created_by) && e.created_at >= since)) return true;
+	if (questions.some((q) => q.slice_id === sl.id && lane.test(q.created_by) && q.created_at >= since)) return true;
+	const never = neverReadyLanes(control);
+	return control.some((c) => {
+		if (c.laneId === null || never.has(c.laneId) || c.createdAt < since) return false;
+		return c.prefix === "released-open" || (c.prefix === "lane-exit" && OWN_WORD_ENDS.includes(laneExit([c], c.laneId)?.outcome ?? ""));
+	});
+}
+
+/** The ids of train `wl`'s own lanes, `lane-<wl without wl->-<n>` (`reserveLane`'s numbering); machinery writers never match. */
+function trainLanePattern(wl: string): RegExp {
+	return new RegExp(`^lane-${wl.replace(/^wl-/, "")}-[1-9]\\d*$`);
 }
 
 /**
@@ -1423,13 +1704,13 @@ export interface TrainAlert {
 	q: QuestionRow;
 	pr: number;
 	options: string[];
-	/** `failed twice` (the tick's retry / skip / stop) or `production merge` (the lane's merged / skip / stop). */
+	/** `failed twice` (the tick's retry / skip / stop), `production merge` (the lane's merged / skip / stop) or `launch limit` (the tick's relaunch / stop, D4). */
 	reason: string;
 	record: AlertRecord;
 }
 
 export function trainAlertReason(options: readonly string[]): string {
-	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : "question";
+	return options.includes("retry") ? "failed twice" : options.includes("merged") ? "production merge" : options.includes("relaunch") ? "launch limit" : "question";
 }
 
 /**
@@ -1529,7 +1810,7 @@ export function raiseTwiceFailed(ledger: Ledger, wl: string, d: TwiceFailed): st
 
 // ---- part 3: a green, reviewed lane PR boards a train on its own (PLAN wl-mvbjiettjrfpxc D1-D3) -------------------------
 
-/** D1: a workload closed longer ago than this is no longer scanned (the scan stays bounded). */
+/** D1: a close or released landing receipt older than this is no longer scanned (the scan stays bounded). */
 export const AUTOBOARD_WINDOW_MS = 14 * 86_400_000;
 
 /** `train-autoboard: on <iso>`: the cutover the train tick writes once on the standing workload (MERGE_TRAIN_BY); receipts before it never board. */
@@ -1556,12 +1837,12 @@ export function isTrainOrFix(entries: readonly EntryRow[], instructions: readonl
 
 /** D1's verdict on workload W: ready to board at a green sha, or why not (the reason the tick's `train-board-skip:` names). */
 export type Landing =
-	| { ready: true; workloadId: string; pr: number; sha: string; run: string; review: string; checkout: string; repo: string; closedAt: string }
+	| { ready: true; workloadId: string; pr: number; sha: string; run: string; review: string; checkout: string; repo: string; readyAt: string }
 	| { ready: false; workloadId: string; pr: number | null; sha: string | null; reason: string };
 
 /** What `landingReady` reads beyond the ledger: the test runner's config, and how a checkout names its GitHub repository (git; injected in tests). */
 export interface LandingContext {
-	config: Pick<TestRunnerConfig, "repos">;
+	config: { repos: readonly Pick<TestRunnerConfig["repos"][number], "origin">[] };
 	ownerRepo?: (checkout: string) => string | null;
 }
 
@@ -1596,11 +1877,11 @@ function reviewPassed(ledger: Ledger, wl: string, entries: readonly EntryRow[], 
 }
 
 /**
- * D1's ledger half for workload `wl`: ready when W is closed (within AUTOBOARD_WINDOW_MS), autonomous, at normal stakes, neither
- * the standing workload nor a merge train nor a fix workload (`isTrainOrFix`), not superseded (`supersededBy`) and not cancelled
- * (a `plan: first` never approved), on a repository the test runner serves; its holder's `done-because:` stands (`doneBecause`)
- * and is newer than the tick's `train-autoboard:` cutover; the newest full-suite run (`testRuns`) names PR n and is green at sha G;
- * and the review rule holds (`reviewPassed`). Otherwise the first failing rule, as a reason. The tick adds the live half (gh).
+ * D1's ledger half for workload `wl`: ready when W is closed within AUTOBOARD_WINDOW_MS, or released with a fast green on
+ * a land-first repository (D9). Released readiness is not closure: no holder, unfinished slices, questions or pending tests
+ * may remain, and close still waits for merged/main coverage. W must be autonomous, normal stakes, neither standing nor a
+ * train/fix, not superseded/cancelled, on a served repository, with a holder done-because newer than the cutover and a passed
+ * review. The newest result must be a green gate (fast only while land-first is on), never red-main. The tick adds gh's live half.
  */
 export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): Landing {
 	let pr: number | null = null;
@@ -1609,9 +1890,14 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	const w = ledger.workload(wl);
 	if (!w) return no("no such workload");
 	if (wl === STANDING_WORKLOAD_ID) return no("the standing workload");
-	if (w.status !== "closed" || w.closed_at === null) return no("the workload is open");
+	const open = w.status === "open";
 	if (w.mode !== "autonomous") return no(`the workload is ${w.mode}`);
 	if (w.stakes !== "normal") return no(`stakes ${w.stakes}`);
+	const busy = ownerBusy(ledger, wl);
+	if (busy !== null) return no(busy);
+	if (open && w.holder !== null) return no("the workload has not been released");
+	if (open && ledger.slices(wl).some((s) => s.state === "open" || s.state === "paused")) return no("the workload has open or paused slices");
+	if (open && ledger.questions(wl).some((q) => q.state === "open")) return no("the workload has open questions");
 	const entries = ledger.entries(wl);
 	const instructions = ledger.instructions(wl);
 	const runs = testRuns(entries);
@@ -1626,24 +1912,137 @@ export function landingReady(ledger: Ledger, wl: string, ctx: LandingContext): L
 	if (checkout === null) return no("no repo: entry");
 	const repo = (ctx.ownerRepo ?? checkoutOwnerRepo)(checkout);
 	if (repo === null || !ctx.config.repos.some((r) => r.origin.toLowerCase() === repo.toLowerCase())) return no(`the test runner does not serve ${repo ?? checkout}`);
+	const enabled = landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), repo);
+	if (open && !enabled) return no("the workload is open");
 	if (doneBecause(entries, holders) === null) return no("no holder done-because");
 	const receipt = entries.findLast((e) => e.kind === "assumption" && holders.includes(e.created_by) && e.body.trim().startsWith("done-because:"))!;
 	const cutover = autoboardCutover(ledger);
 	if (cutover === null) return no("no train-autoboard cutover yet");
 	if (receipt.created_at <= cutover.createdAt) return no(`done-because ${receipt.id} predates the train-autoboard cutover ${cutover.entryId}`);
-	if (Date.parse(ledger.now()) - Date.parse(w.closed_at) > AUTOBOARD_WINDOW_MS) return no("closed more than 14 days ago");
+	const readyAt = w.closed_at ?? receipt.created_at;
+	if (Date.parse(ledger.now()) - Date.parse(readyAt) > AUTOBOARD_WINDOW_MS) return no(open ? "released more than 14 days ago" : "closed more than 14 days ago");
 	if (newestRun === null) return no("no full-suite run");
 	const result = newestRun.result;
 	if (result === null) return no(`the newest run ${newestRun.request.runId} on #${pr} has no result`);
 	if (result.verdict !== "green") return no(`the newest run ${newestRun.request.runId} on #${pr} is ${result.verdict}`);
+	if (result.scope === "fast" && !enabled) return no("land-first is off: a fast green is not a full-suite result");
+	if (open && result.scope !== "fast") return no("the workload is open");
 	sha = result.sha;
 	const review = reviewPassed(ledger, wl, entries, holders);
 	if (!review.ok) return no(review.reason);
-	return { ready: true, workloadId: wl, pr: pr!, sha: sha!, run: newestRun.request.runId, review: review.entryId, checkout, repo, closedAt: w.closed_at };
+	return { ready: true, workloadId: wl, pr: pr!, sha: sha!, run: newestRun.request.runId, review: review.entryId, checkout, repo, readyAt };
+}
+
+/**
+ * PLAN wl-mvg8itbt0rz3ls D2 rule 3, stricter than the auto-board `reviewPassed`: W's review is settled and passed. The reviewed
+ * slices are every slice of W that is not a plan slice (a plan question's slice, the slice of the auto-start's
+ * `plan: approved auto …`, which raises no question row, or, while `plan: first` stands unapproved (`planFirst`), the slice that
+ * holds the plan role now (`planSlice`), whose plan may be reviewed before its question exists) and has any `review-group:`, review `hand-spawn: … review yes`
+ * or `review-round:` entry; at least one exists; each one's newest `review-loop-end:` (from a holder lane or the surface, as
+ * `reviewPassed` reads it) is `pass` or `accept`, and after it that slice has no `review-group:`, review `hand-spawn:` or
+ * `review-round:` (the later-entry rule of `planAutoStartRound`, surface/extensions/lane-tools.ts): a review dispatched after a
+ * pass and not yet settled fails. Otherwise the first failing slice, as a reason.
+ */
+export function reviewSettledPassed(ledger: Ledger, wl: string): { ok: true } | { ok: false; reason: string } {
+	const no = (reason: string) => ({ ok: false as const, reason });
+	const entries = ledger.entries(wl);
+	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
+	const control = controlEntries(entries, holders);
+	const planQuestions = new Set(control.filter((c) => c.prefix === "plan-question").map((c) => c.rest.split(/\s/)[0]));
+	const sliceOf = new Map(entries.map((e) => [e.id, e.slice_id]));
+	const pending = planFirst(control) !== null ? planSlice(ledger.slices(wl)) : null;
+	const planSlices = new Set([
+		...ledger.questions(wl).filter((q) => planQuestions.has(q.id)).map((q) => q.slice_id),
+		...control.filter((c) => c.prefix === "plan" && /^approved auto\b/.test(c.rest)).map((c) => sliceOf.get(c.id) ?? null),
+		...(pending === null ? [] : [pending.id]),
+	]);
+	/** The slice a review dispatch or round entry is about, or null for any other entry. */
+	const reviewOf = (e: EntryRow): string | null => {
+		if (e.kind !== "assumption") return null;
+		const body = e.body.trim();
+		if (parseHandSpawn(body)?.review === true) return e.slice_id;
+		return parseReviewGroup(body)?.slice ?? parseReviewRound(body)?.slice ?? null;
+	};
+	const reviewed = [...new Set(entries.map(reviewOf).filter((sl): sl is string => sl !== null && !planSlices.has(sl)))];
+	if (reviewed.length === 0) return no(`${wl} has no review on any slice`);
+	for (const sl of reviewed) {
+		const endAt = entries.findLastIndex(
+			(e) => e.kind === "assumption" && (holders.includes(e.created_by) || e.created_by === SURFACE_BY) && parseReviewLoopEnd(e.body)?.slice === sl,
+		);
+		if (endAt < 0) return no(`the review of ${sl} on ${wl} has not ended`);
+		const reason = parseReviewLoopEnd(entries[endAt]!.body)!.reason;
+		if (reason !== "pass" && reason !== "accept") return no(`the review of ${sl} on ${wl} ended ${reason}, not pass or accept`);
+		if (entries.slice(endAt + 1).some((e) => reviewOf(e) === sl)) return no(`a review of ${sl} on ${wl} was dispatched after its loop ended ${reason} and has not settled`);
+	}
+	return { ok: true };
+}
+
+/**
+ * PLAN wl-mvg8itbt0rz3ls D2: the `trainSignoff` fact Jo's ruling `train-signoff` (gates/src/rulings.ts) reads for PR `pr` on train
+ * `train` (repository `trainRepo`), from the ledger, gh's `view` of the PR (TASK_VIEW_FIELDS) and main's `protection` as read
+ * live (`mainProtectionGap`). Ok only when all hold, else the first failing rule as the reason:
+ * (0) no train slice of `pr` (its disposition slice or a `-full-<r>` one, `trainSlicePr`) has an open question (D6: a merge
+ *     question already open stays Jo's), and the train is not held by Jo's stop (`trainHold`: only his train word resumes it);
+ * (1) an authenticated Jo `train:` binding on the train names `pr` (`trainBindings` with source jo, every binding: a later
+ *     `train <N>` or resume counts, a PR only the tick boarded does not);
+ * (2) `branchWorkload` (prStakes' D1 lookup) finds the PR's workload W, W's stakes are production, W has no plan hold
+ *     (`planHold`: Jo's `halt`, or the auto-start's) and no plan pending (`planFirst`: `plan: first` with no `plan: approved`);
+ * (3) W's review is settled and passed (`reviewSettledPassed`);
+ * (4) the newest runner request on `pr` with a result, on the train or on W (`testRuns`; their requests in the ledger's own
+ *     order across both workloads, created_at then rowid), is green at the PR's current head `view.headRefOid`: full scope,
+ *     or fast scope while land-first is on for `trainRepo` (`landFirstOn`). Production stakes alone do not require full scope.
+ *     A full-scope red-main passes too, but only while land-first is off: on a land-first repository the gate posts failure
+ *     on a red-main;
+ * (5) `protection` is ok.
+ * The lane tool calls it inside the `ledger.write` that decides or raises, so a stop, a halt or a question recorded while gh
+ * was read is seen here. It is asked only on the PR's disposition slice (`trainSliceId`), the slice the action completes.
+ */
+export function trainSignoff(ledger: Ledger, train: string, pr: number, view: TaskView, trainRepo: string, protection: Protection): TrainSignoffFact {
+	const no = (reason: string): TrainSignoffFact => ({ ok: false, reason });
+	const trainEntries = ledger.entries(train);
+	const trainInstructions = ledger.instructions(train);
+	const trainQuestions = ledger.questions(train);
+	if (view.number !== pr) return no(`gh's view is of #${view.number}, not #${pr}`);
+	const slice = trainSliceId(train, pr);
+	const asked = trainQuestions.find((q) => q.state === "open" && trainSlicePr(q.slice_id, train) === pr);
+	if (asked !== undefined) return no(`${asked.slice_id} has open question ${asked.id}: Jo's answer stands`);
+	const stopped = trainHold({ entries: trainEntries, instructions: trainInstructions, questions: trainQuestions });
+	if (stopped !== null) return no(stopped);
+	if (!trainBindings(trainEntries, trainInstructions).some((b) => b.source === "jo" && b.prs.includes(pr))) return no(`no train word of Jo's on ${train} names #${pr}`);
+	const b = branchWorkload(view, trainRepo, ledger);
+	if (!b.ok) return no(b.reason);
+	if (b.w.stakes !== "production") return no(`${b.id}'s stakes are ${b.w.stakes}, not production`);
+	const hold = planHold(ledger, b.id);
+	if (hold !== null) return no(`${hold.reason}: the train holds its PRs`);
+	const wEntries = ledger.entries(b.id);
+	const plan = planFirst(controlEntries(wEntries, holdersOf(wEntries, b.w.holder, ledger.holders(b.id))));
+	if (plan !== null) return no(`${b.id}'s plan is not approved (plan: first ${plan.trigger})`);
+	const review = reviewSettledPassed(ledger, b.id);
+	if (!review.ok) return no(review.reason);
+	const runs = [...testRuns(trainEntries), ...testRuns(ledger.entries(b.id))].filter((r) => r.request.pr === pr && r.result !== null);
+	// The ledger's own order over both workloads' entries (`Ledger.entries` orders by created_at, then rowid): two requests in
+	// one millisecond are ordered as they were written, never by which workload they are on.
+	const order = new Map(
+		ledger.db.query<{ id: string }, [string, string]>("SELECT id FROM entries WHERE workload_id IN (?1, ?2) ORDER BY created_at, rowid").all(train, b.id)
+			.map((e, i) => [e.id, i] as const),
+	);
+	const at = (r: RunRecord): number => order.get(r.request.entryId)!;
+	const newest = runs.reduce<RunRecord | null>((a, r) => (a === null || at(r) > at(a) ? r : a), null);
+	if (newest === null) return no(`no full-suite run on #${pr} has a result`);
+	const result = newest.result!;
+	const enabled = landFirstOn(ledger.entries(STANDING_WORKLOAD_ID), ledger.instructions(STANDING_WORKLOAD_ID), trainRepo);
+	const greenOk = isFullSuiteGreen(result) || (enabled && result.scope === "fast" && result.verdict === "green");
+	const redMainOk = result.verdict === "red-main" && result.scope === "full" && !enabled;
+	if (!greenOk && !redMainOk) {
+		return no(`the newest run ${result.runId} on #${pr} is ${result.scope === "fast" ? `a fast-check ${result.verdict}` : result.verdict}, not ${enabled ? "green" : "a full-scope green or red-main (land-first is off)"}`);
+	}
+	if (result.sha !== view.headRefOid) return no(`the newest run ${result.runId} on #${pr} tested ${result.sha}, not its head ${view.headRefOid}`);
+	if (protection.state !== "ok") return no(`main's protection on ${trainRepo} is ${protection.state}: ${protection.text}`);
+	return { ok: true, pr, slice, repo: trainRepo, head: view.headRefOid, run: result.runId };
 }
 
 /** Every workload, open or closed, that ever carried a membership entry (`train:` or `train-board:`) and is a train, oldest first. */
-function everyTrain(ledger: Ledger): string[] {
+export function everyTrain(ledger: Ledger): string[] {
 	return ledger.db.query<{ id: string }, [string, string]>(
 		`SELECT w.id AS id FROM workloads w WHERE EXISTS (
 		   SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption' AND (
@@ -1676,7 +2075,13 @@ export function boardLanding(
 	const no = (reason: string): BoardResult => ({ boarded: false, reason });
 	return ledger.write(() => {
 		const w = ledger.workload(l.workloadId);
-		if (!w || w.status !== "closed") return no(`${l.workloadId} is not closed`);
+		if (!w) return no(`${l.workloadId} no longer exists`);
+		// GH was read outside this transaction. A reclaim, new slice, run, review or activation change must prevent boarding.
+		const fresh = landingReady(ledger, l.workloadId, { config: { repos: [{ origin: l.repo }] } });
+		if (!fresh.ready) return no(fresh.reason);
+		if (fresh.pr !== l.pr || fresh.sha !== l.sha || fresh.run !== l.run || fresh.review !== l.review || fresh.checkout !== l.checkout || fresh.repo !== l.repo) {
+			return no(`${l.workloadId}'s landing changed after the live PR read; retry next pass`);
+		}
 		const cutover = autoboardCutover(ledger);
 		if (cutover === null) return no("no train-autoboard cutover yet");
 		const trains = everyTrain(ledger).filter((t) => {
@@ -1731,11 +2136,20 @@ export function boardSkips(ledger: Pick<Ledger, "entries">): { bodies: Set<strin
 	return { bodies, ended };
 }
 
-/** D1's scan: every workload closed within AUTOBOARD_WINDOW_MS, the standing one excepted, newest close first. */
+/** D1/D9's scan: recent closed workloads and released open workloads with a recent landing receipt, newest readiness first. */
 export function autoboardCandidates(ledger: Ledger): string[] {
 	const since = new Date(Date.parse(ledger.now()) - AUTOBOARD_WINDOW_MS).toISOString();
 	return ledger.db.query<{ id: string }, [string, string]>(
-		`SELECT id FROM workloads WHERE status = 'closed' AND closed_at >= ?1 AND id <> ?2 ORDER BY closed_at DESC, id DESC`,
+		`SELECT w.id FROM workloads w
+		 WHERE w.id <> ?2 AND (
+		   (w.status = 'closed' AND w.closed_at >= ?1) OR
+		   (w.status = 'open' AND w.holder IS NULL AND EXISTS (
+		     SELECT 1 FROM entries e WHERE e.workload_id = w.id AND e.kind = 'assumption'
+		       AND e.body LIKE 'done-because:%' AND e.created_at >= ?1
+		   ))
+		 )
+		 ORDER BY COALESCE(w.closed_at, (SELECT MAX(e.created_at) FROM entries e
+		   WHERE e.workload_id = w.id AND e.kind = 'assumption' AND e.body LIKE 'done-because:%')) DESC, w.id DESC`,
 	).all(since, STANDING_WORKLOAD_ID).map((r) => r.id);
 }
 
@@ -1887,23 +2301,461 @@ export function mainRedRows(ledger: Ledger, ownerRepo: (checkout: string) => str
 }
 
 const PROTECTION_PASS_RE = /^train-error:\s+pr\s+[1-9]\d*\s+protection\b/;
+/** The train brief's pass-over while landing is stopped (PLAN wl-mvq4edbaf13vnk D9): `train-error: pr <n> landing-stopped <reason>`. */
+const LANDING_PASS_RE = /^train-error:\s+pr\s+[1-9]\d*\s+landing-stopped\b/;
+
+/** The PRs of train `wl`, not terminal, whose newest holder pass-over (`train-error: pr <n> …`) matches `kind`. */
+function passOversOf(ledger: Ledger, wl: string, kind: RegExp): Set<number> {
+	const entries = ledger.entries(wl);
+	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
+	const newest = new Map<number, boolean>();
+	for (const e of entries) {
+		const p = e.kind === "assumption" && holders.includes(e.created_by) ? PASSED_OVER_RE.exec(e.body.trim()) : null;
+		if (p) newest.set(Number(p[1]), kind.test(e.body.trim()));
+	}
+	const out = new Set<number>();
+	for (const [n, matched] of newest) {
+		const sl = ledger.slice(trainSliceId(wl, n));
+		if (matched && !(sl && (sl.state === "done" || sl.state === "cancelled"))) out.add(n);
+	}
+	return out;
+}
 
 /**
  * The PRs of train `wl`, not terminal, whose newest holder pass-over (`train-error: pr <n> …`) is for main's protection (D5's
  * `train-error: pr <n> protection <gap>`): D6 holds their backoff wake while the episode is open and wakes the train when it clears.
  */
 export function protectionPassOvers(ledger: Ledger, wl: string): Set<number> {
-	const entries = ledger.entries(wl);
-	const holders = holdersOf(entries, ledger.workload(wl)?.holder ?? null, ledger.holders(wl));
-	const newest = new Map<number, boolean>();
-	for (const e of entries) {
-		const p = e.kind === "assumption" && holders.includes(e.created_by) ? PASSED_OVER_RE.exec(e.body.trim()) : null;
-		if (p) newest.set(Number(p[1]), PROTECTION_PASS_RE.test(e.body.trim()));
+	return passOversOf(ledger, wl, PROTECTION_PASS_RE);
+}
+
+/**
+ * The PRs of train `wl`, not terminal, whose newest holder pass-over is `train-error: pr <n> landing-stopped …` (PLAN
+ * wl-mvq4edbaf13vnk D9): the tick holds their backoff wake while the repository's landing is stopped and wakes the train when it reopens (D6).
+ */
+export function landingPassOvers(ledger: Ledger, wl: string): Set<number> {
+	return passOversOf(ledger, wl, LANDING_PASS_RE);
+}
+
+// ---- the train's own lane outside the cap (PLAN wl-mvpsrr4tr0p1xc D2, D4) -------------------------------------------
+
+const READY_AT_RE = /^at (\S+)$/;
+
+/**
+ * D2: the newest prompt row cut on a workload: the time the newest `lane-ready: <laneId> at <iso>` of a lane some `launch:`
+ * attempt named carries (the runner takes it before `promptFor` reads the rows), or that entry's own time when its body
+ * names none; null when no launched lane ever got ready.
+ */
+export function lastReadyAt(control: readonly ControlEntry[]): string | null {
+	const launched = new Set(attempts(control).map((a) => a.laneId));
+	let out: string | null = null;
+	for (const c of control) {
+		if (c.prefix !== "lane-ready" || c.laneId === null || !launched.has(c.laneId)) continue;
+		const at = READY_AT_RE.exec(c.rest)?.[1] ?? c.createdAt;
+		if (out === null || at > out) out = at;
 	}
-	const out = new Set<number>();
-	for (const [n, protection] of newest) {
-		const sl = ledger.slice(trainSliceId(wl, n));
-		if (protection && !(sl && (sl.state === "done" || sl.state === "cancelled"))) out.add(n);
+	return out;
+}
+
+/**
+ * D2's consumption rule for a cap-exempt train, one rule for every cause: the resolution whose instruction was written at
+ * `instructionAt` is consumed when some launched lane wrote a `lane-ready:` whose time is later (strict, `lastReadyAt`), so
+ * it was in that lane's first prompt. Naming it in a `launch: … cause resume` consumes nothing: a launch that never gets ready
+ * leaves it to wake the train again (bounded by `trainLaunchFailures`). `launchable` applies it to a cap-exempt workload's
+ * resolutions; the tick's `actionable` reads it for an answered or withdrawn lane question.
+ */
+export function consumedByReady(control: readonly ControlEntry[], instructionAt: string): boolean {
+	const cut = lastReadyAt(control);
+	return cut !== null && instructionAt < cut;
+}
+
+/** D4: this many consecutive train launches that never got ready stop every launch path (PR #308's `RETRY_LIMIT` number, not an import). */
+export const TRAIN_LAUNCH_LIMIT = 3;
+/** D4: the options of Jo's NOW question at the limit: `relaunch` resets the count, `stop` leaves it. Not `retry` (`twiceFailed` reads that). */
+export const TRAIN_LAUNCH_OPTIONS: readonly string[] = ["relaunch", "stop"];
+
+/** What `trainLaunchFailures` reads: the train's rows and its holder now. */
+export interface TrainLaunchRows {
+	entries: readonly EntryRow[];
+	instructions: readonly InstructionRow[];
+	questions: readonly QuestionRow[];
+	holder: string | null;
+	holderLeaseUntil: string | null;
+	now: string;
+}
+
+/** The consecutive failed launches since the newest reset (D4), oldest first. */
+export interface TrainLaunchFailures {
+	count: number;
+	/** The counted attempts' lane ids. */
+	lanes: string[];
+	/** One line per counted attempt: `<laneId> (<launch time>): <why it ended without readiness>`. */
+	failures: string[];
+	/** The oldest and newest counted attempt's `launch:` time; null when none is counted. */
+	first: string | null;
+	last: string | null;
+}
+
+/**
+ * D4: the train's `launch:` attempts after the newest reset, walked newest first, counting each that has no `lane-ready:` and
+ * has ended: it has a `launch-failed:` or a `lane-exit: … outcome never-ready`, or a later attempt exists, or it is the newest
+ * attempt and the workload is no longer held by it under a live lease (a starter or runner that died before readiness without
+ * finalizing). The walk stops at an attempt whose lane wrote `lane-ready:` and at a by-hand attempt (`cause interactive`: Jo's
+ * session gets its first prompt from a file and has no runner readiness step, so it is never a failed launch, as
+ * `neverReadyLanes` reads it); the newest attempt still held under a live lease and not ready is in flight and not counted. A
+ * reset is Jo's `launch-requested: by jo`, Jo's `relaunch` answer to the D4 question (the tick's, options
+ * `TRAIN_LAUNCH_OPTIONS`) or a `train:` binding; an attempt counts only when written after it (entry order on a tie with an
+ * entry, the attempt on a tie with an answer). Pure: pass the rows one read took.
+ */
+export function trainLaunchFailures(rows: TrainLaunchRows): TrainLaunchFailures {
+	const control = controlEntries(rows.entries, holdersOf(rows.entries, rows.holder));
+	const order = new Map(control.map((c, i) => [c.id, i]));
+	const resets: { at: string; index: number | null }[] = [];
+	for (const c of control) {
+		if (c.prefix === "launch-requested" && c.createdBy === SURFACE_BY && /^by jo\b/.test(c.rest)) resets.push({ at: c.createdAt, index: order.get(c.id)! });
 	}
+	for (const b of prBindings(rows.entries, rows.instructions, ["train"])) {
+		const index = order.get(b.entryId);
+		if (index !== undefined) resets.push({ at: b.createdAt, index });
+	}
+	for (const q of rows.questions) {
+		if (q.created_by !== MERGE_TRAIN_BY || !(JSON.parse(q.options) as string[]).includes("relaunch")) continue;
+		const ins = joAnswer(q, rows.instructions, "relaunch");
+		if (ins) resets.push({ at: ins.created_at, index: null });
+	}
+	const reset = resets.reduce<{ at: string; index: number | null } | null>((a, r) => (a === null || r.at > a.at || (r.at === a.at && (r.index ?? Infinity) > (a.index ?? Infinity)) ? r : a), null);
+	const list = attempts(control).filter((a) => reset === null || a.createdAt > reset.at || (a.createdAt === reset.at && (reset.index === null || order.get(a.entryId)! > reset.index)));
+	const counted: { laneId: string; at: string; line: string }[] = [];
+	const live = heldLive({ holder: rows.holder, holder_lease_until: rows.holderLeaseUntil }, rows.now);
+	for (let i = list.length - 1; i >= 0; i--) {
+		const a = list[i]!;
+		if (a.cause?.kind === "interactive" || control.some((c) => c.prefix === "lane-ready" && c.laneId === a.laneId)) break;
+		const failed = control.find((c) => c.prefix === "launch-failed" && c.laneId === a.laneId);
+		const exit = laneExit(control, a.laneId);
+		const next = list[i + 1];
+		const why = failed ? `launch-failed: ${failed.rest}`
+			: exit?.outcome === "never-ready" ? "lane-exit: outcome never-ready"
+			: next ? `no lane-ready:, superseded by ${next.laneId}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`
+			: rows.holder === a.laneId && live ? null
+			: `no lane-ready:, ${rows.holder === a.laneId ? "its lease lapsed" : `the workload is held by ${rows.holder ?? "no one"}`}${exit ? ` (lane-exit: outcome ${exit.outcome})` : ""}`;
+		if (why !== null) counted.unshift({ laneId: a.laneId, at: a.createdAt, line: `${a.laneId} (${a.createdAt}): ${why}` });
+	}
+	return {
+		count: counted.length,
+		lanes: counted.map((c) => c.laneId),
+		failures: counted.map((c) => c.line),
+		first: counted[0]?.at ?? null,
+		last: counted.at(-1)?.at ?? null,
+	};
+}
+
+/** D4's question body: the count, the time span and lanes, what each answer does, then each failure line. */
+export function trainLaunchLimitBody(wl: string, f: TrainLaunchFailures): string {
+	return [
+		`merge train ${wl}: ${f.count} consecutive launches never got ready, ${f.first} to ${f.last} (lanes ${f.lanes.join(", ")}); ` +
+			"nothing launches the train until you answer. relaunch resets the count and the next tick pass relaunches it; " +
+			"stop leaves it stopped until your launch word or a train word.",
+		"",
+		...f.failures.map((line) => `- ${line}`),
+	].join("\n");
+}
+
+/**
+ * D4 (PLAN wl-mvpsrr4tr0p1xc), the tick's side, in one transaction: at the limit (`trainLaunchFailures` counts
+ * TRAIN_LAUNCH_LIMIT), Jo's NOW question, once per episode: unless a D4 question (the tick's, options TRAIN_LAUNCH_OPTIONS)
+ * open or resolved was created at or after the episode's first counted attempt, `askJo(…, now: "incident")` on the slice of
+ * the train's first non-terminal PR in `trainPrs` order (added as the tick when no lane added it), so its needs-you line is
+ * `NOW (incident)` and on fire, and the alert ladder files its jo-issues issue. Returns the question id, null when none is
+ * owed, or `{ noSlice }` when the train has no non-terminal PR to carry it.
+ */
+export function raiseLaunchLimit(ledger: Ledger, wl: string): string | { noSlice: true } | null {
+	return ledger.write(() => {
+		const w = ledger.workload(wl);
+		if (!w) return null;
+		const questions = ledger.questions(wl);
+		const instructions = ledger.instructions(wl);
+		const entries = ledger.entries(wl);
+		const f = trainLaunchFailures({ entries, instructions, questions, holder: w.holder, holderLeaseUntil: w.holder_lease_until, now: ledger.now() });
+		if (f.count < TRAIN_LAUNCH_LIMIT || f.first === null) return null;
+		const asked = questions.some((q) => q.created_by === MERGE_TRAIN_BY && (JSON.parse(q.options) as string[]).includes("relaunch") && q.created_at >= f.first!);
+		if (asked) return null;
+		const pr = trainPrs(entries, instructions).find((n) => {
+			const sl = ledger.slice(trainSliceId(wl, n));
+			return !(sl && (sl.state === "done" || sl.state === "cancelled"));
+		});
+		if (pr === undefined) return { noSlice: true };
+		const sl = ensurePrSlice(ledger, wl, pr);
+		const r = askJo(ledger, { by: MERGE_TRAIN_BY, workloadId: wl, sliceId: sl, body: trainLaunchLimitBody(wl, f), options: [...TRAIN_LAUNCH_OPTIONS], now: "incident" }, { asker: "train" });
+		return raisedId(r, `the launch limit question of ${wl}`);
+	});
+}
+
+// ---- land-first: the tick's rows on the standing workload (PLAN wl-mvq4edbaf13vnk D6-D8) ----------------------------------
+
+/** What one tick pass reconciled for one repository (D6): landing state, its reasons, the oldest suspect, the repair head and the watermark. */
+export interface TrainReconciled {
+	/** Lowercase `owner/repo`. */
+	repo: string;
+	/** The pass's ledger time, ISO. */
+	at: string;
+	tip: string;
+	g: string | null;
+	open: boolean;
+	/** When the oldest suspect landed, ISO; null with no suspects. */
+	oldest: string | null;
+	/** The head the gate posted the incident's repair success on, while stopped (D7); null otherwise. */
+	repair: string | null;
+	/** The entry id of the newest main-run settle the pass read (§ 2's watermark); null when none exists. */
+	read: string | null;
+	/** Every reason landing is stopped, `; `-joined; empty when open. */
+	reasons: string;
+}
+
+const RECONCILED_RE = /^train-reconciled: repo (\S+\/\S+) at (\S+) tip ([0-9a-f]{40}) g ([0-9a-f]{40}|none) landing (open|stopped) oldest (\S+) repair ([0-9a-f]{40}|none) read (en-[a-z0-9]+|none) reasons (.*)$/;
+
+/**
+ * `train-reconciled: repo <owner/repo> at <iso> tip <sha> g <sha|none> landing open|stopped oldest <iso|none> repair <sha|none>
+ * read <en-…|none> reasons <…>`: the tick's alone (MERGE_TRAIN_BY), on the standing workload, one line, `reasons` last (`none` when empty).
+ */
+export function trainReconciledBody(r: TrainReconciled): string {
+	const reasons = r.reasons.replace(/\s+/g, " ").trim();
+	const body = `train-reconciled: repo ${r.repo.toLowerCase()} at ${r.at} tip ${r.tip} g ${r.g ?? "none"} landing ${r.open ? "open" : "stopped"} oldest ${r.oldest ?? "none"} repair ${r.repair ?? "none"} read ${r.read ?? "none"} reasons ${reasons === "" ? "none" : reasons}`;
+	if (parseTrainReconciled(body) === null) throw new Error(`train-reconciled: the body for ${r.repo} at ${r.at} does not parse (a sha or time is malformed): ${body}`);
+	return body;
+}
+
+/** A full `train-reconciled:` body parsed, or null when it is not that shape. */
+export function parseTrainReconciled(body: string): TrainReconciled | null {
+	const m = RECONCILED_RE.exec(body.trim());
+	if (!m || !Number.isFinite(Date.parse(m[2]!)) || (m[6] !== "none" && !Number.isFinite(Date.parse(m[6]!)))) return null;
+	const none = (s: string) => (s === "none" ? null : s);
+	return { repo: m[1]!, at: m[2]!, tip: m[3]!, g: none(m[4]!), open: m[5] === "open", oldest: none(m[6]!), repair: none(m[7]!), read: none(m[8]!), reasons: m[9] === "none" ? "" : m[9]! };
+}
+
+/** The newest valid `train-reconciled:` the tick wrote (`controlEntries` drops any other writer) for `repo`, with its entry; null when none. */
+export function latestTrainReconciled(entries: readonly EntryRow[], repo: string): { entryId: string; createdAt: string; r: TrainReconciled } | null {
+	const want = repo.toLowerCase();
+	let out: { entryId: string; createdAt: string; r: TrainReconciled } | null = null;
+	for (const c of controlEntries(entries)) {
+		const r = c.prefix === "train-reconciled" ? parseTrainReconciled(c.body) : null;
+		if (r !== null && r.repo === want) out = { entryId: c.id, createdAt: c.createdAt, r };
+	}
+	return out;
+}
+
+/** An inconclusive main run is re-requested only once it is this old (§ 2 Attempts, D6). */
+export const MAIN_RETRY_MS = 15 * 60_000;
+/** Landing stops longer than this after the repair's wake have not been repaired (D6, F3): one repair-failed notice. */
+export const REPAIR_FAIL_MS = 30 * 60_000;
+/** Revocation posts per open head before the tick gives up on it (D6, F6). */
+export const REVOKE_ATTEMPTS = 3;
+/** Promotion attempts per verified commit G before the tick gives up on it (§ 2 Protect the verifier, R31). */
+export const PROMOTE_ATTEMPTS = 3;
+/** The render's stale-tick bound (D8): no `train-reconciled:` this recent while land-first is on. */
+export const RECONCILED_STALE_MS = 15 * 60_000;
+
+/**
+ * One of the tick's land-first rows (D6), `train-notice: land-first <repo> <event> …` on the standing workload as MERGE_TRAIN_BY
+ * (`tick-refused` names the repository `*`: the self-check is the tick's, not a repository's):
+ * - `exhausted <sha> block <n>`: main commit `sha`'s attempt block n is exhausted (§ 2 Attempts), once per block;
+ * - `revoke-failed #<n> <head> attempt <k> <error>`, `revoke-gave-up #<n> <head> <error>` after REVOKE_ATTEMPTS, and
+ *   `revoke-cleared #<n> <head> <why>` once that head is no longer the PR's open head;
+ * - `stop-raised` / `stop-updated <kind> tip <sha> g <sha|none> suspects <#n,…|none> failing <n|none>`: a stop episode opens or
+ *   changes kind or tip; `stop-filed <issue url>` its jo-issues issue (regression or infrastructure); `stop-cleared <why>` ends it;
+ * - `repair-woken <tip> train <wl|none>` (D7, once per episode) and `repair-failed <tip> woken <iso>` 30 minutes on;
+ * - `promote-failed <g> attempt <k> <error>`, `promote-gave-up <g> <error>`, `promote-schema <barrier> target <g> current
+ *   <sha|none> issue <url|none>` (schema barrier and the actual verified target; old rows have no target) and `promote-ok <g>`;
+ * - `tick-refused <reason>`: the tick's self-check refused while land-first is on.
+ */
+export type LandFirstEvent =
+	| { event: "exhausted"; sha: string; block: number }
+	| { event: "revoke-failed"; pr: number; head: string; attempt: number; error: string }
+	| { event: "revoke-gave-up"; pr: number; head: string; error: string }
+	| { event: "revoke-cleared"; pr: number; head: string; why: string }
+	| { event: "stop-raised" | "stop-updated"; kind: "regression" | "infrastructure" | "depth"; tip: string; g: string | null; suspects: number[]; failing: number | null }
+	| { event: "stop-filed"; url: string }
+	| { event: "stop-cleared"; why: string }
+	| { event: "repair-woken"; tip: string; train: string | null }
+	| { event: "repair-failed"; tip: string; woken: string }
+	| { event: "promote-failed"; g: string; attempt: number; error: string }
+	| { event: "promote-gave-up"; g: string; error: string }
+	| { event: "promote-schema"; sha: string; g: string | null; current: string | null; issue: string | null }
+	| { event: "promote-ok"; g: string }
+	| { event: "tick-refused"; reason: string };
+export type LandFirstRow = LandFirstEvent & { repo: string; entryId: string; createdAt: string };
+
+const oneLine = (s: string) => s.replace(/\s+/g, " ").trim() || "none";
+
+/** `train-notice: land-first <repo> <event> …` for `e` (`LandFirstEvent`); free text is put on one line. */
+export function landFirstNoticeBody(repo: string, e: LandFirstEvent): string {
+	const none = (s: string | null) => s ?? "none";
+	const rest = ((): string => {
+		switch (e.event) {
+			case "exhausted": return `${e.sha} block ${e.block}`;
+			case "revoke-failed": return `#${e.pr} ${e.head} attempt ${e.attempt} ${oneLine(e.error)}`;
+			case "revoke-gave-up": return `#${e.pr} ${e.head} ${oneLine(e.error)}`;
+			case "revoke-cleared": return `#${e.pr} ${e.head} ${oneLine(e.why)}`;
+			case "stop-raised":
+			case "stop-updated":
+				return `${e.kind} tip ${e.tip} g ${none(e.g)} suspects ${e.suspects.length === 0 ? "none" : e.suspects.map((n) => `#${n}`).join(",")} failing ${e.failing ?? "none"}`;
+			case "stop-filed": return e.url;
+			case "stop-cleared": return oneLine(e.why);
+			case "repair-woken": return `${e.tip} train ${none(e.train)}`;
+			case "repair-failed": return `${e.tip} woken ${e.woken}`;
+			case "promote-failed": return `${e.g} attempt ${e.attempt} ${oneLine(e.error)}`;
+			case "promote-gave-up": return `${e.g} ${oneLine(e.error)}`;
+			case "promote-schema": return `${e.sha} target ${none(e.g)} current ${none(e.current)} issue ${none(e.issue)}`;
+			case "promote-ok": return e.g;
+			case "tick-refused": return oneLine(e.reason);
+		}
+	})();
+	return `train-notice: land-first ${repo.toLowerCase()} ${e.event} ${rest}`;
+}
+
+const LF_NOTICE_RE = /^land-first (\S+) (\S+) (.*)$/;
+const SHA = "([0-9a-f]{40})";
+const SHA_OR_NONE = "([0-9a-f]{40}|none)";
+const STOP_STATE = `(regression|infrastructure|depth) tip ${SHA} g ${SHA_OR_NONE} suspects (none|#[1-9]\\d*(?:,#[1-9]\\d*)*) failing (none|\\d+)`;
+const LF_EVENT_RE: Record<LandFirstEvent["event"], RegExp> = {
+	exhausted: new RegExp(`^${SHA} block ([1-9]\\d*)$`),
+	"revoke-failed": new RegExp(`^#([1-9]\\d*) ${SHA} attempt ([1-9]\\d*) (.+)$`),
+	"revoke-gave-up": new RegExp(`^#([1-9]\\d*) ${SHA} (.+)$`),
+	"revoke-cleared": new RegExp(`^#([1-9]\\d*) ${SHA} (.+)$`),
+	"stop-raised": new RegExp(`^${STOP_STATE}$`),
+	"stop-updated": new RegExp(`^${STOP_STATE}$`),
+	"stop-filed": /^(https:\/\/\S+)$/,
+	"stop-cleared": /^(.+)$/,
+	"repair-woken": new RegExp(`^${SHA} train (wl-[a-z0-9]+|none)$`),
+	"repair-failed": new RegExp(`^${SHA} woken (\\S+)$`),
+	"promote-failed": new RegExp(`^${SHA} attempt ([1-9]\\d*) (.+)$`),
+	"promote-gave-up": new RegExp(`^${SHA} (.+)$`),
+	"promote-schema": new RegExp(`^${SHA}(?: target ${SHA_OR_NONE})? current ${SHA_OR_NONE} issue (https:\\/\\/\\S+|none)$`),
+	"promote-ok": new RegExp(`^${SHA}$`),
+	"tick-refused": /^(.+)$/,
+};
+
+/** One `train-notice: land-first …` rest (`controlEntries`' `rest`) parsed, or null when it is not that shape. */
+function parseLandFirst(rest: string): (LandFirstEvent & { repo: string }) | null {
+	const top = LF_NOTICE_RE.exec(rest);
+	if (!top || !Object.hasOwn(LF_EVENT_RE, top[2]!)) return null;
+	const event = top[2] as LandFirstEvent["event"];
+	const m = LF_EVENT_RE[event].exec(top[3]!);
+	if (!m) return null;
+	const repo = top[1]!;
+	const orNull = (s: string) => (s === "none" ? null : s);
+	switch (event) {
+		case "exhausted": return { repo, event, sha: m[1]!, block: Number(m[2]) };
+		case "revoke-failed": return { repo, event, pr: Number(m[1]), head: m[2]!, attempt: Number(m[3]), error: m[4]! };
+		case "revoke-gave-up": return { repo, event, pr: Number(m[1]), head: m[2]!, error: m[3]! };
+		case "revoke-cleared": return { repo, event, pr: Number(m[1]), head: m[2]!, why: m[3]! };
+		case "stop-raised":
+		case "stop-updated":
+			return {
+				repo, event, kind: m[1] as "regression" | "infrastructure" | "depth", tip: m[2]!, g: orNull(m[3]!),
+				suspects: m[4] === "none" ? [] : m[4]!.split(",").map((s) => Number(s.slice(1))), failing: m[5] === "none" ? null : Number(m[5]),
+			};
+		case "stop-filed": return { repo, event, url: m[1]! };
+		case "stop-cleared": return { repo, event, why: m[1]! };
+		case "repair-woken": return { repo, event, tip: m[1]!, train: orNull(m[2]!) };
+		case "repair-failed": return { repo, event, tip: m[1]!, woken: m[2]! };
+		case "promote-failed": return { repo, event, g: m[1]!, attempt: Number(m[2]), error: m[3]! };
+		case "promote-gave-up": return { repo, event, g: m[1]!, error: m[2]! };
+		case "promote-schema": return { repo, event, sha: m[1]!, g: m[2] === undefined ? null : orNull(m[2]), current: orNull(m[3]!), issue: orNull(m[4]!) };
+		case "promote-ok": return { repo, event, g: m[1]! };
+		case "tick-refused": return { repo, event, reason: m[1]! };
+	}
+}
+
+/** Every valid land-first row the tick wrote (`controlEntries` drops any other writer), oldest first; `repo` filters (lowercase) when given. */
+export function landFirstRows(entries: readonly EntryRow[], repo?: string): LandFirstRow[] {
+	const out: LandFirstRow[] = [];
+	for (const c of controlEntries(entries)) {
+		const r = c.prefix === "train-notice" ? parseLandFirst(c.rest) : null;
+		if (r !== null && (repo === undefined || r.repo === repo.toLowerCase())) out.push({ ...r, entryId: c.id, createdAt: c.createdAt });
+	}
+	return out;
+}
+
+/** A repository's open stop episode (D6): its opening row, its newest state, its issue and its repair rows; null when none is open. */
+export interface StopEpisode {
+	raised: Extract<LandFirstRow, { event: "stop-raised" }>;
+	/** The newest `stop-raised` or `stop-updated` of the episode. */
+	state: Extract<LandFirstRow, { event: "stop-raised" | "stop-updated" }>;
+	filed: string | null;
+	woken: Extract<LandFirstRow, { event: "repair-woken" }> | null;
+	failed: Extract<LandFirstRow, { event: "repair-failed" }> | null;
+}
+
+/** The open stop episode among one repository's rows (`landFirstRows(entries, repo)`): the newest `stop-raised` with no `stop-cleared` after it. */
+export function stopEpisode(rows: readonly LandFirstRow[]): StopEpisode | null {
+	let ep: StopEpisode | null = null;
+	for (const r of rows) {
+		if (r.event === "stop-raised") ep = { raised: r, state: r, filed: null, woken: null, failed: null };
+		else if (ep === null) continue;
+		else if (r.event === "stop-updated") ep.state = r;
+		else if (r.event === "stop-filed") ep.filed = r.url;
+		else if (r.event === "repair-woken") ep.woken = r;
+		else if (r.event === "repair-failed") ep.failed = r;
+		else if (r.event === "stop-cleared") ep = null;
+	}
+	return ep;
+}
+
+/** One stop episode in a sentence (D6): what stopped, where, G, the suspects, why, and the next step; the head of its jo-issues issue. */
+export function stopSummary(repo: string, s: { kind: string; tip: string; g: string | null; suspects: number[]; reasons: string[] }): string {
+	const next = s.kind === "regression"
+		? "next: the merge train reverts the suspects (one attempt per wake), or an owner names a fix PR in this issue"
+		: s.kind === "infrastructure"
+			? `next: the tick re-requests main's run (3 per block); if the runner is broken, fix it, then say main-retry ${repo}`
+			: "next: main's runs of the suspects reopen landing once they are green";
+	return `Landing stopped on ${repo} (${s.kind}) at ${s.tip.slice(0, 7)}, G ${s.g?.slice(0, 7) ?? "none"}, suspects ${s.suspects.length === 0 ? "none" : s.suspects.map((n) => `#${n}`).join(", ")}: ${s.reasons.join("; ")}. ${next}.`;
+}
+
+/**
+ * Every repository land-first is on for now, lowercase; `includePendingOff` also includes repositories
+ * whose off revocations are unfinished. Prefer the full owner/repo from tick rows over Jo's short name.
+ */
+export function landFirstRepos(entries: readonly EntryRow[], instructions: readonly InstructionRow[], includePendingOff = false): string[] {
+	const full = new Set<string>();
+	for (const c of controlEntries(entries)) {
+		const r = c.prefix === "train-reconciled" ? parseTrainReconciled(c.body)?.repo : c.prefix === "train-notice" ? parseLandFirst(c.rest)?.repo : undefined;
+		if (r !== undefined && r !== "*") full.add(r);
+	}
+	const named = controlEntries(entries).filter((c) => c.prefix === "land-first").map((c) => c.rest.split(" ")[0]!.toLowerCase());
+	const out = new Set(full);
+	for (const n of named) if (![...full].some((f) => sameRepo(f, n))) out.add(n);
+	return [...out].filter((r) => includePendingOff ? landFirstHeld(entries, instructions, r) : landFirstOn(entries, instructions, r)).sort();
+}
+
+/** A control process's own root as git and the file system read it now (§ 2 Protect the verifier, Self-checks). */
+export interface ControlRoot {
+	/** The repository root, symlinks resolved. */
+	root: string;
+	/** Its HEAD commit. */
+	head: string;
+	/** Tracked files with changes (`git status --porcelain --untracked-files=no`). */
+	modified: string[];
+	/** `~/.agent-system-2/verified/current`, symlinks resolved; null when it does not exist. */
+	current: string | null;
+	/** The commit `current` has checked out; null when `current` does not exist. */
+	currentHead: string | null;
+	/** The root's origin as lowercase `owner/repo`; null when it has none GitHub names. */
+	repo: string | null;
+}
+
+/**
+ * Why a control root fails § 2's self-check, every reason. New processes load `verified/current`; a process already
+ * running may finish from an older immutable sibling `verified/<HEAD 12>` after promotion. Either root must have a
+ * green believable main verdict and unmodified tracked files. An arbitrary checkout or sibling name is never accepted.
+ */
+export function controlRootRefusal(r: ControlRoot, entries: readonly EntryRow[]): string[] {
+	const out: string[] = [];
+	if (r.current === null) out.push("no verified control root: ~/.agent-system-2/verified/current does not exist");
+	else if (r.root !== r.current && !(dirname(r.root) === dirname(r.current)
+		&& /\/\.agent-system-2\/verified\/[0-9a-f]{12}$/.test(r.root) && basename(r.root) === r.head.slice(0, 12))) {
+		out.push(`root ${r.root} is not verified/current (${r.current})`);
+	}
+	if (mainVerdicts(mainResults(entries)).get(r.head)?.verdict !== "green") out.push(`HEAD ${r.head.slice(0, 12)} has no green believable main verdict`);
+	if (r.modified.length > 0) out.push(`tracked files modified: ${r.modified.join(", ")}`);
 	return out;
 }

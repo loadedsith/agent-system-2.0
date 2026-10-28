@@ -16,12 +16,15 @@ ledger/SCHEMA.md	doc	-
 ledger/schema.sql	ledger-schema	{ledger_db}
 ledger/src/index.ts	ledger-module	-
 ledger/src/locality.ts	ledger-module	-
+ledger/src/native.ts	ledger-module	-
 ledger/scripts/init.ts	ledger-init	-
 ledger/scripts/backup.ts	ledger-backup	-
 ledger/test/facts.test.ts	test	-
 ledger/test/install.test.ts	test	-
 ledger/test/ledger.test.ts	test	-
 ledger/test/raw-sqlite.test.ts	test	-
+ledger/test/locality.test.ts	test	-
+ledger/test/no-spawn.test.ts	test	-
 install/manifest.tsv	install	-
 install/install.sh	install	-
 install/fresh-machine-test.sh	install	-
@@ -126,6 +129,8 @@ gates/src/git-model.ts	module	-
 gates/src/fence.ts	module	-
 gates/test/case-and-noexec.test.ts	test	-
 gates/test/rulings.test.ts	test	-
+gates/test/r06-reserved.test.ts	test	-
+gates/test/r06-land-first.test.ts	test	-
 gates/test/extension.test.ts	test	-
 gates/test/helpers.ts	test	-
 gates/test/known-fragment.test.ts	test	-
@@ -1107,6 +1112,7 @@ surface/test/lane-live-lane.test.ts	test	-
 surface/test/lane-smoke.test.ts	test	-
 surface/test/lane-model.test.ts	test	-
 surface/test/lane-model-script.test.ts	test	-
+surface/test/lane-resume-script.test.ts	test	-
 surface/test/by-hand-context.test.ts	test	-
 surface/test/lane-headroom-script.test.ts	test	-
 surface/src/ctx-index.ts	module	-
@@ -1127,7 +1133,12 @@ surface/test/turn-idle.test.ts	test	-
 surface/test/wake-push.test.ts	test	-
 surface/src/test-run.ts	module	-
 surface/test/test-run.test.ts	test	-
+surface/src/fast-set.ts	module	-
+surface/test/fast-set.test.ts	test	-
+surface/src/main-state.ts	module	-
+surface/test/main-state.test.ts	test	-
 surface/scripts/test-runner.ts	module	-
+surface/scripts/promote-verified.ts	module	-
 surface/test/test-runner.test.ts	test	-
 surface/scripts/test-run-waits.ts	module	-
 surface/test/test-run-waits.test.ts	test	-
@@ -1144,10 +1155,18 @@ surface/scripts/train-tick.ts	module	-
 surface/test/train-tick.test.ts	test	-
 surface/test/train-world.ts	test	-
 surface/test/train-escalation.test.ts	test	-
+surface/test/train-live.test.ts	test	-
+surface/test/train-signoff.test.ts	test	-
 install/com.agent-system-2.train-tick.plist	install	-
 surface/scripts/test-exec.ts	module	-
 surface/src/as2test.ts	module	-
+surface/src/as2test-temp.ts	module	-
 surface/test/as2test.test.ts	test	-
+surface/test/as2test-temp.test.ts	test	-
+surface/src/stuck-detect.ts	module	-
+surface/test/stuck-detect.test.ts	test	-
+surface/scripts/stuck-report.ts	module	-
+surface/test/stuck-report.test.ts	test	-
 install/as2test-setup.sh	install	-
 gates/test/r08-push-dest.test.ts	test	-
 surface/test/close-fresh.test.ts	test	-
@@ -1223,8 +1242,10 @@ ledger/test/fixtures/live-guard/reach.fixture.ts	test	-
 surface/src/pending.ts	module	-
 surface/src/batch.ts	module	-
 surface/src/notice.ts	module	-
+surface/src/headroom-notice.ts	module	-
 surface/test/pending.test.ts	test	-
 surface/test/batch.test.ts	test	-
+surface/test/headroom-notice.test.ts	test	-
 # Migration items one file each (wl-mv5mvvs64ahq0w): the numbering tool .github/workflows/migration-number.yml runs.
 surface/src/migration-items.ts	module	-
 surface/scripts/migration-items.ts	module	-
@@ -1269,6 +1290,9 @@ surface/test/rank.test.ts	test	-
 surface/test/rank-tool.test.ts	test	-
 surface/test/rank-audit.test.ts	test	-
 surface/test/rank-launch.test.ts	test	-
+surface/test/priority-pause.test.ts	test	-
+# Intake queue (migration/items/intake-queue.md): queued asks wait in rank order and launch when a slot frees.
+surface/test/intake-queue.test.ts	test	-
 # Phoenix tracing (wl-mv65t5d34lts00): the tracing switch (reader, word, tests) and the Phoenix LaunchAgent,
 # on by default. install/phoenix-agent.sh fills and loads the plist; install.sh runs it (step 6e).
 install/com.agent-system-2.phoenix.plist	install	-
@@ -1306,7 +1330,9 @@ plugins/ask-graham/package.json	data	-
 plugins/ask-graham/skills/ask-graham/SKILL.md	skill	-
 plugins/ask-graham/skills/ask-graham/references/comparables-criteria.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/references/graham-answers.md	skill-asset	-
+plugins/ask-graham/skills/ask-graham/references/upkeep.md	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/intensity.mjs	skill-asset	-
+plugins/ask-graham/skills/ask-graham/scripts/upkeep.mjs	skill-asset	-
 plugins/ask-graham/skills/ask-graham/scripts/verdict.mjs	skill-asset	-
 plugins/i-have-audhd/.claude-plugin/plugin.json	data	-
 plugins/i-have-audhd/.omp-plugin/plugin.json	data	-
@@ -1323,6 +1349,7 @@ plugins/i-have-audhd/hooks/i-have-audhd-inject.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-prompt.mjs	module	-
 plugins/i-have-audhd/hooks/i-have-audhd-stop.mjs	module	-
 plugins/i-have-audhd/judge/ask.mjs	module	-
+plugins/i-have-audhd/lib/alerts.mjs	module	-
 plugins/i-have-audhd/lib/config.mjs	module	-
 plugins/i-have-audhd/lib/judge-setup.mjs	module	-
 plugins/i-have-audhd/lib/pending.mjs	module	-
@@ -1373,9 +1400,46 @@ plugins/paired-coding/server/pair-server.mjs	module	-
 plugins/paired-coding/skills/paired-coding/SKILL.md	skill	-
 plugins/test/by-hand-session.test.ts	test	-
 plugins/test/loader.test.ts	test	-
+# Self-heal Phase 1, detect and report (wl-mvbcjageg7o2yo, migration/items/self-heal-phase1-report.md): the shared types,
+# the runner's lane metrics, held messages delivered at close, the counts and the daily report with its launchd job.
+surface/src/selfheal/types.ts	module	-
+surface/src/metrics.ts	module	-
+surface/test/lane-metrics.test.ts	test	-
+surface/test/close-held.test.ts	test	-
+surface/src/selfheal/counts.ts	module	-
+surface/scripts/daily-report.ts	module	-
+surface/test/daily-report.test.ts	test	-
+install/com.agent-system-2.daily-report.plist	install	-
+surface/src/selfheal/detectors.ts	module	-
+surface/src/selfheal/read.ts	module	-
+surface/test/selfheal-detectors.test.ts	test	-
+surface/test/fixtures/selfheal/README.md	doc	-
+surface/test/fixtures/selfheal/compaction-loop.jsonl	test	-
+surface/test/fixtures/selfheal/compaction-loop-jp-build.jsonl	test	-
+surface/test/fixtures/selfheal/compaction-loop-clean.jsonl	test	-
+surface/test/fixtures/selfheal/paste-drop.jsonl	test	-
+surface/test/fixtures/selfheal/paste-drop-clean.jsonl	test	-
+surface/test/fixtures/selfheal/paste-drop-smoke.jsonl	test	-
+surface/test/fixtures/selfheal/hand-lab.json	test	-
+surface/test/fixtures/selfheal/hand-lab-clean.json	test	-
+surface/test/fixtures/selfheal/ceiling-wall.json	test	-
+surface/test/fixtures/selfheal/ceiling-wall-clean.json	test	-
+surface/test/fixtures/selfheal/flaky-test.json	test	-
+surface/test/fixtures/selfheal/flaky-test-clean.json	test	-
+surface/test/fixtures/selfheal/model-start.json	test	-
+surface/test/fixtures/selfheal/model-start-clean.json	test	-
+surface/test/fixtures/selfheal/jetsam/JetsamEvent-2026-10-13-124141.ips	test	-
+surface/test/fixtures/selfheal/jetsam/JetsamEvent-2026-10-14-053054.ips	test	-
+surface/test/fixtures/selfheal/jetsam/JetsamEvent-2026-10-16-053539.ips	test	-
 plugins/test/omp-host.ts	test	-
 plugins/test/paired-coding.test.ts	test	-
 # The P-11 bridge for the paired adapter's pair_write, pair_edit and pair_run (wl-mvb9mw00ycfjeo PLAN-2 D5,
 # 2026-10-19): the canonical write/edit/bash view the rows and observers read, and its tests.
 gates/src/pair-call.ts	module	-
 gates/test/paired-coding.test.ts	test	-
+# GitHub's saved compare and commit answers for PR #305 (aebe37a4...cde03460), the decision-log carry fixture
+# (wl-mvpwkpqobyp20w PLAN D5, 2026-10-26).
+surface/test/fixtures/train-carry-305/compare.json	test	-
+surface/test/fixtures/train-carry-305/commit-cde03460.json	test	-
+surface/test/fixtures/full-suite-publication-worker.ts	test	-
+surface/test/land-first-off.test.ts	test	-
