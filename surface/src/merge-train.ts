@@ -450,7 +450,8 @@ export function trainBrief(wl: string, prs: readonly number[], source: TrainSour
 		`5. Conversion commit: \`${RESOLVE_COMMAND} convert --pr <n> --workload <head workload> --base origin/main\`. When it wrote ` +
 			"files, `git add` them and commit `migration: #<n>'s item to migration/items/<slug>.md`. Then `check` must exit 0, and " +
 			"`git status --porcelain` must be empty.",
-		"6. Declare the slice artifact (a bare `bun test <the PR's changed test files> surface/test/migration-items.test.ts`), pass it " +
+		"6. Declare the slice artifact (a bare `bun test surface/test/migration-items.test.ts`; the PR's changed test files run in `lane_full_test`, " +
+			"outside the lane fence where lane tests' `ps` calls work, so this step does not run them), pass it " +
 			`on that clean tree, then \`${TRAIN_PUSH}\` (no force) in a bash call of its own from the PR worktree (its cwd, or a leading \`cd\`). Use the PR's open \`${full}\`, or add the next r when ` +
 			`none is open. Then \`lane_full_test { pr: <n>, slice: ${full} }\`; a green or a \`red-main\` completes that slice itself. Green → step 7. ` +
 			"`red-main` (every failing test also fails in the runner's run of main's base, so the PR adds none; the result names base's sha): " +
