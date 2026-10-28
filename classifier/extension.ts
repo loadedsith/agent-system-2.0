@@ -159,7 +159,7 @@ import {
 	questionSha256,
 } from "./src/classify";
 import { repoFingerprint } from "./src/fingerprint";
-import { type Headroom, headroom } from "./src/headroom";
+import { type Headroom, type HeadroomUse, headroom } from "./src/headroom";
 import { askChoices, type ChoiceAnswer, type ChoiceJudge, type ChoiceQuestions, loadChoiceQuestions } from "./src/judge-ask";
 import {
 	type Builders,
@@ -582,7 +582,8 @@ async function availableRow(
 /**
  * Legal spawn entries, with quota decisions against available configured budget alternatives.
  * Selectors absent from `budgets` fail closed; its other selectors never gain spawn authority. Core owns lab
- * filtering, ordering and comparison policy. Null room preserves credential/refusal-only Kimi checks.
+ * filtering, ordering and comparison policy. Null room preserves credential/refusal-only Kimi checks. `use` is
+ * `review` for a review hand or plan (Jo's OpenAI-reviews-only rule, classifier/src/headroom.ts `HeadroomUse`).
  */
 async function usableRow(
 	row: readonly string[],
@@ -592,6 +593,7 @@ async function usableRow(
 	spawnKey: string | null,
 	room: Headroom | null = null,
 	budgets: readonly string[] = row,
+	use?: HeadroomUse,
 ) {
 	const available = await availableRow(budgets, registry, disabled, refused, spawnKey);
 	const usable: string[] = [];
@@ -602,7 +604,7 @@ async function usableRow(
 		if (!budgets.includes(selector)) why[selector] = "not in the configured budget row";
 		else if (available.why[selector]) why[selector] = available.why[selector]!;
 		else {
-			const decision = room?.decisionFor(selector, available.usable);
+			const decision = room?.decisionFor(selector, available.usable, use);
 			if (decision?.out) why[selector] = `projected out: ${(projected[selector] = decision.out)}`;
 			else {
 				usable.push(selector);
@@ -1753,7 +1755,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 		live();
 		const now = clock();
 		const registry = ctx.modelRegistry as unknown as ModelAvailability;
-		const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(ledger.entries(c.workloadId), now), null, headroom({ now }));
+		const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(ledger.entries(c.workloadId), now), null, headroom({ now }), row, "review");
 		live();
 		const at = { workloadId: c.workloadId, by: deps.laneId };
 		if (field.field === "panel") {
@@ -2440,7 +2442,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 					const row = reviewRow(deps.tierTable(), c.routing.tier);
 					const disabled = new Set(await deps.disabledProviders(ctx));
 					const registry = ctx.modelRegistry as unknown as ModelAvailability;
-					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null, headroom({ now: clock() }));
+					const { usable, why } = await usableRow(row, registry, disabled, refusedProviders(entries, clock()), null, headroom({ now: clock() }), row, "review");
 					if (!attempt.live) throw retired();
 					const input = { row, usable, builders: buildersOf(c.workloadId), stakes: "production" as const, skipped: why };
 					const plan = reviewPlan({ ...input, grant: false });
@@ -2677,7 +2679,7 @@ export function createClassifierExtension(deps: ClassifierDeps) {
 				if (build && "error" in build) return refuse(refusedRow(`agent-system-2 classifier: ${build.error}`));
 				const row = build ? build.row : reviewRow(table, tier);
 				const room = headroom({ now: clock() });
-				const { usable, why, skipped, projected: out, retained } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row);
+				const { usable, why, skipped, projected: out, retained } = await usableRow(row, registry, disabled, providerRefused, spawnKey, room, build ? table[tier] : row, build ? undefined : "review");
 				const retainedNotes = (models: readonly string[]) => models.flatMap(selector => retained[selector] ? [retained[selector]!] : []);
 				const pin = found?.lab ?? null;
 				projected = Object.entries(out).filter(([selector]) => pin === null || labOf(selector) === pin);
